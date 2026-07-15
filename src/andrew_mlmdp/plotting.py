@@ -8,6 +8,48 @@ from matplotlib.patches import Rectangle
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
 
 
+def _draw_walls(
+    maze: Maze,
+    ax,
+    *,
+    color: str,
+    zorder: int | None = None,
+) -> None:
+    """Draw one unit square for each wall without changing axis formatting."""
+
+    for row, column in maze.walls:
+        wall_options = {
+            "facecolor": color,
+            "edgecolor": color,
+        }
+        if zorder is not None:
+            wall_options["zorder"] = zorder
+        ax.add_patch(
+            Rectangle(
+                (column - 0.5, row - 0.5),
+                1.0,
+                1.0,
+                **wall_options,
+            )
+        )
+
+
+def _format_maze_axes(maze: Maze, ax, *, show_grid: bool) -> None:
+    """Apply the shared row/column coordinate system to a maze plot."""
+
+    number_of_rows, number_of_columns = maze.shape
+    ax.set_xlim(-0.5, number_of_columns - 0.5)
+    ax.set_ylim(number_of_rows - 0.5, -0.5)
+    ax.set_aspect("equal")
+    ax.set_xticks(np.arange(number_of_columns))
+    ax.set_yticks(np.arange(number_of_rows))
+    if show_grid:
+        ax.grid(color="0.86", linewidth=0.6)
+        ax.set_axisbelow(True)
+    ax.set_xlabel("column")
+    ax.set_ylabel("row")
+
+
 def plot_subgoal_passive_dynamics(
     maze: Maze,
     subgoals: list[Coordinate] | tuple[Coordinate, ...],
@@ -41,16 +83,7 @@ def plot_subgoal_passive_dynamics(
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
-    for row, column in maze.walls:
-        wall = Rectangle(
-            (column - 0.5, row - 0.5),
-            1.0,
-            1.0,
-            facecolor="black",
-            edgecolor="black",
-            zorder=1,
-        )
-        ax.add_patch(wall)
+    _draw_walls(maze, ax, color="black", zorder=1)
 
     edges = []
     for first in range(number_of_subgoals):
@@ -113,14 +146,7 @@ def plot_subgoal_passive_dynamics(
                 zorder=4,
             )
 
-    number_of_rows, number_of_columns = maze.shape
-    ax.set_xlim(-0.5, number_of_columns - 0.5)
-    ax.set_ylim(number_of_rows - 0.5, -0.5)
-    ax.set_aspect("equal")
-    ax.set_xticks(np.arange(number_of_columns))
-    ax.set_yticks(np.arange(number_of_rows))
-    ax.set_xlabel("column")
-    ax.set_ylabel("row")
+    _format_maze_axes(maze, ax, show_grid=False)
     ax.set_title("Task-independent layer-2 passive dynamics")
 
     return ax
@@ -187,19 +213,9 @@ def plot_controlled_dynamics(
     if largest_probability > 0.0:
         arrow_scale = 0.42 / largest_probability
 
-    number_of_rows, number_of_columns = maze.shape
-
     # Draw walls as cells. Free space stays white so the dense arrows remain
     # the most prominent information in the figure.
-    for row, column in maze.walls:
-        wall = Rectangle(
-            (column - 0.5, row - 0.5),
-            1.0,
-            1.0,
-            facecolor="0.18",
-            edgecolor="0.18",
-        )
-        ax.add_patch(wall)
+    _draw_walls(maze, ax, color="0.18")
 
     for coordinate, row_change, column_change, probability in arrows:
         row, column = coordinate
@@ -235,15 +251,7 @@ def plot_controlled_dynamics(
         zorder=4,
     )
 
-    ax.set_xlim(-0.5, number_of_columns - 0.5)
-    ax.set_ylim(number_of_rows - 0.5, -0.5)
-    ax.set_aspect("equal")
-    ax.set_xticks(np.arange(number_of_columns))
-    ax.set_yticks(np.arange(number_of_rows))
-    ax.grid(color="0.86", linewidth=0.6)
-    ax.set_axisbelow(True)
-    ax.set_xlabel("column")
-    ax.set_ylabel("row")
+    _format_maze_axes(maze, ax, show_grid=True)
     ax.set_title("Controlled next-state probabilities")
 
     return ax
@@ -268,17 +276,7 @@ def plot_trajectory(
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
-    number_of_rows, number_of_columns = maze.shape
-
-    for row, column in maze.walls:
-        wall = Rectangle(
-            (column - 0.5, row - 0.5),
-            1.0,
-            1.0,
-            facecolor="0.18",
-            edgecolor="0.18",
-        )
-        ax.add_patch(wall)
+    _draw_walls(maze, ax, color="0.18")
 
     rows = []
     columns = []
@@ -322,15 +320,7 @@ def plot_trajectory(
         zorder=4,
     )
 
-    ax.set_xlim(-0.5, number_of_columns - 0.5)
-    ax.set_ylim(number_of_rows - 0.5, -0.5)
-    ax.set_aspect("equal")
-    ax.set_xticks(np.arange(number_of_columns))
-    ax.set_yticks(np.arange(number_of_rows))
-    ax.grid(color="0.86", linewidth=0.6)
-    ax.set_axisbelow(True)
-    ax.set_xlabel("column")
-    ax.set_ylabel("row")
+    _format_maze_axes(maze, ax, show_grid=True)
     ax.set_title(f"Sample controlled rollout ({len(trajectory) - 1} steps)")
 
     return ax

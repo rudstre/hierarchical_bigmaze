@@ -7,6 +7,7 @@ import numpy as np
 
 from andrew_mlmdp import (
     Maze,
+    ModelParameters,
     build_two_layer_model,
     compute_layer_one_plan,
     plot_trajectory,
@@ -30,14 +31,18 @@ def main() -> None:
     maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
     start = (1, 0)
     goal = (10, 9)
-    beta = 10.0
+    parameters = ModelParameters()
 
-    model = build_two_layer_model(maze, SUBGOALS, goal)
-    initial_plan = compute_layer_one_plan(model, start, beta=beta)
+    model = build_two_layer_model(
+        maze,
+        SUBGOALS,
+        goal,
+        parameters=parameters,
+    )
+    initial_plan = compute_layer_one_plan(model, start)
     rollout = sample_hierarchical_rollout(
         model,
         start,
-        beta=beta,
         seed=28,
     )
 
@@ -48,14 +53,14 @@ def main() -> None:
         gridspec_kw={"width_ratios": [1.0, 1.0, 1.35]},
     )
     matrix_maximum = max(
-        model.layer_two_passive.max(),
-        model.layer_two_controlled.max(),
+        model.upper_dynamics.passive.max(),
+        model.upper_controlled.max(),
     )
     abstract_labels = SUBGOAL_LABELS + ("goal",)
 
     for ax, matrix, title in (
-        (axes[0], model.layer_two_passive, "Layer 2 passive"),
-        (axes[1], model.layer_two_controlled, "Layer 2 controlled"),
+        (axes[0], model.upper_dynamics.passive, "Layer 2 passive"),
+        (axes[1], model.upper_controlled, "Layer 2 controlled"),
     ):
         image = ax.imshow(
             matrix,
@@ -129,6 +134,7 @@ def main() -> None:
     figure.savefig(output_file, dpi=180, bbox_inches="tight")
     plt.close(figure)
 
+    print("parameters:", parameters)
     print("target order:", SUBGOAL_LABELS + ("goal",))
     print("initial first-hit probabilities:", initial_plan.passive_abstract)
     print("initial inpainted rewards:", initial_plan.inpainted_rewards)

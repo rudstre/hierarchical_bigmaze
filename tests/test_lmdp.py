@@ -4,12 +4,16 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
+    FirstExitDynamics,
     Maze,
+    ModelParameters,
     build_passive_dynamics,
+    controlled_from_desirability,
     controlled_dynamics,
     desirability_grid,
     sample_rollout,
     solve_desirability,
+    solve_first_exit,
 )
 
 
@@ -37,7 +41,7 @@ def test_one_cell_maze_contains_only_goal_desirability() -> None:
     desirability = solve_desirability(
         maze,
         goal=(0, 0),
-        control_cost=1.0,
+        parameters=ModelParameters(control_cost=1.0),
     )
 
     assert desirability.dtype == np.float64
@@ -54,7 +58,8 @@ def test_corridor_desirability_increases_toward_goal() -> None:
 def test_solution_satisfies_linear_bellman_equation() -> None:
     maze = Maze.from_ascii("...\n.#.\n...")
     goal = (2, 2)
-    desirability = solve_desirability(maze, goal, control_cost=1.0)
+    parameters = ModelParameters(control_cost=1.0)
+    desirability = solve_desirability(maze, goal, parameters=parameters)
     passive_dynamics = build_passive_dynamics(maze)
 
     goal_state = maze.state_index(goal)
@@ -87,26 +92,25 @@ def test_goal_must_be_a_free_cell(goal: tuple[int, int]) -> None:
 
 
 @pytest.mark.parametrize(
-    ("parameters", "message"),
+    ("parameter_values", "message"),
     [
         ({"interior_reward": 0.0}, "negative"),
         ({"control_cost": 0.0}, "positive"),
     ],
 )
 def test_solver_parameters_must_define_a_well_posed_problem(
-    parameters: dict[str, float],
+    parameter_values: dict[str, float],
     message: str,
 ) -> None:
-    maze = Maze.from_ascii("..")
-
     with pytest.raises(ValueError, match=message):
-        solve_desirability(maze, (0, 1), **parameters)
+        ModelParameters(**parameter_values)
 
 
 def test_four_rooms_desirability_and_grid_view() -> None:
     maze = Maze.from_file(FOUR_ROOMS_FILE)
     goal = (10, 9)
-    desirability = solve_desirability(maze, goal, control_cost=1.0)
+    parameters = ModelParameters(control_cost=1.0)
+    desirability = solve_desirability(maze, goal, parameters=parameters)
     grid = desirability_grid(maze, desirability)
 
     assert desirability.shape == (97,)
@@ -151,6 +155,48 @@ def test_controlled_column_matches_equation_six() -> None:
     expected /= expected.sum()
 
     assert controlled[:, current_state] == pytest.approx(expected)
+
+
+def test_generic_first_exit_helpers_match_maze_solution() -> None:
+    maze = Maze.from_ascii("...")
+    goal = (0, 2)
+    parameters = ModelParameters()
+    passive = build_passive_dynamics(maze)
+    goal_state = maze.state_index(goal)
+    interior_states = np.asarray([0, 1])
+    dynamics = FirstExitDynamics(
+        passive[np.ix_(interior_states, interior_states)],
+        passive[goal_state, interior_states][np.newaxis, :],
+    )
+    goal_desirability = np.exp(
+        parameters.goal_reward / parameters.control_cost
+    )
+    q_interior = np.exp(
+        parameters.interior_reward / parameters.control_cost
+    )
+
+    interior = solve_first_exit(
+        dynamics,
+        np.asarray([goal_desirability]),
+        q_interior,
+    )
+    complete = np.concatenate([interior, [goal_desirability]])
+
+    assert complete == pytest.approx(
+        solve_desirability(maze, goal, parameters=parameters)
+    )
+    assert controlled_from_desirability(passive, complete) == pytest.approx(
+        controlled_dynamics(maze, complete)
+    )
+
+
+def test_canonical_parameter_defaults() -> None:
+    parameters = ModelParameters()
+
+    assert parameters.alpha == 1.0
+    assert parameters.control_cost == 0.15
+    assert parameters.off_target_reward == -2.0
+    assert parameters.beta == 10.0
 
 
 def test_controlled_dynamics_prefer_movement_toward_goal() -> None:

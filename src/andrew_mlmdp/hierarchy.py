@@ -1,56 +1,87 @@
-"""Exact two-layer MLMDP calculations for maze navigation.
+"""Two-layer multitask LMDPs for maze navigation.
 
-The implementation follows the matrix construction in Saxe, Earle, and
-Rosman (2017). Arrays remain public on the result dataclasses so each step of
-the calculation can be inspected directly in a notebook.
+The module follows the paper's construction in order: augment the physical
+process with subgoal boundaries, derive first-hit dynamics, construct the task
+basis, and solve the abstract layer. Intermediate arrays remain public so a
+researcher can inspect every calculation directly.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 
-from andrew_mlmdp.lmdp import build_passive_dynamics
+from andrew_mlmdp.lmdp import (
+    FirstExitDynamics,
+    ModelParameters,
+    build_passive_dynamics,
+    controlled_from_desirability,
+    solve_first_exit,
+)
 from andrew_mlmdp.maze import Coordinate, Maze
 
 
-@dataclass
-class TwoLayerModel:
-    """All fixed matrices for one set of subgoals and one current goal.
+@dataclass(frozen=True)
+class TaskBasis:
+    """Boundary tasks and their solved interior desirabilities.
 
-    Abstract rows follow ``targets = subgoals + (goal,)``. Layer-2 columns
-    follow subgoal order because the goal is its first-exit boundary.
+    Columns are component tasks. ``boundary_desirability`` is the paper's
+    ``Q_b`` with shape ``(n_boundary, n_tasks)``; ``interior_desirability`` is
+    ``Z_i`` with shape ``(n_interior, n_tasks)``.
+    """
+
+    boundary_desirability: np.ndarray
+    interior_desirability: np.ndarray
+
+    def __post_init__(self) -> None:
+        boundary = np.asarray(self.boundary_desirability, dtype=np.float64)
+        interior = np.asarray(self.interior_desirability, dtype=np.float64)
+        if boundary.ndim != 2 or interior.ndim != 2:
+            raise ValueError("Task-basis arrays must be matrices")
+        if boundary.shape[1] != interior.shape[1]:
+            raise ValueError("Task-basis matrices must have the same columns")
+        object.__setattr__(self, "boundary_desirability", boundary)
+        object.__setattr__(self, "interior_desirability", interior)
+
+
+@dataclass(frozen=True)
+class TwoLayerModel:
+    """Inspectable fixed calculations for one goal and set of subgoals.
+
+    Lower boundary rows and task-basis rows follow ``targets``: all subgoals in
+    caller-supplied order, then the physical goal. Upper-layer columns follow
+    subgoal order; its only boundary row is the physical goal.
     """
 
     maze: Maze
     subgoals: tuple[Coordinate, ...]
     goal: Coordinate
     targets: tuple[Coordinate, ...]
+    parameters: ModelParameters
     interior_states: np.ndarray
     interior_state_by_coordinate: dict[Coordinate, int]
-    layer_one_interior_passive: np.ndarray
-    layer_one_subgoal_passive: np.ndarray
-    layer_one_goal_passive: np.ndarray
-    layer_one_fundamental: np.ndarray
+    lower_dynamics: FirstExitDynamics
     first_hit_probabilities: np.ndarray
-    boundary_task_basis: np.ndarray
-    layer_one_desirability_basis: np.ndarray
-    layer_two_passive: np.ndarray
-    layer_two_desirability: np.ndarray
-    layer_two_controlled: np.ndarray
-    interior_reward: float
-    goal_reward: float
-    off_target_reward: float
-    control_cost: float
-    alpha: float
+    task_basis: TaskBasis
+    upper_dynamics: FirstExitDynamics
+    upper_desirability: np.ndarray
+    upper_controlled: np.ndarray
+
+    @property
+    def lower_subgoal_passive(self) -> np.ndarray:
+        """Lower-layer passive rows for abstract subgoal copies."""
+
+        return self.lower_dynamics.boundary_passive[:-1]
+
+    @property
+    def lower_goal_passive(self) -> np.ndarray:
+        """Lower-layer passive row for the physical terminal goal."""
+
+        return self.lower_dynamics.boundary_passive[-1:]
 
 
-@dataclass
+@dataclass(frozen=True)
 class LayerOnePlan:
-    """Dynamic layer-1 task composition for one physical location.
-
-    ``layer_one_controlled`` has physical non-goal rows first, followed by
-    subgoal copies and the goal. Its columns follow ``model.interior_states``.
-    """
+    """Top-down task composition and lower policy at one physical location."""
 
     current: Coordinate
     passive_abstract: np.ndarray
@@ -64,9 +95,9 @@ class LayerOnePlan:
     layer_one_controlled: np.ndarray
 
 
-@dataclass
+@dataclass(frozen=True)
 class HierarchicalRollout:
-    """A physical trajectory and the zero-time hierarchy events within it."""
+    """A physical trajectory and its zero-time hierarchy events."""
 
     trajectory: list[Coordinate]
     subgoal_accesses: list[Coordinate]
@@ -81,53 +112,35 @@ def build_subgoal_passive_dynamics(
     maze: Maze,
     subgoals: list[Coordinate] | tuple[Coordinate, ...],
     *,
-    alpha: float = 0.1,
+    parameters: ModelParameters = ModelParameters(),
 ) -> np.ndarray:
-    """Derive the task-independent passive dynamics between subgoals.
+    """Derive task-independent passive dynamics between subgoals.
 
-    This is the six-node graph shown in Figure 3a of the paper. All physical
-    maze cells remain interior states; the only boundaries are access copies
-    of the configured subgoals. A task-specific goal is deliberately absent.
+    This is the square six-node graph used in Figure 3a for the supplied
+    four-room configuration. The calculation itself accepts any connected maze
+    and any nonempty set of unique free-cell subgoals.
     """
 
-    ordered_subgoals = tuple(subgoals)
-    if not ordered_subgoals:
-        raise ValueError("At least one subgoal is required")
-    if len(set(ordered_subgoals)) != len(ordered_subgoals):
-        raise ValueError("Subgoals must be unique")
-    if alpha <= 0.0:
-        raise ValueError("Alpha must be positive")
-
-    number_of_states = len(maze.free_cells)
-    number_of_subgoals = len(ordered_subgoals)
+    ordered_subgoals = _validate_subgoals(maze, subgoals)
     physical_passive = build_passive_dynamics(maze)
-    subgoal_access = np.zeros(
-        (number_of_subgoals, number_of_states),
-        dtype=np.float64,
+    subgoal_access = _subgoal_access_matrix(
+        maze,
+        ordered_subgoals,
+        np.arange(len(maze.free_cells)),
+        parameters.alpha,
+    )
+    physical_passive, subgoal_access = _normalize_augmented_columns(
+        physical_passive,
+        subgoal_access,
     )
 
-    for subgoal_state, coordinate in enumerate(ordered_subgoals):
-        physical_state = maze.state_index(coordinate)
-        subgoal_access[subgoal_state, physical_state] = alpha
-
-    # Access copies add passive mass at subgoal cells. Renormalizing the full
-    # stack preserves the paper's convention that every column sums to one.
-    stacked_passive = np.vstack([physical_passive, subgoal_access])
-    column_normalizers = stacked_passive.sum(axis=0)
-    physical_passive /= column_normalizers[np.newaxis, :]
-    subgoal_access /= column_normalizers[np.newaxis, :]
-
-    identity = np.eye(number_of_states)
-    fundamental_matrix = np.linalg.solve(
-        identity - physical_passive,
-        identity,
-    )
-
-    layer_two_passive = (
-        subgoal_access @ fundamental_matrix @ subgoal_access.T
-    )
-    layer_two_passive /= layer_two_passive.sum(axis=0)[np.newaxis, :]
-    return layer_two_passive
+    # Equation 8 with no task-specific physical boundary in this graph.
+    fundamental = _fundamental_matrix(physical_passive)
+    upper_passive = subgoal_access @ fundamental @ subgoal_access.T
+    column_sums = upper_passive.sum(axis=0)
+    if np.any(column_sums == 0.0):
+        raise ValueError("A subgoal has no reachable abstract target")
+    return upper_passive / column_sums[np.newaxis, :]
 
 
 def build_two_layer_model(
@@ -135,167 +148,50 @@ def build_two_layer_model(
     subgoals: list[Coordinate] | tuple[Coordinate, ...],
     goal: Coordinate,
     *,
-    alpha: float = 0.1,
-    interior_reward: float = -0.1,
-    goal_reward: float = 1.0,
-    off_target_reward: float = -0.1,
-    control_cost: float = 1.0,
+    parameters: ModelParameters = ModelParameters(),
 ) -> TwoLayerModel:
-    """Construct an exact two-layer model for one maze-navigation task."""
+    """Construct the exact two-layer model for one maze-navigation task."""
 
-    ordered_subgoals = tuple(subgoals)
-    if not ordered_subgoals:
-        raise ValueError("At least one subgoal is required")
-    if len(set(ordered_subgoals)) != len(ordered_subgoals):
-        raise ValueError("Subgoals must be unique")
+    ordered_subgoals = _validate_subgoals(maze, subgoals)
+    maze.state_index(goal)
     if goal in ordered_subgoals:
         raise ValueError("The goal and subgoals must be disjoint")
-    if alpha <= 0.0:
-        raise ValueError("Alpha must be positive")
-    if interior_reward >= 0.0:
-        raise ValueError("Interior reward must be negative")
-    if control_cost <= 0.0:
-        raise ValueError("Control cost must be positive")
 
-    goal_state = maze.state_index(goal)
-    for subgoal in ordered_subgoals:
-        maze.state_index(subgoal)
-
-    # The original goal is removed from layer 1's interior state set. Subgoal
-    # cells remain ordinary physical states and receive separate boundary copies.
-    interior_states = []
-    for state in range(len(maze.free_cells)):
-        if state != goal_state:
-            interior_states.append(state)
-    interior_states = np.asarray(interior_states, dtype=int)
-
-    interior_state_by_coordinate: dict[Coordinate, int] = {}
-    for interior_state, physical_state in enumerate(interior_states):
-        coordinate = maze.coordinate(int(physical_state))
-        interior_state_by_coordinate[coordinate] = interior_state
-
-    passive = build_passive_dynamics(maze)
-    layer_one_interior = passive[np.ix_(interior_states, interior_states)]
-    layer_one_goal = passive[goal_state, interior_states][np.newaxis, :]
-
-    number_of_subgoals = len(ordered_subgoals)
-    number_of_interior_states = len(interior_states)
-    layer_one_subgoals = np.zeros(
-        (number_of_subgoals, number_of_interior_states),
-        dtype=np.float64,
-    )
-    for subgoal_state, coordinate in enumerate(ordered_subgoals):
-        interior_state = interior_state_by_coordinate[coordinate]
-        layer_one_subgoals[subgoal_state, interior_state] = alpha
-
-    # Adding access-copy rows increases mass only at configured subgoals. The
-    # paper renormalizes the complete stacked column after this augmentation.
-    stacked_passive = np.vstack(
-        [layer_one_interior, layer_one_subgoals, layer_one_goal]
-    )
-    column_normalizers = stacked_passive.sum(axis=0)
-    layer_one_interior /= column_normalizers[np.newaxis, :]
-    layer_one_subgoals /= column_normalizers[np.newaxis, :]
-    layer_one_goal /= column_normalizers[np.newaxis, :]
-
-    identity = np.eye(number_of_interior_states)
-    layer_one_fundamental = np.linalg.solve(
-        identity - layer_one_interior,
-        identity,
-    )
-
-    layer_one_boundary = np.vstack([layer_one_subgoals, layer_one_goal])
-    first_hit_probabilities = layer_one_boundary @ layer_one_fundamental
-
-    # Equations 8 and 9: layer 2 inherits its passive dynamics from first-exit
-    # probabilities under layer 1. Diagonal self-transitions are retained.
-    layer_two_subgoals = (
-        layer_one_subgoals
-        @ layer_one_fundamental
-        @ layer_one_subgoals.T
-    )
-    layer_two_goal = (
-        layer_one_goal
-        @ layer_one_fundamental
-        @ layer_one_subgoals.T
-    )
-    layer_two_passive = np.vstack([layer_two_subgoals, layer_two_goal])
-    layer_two_normalizers = layer_two_passive.sum(axis=0)
-    if np.any(layer_two_normalizers == 0.0):
-        raise ValueError("A layer-2 state has no reachable abstract target")
-    layer_two_passive /= layer_two_normalizers[np.newaxis, :]
-
-    q_interior = np.exp(interior_reward / control_cost)
-    z_goal = np.exp(goal_reward / control_cost)
-    layer_two_desirability = np.empty(
-        number_of_subgoals + 1,
-        dtype=np.float64,
-    )
-    layer_two_desirability[-1] = z_goal
-    layer_two_desirability[:-1] = _solve_first_exit(
-        layer_two_passive[:-1, :],
-        layer_two_passive[-1:, :],
-        np.asarray([z_goal]),
-        q_interior,
-    )
-    layer_two_controlled = _controlled_from_desirability(
-        layer_two_passive,
-        layer_two_desirability,
-    )
-
-    # Boundary task order is [subgoals..., goal]. Cross-block zeros keep the
-    # original goal task separate from the newly added subgoal task family.
-    number_of_targets = number_of_subgoals + 1
-    boundary_task_basis = np.zeros(
-        (number_of_targets, number_of_targets),
-        dtype=np.float64,
-    )
-    subgoal_task_basis = np.full(
-        (number_of_subgoals, number_of_subgoals),
-        np.exp(off_target_reward / control_cost),
-        dtype=np.float64,
-    )
-    np.fill_diagonal(
-        subgoal_task_basis,
-        np.exp(goal_reward / control_cost),
-    )
-    boundary_task_basis[:-1, :-1] = subgoal_task_basis
-    boundary_task_basis[-1, -1] = z_goal
-
-    layer_one_desirability_basis = np.empty(
-        (number_of_interior_states, number_of_targets),
-        dtype=np.float64,
-    )
-    for task in range(number_of_targets):
-        layer_one_desirability_basis[:, task] = _solve_first_exit(
-            layer_one_interior,
-            layer_one_boundary,
-            boundary_task_basis[:, task],
-            q_interior,
+    interior_states, interior_state_by_coordinate, lower_dynamics = (
+        _build_augmented_lower_dynamics(
+            maze,
+            ordered_subgoals,
+            goal,
+            parameters.alpha,
         )
+    )
+    fundamental = _fundamental_matrix(lower_dynamics.interior_passive)
+    first_hit_probabilities = (
+        lower_dynamics.boundary_passive @ fundamental
+    )
+
+    # Equations 8 and 9 derive abstract reachability from the lower layer.
+    upper_dynamics = _build_upper_dynamics(lower_dynamics, fundamental)
+    upper_desirability, upper_controlled = _solve_upper_layer(
+        upper_dynamics,
+        parameters,
+    )
+    task_basis = _build_task_basis(lower_dynamics, parameters)
 
     return TwoLayerModel(
         maze=maze,
         subgoals=ordered_subgoals,
         goal=goal,
         targets=ordered_subgoals + (goal,),
+        parameters=parameters,
         interior_states=interior_states,
         interior_state_by_coordinate=interior_state_by_coordinate,
-        layer_one_interior_passive=layer_one_interior,
-        layer_one_subgoal_passive=layer_one_subgoals,
-        layer_one_goal_passive=layer_one_goal,
-        layer_one_fundamental=layer_one_fundamental,
+        lower_dynamics=lower_dynamics,
         first_hit_probabilities=first_hit_probabilities,
-        boundary_task_basis=boundary_task_basis,
-        layer_one_desirability_basis=layer_one_desirability_basis,
-        layer_two_passive=layer_two_passive,
-        layer_two_desirability=layer_two_desirability,
-        layer_two_controlled=layer_two_controlled,
-        interior_reward=interior_reward,
-        goal_reward=goal_reward,
-        off_target_reward=off_target_reward,
-        control_cost=control_cost,
-        alpha=alpha,
+        task_basis=task_basis,
+        upper_dynamics=upper_dynamics,
+        upper_desirability=upper_desirability,
+        upper_controlled=upper_controlled,
     )
 
 
@@ -303,44 +199,55 @@ def compute_layer_one_plan(
     model: TwoLayerModel,
     current: Coordinate,
     *,
-    beta: float = 10.0,
+    beta: float | None = None,
 ) -> LayerOnePlan:
-    """Inpaint rewards and compose the layer-1 task for ``current``."""
+    """Inpaint rewards and compose the lower-layer task for ``current``."""
 
     model.maze.state_index(current)
     if current == model.goal:
         raise ValueError("The terminal goal has no outgoing layer-1 plan")
+    inpainting_scale = model.parameters.beta if beta is None else beta
+    if not np.isfinite(inpainting_scale) or inpainting_scale <= 0.0:
+        raise ValueError("Beta must be finite and positive")
 
     if current in model.subgoals:
         abstract_state = model.subgoals.index(current)
-        passive_abstract = model.layer_two_passive[:, abstract_state].copy()
-        controlled_abstract = model.layer_two_controlled[:, abstract_state].copy()
+        passive_abstract = model.upper_dynamics.passive[
+            :, abstract_state
+        ].copy()
+        controlled_abstract = model.upper_controlled[:, abstract_state].copy()
     else:
-        # A general physical start is not a persistent layer-2 state. Its first
-        # abstract hit distribution supplies a temporary passive column.
+        # A general start is represented by its lower-layer first-hit column;
+        # it is not inserted as a persistent state in the upper model.
         interior_state = model.interior_state_by_coordinate[current]
-        passive_abstract = model.first_hit_probabilities[:, interior_state].copy()
-        controlled_abstract = passive_abstract * model.layer_two_desirability
+        passive_abstract = model.first_hit_probabilities[
+            :, interior_state
+        ].copy()
+        controlled_abstract = passive_abstract * model.upper_desirability
         controlled_abstract /= controlled_abstract.sum()
 
-    number_of_subgoals = len(model.subgoals)
-    inpainted_rewards = np.empty(number_of_subgoals + 1, dtype=np.float64)
-    inpainted_rewards[:-1] = beta * (
+    # Equation 10 supplies rewards only for abstract subgoal copies. The
+    # physical goal keeps the task's original terminal reward.
+    inpainted_rewards = np.empty(len(model.targets), dtype=np.float64)
+    inpainted_rewards[:-1] = inpainting_scale * (
         controlled_abstract[:-1] - passive_abstract[:-1]
     )
-    inpainted_rewards[-1] = model.goal_reward
-
+    inpainted_rewards[-1] = model.parameters.goal_reward
     target_boundary_desirability = np.exp(
-        inpainted_rewards / model.control_cost
+        inpainted_rewards / model.parameters.control_cost
     )
+
+    # Paper Equation 7, using its stated pseudoinverse-and-clipping
+    # approximation for tasks outside the exact span of Q_b.
     raw_weights = (
-        np.linalg.pinv(model.boundary_task_basis)
+        np.linalg.pinv(model.task_basis.boundary_desirability)
         @ target_boundary_desirability
     )
     weights = np.maximum(0.0, raw_weights)
-
-    interior_desirability = model.layer_one_desirability_basis @ weights
-    reconstructed_boundary = model.boundary_task_basis @ weights
+    interior_desirability = model.task_basis.interior_desirability @ weights
+    reconstructed_boundary = (
+        model.task_basis.boundary_desirability @ weights
+    )
 
     physical_desirability = np.empty(
         len(model.maze.free_cells),
@@ -350,21 +257,13 @@ def compute_layer_one_plan(
     goal_state = model.maze.state_index(model.goal)
     physical_desirability[goal_state] = reconstructed_boundary[-1]
 
-    layer_one_passive = np.vstack(
-        [
-            model.layer_one_interior_passive,
-            model.layer_one_subgoal_passive,
-            model.layer_one_goal_passive,
-        ]
-    )
     complete_desirability = np.concatenate(
         [interior_desirability, reconstructed_boundary]
     )
-    layer_one_controlled = _controlled_from_desirability(
-        layer_one_passive,
+    layer_one_controlled = controlled_from_desirability(
+        model.lower_dynamics.passive,
         complete_desirability,
     )
-
     return LayerOnePlan(
         current=current,
         passive_abstract=passive_abstract,
@@ -383,7 +282,7 @@ def sample_hierarchical_rollout(
     model: TwoLayerModel,
     start: Coordinate,
     *,
-    beta: float = 10.0,
+    beta: float | None = None,
     max_steps: int = 500,
     max_abstract_accesses: int = 500,
     seed: int | None = None,
@@ -422,9 +321,9 @@ def sample_hierarchical_rollout(
             :, current_state
         ].copy()
 
-        # Re-accessing the subgoal that supplied the current plan changes
-        # nothing. Conditioning on the next meaningful outcome analytically
-        # marginalizes any number of these zero-time self-accesses.
+        # Re-accessing the subgoal that supplied the current plan changes no
+        # state or reward. Condition on the next meaningful outcome instead of
+        # repeatedly sampling this zero-time no-op.
         if current == active_subgoal:
             active_subgoal_state = model.subgoals.index(active_subgoal)
             access_row = len(model.interior_states) + active_subgoal_state
@@ -437,7 +336,6 @@ def sample_hierarchical_rollout(
                 p=transition_probabilities,
             )
         )
-
         number_of_interior_states = len(model.interior_states)
         if next_state < number_of_interior_states:
             physical_state = int(model.interior_states[next_state])
@@ -460,8 +358,6 @@ def sample_hierarchical_rollout(
                 status="reached_goal",
             )
 
-        # Accessing a subgoal copy invokes layer 2 without advancing physical
-        # time. Execution resumes from the associated traversable maze cell.
         if len(subgoal_accesses) >= max_abstract_accesses:
             return HierarchicalRollout(
                 trajectory=trajectory,
@@ -473,6 +369,8 @@ def sample_hierarchical_rollout(
                 status="abstract_access_limit",
             )
 
+        # Subgoal-copy access invokes the upper layer without advancing
+        # physical time; execution resumes at the corresponding physical cell.
         current = model.subgoals[boundary_state]
         subgoal_accesses.append(current)
         active_subgoal = current
@@ -490,33 +388,179 @@ def sample_hierarchical_rollout(
     )
 
 
-def _solve_first_exit(
+def _validate_subgoals(
+    maze: Maze,
+    subgoals: list[Coordinate] | tuple[Coordinate, ...],
+) -> tuple[Coordinate, ...]:
+    ordered_subgoals = tuple(subgoals)
+    if not ordered_subgoals:
+        raise ValueError("At least one subgoal is required")
+    if len(set(ordered_subgoals)) != len(ordered_subgoals):
+        raise ValueError("Subgoals must be unique")
+    for subgoal in ordered_subgoals:
+        maze.state_index(subgoal)
+    return ordered_subgoals
+
+
+def _subgoal_access_matrix(
+    maze: Maze,
+    subgoals: tuple[Coordinate, ...],
+    interior_states: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    physical_to_interior = {
+        int(physical_state): interior_state
+        for interior_state, physical_state in enumerate(interior_states)
+    }
+    access = np.zeros(
+        (len(subgoals), len(interior_states)),
+        dtype=np.float64,
+    )
+    for subgoal_state, coordinate in enumerate(subgoals):
+        physical_state = maze.state_index(coordinate)
+        access[subgoal_state, physical_to_interior[physical_state]] = alpha
+    return access
+
+
+def _normalize_augmented_columns(
     interior_passive: np.ndarray,
     boundary_passive: np.ndarray,
-    boundary_desirability: np.ndarray,
-    q_interior: float,
-) -> np.ndarray:
-    """Solve the linear Bellman equation for explicit matrix blocks."""
+) -> tuple[np.ndarray, np.ndarray]:
+    column_sums = np.vstack(
+        [interior_passive, boundary_passive]
+    ).sum(axis=0)
+    if np.any(column_sums == 0.0):
+        raise ValueError("Augmented passive dynamics contain an empty column")
+    interior_passive /= column_sums[np.newaxis, :]
+    boundary_passive /= column_sums[np.newaxis, :]
+    return interior_passive, boundary_passive
 
-    number_of_interior_states = interior_passive.shape[0]
-    coefficient_matrix = np.eye(number_of_interior_states)
-    coefficient_matrix -= q_interior * interior_passive.T
-    right_hand_side = (
-        q_interior
-        * boundary_passive.T
-        @ boundary_desirability
+
+def _build_augmented_lower_dynamics(
+    maze: Maze,
+    subgoals: tuple[Coordinate, ...],
+    goal: Coordinate,
+    alpha: float,
+) -> tuple[np.ndarray, dict[Coordinate, int], FirstExitDynamics]:
+    goal_state = maze.state_index(goal)
+    interior_states = np.asarray(
+        [
+            state
+            for state in range(len(maze.free_cells))
+            if state != goal_state
+        ],
+        dtype=int,
     )
-    return np.linalg.solve(coefficient_matrix, right_hand_side)
+    coordinate_to_interior = {
+        maze.coordinate(int(physical_state)): interior_state
+        for interior_state, physical_state in enumerate(interior_states)
+    }
+
+    passive = build_passive_dynamics(maze)
+    interior_passive = passive[np.ix_(interior_states, interior_states)]
+    subgoal_passive = _subgoal_access_matrix(
+        maze,
+        subgoals,
+        interior_states,
+        alpha,
+    )
+    goal_passive = passive[goal_state, interior_states][np.newaxis, :]
+    boundary_passive = np.vstack([subgoal_passive, goal_passive])
+    interior_passive, boundary_passive = _normalize_augmented_columns(
+        interior_passive,
+        boundary_passive,
+    )
+    return (
+        interior_states,
+        coordinate_to_interior,
+        FirstExitDynamics(interior_passive, boundary_passive),
+    )
 
 
-def _controlled_from_desirability(
-    passive: np.ndarray,
-    desirability: np.ndarray,
-) -> np.ndarray:
-    """Apply Equation 6 to a possibly rectangular first-exit matrix."""
+def _fundamental_matrix(interior_passive: np.ndarray) -> np.ndarray:
+    identity = np.eye(interior_passive.shape[0])
+    return np.linalg.solve(identity - interior_passive, identity)
 
-    unnormalized = passive * desirability[:, np.newaxis]
-    column_normalizers = unnormalized.sum(axis=0)
-    if np.any(column_normalizers == 0.0):
-        raise ValueError("Controlled dynamics contain a zero-mass column")
-    return unnormalized / column_normalizers[np.newaxis, :]
+
+def _build_upper_dynamics(
+    lower: FirstExitDynamics,
+    fundamental: np.ndarray,
+) -> FirstExitDynamics:
+    lower_subgoals = lower.boundary_passive[:-1]
+    lower_goal = lower.boundary_passive[-1:]
+    upper_interior = lower_subgoals @ fundamental @ lower_subgoals.T
+    upper_boundary = lower_goal @ fundamental @ lower_subgoals.T
+    upper_interior, upper_boundary = _normalize_augmented_columns(
+        upper_interior,
+        upper_boundary,
+    )
+    return FirstExitDynamics(upper_interior, upper_boundary)
+
+
+def _solve_upper_layer(
+    dynamics: FirstExitDynamics,
+    parameters: ModelParameters,
+) -> tuple[np.ndarray, np.ndarray]:
+    q_interior = np.exp(
+        parameters.interior_reward / parameters.control_cost
+    )
+    goal_desirability = np.exp(
+        parameters.goal_reward / parameters.control_cost
+    )
+    interior_desirability = solve_first_exit(
+        dynamics,
+        np.asarray([goal_desirability]),
+        q_interior,
+    )
+    desirability = np.concatenate(
+        [interior_desirability, np.asarray([goal_desirability])]
+    )
+    controlled = controlled_from_desirability(
+        dynamics.passive,
+        desirability,
+    )
+    return desirability, controlled
+
+
+def _build_task_basis(
+    lower: FirstExitDynamics,
+    parameters: ModelParameters,
+) -> TaskBasis:
+    number_of_subgoals = lower.number_of_boundary_states - 1
+    number_of_targets = lower.number_of_boundary_states
+    goal_desirability = np.exp(
+        parameters.goal_reward / parameters.control_cost
+    )
+    off_target_desirability = np.exp(
+        parameters.off_target_reward / parameters.control_cost
+    )
+
+    # The paper's augmented basis is block diagonal: reusable subgoal tasks
+    # occupy the first block and the original physical goal remains separate.
+    boundary_basis = np.zeros(
+        (number_of_targets, number_of_targets),
+        dtype=np.float64,
+    )
+    subgoal_basis = np.full(
+        (number_of_subgoals, number_of_subgoals),
+        off_target_desirability,
+        dtype=np.float64,
+    )
+    np.fill_diagonal(subgoal_basis, goal_desirability)
+    boundary_basis[:-1, :-1] = subgoal_basis
+    boundary_basis[-1, -1] = goal_desirability
+
+    q_interior = np.exp(
+        parameters.interior_reward / parameters.control_cost
+    )
+    interior_basis = np.column_stack(
+        [
+            solve_first_exit(
+                lower,
+                boundary_basis[:, task],
+                q_interior,
+            )
+            for task in range(number_of_targets)
+        ]
+    )
+    return TaskBasis(boundary_basis, interior_basis)

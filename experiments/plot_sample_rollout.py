@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 from andrew_mlmdp import (
     Maze,
+    ModelParameters,
     controlled_dynamics,
     plot_trajectory,
     sample_rollout,
@@ -20,8 +21,9 @@ def main() -> None:
     maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
     start = (0, 0)
     goal = (10, 9)
+    parameters = ModelParameters()
 
-    desirability = solve_desirability(maze, goal)
+    desirability = solve_desirability(maze, goal, parameters=parameters)
     controlled = controlled_dynamics(maze, desirability)
     trajectory = sample_rollout(
         maze,
@@ -41,6 +43,7 @@ def main() -> None:
     reached_goal = trajectory[-1] == goal
     print(f"reached goal: {reached_goal}")
     print(f"steps: {len(trajectory) - 1}")
+    print("parameters:", parameters)
     print(output_file)
 
 

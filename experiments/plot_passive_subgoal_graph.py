@@ -7,6 +7,7 @@ import numpy as np
 
 from andrew_mlmdp import (
     Maze,
+    ModelParameters,
     build_subgoal_passive_dynamics,
     plot_subgoal_passive_dynamics,
 )
@@ -26,7 +27,12 @@ SUBGOALS = (
 
 def main() -> None:
     maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
-    passive = build_subgoal_passive_dynamics(maze, SUBGOALS)
+    parameters = ModelParameters()
+    passive = build_subgoal_passive_dynamics(
+        maze,
+        SUBGOALS,
+        parameters=parameters,
+    )
 
     figure, ax = plt.subplots(figsize=(7, 7))
     plot_subgoal_passive_dynamics(maze, SUBGOALS, passive, ax=ax)
@@ -48,6 +54,7 @@ def main() -> None:
             edge_strengths.append((probability, edge_name))
 
     np.set_printoptions(precision=4, suppress=True)
+    print("parameters:", parameters)
     print("subgoal order:", SUBGOAL_LABELS)
     print("task-independent passive dynamics:")
     print(passive)
