@@ -6,6 +6,7 @@ import pytest
 from andrew_mlmdp import (
     Maze,
     build_passive_dynamics,
+    build_subgoal_passive_dynamics,
     build_two_layer_model,
     compute_layer_one_plan,
     sample_hierarchical_rollout,
@@ -31,6 +32,39 @@ def corridor_model():
         subgoals=((0, 0), (0, 2)),
         goal=(0, 3),
     )
+
+
+def test_task_independent_subgoal_passive_matches_direct_calculation() -> None:
+    maze = Maze.from_ascii("....")
+    subgoals = ((0, 0), (0, 2))
+    alpha = 0.1
+    actual = build_subgoal_passive_dynamics(
+        maze,
+        subgoals,
+        alpha=alpha,
+    )
+
+    physical_passive = build_passive_dynamics(maze)
+    subgoal_access = np.zeros((2, 4))
+    subgoal_access[0, maze.state_index(subgoals[0])] = alpha
+    subgoal_access[1, maze.state_index(subgoals[1])] = alpha
+
+    stacked = np.vstack([physical_passive, subgoal_access])
+    normalizers = stacked.sum(axis=0)
+    physical_passive /= normalizers[np.newaxis, :]
+    subgoal_access /= normalizers[np.newaxis, :]
+    identity = np.eye(4)
+    fundamental_matrix = np.linalg.solve(
+        identity - physical_passive,
+        identity,
+    )
+    expected = subgoal_access @ fundamental_matrix @ subgoal_access.T
+    expected /= expected.sum(axis=0)[np.newaxis, :]
+
+    assert actual == pytest.approx(expected)
+    assert np.all(actual >= 0.0)
+    assert np.allclose(actual.sum(axis=0), 1.0)
+    assert np.all(np.diag(actual) > 0.0)
 
 
 def test_layer_one_augmentation_preserves_goal_and_subgoal_roles(
@@ -309,6 +343,25 @@ def test_four_room_model_dimensions() -> None:
     assert model.layer_two_controlled.shape == (7, 6)
     assert np.allclose(model.layer_two_passive.sum(axis=0), 1.0)
     assert np.allclose(model.layer_two_controlled.sum(axis=0), 1.0)
+
+
+def test_four_room_task_independent_graph_has_paper_edge_order() -> None:
+    maze = Maze.from_file(FOUR_ROOMS_FILE)
+    passive = build_subgoal_passive_dynamics(maze, FOUR_ROOM_SUBGOALS)
+
+    edge_strengths = []
+    for first in range(len(FOUR_ROOM_SUBGOALS)):
+        for second in range(first + 1, len(FOUR_ROOM_SUBGOALS)):
+            strength = 0.5 * (
+                passive[second, first] + passive[first, second]
+            )
+            edge_strengths.append((strength, first, second))
+
+    ordered_edges = [
+        (first, second)
+        for _, first, second in sorted(edge_strengths, reverse=True)
+    ]
+    assert ordered_edges[:2] == [(4, 5), (0, 2)]  # E-F, then A-C
 
 
 @pytest.mark.parametrize(

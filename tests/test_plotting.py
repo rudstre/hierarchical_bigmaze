@@ -4,12 +4,29 @@ matplotlib.use("Agg")
 
 from andrew_mlmdp import (  # noqa: E402
     Maze,
+    build_subgoal_passive_dynamics,
     controlled_dynamics,
     plot_controlled_dynamics,
+    plot_subgoal_passive_dynamics,
     plot_trajectory,
     sample_rollout,
     solve_desirability,
 )
+
+
+def test_subgoal_passive_plot_can_be_rendered(tmp_path) -> None:
+    maze = Maze.from_ascii("...\n.#.\n...")
+    subgoals = ((0, 0), (0, 2), (2, 2))
+    passive = build_subgoal_passive_dynamics(maze, subgoals)
+
+    ax = plot_subgoal_passive_dynamics(maze, subgoals, passive)
+    output_file = tmp_path / "subgoal_passive.png"
+    ax.figure.savefig(output_file)
+
+    # Three subgoals produce three undirected links. Diagonal passive mass is
+    # retained in the matrix but deliberately has no line in the figure.
+    assert len(ax.lines) == 3
+    assert output_file.stat().st_size > 0
 
 
 def test_controlled_dynamics_plot_can_be_rendered(tmp_path) -> None:

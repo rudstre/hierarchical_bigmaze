@@ -2,9 +2,128 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import Normalize
 from matplotlib.patches import Rectangle
 
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
+
+
+def plot_subgoal_passive_dynamics(
+    maze: Maze,
+    subgoals: list[Coordinate] | tuple[Coordinate, ...],
+    passive: np.ndarray,
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    ax=None,
+):
+    """Plot the paper-style passive transition graph between subgoals.
+
+    Figure 3a uses undirected weighted links. The numerical matrix retains both
+    directions and its diagonal; the plot averages each pair of directions and
+    omits self-transitions because they have no spatial edge to draw.
+    """
+
+    ordered_subgoals = tuple(subgoals)
+    number_of_subgoals = len(ordered_subgoals)
+    values = np.asarray(passive, dtype=np.float64)
+    expected_shape = (number_of_subgoals, number_of_subgoals)
+    if values.shape != expected_shape:
+        raise ValueError(
+            f"Passive dynamics must have shape {expected_shape}, "
+            f"got {values.shape}"
+        )
+    if labels is not None and len(labels) != number_of_subgoals:
+        raise ValueError("Labels must match the number of subgoals")
+
+    for coordinate in ordered_subgoals:
+        maze.state_index(coordinate)
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 7))
+
+    for row, column in maze.walls:
+        wall = Rectangle(
+            (column - 0.5, row - 0.5),
+            1.0,
+            1.0,
+            facecolor="black",
+            edgecolor="black",
+            zorder=1,
+        )
+        ax.add_patch(wall)
+
+    edges = []
+    for first in range(number_of_subgoals):
+        for second in range(first + 1, number_of_subgoals):
+            probability = 0.5 * (
+                values[second, first] + values[first, second]
+            )
+            edges.append((first, second, probability))
+
+    largest_probability = 0.0
+    for _, _, probability in edges:
+        largest_probability = max(largest_probability, probability)
+
+    color_scale = Normalize(vmin=0.0, vmax=largest_probability)
+    color_map = plt.get_cmap("YlOrRd")
+    for first, second, probability in edges:
+        first_row, first_column = ordered_subgoals[first]
+        second_row, second_column = ordered_subgoals[second]
+        relative_probability = 0.0
+        if largest_probability > 0.0:
+            relative_probability = probability / largest_probability
+
+        ax.plot(
+            [first_column, second_column],
+            [first_row, second_row],
+            color=color_map(color_scale(probability)),
+            linewidth=0.35 + 4.0 * relative_probability,
+            alpha=0.35 + 0.60 * relative_probability,
+            solid_capstyle="round",
+            zorder=2,
+        )
+
+    rows = []
+    columns = []
+    for row, column in ordered_subgoals:
+        rows.append(row)
+        columns.append(column)
+
+    ax.scatter(
+        columns,
+        rows,
+        s=105,
+        facecolor="#ff1f0f",
+        edgecolor="#ff6a3d",
+        linewidth=1.0,
+        zorder=3,
+    )
+
+    if labels is not None:
+        for label, (row, column) in zip(labels, ordered_subgoals):
+            ax.text(
+                column,
+                row,
+                label,
+                color="white",
+                fontsize=8,
+                fontweight="bold",
+                horizontalalignment="center",
+                verticalalignment="center",
+                zorder=4,
+            )
+
+    number_of_rows, number_of_columns = maze.shape
+    ax.set_xlim(-0.5, number_of_columns - 0.5)
+    ax.set_ylim(number_of_rows - 0.5, -0.5)
+    ax.set_aspect("equal")
+    ax.set_xticks(np.arange(number_of_columns))
+    ax.set_yticks(np.arange(number_of_rows))
+    ax.set_xlabel("column")
+    ax.set_ylabel("row")
+    ax.set_title("Task-independent layer-2 passive dynamics")
+
+    return ax
 
 
 def plot_controlled_dynamics(

@@ -428,6 +428,7 @@ andrew_mlmdp/
 |       `-- plotting.py
 |-- experiments/
 |   |-- plot_flat_policy.py
+|   |-- plot_passive_subgoal_graph.py
 |   |-- plot_sample_rollout.py
 |   |-- plot_two_layer.py
 |   |-- four_rooms_exact.py
@@ -470,6 +471,11 @@ exposes exact linear composition and approximate target projection while
 returning both weights and reconstruction error.
 
 ### Two-layer functions
+
+`build_subgoal_passive_dynamics` constructs the task-independent abstract graph
+used in the paper's Figure 3a, before a current goal is inserted. The resulting
+square matrix retains subgoal self-transitions; `plot_subgoal_passive_dynamics`
+draws only its off-diagonal probabilities as weighted links over the maze.
 
 `build_two_layer_model` constructs the fixed matrices for one current goal.
 `compute_layer_one_plan` performs controlled-minus-passive reward inpainting

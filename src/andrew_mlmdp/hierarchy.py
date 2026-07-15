@@ -77,6 +77,59 @@ class HierarchicalRollout:
     status: str
 
 
+def build_subgoal_passive_dynamics(
+    maze: Maze,
+    subgoals: list[Coordinate] | tuple[Coordinate, ...],
+    *,
+    alpha: float = 0.1,
+) -> np.ndarray:
+    """Derive the task-independent passive dynamics between subgoals.
+
+    This is the six-node graph shown in Figure 3a of the paper. All physical
+    maze cells remain interior states; the only boundaries are access copies
+    of the configured subgoals. A task-specific goal is deliberately absent.
+    """
+
+    ordered_subgoals = tuple(subgoals)
+    if not ordered_subgoals:
+        raise ValueError("At least one subgoal is required")
+    if len(set(ordered_subgoals)) != len(ordered_subgoals):
+        raise ValueError("Subgoals must be unique")
+    if alpha <= 0.0:
+        raise ValueError("Alpha must be positive")
+
+    number_of_states = len(maze.free_cells)
+    number_of_subgoals = len(ordered_subgoals)
+    physical_passive = build_passive_dynamics(maze)
+    subgoal_access = np.zeros(
+        (number_of_subgoals, number_of_states),
+        dtype=np.float64,
+    )
+
+    for subgoal_state, coordinate in enumerate(ordered_subgoals):
+        physical_state = maze.state_index(coordinate)
+        subgoal_access[subgoal_state, physical_state] = alpha
+
+    # Access copies add passive mass at subgoal cells. Renormalizing the full
+    # stack preserves the paper's convention that every column sums to one.
+    stacked_passive = np.vstack([physical_passive, subgoal_access])
+    column_normalizers = stacked_passive.sum(axis=0)
+    physical_passive /= column_normalizers[np.newaxis, :]
+    subgoal_access /= column_normalizers[np.newaxis, :]
+
+    identity = np.eye(number_of_states)
+    fundamental_matrix = np.linalg.solve(
+        identity - physical_passive,
+        identity,
+    )
+
+    layer_two_passive = (
+        subgoal_access @ fundamental_matrix @ subgoal_access.T
+    )
+    layer_two_passive /= layer_two_passive.sum(axis=0)[np.newaxis, :]
+    return layer_two_passive
+
+
 def build_two_layer_model(
     maze: Maze,
     subgoals: list[Coordinate] | tuple[Coordinate, ...],
@@ -101,8 +154,6 @@ def build_two_layer_model(
         raise ValueError("Alpha must be positive")
     if interior_reward >= 0.0:
         raise ValueError("Interior reward must be negative")
-    if off_target_reward >= 0.0:
-        raise ValueError("Off-target reward must be negative")
     if control_cost <= 0.0:
         raise ValueError("Control cost must be positive")
 
