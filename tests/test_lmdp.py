@@ -8,6 +8,7 @@ from andrew_mlmdp import (
     build_passive_dynamics,
     controlled_dynamics,
     desirability_grid,
+    sample_rollout,
     solve_desirability,
 )
 
@@ -175,3 +176,50 @@ def test_controlled_dynamics_reject_zero_normalizer() -> None:
 
     with pytest.raises(ValueError, match="zero total desirability"):
         controlled_dynamics(maze, np.zeros(2))
+
+
+def test_sample_rollout_reaches_corridor_goal() -> None:
+    maze = Maze.from_ascii("...")
+    goal = (0, 2)
+    desirability = solve_desirability(maze, goal)
+    controlled = controlled_dynamics(maze, desirability)
+
+    trajectory = sample_rollout(
+        maze,
+        controlled,
+        start=(0, 0),
+        goal=goal,
+        seed=4,
+        max_steps=100,
+    )
+
+    assert trajectory[0] == (0, 0)
+    assert trajectory[-1] == goal
+
+    for current, following in zip(trajectory, trajectory[1:]):
+        row_distance = abs(current[0] - following[0])
+        column_distance = abs(current[1] - following[1])
+        assert row_distance + column_distance <= 1
+
+
+def test_sample_rollout_is_reproducible() -> None:
+    maze = Maze.from_ascii("...")
+    goal = (0, 2)
+    desirability = solve_desirability(maze, goal)
+    controlled = controlled_dynamics(maze, desirability)
+
+    first = sample_rollout(maze, controlled, (0, 0), goal, seed=12)
+    second = sample_rollout(maze, controlled, (0, 0), goal, seed=12)
+
+    assert first == second
+
+
+def test_rollout_at_goal_has_no_transitions() -> None:
+    maze = Maze.from_ascii("...")
+    goal = (0, 2)
+    desirability = solve_desirability(maze, goal)
+    controlled = controlled_dynamics(maze, desirability)
+
+    trajectory = sample_rollout(maze, controlled, goal, goal, seed=1)
+
+    assert trajectory == [goal]

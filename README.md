@@ -26,6 +26,8 @@ from andrew_mlmdp import (
     controlled_dynamics,
     desirability_grid,
     plot_controlled_dynamics,
+    plot_trajectory,
+    sample_rollout,
     solve_desirability,
 )
 
@@ -35,6 +37,15 @@ z = solve_desirability(maze, goal)
 z_grid = desirability_grid(maze, z)
 controlled = controlled_dynamics(maze, z)
 ax = plot_controlled_dynamics(maze, controlled, goal=goal)
+
+trajectory = sample_rollout(
+    maze,
+    controlled,
+    start=(0, 0),
+    goal=goal,
+    seed=7,
+)
+trajectory_ax = plot_trajectory(maze, trajectory, goal=goal)
 ```
 
 The code deliberately uses direct loops and standard-library data structures
@@ -398,6 +409,7 @@ andrew_mlmdp/
 |       `-- plotting.py
 |-- experiments/
 |   |-- plot_flat_policy.py
+|   |-- plot_sample_rollout.py
 |   |-- four_rooms_exact.py
 |   `-- four_rooms_learning.py
 `-- tests/

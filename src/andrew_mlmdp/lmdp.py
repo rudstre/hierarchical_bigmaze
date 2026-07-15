@@ -114,6 +114,54 @@ def controlled_dynamics(
     return controlled
 
 
+def sample_rollout(
+    maze: Maze,
+    controlled: np.ndarray,
+    start: Coordinate,
+    goal: Coordinate,
+    *,
+    max_steps: int = 500,
+    seed: int | None = None,
+) -> list[Coordinate]:
+    """Sample one trajectory from controlled dynamics until the goal is hit.
+
+    The returned path includes the start and, when reached, the goal. A seed is
+    accepted directly so example trajectories are easy to reproduce.
+    """
+
+    number_of_states = len(maze.free_cells)
+    values = np.asarray(controlled, dtype=np.float64)
+    expected_shape = (number_of_states, number_of_states)
+    if values.shape != expected_shape:
+        raise ValueError(
+            f"Controlled dynamics must have shape {expected_shape}, "
+            f"got {values.shape}"
+        )
+    if max_steps < 0:
+        raise ValueError("Maximum steps must be non-negative")
+
+    maze.state_index(start)
+    maze.state_index(goal)
+
+    random_generator = np.random.default_rng(seed)
+    trajectory = [start]
+    current_coordinate = start
+
+    for _ in range(max_steps):
+        if current_coordinate == goal:
+            break
+
+        current_state = maze.state_index(current_coordinate)
+        next_state = random_generator.choice(
+            number_of_states,
+            p=values[:, current_state],
+        )
+        current_coordinate = maze.coordinate(int(next_state))
+        trajectory.append(current_coordinate)
+
+    return trajectory
+
+
 def desirability_grid(
     maze: Maze,
     desirability: np.ndarray,
