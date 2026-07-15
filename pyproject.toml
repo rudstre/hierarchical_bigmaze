@@ -8,9 +8,13 @@ version = "0.1.0"
 description = "Readable research code for multitask LMDP maze navigation"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26"]
+dependencies = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+]
 
 [project.optional-dependencies]
+notebook = ["jupyterlab>=4"]
 test = ["pytest>=8"]
 
 [tool.pytest.ini_options]

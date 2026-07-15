@@ -79,6 +79,41 @@ def solve_desirability(
     return desirability
 
 
+def controlled_dynamics(
+    maze: Maze,
+    desirability: np.ndarray,
+) -> np.ndarray:
+    """Return the optimal controlled next-state distribution.
+
+    Both the returned matrix and the passive matrix use the convention
+    ``matrix[next_state, current_state]``. Thus, each column describes the
+    possible next states from one current state.
+    """
+
+    values = np.asarray(desirability, dtype=np.float64)
+    expected_shape = (len(maze.free_cells),)
+    if values.shape != expected_shape:
+        raise ValueError(
+            f"Desirability must have shape {expected_shape}, got {values.shape}"
+        )
+
+    passive_dynamics = build_passive_dynamics(maze)
+
+    # Equation 6 weights each passive next-state probability by the
+    # desirability of that next state. The current state indexes columns.
+    unnormalized = passive_dynamics * values[:, np.newaxis]
+    column_normalizers = unnormalized.sum(axis=0)
+
+    if np.any(column_normalizers == 0.0):
+        raise ValueError(
+            "Controlled dynamics are undefined when a column has zero "
+            "total desirability"
+        )
+
+    controlled = unnormalized / column_normalizers[np.newaxis, :]
+    return controlled
+
+
 def desirability_grid(
     maze: Maze,
     desirability: np.ndarray,

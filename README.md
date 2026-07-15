@@ -21,16 +21,33 @@ Goals and subgoals will be assigned later by the MLMDP code, not by maze
 construction.
 
 ```python
-from andrew_mlmdp import Maze, desirability_grid, solve_desirability
+from andrew_mlmdp import (
+    Maze,
+    controlled_dynamics,
+    desirability_grid,
+    plot_controlled_dynamics,
+    solve_desirability,
+)
 
 maze = Maze.from_file("mazes/four_rooms.txt")
-z = solve_desirability(maze, goal=(10, 9))
+goal = (10, 9)
+z = solve_desirability(maze, goal)
 z_grid = desirability_grid(maze, z)
+controlled = controlled_dynamics(maze, z)
+ax = plot_controlled_dynamics(maze, controlled, goal=goal)
 ```
 
 The code deliberately uses direct loops and standard-library data structures
 so coordinate conventions, state ordering, and obstacle handling remain easy
 to inspect during research.
+
+The current examples can also be run interactively in
+`notebooks/flat_lmdp_examples.ipynb`:
+
+```shell
+uv sync --extra notebook
+uv run jupyter lab notebooks/flat_lmdp_examples.ipynb
+```
 
 ## Core Model
 
@@ -369,6 +386,8 @@ andrew_mlmdp/
 |-- pyproject.toml
 |-- mazes/
 |   `-- four_rooms.txt
+|-- notebooks/
+|   `-- flat_lmdp_examples.ipynb
 |-- src/
 |   `-- andrew_mlmdp/
 |       |-- maze.py
@@ -378,18 +397,19 @@ andrew_mlmdp/
 |       |-- rollout.py
 |       `-- plotting.py
 |-- experiments/
+|   |-- plot_flat_policy.py
 |   |-- four_rooms_exact.py
 |   `-- four_rooms_learning.py
 `-- tests/
     |-- test_maze.py
     |-- test_lmdp.py
+    |-- test_plotting.py
     |-- test_multitask.py
     `-- test_hierarchy.py
 ```
 
-The initial runtime is Python 3.11 or newer with NumPy. Matplotlib will be added
-for figures when plotting work begins. Tests use pytest. Packaging and commands
-are managed through `pyproject.toml`.
+The initial runtime is Python 3.11 or newer with NumPy and Matplotlib. Tests use
+pytest. Packaging and commands are managed through `pyproject.toml`.
 
 ## Planned Interfaces
 
@@ -406,8 +426,10 @@ has no knowledge of tasks, goals, subgoals, rewards, or hierarchy.
 
 `build_passive_dynamics` constructs the column-stochastic random walk directly
 from a `Maze`. `solve_desirability` performs the exact one-goal first-exit
-solve. Later learning and policy functions will remain separate unless shared
-state genuinely requires a model object.
+solve. `controlled_dynamics` applies the paper's closed-form next-state control
+distribution, and `plot_controlled_dynamics` draws its directional probability
+mass directly on the maze. These remain separate functions because they share
+no mutable model state.
 
 ### `TaskBasis`
 

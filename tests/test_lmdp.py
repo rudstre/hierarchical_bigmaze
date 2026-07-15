@@ -6,6 +6,7 @@ import pytest
 from andrew_mlmdp import (
     Maze,
     build_passive_dynamics,
+    controlled_dynamics,
     desirability_grid,
     solve_desirability,
 )
@@ -121,3 +122,56 @@ def test_grid_view_rejects_wrong_vector_shape() -> None:
     with pytest.raises(ValueError, match="shape"):
         desirability_grid(maze, np.ones((1, 2)))
 
+
+def test_controlled_dynamics_are_column_stochastic() -> None:
+    maze = Maze.from_file(FOUR_ROOMS_FILE)
+    desirability = solve_desirability(maze, goal=(10, 9))
+    passive = build_passive_dynamics(maze)
+    controlled = controlled_dynamics(maze, desirability)
+
+    assert controlled.shape == passive.shape
+    assert np.all(controlled >= 0.0)
+    assert np.allclose(controlled.sum(axis=0), 1.0)
+    assert np.all(controlled[passive == 0.0] == 0.0)
+
+
+def test_controlled_column_matches_equation_six() -> None:
+    maze = Maze.from_ascii("...")
+    desirability = solve_desirability(maze, goal=(0, 2))
+    passive = build_passive_dynamics(maze)
+    controlled = controlled_dynamics(maze, desirability)
+
+    current_state = maze.state_index((0, 1))
+    expected = passive[:, current_state] * desirability
+    expected /= expected.sum()
+
+    assert controlled[:, current_state] == pytest.approx(expected)
+
+
+def test_controlled_dynamics_prefer_movement_toward_goal() -> None:
+    maze = Maze.from_ascii("...")
+    desirability = solve_desirability(maze, goal=(0, 2))
+    controlled = controlled_dynamics(maze, desirability)
+
+    current_state = maze.state_index((0, 1))
+    state_away_from_goal = maze.state_index((0, 0))
+    state_toward_goal = maze.state_index((0, 2))
+
+    assert (
+        controlled[state_toward_goal, current_state]
+        > controlled[state_away_from_goal, current_state]
+    )
+
+
+def test_controlled_dynamics_reject_wrong_vector_shape() -> None:
+    maze = Maze.from_ascii("..")
+
+    with pytest.raises(ValueError, match="shape"):
+        controlled_dynamics(maze, np.ones((1, 2)))
+
+
+def test_controlled_dynamics_reject_zero_normalizer() -> None:
+    maze = Maze.from_ascii("..")
+
+    with pytest.raises(ValueError, match="zero total desirability"):
+        controlled_dynamics(maze, np.zeros(2))
