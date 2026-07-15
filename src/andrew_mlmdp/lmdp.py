@@ -30,7 +30,7 @@ def solve_desirability(
     *,
     interior_reward: float = -0.1,
     goal_reward: float = 1.0,
-    control_cost: float = 1.0,
+    control_cost: float = .3,
 ) -> np.ndarray:
     """Solve a flat first-exit LMDP with one absorbing goal state.
 

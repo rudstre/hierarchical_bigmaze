@@ -17,17 +17,20 @@ inter-layer communication are covered by tests.
 
 The first physical-maze component is implemented in `andrew_mlmdp.maze`. Maze
 geometry lives in separate text files and contains only walls and free cells.
-Goals and subgoals will be assigned later by the MLMDP code, not by maze
-construction.
+Goals and subgoals are supplied to the MLMDP functions, not stored in maze
+construction or geometry files.
 
 ```python
 from andrew_mlmdp import (
     Maze,
+    build_two_layer_model,
+    compute_layer_one_plan,
     controlled_dynamics,
     desirability_grid,
     plot_controlled_dynamics,
     plot_trajectory,
     sample_rollout,
+    sample_hierarchical_rollout,
     solve_desirability,
 )
 
@@ -46,11 +49,25 @@ trajectory = sample_rollout(
     seed=7,
 )
 trajectory_ax = plot_trajectory(maze, trajectory, goal=goal)
+
+subgoals = ((0, 0), (9, 2), (2, 3), (3, 7), (9, 7), (7, 9))
+model = build_two_layer_model(maze, subgoals, goal)
+layer_one_plan = compute_layer_one_plan(model, current=(1, 0), beta=10.0)
+hierarchical_rollout = sample_hierarchical_rollout(
+    model,
+    start=(1, 0),
+    beta=10.0,
+    seed=28,
+)
 ```
 
 The code deliberately uses direct loops and standard-library data structures
 so coordinate conventions, state ordering, and obstacle handling remain easy
 to inspect during research.
+
+The exact two-layer implementation currently builds a basis for the configured
+subgoals and one current goal. Reusable candidate-goal libraries remain a later
+multitask milestone.
 
 The current examples can also be run interactively in
 `notebooks/flat_lmdp_examples.ipynb`:
@@ -167,47 +184,49 @@ stochastic policy semantics.
 
 ### Goal and subgoal roles
 
-Goal and subgoal semantics belong to the future MLMDP model, not to `Maze` or
-the geometry file. The MLMDP configuration will select two disjoint sets of
-free physical states:
+Goal and subgoal semantics belong to the MLMDP functions, not to `Maze` or the
+geometry file. The current constructor receives two disjoint inputs:
 
-- **Candidate goals:** nodes from which a task selects exactly one current goal.
+- **Current goal:** the sole terminal boundary for the current task.
 - **Subgoals:** reusable access points, normally placed at doors or useful
   junctions.
 
-Layer 1 precomputes one component desirability for every candidate goal and
-every subgoal. To keep physical subgoal and goal cells traversable, basis
-targets are represented by abstract terminal copies attached to their physical
-cells. Entering a subgoal copy invokes layer 2 without making the corresponding
-physical cell permanently absorbing. A task enables all subgoal copies and its
-selected goal copy; non-current goal copies are excluded from that task's
-active abstract model.
+The physical goal is removed from layer 1's interior states and remains the
+original first-exit boundary. Each subgoal cell remains a traversable physical
+state and receives a separate abstract boundary copy. Entering a subgoal copy
+invokes layer 2 without making its physical cell absorbing.
 
-The complete precomputed basis still has a fixed column order:
+The current basis has a fixed row and column order:
 
 ```text
-[candidate goal copies..., subgoal copies...]
+[subgoal copies..., current goal]
 ```
 
-Restricting to one task selects columns and active abstract states; it does not
-change node identifiers or mutate the stored basis.
+A reusable candidate-goal library will later construct and retain these
+task-specific bases for multiple goals.
 
 ### Abstract-target access dynamics
 
-Layer 1 augments the physical passive dynamics with transitions from configured
-target locations to their abstract copies. `P_b` contains access to candidate
-goal copies and `P_t` contains access to subgoal copies. The default abstract
-access probability is `alpha = 0.1`; inactive goal-copy rows are removed when a
-task is selected. The physical, goal-boundary, and subgoal-access blocks are
-stacked and each current-state column is renormalized:
+Layer 1 augments the physical passive dynamics with transitions from subgoal
+locations to their abstract copies. `P_t` contains these access transitions;
+`P_g` contains the original passive transitions into the physical goal. The
+default abstract access probability is `alpha = 0.1` and applies only to
+`P_t`. The blocks are stacked and each current-state column is renormalized:
 
 ```math
-\widetilde P^1 = \mathcal N([P_i^1; P_b^1; P_t^1]).
+\widetilde P^1 = \mathcal N([P_i^1; P_t^1; P_g^1]).
 ```
 
-Abstract-copy transitions do not consume physical time. A goal-copy transition
-terminates the task. After a subgoal-copy transition, layer 2 supplies new
-guidance and execution resumes from the associated physical cell.
+Subgoal-copy transitions do not consume physical time. A transition into the
+physical goal consumes the final physical step and terminates the task. After a
+subgoal-copy transition, layer 2 supplies new guidance and execution resumes
+from the associated physical cell.
+
+Once a subgoal supplies the active plan, immediately accessing that same copy
+again would change no state, reward, or weight. Hierarchical rollouts
+marginalize this zero-time no-op by setting its probability to zero and
+renormalizing the meaningful outcomes. Logged abstract accesses therefore
+represent changes of active layer-2 state.
 
 ## Two-Layer Architecture
 
@@ -236,13 +255,13 @@ probabilities:
 ```math
 P_{II}^2 = \widetilde P_t^1 F \widetilde P_t^{1T},
 \qquad
-P_{BI}^2 = \widetilde P_b^1 F \widetilde P_t^{1T}.
+P_{BI}^2 = \widetilde P_g^1 F \widetilde P_t^{1T}.
 ```
 
-The implementation will compute these with linear solves rather than forming a
-dense inverse. It will then select the current goal, remove inactive goal
-copies, and renormalize each surviving layer-2 column. Zero-mass columns are a
-configuration error, since they indicate an unreachable abstract state.
+The implementation computes these with linear solves rather than explicitly
+calling a matrix inverse, then renormalizes each layer-2 column. Zero-mass
+columns are a configuration error because they indicate an unreachable
+abstract state.
 
 Layer-2 interior rewards use the same small negative step cost as the initial
 paper replication. A later extension may accumulate expected layer-1 reward
@@ -258,9 +277,9 @@ subgoals to layer 1 using the paper's controlled-minus-passive signal:
 r_t^1 = \beta\left(a_i^2(\cdot|s) - P_i^2(\cdot|s)\right),
 ```
 
-where `beta = 1` is the initial reward-inpainting scale because the paper only
-specifies proportionality. This reward is exponentiated, projected into the
-active layer-1 task basis, and composed:
+where `beta = 10` is the initial implementation convention. The paper specifies
+only proportionality, so this value is not attributed to the paper. The reward
+is exponentiated, projected into the active layer-1 task basis, and composed:
 
 ```math
 q_t^1 = \exp(r_t^1/\lambda),
@@ -292,10 +311,10 @@ temporary start node is inserted into the persistent layer-2 model.
 4. Sample physical transitions until the goal or a subgoal access copy is hit.
 5. If a subgoal copy is hit, update the layer-2 state, recompute inpainted
    rewards and task weights, and resume from its physical cell.
-6. If the selected goal copy is hit, terminate the episode.
+6. If the physical goal boundary is hit, terminate the episode.
 
 A rollout has a configurable step cap and returns an explicit `reached_goal`,
-`step_limit`, or `unreachable` status. Numerical failures and invalid
+`step_limit`, or `abstract_access_limit` status. Numerical failures and invalid
 probability vectors are errors rather than implicit rollout termination.
 
 ## Implementation Roadmap
@@ -410,6 +429,7 @@ andrew_mlmdp/
 |-- experiments/
 |   |-- plot_flat_policy.py
 |   |-- plot_sample_rollout.py
+|   |-- plot_two_layer.py
 |   |-- four_rooms_exact.py
 |   `-- four_rooms_learning.py
 `-- tests/
@@ -449,12 +469,14 @@ Owns ordered target IDs, `Q_b`, `Z_i`, and the shared LMDP definition. It
 exposes exact linear composition and approximate target projection while
 returning both weights and reconstruction error.
 
-### `TwoLayerMLMDP`
+### Two-layer functions
 
-Owns the layer-1 basis, subgoal access mapping, full derived abstract dynamics,
-and task-specific layer-2 construction. It exposes initial guidance,
-controlled-minus-passive reward inpainting, layer-1 composition, and updates
-after subgoal access.
+`build_two_layer_model` constructs the fixed matrices for one current goal.
+`compute_layer_one_plan` performs controlled-minus-passive reward inpainting
+and task composition at a physical location. `sample_hierarchical_rollout`
+samples physical transitions and records zero-time subgoal-copy accesses. The
+returned dataclasses contain the intermediate matrices rather than hiding them
+behind a stateful planner object.
 
 ### Experiment records
 
@@ -494,7 +516,10 @@ Integration tests will cover:
 - Goal reward: `1.0`.
 - Control temperature: `lambda = 1.0`.
 - Abstract target-access probability: `alpha = 0.1`.
-- Reward-inpainting scale: `beta = 1.0`.
+- Reward-inpainting scale: `beta = 10.0`, an implementation convention because
+  the paper specifies only proportionality.
+- Off-target subgoal basis reward: `-0.1`, matching the documented step-reward
+  magnitude while remaining an explicit replication assumption.
 - Passive commands: north, south, east, west, and stay with equal command
   probability before invalid moves collapse into self-transitions.
 - Candidate goals are selected only from the configured goal set.

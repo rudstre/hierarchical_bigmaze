@@ -34,7 +34,11 @@ def test_passive_dynamics_are_column_stochastic() -> None:
 
 def test_one_cell_maze_contains_only_goal_desirability() -> None:
     maze = Maze.from_ascii(".")
-    desirability = solve_desirability(maze, goal=(0, 0))
+    desirability = solve_desirability(
+        maze,
+        goal=(0, 0),
+        control_cost=1.0,
+    )
 
     assert desirability.dtype == np.float64
     assert desirability == pytest.approx([np.exp(1.0)])
@@ -50,7 +54,7 @@ def test_corridor_desirability_increases_toward_goal() -> None:
 def test_solution_satisfies_linear_bellman_equation() -> None:
     maze = Maze.from_ascii("...\n.#.\n...")
     goal = (2, 2)
-    desirability = solve_desirability(maze, goal)
+    desirability = solve_desirability(maze, goal, control_cost=1.0)
     passive_dynamics = build_passive_dynamics(maze)
 
     goal_state = maze.state_index(goal)
@@ -102,7 +106,7 @@ def test_solver_parameters_must_define_a_well_posed_problem(
 def test_four_rooms_desirability_and_grid_view() -> None:
     maze = Maze.from_file(FOUR_ROOMS_FILE)
     goal = (10, 9)
-    desirability = solve_desirability(maze, goal)
+    desirability = solve_desirability(maze, goal, control_cost=1.0)
     grid = desirability_grid(maze, desirability)
 
     assert desirability.shape == (97,)
