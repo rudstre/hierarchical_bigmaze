@@ -3,12 +3,14 @@
 from andrew_mlmdp.hierarchy import (
     HierarchicalRollout,
     LayerOnePlan,
+    OnlineHierarchicalRollout,
     TaskBasis,
     TwoLayerModel,
     build_subgoal_passive_dynamics,
     build_two_layer_model,
     compute_layer_one_plan,
     sample_hierarchical_rollout,
+    sample_online_hierarchical_rollout,
 )
 from andrew_mlmdp.lmdp import (
     FirstExitDynamics,
@@ -20,6 +22,7 @@ from andrew_mlmdp.lmdp import (
     sample_rollout,
     solve_desirability,
     solve_first_exit,
+    z_iteration_step,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting import (
@@ -36,6 +39,7 @@ __all__ = [
     "LayerOnePlan",
     "Maze",
     "ModelParameters",
+    "OnlineHierarchicalRollout",
     "TaskBasis",
     "TwoLayerModel",
     "build_passive_dynamics",
@@ -51,6 +55,8 @@ __all__ = [
     "plot_trajectory",
     "sample_rollout",
     "sample_hierarchical_rollout",
+    "sample_online_hierarchical_rollout",
     "solve_desirability",
     "solve_first_exit",
+    "z_iteration_step",
 ]

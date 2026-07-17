@@ -4,6 +4,8 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+import numpy as np
+import pytest
 
 from andrew_mlmdp import (  # noqa: E402
     Maze,
@@ -17,6 +19,9 @@ from andrew_mlmdp import (  # noqa: E402
     plot_trajectory,
     sample_rollout,
     solve_desirability,
+)
+from andrew_mlmdp.hierarchy import (  # noqa: E402
+    _trace_online_hierarchical_rollout,
 )
 from andrew_mlmdp.plotting import _trace_hierarchical_rollout  # noqa: E402
 
@@ -153,3 +158,56 @@ def test_hierarchical_rollout_trace_records_subgoal_access() -> None:
         elif frame.event == "subgoal_access":
             assert frame.plan is not previous_plan
         previous_plan = frame.plan
+
+
+def test_online_rollout_animation_updates_desirability_not_task_weights() -> None:
+    maze = Maze.from_ascii("....")
+    model = build_two_layer_model(
+        maze,
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 3),
+    )
+    animation = animate_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        goal_learning="online",
+        seed=0,
+        max_steps=20,
+    )
+    frames = _trace_online_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        initial_goal_desirability=None,
+        z_sweeps_per_step=1,
+        beta=None,
+        max_steps=20,
+        max_abstract_accesses=500,
+        seed=0,
+    )
+
+    first_step_index = next(
+        index
+        for index, frame in enumerate(frames)
+        if frame.event == "physical_step"
+    )
+    before = frames[first_step_index - 1]
+    after = frames[first_step_index]
+    assert before.plan is not None
+    assert after.plan is not None
+    assert not np.allclose(
+        before.plan.physical_desirability,
+        after.plan.physical_desirability,
+    )
+    assert after.plan.weights == pytest.approx(before.plan.weights)
+
+    animation._draw_next_frame(first_step_index, blit=False)
+    desirability_ax = next(
+        ax
+        for ax in animation._fig.axes
+        if ax.get_title()
+        == "Layer-1 desirability: learned goal + subtask guidance"
+    )
+    assert desirability_ax.images
+
+    animation._draw_was_started = True
+    plt.close(animation._fig)

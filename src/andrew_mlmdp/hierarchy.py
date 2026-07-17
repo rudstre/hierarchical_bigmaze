@@ -6,7 +6,7 @@ basis, and solve the abstract layer. Intermediate arrays remain public so a
 researcher can inspect every calculation directly.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -16,6 +16,7 @@ from andrew_mlmdp.lmdp import (
     build_passive_dynamics,
     controlled_from_desirability,
     solve_first_exit,
+    z_iteration_step,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 
@@ -106,6 +107,44 @@ class HierarchicalRollout:
     abstract_accesses: int
     reached_goal: bool
     status: str
+
+
+@dataclass(frozen=True)
+class OnlineHierarchicalRollout:
+    """A hierarchical rollout with an incrementally learned goal solution."""
+
+    trajectory: list[Coordinate]
+    subgoal_accesses: list[Coordinate]
+    weight_history: list[np.ndarray]
+    goal_desirability_history: list[np.ndarray]
+    physical_steps: int
+    abstract_accesses: int
+    z_iterations: int
+    reached_goal: bool
+    status: str
+
+    @property
+    def final_goal_desirability(self) -> np.ndarray:
+        """Return the learned goal vector after the final Z sweep."""
+
+        return self.goal_desirability_history[-1]
+
+
+@dataclass(frozen=True)
+class _OnlineHierarchicalRolloutFrame:
+    """One drawable moment in an online hierarchical rollout."""
+
+    event: str
+    coordinate: Coordinate
+    trajectory: tuple[Coordinate, ...]
+    plan: LayerOnePlan | None
+    active_subgoal: Coordinate | None
+    requested_subgoal: Coordinate | None
+    physical_steps: int
+    abstract_accesses: int
+    goal_desirability: np.ndarray
+    z_iterations: int
+    status: str | None = None
 
 
 def build_subgoal_passive_dynamics(
@@ -200,8 +239,14 @@ def compute_layer_one_plan(
     current: Coordinate,
     *,
     beta: float | None = None,
+    goal_interior_desirability: np.ndarray | None = None,
 ) -> LayerOnePlan:
-    """Inpaint rewards and compose the lower-layer task for ``current``."""
+    """Inpaint rewards and compose the lower-layer task for ``current``.
+
+    By default all task-basis columns use their exact solutions. Supplying a
+    goal vector replaces only the final basis column, leaving the reusable
+    subtask solutions and the layer-2 calculation unchanged.
+    """
 
     model.maze.state_index(current)
     if current == model.goal:
@@ -244,25 +289,14 @@ def compute_layer_one_plan(
         @ target_boundary_desirability
     )
     weights = np.maximum(0.0, raw_weights)
-    interior_desirability = model.task_basis.interior_desirability @ weights
     reconstructed_boundary = (
         model.task_basis.boundary_desirability @ weights
     )
-
-    physical_desirability = np.empty(
-        len(model.maze.free_cells),
-        dtype=np.float64,
-    )
-    physical_desirability[model.interior_states] = interior_desirability
-    goal_state = model.maze.state_index(model.goal)
-    physical_desirability[goal_state] = reconstructed_boundary[-1]
-
-    complete_desirability = np.concatenate(
-        [interior_desirability, reconstructed_boundary]
-    )
-    layer_one_controlled = controlled_from_desirability(
-        model.lower_dynamics.passive,
-        complete_desirability,
+    physical_desirability, layer_one_controlled = _compose_lower_policy(
+        model,
+        weights,
+        reconstructed_boundary,
+        goal_interior_desirability=goal_interior_desirability,
     )
     return LayerOnePlan(
         current=current,
@@ -275,6 +309,99 @@ def compute_layer_one_plan(
         reconstructed_boundary_desirability=reconstructed_boundary,
         physical_desirability=physical_desirability,
         layer_one_controlled=layer_one_controlled,
+    )
+
+
+def _compose_lower_policy(
+    model: TwoLayerModel,
+    weights: np.ndarray,
+    reconstructed_boundary: np.ndarray,
+    *,
+    goal_interior_desirability: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Combine fixed subtask solutions with an exact or learned goal column."""
+
+    basis = model.task_basis.interior_desirability
+    if goal_interior_desirability is None:
+        interior_desirability = basis @ weights
+    else:
+        learned_goal = _validated_goal_desirability(
+            model,
+            goal_interior_desirability,
+        )
+        interior_desirability = (
+            basis[:, :-1] @ weights[:-1]
+            + learned_goal * weights[-1]
+        )
+
+    physical_desirability = np.empty(
+        len(model.maze.free_cells),
+        dtype=np.float64,
+    )
+    physical_desirability[model.interior_states] = interior_desirability
+    goal_state = model.maze.state_index(model.goal)
+    physical_desirability[goal_state] = reconstructed_boundary[-1]
+
+    complete_desirability = np.concatenate(
+        [interior_desirability, reconstructed_boundary]
+    )
+    if goal_interior_desirability is None:
+        controlled = controlled_from_desirability(
+            model.lower_dynamics.passive,
+            complete_desirability,
+        )
+    else:
+        # Early online iterates may leave states with no usable desirability.
+        # Keep those columns at zero so rollout code can report ``zero_policy``.
+        unnormalized = (
+            model.lower_dynamics.passive
+            * complete_desirability[:, np.newaxis]
+        )
+        normalizers = unnormalized.sum(axis=0)
+        controlled = np.zeros_like(unnormalized)
+        usable = np.isfinite(normalizers) & (normalizers > 0.0)
+        controlled[:, usable] = (
+            unnormalized[:, usable] / normalizers[usable]
+        )
+    return physical_desirability, controlled
+
+
+def _validated_goal_desirability(
+    model: TwoLayerModel,
+    values: np.ndarray,
+) -> np.ndarray:
+    goal_desirability = np.asarray(values, dtype=np.float64)
+    expected_shape = (len(model.interior_states),)
+    if goal_desirability.shape != expected_shape:
+        raise ValueError(
+            "Initial goal desirability must have shape "
+            f"{expected_shape}, got {goal_desirability.shape}"
+        )
+    if (
+        np.any(goal_desirability < 0.0)
+        or not np.all(np.isfinite(goal_desirability))
+    ):
+        raise ValueError(
+            "Initial goal desirability must be finite and non-negative"
+        )
+    return goal_desirability
+
+
+def _plan_with_goal_desirability(
+    model: TwoLayerModel,
+    plan: LayerOnePlan,
+    goal_desirability: np.ndarray,
+) -> LayerOnePlan:
+    physical, controlled = _compose_lower_policy(
+        model,
+        plan.weights,
+        plan.reconstructed_boundary_desirability,
+        goal_interior_desirability=goal_desirability,
+    )
+    return replace(
+        plan,
+        physical_desirability=physical,
+        layer_one_controlled=controlled,
     )
 
 
@@ -386,6 +513,317 @@ def sample_hierarchical_rollout(
         reached_goal=False,
         status="step_limit",
     )
+
+
+def sample_online_hierarchical_rollout(
+    model: TwoLayerModel,
+    start: Coordinate,
+    *,
+    initial_goal_desirability: np.ndarray | None = None,
+    z_sweeps_per_step: int = 1,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+) -> OnlineHierarchicalRollout:
+    """Sample a rollout while learning only the physical-goal solution.
+
+    The reusable subtask basis and layer 2 remain exact. After each
+    nonterminal physical transition, Equation 5 is swept over the full learned
+    goal vector and the lower policy is rebuilt with the current task weights.
+    """
+
+    rollout, _ = _run_online_hierarchical_rollout(
+        model,
+        start,
+        initial_goal_desirability=initial_goal_desirability,
+        z_sweeps_per_step=z_sweeps_per_step,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+    )
+    return rollout
+
+
+def _trace_online_hierarchical_rollout(
+    model: TwoLayerModel,
+    start: Coordinate,
+    *,
+    initial_goal_desirability: np.ndarray | None,
+    z_sweeps_per_step: int,
+    beta: float | None,
+    max_steps: int,
+    max_abstract_accesses: int,
+    seed: int | None,
+) -> list[_OnlineHierarchicalRolloutFrame]:
+    """Return the online rollout's frame-level events for plotting and tests."""
+
+    _, frames = _run_online_hierarchical_rollout(
+        model,
+        start,
+        initial_goal_desirability=initial_goal_desirability,
+        z_sweeps_per_step=z_sweeps_per_step,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+    )
+    return frames
+
+
+def _run_online_hierarchical_rollout(
+    model: TwoLayerModel,
+    start: Coordinate,
+    *,
+    initial_goal_desirability: np.ndarray | None,
+    z_sweeps_per_step: int,
+    beta: float | None,
+    max_steps: int,
+    max_abstract_accesses: int,
+    seed: int | None,
+) -> tuple[OnlineHierarchicalRollout, list[_OnlineHierarchicalRolloutFrame]]:
+    model.maze.state_index(start)
+    if max_steps < 0:
+        raise ValueError("Maximum steps must be non-negative")
+    if max_abstract_accesses < 0:
+        raise ValueError("Maximum abstract accesses must be non-negative")
+    if (
+        isinstance(z_sweeps_per_step, (bool, np.bool_))
+        or not isinstance(z_sweeps_per_step, (int, np.integer))
+        or z_sweeps_per_step < 1
+    ):
+        raise ValueError("Z sweeps per step must be a positive integer")
+
+    if initial_goal_desirability is None:
+        goal_desirability = np.zeros(
+            len(model.interior_states),
+            dtype=np.float64,
+        )
+    else:
+        goal_desirability = _validated_goal_desirability(
+            model,
+            initial_goal_desirability,
+        ).copy()
+    goal_history = [goal_desirability.copy()]
+
+    if start == model.goal:
+        frames = [
+            _OnlineHierarchicalRolloutFrame(
+                event="terminal",
+                coordinate=start,
+                trajectory=(start,),
+                plan=None,
+                active_subgoal=None,
+                requested_subgoal=None,
+                physical_steps=0,
+                abstract_accesses=0,
+                goal_desirability=goal_desirability.copy(),
+                z_iterations=0,
+                status="reached_goal",
+            )
+        ]
+        return (
+            OnlineHierarchicalRollout(
+                trajectory=[start],
+                subgoal_accesses=[],
+                weight_history=[],
+                goal_desirability_history=goal_history,
+                physical_steps=0,
+                abstract_accesses=0,
+                z_iterations=0,
+                reached_goal=True,
+                status="reached_goal",
+            ),
+            frames,
+        )
+
+    q_interior = np.exp(
+        model.parameters.interior_reward
+        / model.parameters.lower_control_cost
+    )
+    goal_boundary = np.zeros(
+        model.lower_dynamics.number_of_boundary_states,
+        dtype=np.float64,
+    )
+    goal_boundary[-1] = np.exp(
+        model.parameters.goal_reward
+        / model.parameters.lower_control_cost
+    )
+
+    random_generator = np.random.default_rng(seed)
+    trajectory = [start]
+    subgoal_accesses: list[Coordinate] = []
+    current = start
+    current_plan = compute_layer_one_plan(
+        model,
+        current,
+        beta=beta,
+        goal_interior_desirability=goal_desirability,
+    )
+    active_subgoal = current if current in model.subgoals else None
+    weight_history = [current_plan.weights.copy()]
+    physical_steps = 0
+    z_iterations = 0
+    frames = [
+        _OnlineHierarchicalRolloutFrame(
+            event="initial_plan",
+            coordinate=current,
+            trajectory=tuple(trajectory),
+            plan=current_plan,
+            active_subgoal=active_subgoal,
+            requested_subgoal=active_subgoal,
+            physical_steps=physical_steps,
+            abstract_accesses=0,
+            goal_desirability=goal_desirability.copy(),
+            z_iterations=z_iterations,
+        )
+    ]
+
+    def finish(
+        status: str,
+        *,
+        reached_goal: bool = False,
+        requested_subgoal: Coordinate | None = None,
+    ) -> tuple[
+        OnlineHierarchicalRollout,
+        list[_OnlineHierarchicalRolloutFrame],
+    ]:
+        frames.append(
+            _OnlineHierarchicalRolloutFrame(
+                event="terminal",
+                coordinate=current,
+                trajectory=tuple(trajectory),
+                plan=current_plan,
+                active_subgoal=active_subgoal,
+                requested_subgoal=requested_subgoal,
+                physical_steps=physical_steps,
+                abstract_accesses=len(subgoal_accesses),
+                goal_desirability=goal_desirability.copy(),
+                z_iterations=z_iterations,
+                status=status,
+            )
+        )
+        rollout = OnlineHierarchicalRollout(
+            trajectory=trajectory.copy(),
+            subgoal_accesses=subgoal_accesses.copy(),
+            weight_history=[weights.copy() for weights in weight_history],
+            goal_desirability_history=[
+                values.copy() for values in goal_history
+            ],
+            physical_steps=physical_steps,
+            abstract_accesses=len(subgoal_accesses),
+            z_iterations=z_iterations,
+            reached_goal=reached_goal,
+            status=status,
+        )
+        return rollout, frames
+
+    while physical_steps < max_steps:
+        current_state = model.interior_state_by_coordinate[current]
+        transition_probabilities = current_plan.layer_one_controlled[
+            :, current_state
+        ].copy()
+
+        if current == active_subgoal:
+            active_subgoal_state = model.subgoals.index(active_subgoal)
+            access_row = len(model.interior_states) + active_subgoal_state
+            transition_probabilities[access_row] = 0.0
+
+        probability_mass = transition_probabilities.sum()
+        if (
+            not np.isfinite(probability_mass)
+            or probability_mass <= 0.0
+            or np.any(transition_probabilities < 0.0)
+        ):
+            return finish("zero_policy")
+        transition_probabilities /= probability_mass
+
+        next_state = int(
+            random_generator.choice(
+                current_plan.layer_one_controlled.shape[0],
+                p=transition_probabilities,
+            )
+        )
+        number_of_interior_states = len(model.interior_states)
+        if next_state < number_of_interior_states:
+            physical_state = int(model.interior_states[next_state])
+            current = model.maze.coordinate(physical_state)
+            trajectory.append(current)
+            physical_steps += 1
+
+            for _ in range(z_sweeps_per_step):
+                goal_desirability = z_iteration_step(
+                    model.lower_dynamics,
+                    goal_desirability,
+                    goal_boundary,
+                    q_interior,
+                )
+                z_iterations += 1
+            goal_history.append(goal_desirability.copy())
+            current_plan = _plan_with_goal_desirability(
+                model,
+                current_plan,
+                goal_desirability,
+            )
+            frames.append(
+                _OnlineHierarchicalRolloutFrame(
+                    event="physical_step",
+                    coordinate=current,
+                    trajectory=tuple(trajectory),
+                    plan=current_plan,
+                    active_subgoal=active_subgoal,
+                    requested_subgoal=None,
+                    physical_steps=physical_steps,
+                    abstract_accesses=len(subgoal_accesses),
+                    goal_desirability=goal_desirability.copy(),
+                    z_iterations=z_iterations,
+                )
+            )
+            continue
+
+        boundary_state = next_state - number_of_interior_states
+        if boundary_state == len(model.subgoals):
+            current = model.goal
+            trajectory.append(current)
+            physical_steps += 1
+            return finish("reached_goal", reached_goal=True)
+
+        requested_subgoal = model.subgoals[boundary_state]
+        if len(subgoal_accesses) >= max_abstract_accesses:
+            return finish(
+                "abstract_access_limit",
+                requested_subgoal=requested_subgoal,
+            )
+
+        # This is a zero-time call: layer 2 changes A-F weights, while the
+        # learned goal vector and Z-sweep count remain exactly as they were.
+        current = requested_subgoal
+        subgoal_accesses.append(current)
+        active_subgoal = current
+        current_plan = compute_layer_one_plan(
+            model,
+            current,
+            beta=beta,
+            goal_interior_desirability=goal_desirability,
+        )
+        weight_history.append(current_plan.weights.copy())
+        frames.append(
+            _OnlineHierarchicalRolloutFrame(
+                event="subgoal_access",
+                coordinate=current,
+                trajectory=tuple(trajectory),
+                plan=current_plan,
+                active_subgoal=active_subgoal,
+                requested_subgoal=requested_subgoal,
+                physical_steps=physical_steps,
+                abstract_accesses=len(subgoal_accesses),
+                goal_desirability=goal_desirability.copy(),
+                z_iterations=z_iterations,
+            )
+        )
+
+    return finish("step_limit")
 
 
 def _validate_subgoals(

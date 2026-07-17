@@ -11,6 +11,8 @@ from matplotlib.patches import Rectangle
 from andrew_mlmdp.hierarchy import (
     LayerOnePlan,
     TwoLayerModel,
+    _OnlineHierarchicalRolloutFrame,
+    _trace_online_hierarchical_rollout,
     compute_layer_one_plan,
 )
 from andrew_mlmdp.lmdp import desirability_grid
@@ -30,6 +32,9 @@ class _HierarchicalRolloutFrame:
     physical_steps: int
     abstract_accesses: int
     status: str | None = None
+
+
+_RolloutFrame = _HierarchicalRolloutFrame | _OnlineHierarchicalRolloutFrame
 
 
 def _draw_walls(
@@ -358,6 +363,9 @@ def animate_hierarchical_rollout(
     max_steps: int = 500,
     max_abstract_accesses: int = 500,
     seed: int | None = None,
+    goal_learning: str = "exact",
+    initial_goal_desirability: np.ndarray | None = None,
+    z_sweeps_per_step: int = 1,
     subgoal_labels: list[str] | tuple[str, ...] | None = None,
     interval: int = 500,
     repeat: bool = False,
@@ -365,21 +373,39 @@ def animate_hierarchical_rollout(
 ) -> FuncAnimation:
     """Animate a sampled two-layer rollout as an inspectable dashboard.
 
-    The task-blend panel shows unnormalized subgoal weights only. The active
-    weights are held between zero-time hierarchy calls, matching execution.
-    The returned object is a standard Matplotlib ``FuncAnimation``. It is
-    suitable for notebooks, or for callers that want to choose their own movie
-    writer and file format.
+    ``goal_learning="exact"`` uses the precomputed goal basis column.
+    ``goal_learning="online"`` starts from a supplied or zero goal vector and
+    applies Equation 5 after physical transitions. The task-blend panel shows
+    unnormalized subgoal weights only; they remain held between hierarchy
+    calls in both modes. The returned object is a Matplotlib ``FuncAnimation``.
     """
 
-    frames = _trace_hierarchical_rollout(
-        model,
-        start,
-        beta=beta,
-        max_steps=max_steps,
-        max_abstract_accesses=max_abstract_accesses,
-        seed=seed,
-    )
+    if goal_learning == "exact":
+        if initial_goal_desirability is not None:
+            raise ValueError(
+                "Initial goal desirability is only used in online mode"
+            )
+        frames = _trace_hierarchical_rollout(
+            model,
+            start,
+            beta=beta,
+            max_steps=max_steps,
+            max_abstract_accesses=max_abstract_accesses,
+            seed=seed,
+        )
+    elif goal_learning == "online":
+        frames = _trace_online_hierarchical_rollout(
+            model,
+            start,
+            initial_goal_desirability=initial_goal_desirability,
+            z_sweeps_per_step=z_sweeps_per_step,
+            beta=beta,
+            max_steps=max_steps,
+            max_abstract_accesses=max_abstract_accesses,
+            seed=seed,
+        )
+    else:
+        raise ValueError("Goal learning must be 'exact' or 'online'")
     labels = _target_labels(model, subgoal_labels)
     desirability_norm = _desirability_norm(frames)
 
@@ -495,7 +521,13 @@ def animate_hierarchical_rollout(
         markeredgewidth=0.8,
         zorder=4,
     )
-    desirability_ax.set_title("Layer-1 desirability programmed by layer 2")
+    if goal_learning == "online":
+        desirability_title = (
+            "Layer-1 desirability: learned goal + subtask guidance"
+        )
+    else:
+        desirability_title = "Layer-1 desirability programmed by layer 2"
+    desirability_ax.set_title(desirability_title)
     figure.colorbar(
         desirability_image,
         ax=desirability_ax,
@@ -787,7 +819,7 @@ def _target_labels(
     return labels + ("goal",)
 
 
-def _desirability_norm(frames: list[_HierarchicalRolloutFrame]):
+def _desirability_norm(frames: list[_RolloutFrame]):
     planned_values = [
         frame.plan.physical_desirability
         for frame in frames
@@ -810,7 +842,7 @@ def _desirability_norm(frames: list[_HierarchicalRolloutFrame]):
 
 def _frame_desirability_grid(
     maze: Maze,
-    frame: _HierarchicalRolloutFrame,
+    frame: _RolloutFrame,
 ) -> np.ndarray:
     if frame.plan is None:
         return np.full(maze.shape, np.nan, dtype=np.float64)
@@ -818,7 +850,7 @@ def _frame_desirability_grid(
 
 
 def _frame_task_weights(
-    frame: _HierarchicalRolloutFrame,
+    frame: _RolloutFrame,
     number_of_subgoals: int,
 ) -> np.ndarray:
     if frame.plan is None:
@@ -826,7 +858,7 @@ def _frame_task_weights(
     return frame.plan.weights[:number_of_subgoals]
 
 
-def _task_weight_limit(frames: list[_HierarchicalRolloutFrame]) -> float:
+def _task_weight_limit(frames: list[_RolloutFrame]) -> float:
     weights = [
         frame.plan.weights[:-1]
         for frame in frames
@@ -849,7 +881,7 @@ def _event_title(event: str) -> str:
     return titles[event]
 
 
-def _communication_status(frame: _HierarchicalRolloutFrame) -> str:
+def _communication_status(frame: _RolloutFrame) -> str:
     if frame.event == "initial_plan":
         return "Layer 1 requests an initial task from layer 2."
     if frame.event == "subgoal_access":
@@ -862,7 +894,7 @@ def _communication_status(frame: _HierarchicalRolloutFrame) -> str:
 
 
 def _communication_details(
-    frame: _HierarchicalRolloutFrame,
+    frame: _RolloutFrame,
     labels: tuple[str, ...],
     model: TwoLayerModel,
 ) -> str:
@@ -876,6 +908,11 @@ def _communication_details(
         request_index = model.subgoals.index(frame.requested_subgoal)
         request_label = labels[request_index]
 
+    z_iterations = getattr(frame, "z_iterations", None)
+    learning_detail = ""
+    if z_iterations is not None:
+        learning_detail = f"\nZ sweeps:        {z_iterations}"
+
     return (
         f"physical steps:  {frame.physical_steps}\n"
         f"abstract calls:  {frame.abstract_accesses}\n"
@@ -883,4 +920,5 @@ def _communication_details(
         f"new request:     {request_label}\n"
         f"current cell:    {frame.coordinate}\n"
         f"goal reward:     {model.parameters.goal_reward:g} (fixed)"
+        f"{learning_detail}"
     )

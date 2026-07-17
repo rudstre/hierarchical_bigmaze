@@ -12,7 +12,10 @@ from andrew_mlmdp import (
     build_two_layer_model,
     compute_layer_one_plan,
     sample_hierarchical_rollout,
+    sample_online_hierarchical_rollout,
+    z_iteration_step,
 )
+from andrew_mlmdp.hierarchy import _trace_online_hierarchical_rollout
 
 
 FOUR_ROOMS_FILE = Path(__file__).parents[1] / "mazes" / "four_rooms.txt"
@@ -309,6 +312,170 @@ def test_hierarchical_rollout_is_reproducible_and_legal(
         row_distance = abs(current[0] - following[0])
         column_distance = abs(current[1] - following[1])
         assert row_distance + column_distance <= 1
+
+
+def test_online_rollout_updates_goal_only_after_physical_steps(
+    corridor_model,
+) -> None:
+    model = corridor_model
+    rollout = sample_online_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        seed=0,
+        max_steps=100,
+    )
+    frames = _trace_online_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        initial_goal_desirability=None,
+        z_sweeps_per_step=1,
+        beta=None,
+        max_steps=100,
+        max_abstract_accesses=500,
+        seed=0,
+    )
+
+    assert rollout.status == "reached_goal"
+    assert rollout.reached_goal
+    assert rollout.z_iterations == rollout.physical_steps - 1
+    assert len(rollout.goal_desirability_history) == (
+        rollout.z_iterations + 1
+    )
+    assert len(rollout.weight_history) == rollout.abstract_accesses + 1
+
+    previous = frames[0]
+    for frame in frames[1:]:
+        if frame.event == "physical_step":
+            assert frame.z_iterations == previous.z_iterations + 1
+            assert frame.plan is not None
+            assert previous.plan is not None
+            assert frame.plan.weights == pytest.approx(previous.plan.weights)
+        elif frame.event == "subgoal_access":
+            assert frame.z_iterations == previous.z_iterations
+            assert frame.goal_desirability == pytest.approx(
+                previous.goal_desirability
+            )
+        previous = frame
+
+
+def test_online_goal_sweeps_converge_to_exact_goal_basis(
+    corridor_model,
+) -> None:
+    model = corridor_model
+    boundary = np.zeros(len(model.targets))
+    boundary[-1] = np.exp(
+        model.parameters.goal_reward
+        / model.parameters.lower_control_cost
+    )
+    q_interior = np.exp(
+        model.parameters.interior_reward
+        / model.parameters.lower_control_cost
+    )
+    iterated = np.zeros(len(model.interior_states))
+
+    for _ in range(500):
+        iterated = z_iteration_step(
+            model.lower_dynamics,
+            iterated,
+            boundary,
+            q_interior,
+        )
+
+    assert iterated == pytest.approx(
+        model.task_basis.interior_desirability[:, -1]
+    )
+
+
+def test_online_rollout_copies_and_continues_goal_learning(
+    corridor_model,
+) -> None:
+    model = corridor_model
+    initial = np.full(len(model.interior_states), 0.25)
+    stopped = sample_online_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        initial_goal_desirability=initial,
+        max_steps=0,
+        seed=1,
+    )
+    initial[:] = 99.0
+
+    assert stopped.goal_desirability_history[0] == pytest.approx(0.25)
+    assert not np.shares_memory(
+        stopped.goal_desirability_history[0],
+        initial,
+    )
+
+    first = sample_online_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        seed=0,
+        max_steps=100,
+    )
+    second = sample_online_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        initial_goal_desirability=first.final_goal_desirability,
+        seed=1,
+        max_steps=100,
+    )
+
+    assert second.goal_desirability_history[0] == pytest.approx(
+        first.final_goal_desirability
+    )
+    assert not np.shares_memory(
+        second.goal_desirability_history[0],
+        first.final_goal_desirability,
+    )
+    assert np.linalg.norm(second.final_goal_desirability) > np.linalg.norm(
+        first.final_goal_desirability
+    )
+
+
+@pytest.mark.parametrize(
+    ("initial", "sweeps", "message"),
+    [
+        (np.ones(2), 1, "shape"),
+        (np.asarray([1.0, -1.0, 1.0]), 1, "non-negative"),
+        (np.asarray([1.0, np.inf, 1.0]), 1, "finite"),
+        (None, 0, "positive integer"),
+        (None, 1.5, "positive integer"),
+        (None, True, "positive integer"),
+    ],
+)
+def test_online_rollout_rejects_invalid_learning_inputs(
+    corridor_model,
+    initial,
+    sweeps,
+    message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        sample_online_hierarchical_rollout(
+            corridor_model,
+            start=(0, 1),
+            initial_goal_desirability=initial,
+            z_sweeps_per_step=sweeps,
+        )
+
+
+def test_online_rollout_reports_zero_policy(corridor_model) -> None:
+    empty_basis = replace(
+        corridor_model.task_basis,
+        interior_desirability=np.zeros_like(
+            corridor_model.task_basis.interior_desirability
+        ),
+    )
+    unguided_model = replace(corridor_model, task_basis=empty_basis)
+
+    rollout = sample_online_hierarchical_rollout(
+        unguided_model,
+        start=(0, 1),
+        seed=0,
+    )
+
+    assert rollout.status == "zero_policy"
+    assert rollout.physical_steps == 0
+    assert rollout.z_iterations == 0
 
 
 def test_hierarchical_rollout_limits_and_terminal_start(corridor_model) -> None:

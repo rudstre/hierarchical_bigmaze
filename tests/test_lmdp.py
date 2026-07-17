@@ -14,6 +14,7 @@ from andrew_mlmdp import (
     sample_rollout,
     solve_desirability,
     solve_first_exit,
+    z_iteration_step,
 )
 
 
@@ -189,6 +190,86 @@ def test_generic_first_exit_helpers_match_maze_solution() -> None:
     assert controlled_from_desirability(passive, complete) == pytest.approx(
         controlled_dynamics(maze, complete)
     )
+
+
+def test_z_iteration_step_matches_equation_five() -> None:
+    dynamics = FirstExitDynamics(
+        interior_passive=np.asarray([[0.4, 0.2], [0.3, 0.5]]),
+        boundary_passive=np.asarray([[0.3, 0.3]]),
+    )
+    interior = np.asarray([0.5, 1.5])
+    boundary = np.asarray([4.0])
+    q_interior = np.asarray([0.8, 0.6])
+
+    expected = q_interior * (
+        dynamics.interior_passive.T @ interior
+        + dynamics.boundary_passive.T @ boundary
+    )
+
+    updated = z_iteration_step(
+        dynamics,
+        interior,
+        boundary,
+        q_interior,
+    )
+
+    assert updated == pytest.approx(expected)
+    assert interior == pytest.approx([0.5, 1.5])
+
+
+def test_z_iteration_converges_to_exact_first_exit_solution() -> None:
+    maze = Maze.from_ascii("....")
+    parameters = ModelParameters()
+    passive = build_passive_dynamics(maze)
+    goal_state = maze.state_index((0, 3))
+    interior_states = np.asarray([0, 1, 2])
+    dynamics = FirstExitDynamics(
+        passive[np.ix_(interior_states, interior_states)],
+        passive[goal_state, interior_states][np.newaxis, :],
+    )
+    boundary = np.asarray(
+        [np.exp(parameters.goal_reward / parameters.lower_control_cost)]
+    )
+    q_interior = np.exp(
+        parameters.interior_reward / parameters.lower_control_cost
+    )
+    exact = solve_first_exit(dynamics, boundary, q_interior)
+
+    iterated = np.zeros_like(exact)
+    for _ in range(500):
+        iterated = z_iteration_step(
+            dynamics,
+            iterated,
+            boundary,
+            q_interior,
+        )
+
+    assert iterated == pytest.approx(exact)
+
+
+@pytest.mark.parametrize(
+    ("interior", "boundary", "q_interior", "message"),
+    [
+        (np.ones(3), np.ones(1), 0.5, "Interior desirability"),
+        (np.ones(2), np.ones(2), 0.5, "Boundary desirability"),
+        (np.ones(2), np.ones(1), np.ones(3), "exponentiated reward"),
+        (np.asarray([1.0, -1.0]), np.ones(1), 0.5, "non-negative"),
+        (np.ones(2), np.asarray([np.inf]), 0.5, "finite"),
+    ],
+)
+def test_z_iteration_rejects_invalid_values(
+    interior,
+    boundary,
+    q_interior,
+    message,
+) -> None:
+    dynamics = FirstExitDynamics(
+        interior_passive=np.asarray([[0.5, 0.0], [0.0, 0.5]]),
+        boundary_passive=np.asarray([[0.5, 0.5]]),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        z_iteration_step(dynamics, interior, boundary, q_interior)
 
 
 def test_canonical_parameter_defaults() -> None:

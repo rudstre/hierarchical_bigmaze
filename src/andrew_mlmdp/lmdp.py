@@ -139,6 +139,61 @@ def solve_first_exit(
     return np.linalg.solve(coefficient_matrix, right_hand_side)
 
 
+def z_iteration_step(
+    dynamics: FirstExitDynamics,
+    interior_desirability: np.ndarray,
+    boundary_desirability: np.ndarray,
+    interior_exponentiated_reward: float | np.ndarray,
+) -> np.ndarray:
+    """Apply one full desirability update from paper Equation 5.
+
+    Unlike :func:`solve_first_exit`, this performs one fixed-point iteration
+    and is therefore useful when the solution is learned while an agent moves.
+    The input desirability is not modified.
+    """
+
+    number_of_states = dynamics.number_of_interior_states
+    interior = np.asarray(interior_desirability, dtype=np.float64)
+    expected_interior_shape = (number_of_states,)
+    if interior.shape != expected_interior_shape:
+        raise ValueError(
+            "Interior desirability must have shape "
+            f"{expected_interior_shape}, got {interior.shape}"
+        )
+
+    boundary = np.asarray(boundary_desirability, dtype=np.float64)
+    expected_boundary_shape = (dynamics.number_of_boundary_states,)
+    if boundary.shape != expected_boundary_shape:
+        raise ValueError(
+            "Boundary desirability must have shape "
+            f"{expected_boundary_shape}, got {boundary.shape}"
+        )
+
+    q_interior = np.asarray(interior_exponentiated_reward, dtype=np.float64)
+    if q_interior.ndim == 0:
+        q_interior = np.full(number_of_states, float(q_interior))
+    if q_interior.shape != expected_interior_shape:
+        raise ValueError(
+            "Interior exponentiated reward must be scalar or have shape "
+            f"{expected_interior_shape}, got {q_interior.shape}"
+        )
+
+    if (
+        np.any(interior < 0.0)
+        or np.any(boundary < 0.0)
+        or not np.all(np.isfinite(interior))
+        or not np.all(np.isfinite(boundary))
+    ):
+        raise ValueError("Desirabilities must be finite and non-negative")
+    if np.any(q_interior < 0.0) or not np.all(np.isfinite(q_interior)):
+        raise ValueError("Exponentiated rewards must be finite and non-negative")
+
+    return q_interior * (
+        dynamics.interior_passive.T @ interior
+        + dynamics.boundary_passive.T @ boundary
+    )
+
+
 def controlled_from_desirability(
     passive: np.ndarray,
     desirability: np.ndarray,
