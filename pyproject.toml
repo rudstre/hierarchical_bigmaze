@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-notebook = ["jupyterlab>=4"]
+notebook = ["ipympl>=0.9", "jupyterlab>=4"]
 test = ["pytest>=8"]
 
 [tool.pytest.ini_options]

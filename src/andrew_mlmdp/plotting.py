@@ -6,6 +6,8 @@ from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LogNorm, Normalize
+from matplotlib.figure import Figure
+from matplotlib.backend_bases import MouseButton
 from matplotlib.patches import Rectangle
 
 from andrew_mlmdp.hierarchy import (
@@ -353,6 +355,217 @@ def plot_trajectory(
     ax.set_title(f"Sample controlled rollout ({len(trajectory) - 1} steps)")
 
     return ax
+
+
+def plot_interactive_subgoal_desirability(
+    model: TwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None = None,
+    subgoal_labels: list[str] | tuple[str, ...] | None = None,
+    figsize: tuple[float, float] = (14, 5.5),
+) -> Figure:
+    """Explore the A-F task composition by dragging the current state.
+
+    Layer 2 remains goal-conditioned, but the heatmap deliberately excludes
+    the final physical-goal basis column. The goal is shown spatially and its
+    heatmap cell is masked.
+    """
+
+    model.maze.state_index(start)
+    if start == model.goal:
+        raise ValueError("Start must be a non-goal free cell")
+
+    labels = _target_labels(model, subgoal_labels)[:-1]
+    coordinates = tuple(model.interior_state_by_coordinate)
+    plans = {
+        coordinate: compute_layer_one_plan(model, coordinate, beta=beta)
+        for coordinate in coordinates
+    }
+
+    goal_state = model.maze.state_index(model.goal)
+    subtask_basis = model.task_basis.interior_desirability[:, :-1]
+
+    def subgoal_grid(coordinate: Coordinate) -> np.ndarray:
+        plan = plans[coordinate]
+        values = np.full(
+            len(model.maze.free_cells),
+            np.nan,
+            dtype=np.float64,
+        )
+        values[model.interior_states] = (
+            subtask_basis @ plan.weights[:-1]
+        )
+        values[goal_state] = np.nan
+        return desirability_grid(model.maze, values)
+
+    grids = {coordinate: subgoal_grid(coordinate) for coordinate in coordinates}
+    positive_values = np.concatenate(
+        [grid[np.isfinite(grid) & (grid > 0.0)] for grid in grids.values()]
+    )
+    if positive_values.size:
+        minimum = float(positive_values.min())
+        maximum = float(positive_values.max())
+        if minimum == maximum:
+            maximum = minimum * 1.01
+        desirability_norm = LogNorm(vmin=minimum, vmax=maximum)
+    else:
+        desirability_norm = Normalize(vmin=0.0, vmax=1.0)
+
+    all_subgoal_weights = np.concatenate(
+        [plan.weights[:-1] for plan in plans.values()]
+    )
+    positive_weights = all_subgoal_weights[all_subgoal_weights > 0.0]
+
+    figure, (maze_ax, desirability_ax, weights_ax) = plt.subplots(
+        1,
+        3,
+        figsize=figsize,
+        constrained_layout=True,
+        gridspec_kw={"width_ratios": [1.0, 1.0, 0.72]},
+    )
+
+    _draw_walls(model.maze, maze_ax, color="0.18")
+    _format_maze_axes(model.maze, maze_ax, show_grid=True)
+    subgoal_rows = [coordinate[0] for coordinate in model.subgoals]
+    subgoal_columns = [coordinate[1] for coordinate in model.subgoals]
+    maze_ax.scatter(
+        subgoal_columns,
+        subgoal_rows,
+        s=80,
+        facecolors="none",
+        edgecolors="#d97904",
+        linewidths=1.5,
+        zorder=4,
+    )
+    for label, (row, column) in zip(labels, model.subgoals):
+        maze_ax.text(
+            column + 0.14,
+            row - 0.14,
+            label,
+            color="#8f4f00",
+            fontsize=9,
+            zorder=5,
+        )
+
+    goal_row, goal_column = model.goal
+    for ax in (maze_ax, desirability_ax):
+        ax.plot(
+            goal_column,
+            goal_row,
+            marker="*",
+            markersize=13,
+            markerfacecolor="#d1495b",
+            markeredgecolor="white",
+            markeredgewidth=0.8,
+            zorder=6,
+        )
+
+    start_row, start_column = start
+    (agent_marker,) = maze_ax.plot(
+        start_column,
+        start_row,
+        marker="o",
+        markersize=11,
+        markerfacecolor="#f2cc8f",
+        markeredgecolor="#2d3142",
+        markeredgewidth=1.3,
+        picker=8,
+        zorder=7,
+    )
+    agent_marker.set_gid("agent")
+    maze_ax.set_title(f"Current state: {start}")
+
+    rows, columns = model.maze.shape
+    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    desirability_image = desirability_ax.imshow(
+        grids[start],
+        cmap=color_map,
+        norm=desirability_norm,
+        origin="upper",
+        extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
+    )
+    desirability_image.set_gid("subgoal-desirability")
+    _format_maze_axes(model.maze, desirability_ax, show_grid=False)
+    desirability_ax.set_title("Subgoal-only composed desirability")
+    figure.colorbar(
+        desirability_image,
+        ax=desirability_ax,
+        label="desirability",
+        fraction=0.046,
+        pad=0.04,
+    )
+
+    bar_positions = np.arange(len(model.subgoals))
+    bar_colors = plt.get_cmap("tab10").colors
+    bars = weights_ax.barh(
+        bar_positions,
+        plans[start].weights[:-1],
+        color=[bar_colors[index % len(bar_colors)] for index in bar_positions],
+    )
+    for label, bar in zip(labels, bars):
+        bar.set_gid(f"subgoal-weight-{label}")
+    weights_ax.set_yticks(bar_positions, labels)
+    weights_ax.invert_yaxis()
+    if positive_weights.size:
+        weights_ax.set_xscale("log")
+        weights_ax.set_xlim(
+            0.8 * float(positive_weights.min()),
+            1.05 * float(positive_weights.max()),
+        )
+    else:
+        weights_ax.set_xlim(0.0, 1.0)
+    weights_ax.set_xlabel("unnormalized weight (log scale)")
+    weights_ax.set_title("Task blend commanded by layer 2")
+    weights_ax.grid(axis="x", color="0.86", linewidth=0.6)
+    weights_ax.set_axisbelow(True)
+
+    interaction = {"dragging": False, "current": start}
+
+    def update_location(coordinate: Coordinate) -> None:
+        if coordinate == interaction["current"]:
+            return
+        interaction["current"] = coordinate
+        row, column = coordinate
+        agent_marker.set_data([column], [row])
+        desirability_image.set_data(grids[coordinate])
+        for bar, weight in zip(bars, plans[coordinate].weights[:-1]):
+            bar.set_width(weight)
+        maze_ax.set_title(f"Current state: {coordinate}")
+        figure.canvas.draw_idle()
+
+    def coordinate_from_event(event) -> Coordinate | None:
+        if (
+            event.inaxes is not maze_ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return None
+        coordinate = (int(np.rint(event.ydata)), int(np.rint(event.xdata)))
+        if coordinate not in plans:
+            return None
+        return coordinate
+
+    def on_press(event) -> None:
+        if event.button != MouseButton.LEFT or event.inaxes is not maze_ax:
+            return
+        contains_agent, _ = agent_marker.contains(event)
+        interaction["dragging"] = contains_agent
+
+    def on_motion(event) -> None:
+        if not interaction["dragging"]:
+            return
+        coordinate = coordinate_from_event(event)
+        if coordinate is not None:
+            update_location(coordinate)
+
+    def on_release(event) -> None:
+        interaction["dragging"] = False
+
+    figure.canvas.mpl_connect("button_press_event", on_press)
+    figure.canvas.mpl_connect("motion_notify_event", on_motion)
+    figure.canvas.mpl_connect("button_release_event", on_release)
+    return figure
 
 
 def animate_hierarchical_rollout(

@@ -28,6 +28,7 @@ from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting import (
     animate_hierarchical_rollout,
     plot_controlled_dynamics,
+    plot_interactive_subgoal_desirability,
     plot_subgoal_passive_dynamics,
     plot_trajectory,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "desirability_grid",
     "animate_hierarchical_rollout",
     "plot_controlled_dynamics",
+    "plot_interactive_subgoal_desirability",
     "plot_subgoal_passive_dynamics",
     "plot_trajectory",
     "sample_rollout",
