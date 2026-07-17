@@ -1,11 +1,35 @@
 """Direct plotting functions for inspecting maze LMDPs."""
 
+from dataclasses import dataclass
+
+from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import Normalize
+from matplotlib.colors import LogNorm, Normalize
 from matplotlib.patches import Rectangle
 
+from andrew_mlmdp.hierarchy import (
+    LayerOnePlan,
+    TwoLayerModel,
+    compute_layer_one_plan,
+)
+from andrew_mlmdp.lmdp import desirability_grid
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
+
+
+@dataclass(frozen=True)
+class _HierarchicalRolloutFrame:
+    """One drawable moment in a two-layer rollout."""
+
+    event: str
+    coordinate: Coordinate
+    trajectory: tuple[Coordinate, ...]
+    plan: LayerOnePlan | None
+    active_subgoal: Coordinate | None
+    requested_subgoal: Coordinate | None
+    physical_steps: int
+    abstract_accesses: int
+    status: str | None = None
 
 
 def _draw_walls(
@@ -324,3 +348,539 @@ def plot_trajectory(
     ax.set_title(f"Sample controlled rollout ({len(trajectory) - 1} steps)")
 
     return ax
+
+
+def animate_hierarchical_rollout(
+    model: TwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+    subgoal_labels: list[str] | tuple[str, ...] | None = None,
+    interval: int = 500,
+    repeat: bool = False,
+    figsize: tuple[float, float] = (12, 7),
+) -> FuncAnimation:
+    """Animate a sampled two-layer rollout as an inspectable dashboard.
+
+    The task-blend panel shows unnormalized subgoal weights only. The active
+    weights are held between zero-time hierarchy calls, matching execution.
+    The returned object is a standard Matplotlib ``FuncAnimation``. It is
+    suitable for notebooks, or for callers that want to choose their own movie
+    writer and file format.
+    """
+
+    frames = _trace_hierarchical_rollout(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+    )
+    labels = _target_labels(model, subgoal_labels)
+    desirability_norm = _desirability_norm(frames)
+
+    figure, axes = plt.subplot_mosaic(
+        [["maze", "desirability"], ["weights", "communication"]],
+        figsize=figsize,
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [1.35, 1.0]},
+    )
+    maze_ax = axes["maze"]
+    desirability_ax = axes["desirability"]
+    weights_ax = axes["weights"]
+    communication_ax = axes["communication"]
+
+    _draw_walls(model.maze, maze_ax, color="0.18")
+    _format_maze_axes(model.maze, maze_ax, show_grid=True)
+    maze_ax.set_title("Layer-1 physical state")
+
+    subgoal_rows = [coordinate[0] for coordinate in model.subgoals]
+    subgoal_columns = [coordinate[1] for coordinate in model.subgoals]
+    maze_ax.scatter(
+        subgoal_columns,
+        subgoal_rows,
+        s=80,
+        facecolors="none",
+        edgecolors="#d97904",
+        linewidths=1.5,
+        zorder=4,
+    )
+    for label, (row, column) in zip(labels[:-1], model.subgoals):
+        maze_ax.text(
+            column + 0.14,
+            row - 0.14,
+            label,
+            color="#8f4f00",
+            fontsize=9,
+            zorder=5,
+        )
+
+    start_row, start_column = start
+    goal_row, goal_column = model.goal
+    maze_ax.plot(
+        start_column,
+        start_row,
+        marker="o",
+        markersize=8,
+        markerfacecolor="#4c956c",
+        markeredgecolor="white",
+        markeredgewidth=0.8,
+        zorder=6,
+    )
+    maze_ax.plot(
+        goal_column,
+        goal_row,
+        marker="*",
+        markersize=13,
+        markerfacecolor="#d1495b",
+        markeredgecolor="white",
+        markeredgewidth=0.8,
+        zorder=6,
+    )
+
+    (path_line,) = maze_ax.plot(
+        [],
+        [],
+        color="#286f9b",
+        linewidth=2.0,
+        marker="o",
+        markersize=3.0,
+        markeredgewidth=0.0,
+        alpha=0.85,
+        zorder=5,
+    )
+    (agent_marker,) = maze_ax.plot(
+        [],
+        [],
+        marker="o",
+        markersize=10,
+        markerfacecolor="#f2cc8f",
+        markeredgecolor="#2d3142",
+        markeredgewidth=1.2,
+        zorder=7,
+    )
+    (request_marker,) = maze_ax.plot(
+        [],
+        [],
+        marker="o",
+        markersize=16,
+        markerfacecolor="none",
+        markeredgecolor="#d97904",
+        markeredgewidth=2.0,
+        zorder=8,
+    )
+
+    rows, columns = model.maze.shape
+    first_grid = _frame_desirability_grid(model.maze, frames[0])
+    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    desirability_image = desirability_ax.imshow(
+        first_grid,
+        cmap=color_map,
+        norm=desirability_norm,
+        origin="upper",
+        extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
+    )
+    _format_maze_axes(model.maze, desirability_ax, show_grid=False)
+    desirability_ax.plot(
+        goal_column,
+        goal_row,
+        marker="*",
+        markersize=11,
+        markerfacecolor="#d1495b",
+        markeredgecolor="white",
+        markeredgewidth=0.8,
+        zorder=4,
+    )
+    desirability_ax.set_title("Layer-1 desirability programmed by layer 2")
+    figure.colorbar(
+        desirability_image,
+        ax=desirability_ax,
+        label="desirability",
+        fraction=0.046,
+        pad=0.04,
+    )
+
+    number_of_subgoals = len(model.subgoals)
+    weight_colors = plt.get_cmap("tab10").colors
+    weight_lines = []
+    for index, label in enumerate(labels[:-1]):
+        (line,) = weights_ax.plot(
+            [],
+            [],
+            color=weight_colors[index % len(weight_colors)],
+            linewidth=2.0,
+            marker="o",
+            markersize=3.0,
+            drawstyle="steps-post",
+            label=label,
+        )
+        weight_lines.append(line)
+
+    final_physical_step = max(frame.physical_steps for frame in frames)
+    weights_ax.set_xlim(0.0, max(1, final_physical_step))
+    weights_ax.set_ylim(0.0, _task_weight_limit(frames))
+    weights_ax.set_xlabel("physical steps")
+    weights_ax.set_ylabel("weight")
+    weights_ax.set_title("Task blend commanded by layer 2")
+    weights_ax.legend(
+        loc="upper left",
+        ncols=min(3, number_of_subgoals),
+        frameon=False,
+        fontsize=8,
+    )
+
+    communication_ax.axis("off")
+    status_text = communication_ax.text(
+        0.02,
+        0.95,
+        "",
+        transform=communication_ax.transAxes,
+        verticalalignment="top",
+        fontsize=11,
+    )
+    detail_text = communication_ax.text(
+        0.02,
+        0.70,
+        "",
+        transform=communication_ax.transAxes,
+        verticalalignment="top",
+        fontsize=10,
+        family="monospace",
+    )
+
+    def update(frame_index: int):
+        frame = frames[frame_index]
+        path_columns = [coordinate[1] for coordinate in frame.trajectory]
+        path_rows = [coordinate[0] for coordinate in frame.trajectory]
+        path_line.set_data(path_columns, path_rows)
+        agent_marker.set_data([frame.coordinate[1]], [frame.coordinate[0]])
+
+        if frame.requested_subgoal is None:
+            request_marker.set_data([], [])
+        else:
+            row, column = frame.requested_subgoal
+            request_marker.set_data([column], [row])
+
+        desirability_image.set_data(
+            _frame_desirability_grid(model.maze, frame)
+        )
+        frame_history = frames[: frame_index + 1]
+        history_steps = [item.physical_steps for item in frame_history]
+        history_weights = np.vstack(
+            [
+                _frame_task_weights(item, number_of_subgoals)
+                for item in frame_history
+            ]
+        )
+        for index, line in enumerate(weight_lines):
+            line.set_data(history_steps, history_weights[:, index])
+
+        event_title = _event_title(frame.event)
+        maze_ax.set_title(
+            f"Layer-1 physical state: {event_title} "
+            f"({frame_index + 1}/{len(frames)})"
+        )
+        status_text.set_text(_communication_status(frame))
+        detail_text.set_text(_communication_details(frame, labels, model))
+        return (
+            path_line,
+            agent_marker,
+            request_marker,
+            desirability_image,
+            *weight_lines,
+            status_text,
+            detail_text,
+        )
+
+    animation = FuncAnimation(
+        figure,
+        update,
+        frames=np.arange(len(frames)),
+        interval=interval,
+        repeat=repeat,
+        blit=False,
+    )
+    return animation
+
+
+def _trace_hierarchical_rollout(
+    model: TwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None,
+    max_steps: int,
+    max_abstract_accesses: int,
+    seed: int | None,
+) -> list[_HierarchicalRolloutFrame]:
+    """Sample rollout dynamics with extra moments for animation."""
+
+    model.maze.state_index(start)
+    if max_steps < 0:
+        raise ValueError("Maximum steps must be non-negative")
+    if max_abstract_accesses < 0:
+        raise ValueError("Maximum abstract accesses must be non-negative")
+
+    if start == model.goal:
+        return [
+            _HierarchicalRolloutFrame(
+                event="terminal",
+                coordinate=start,
+                trajectory=(start,),
+                plan=None,
+                active_subgoal=None,
+                requested_subgoal=None,
+                physical_steps=0,
+                abstract_accesses=0,
+                status="reached_goal",
+            )
+        ]
+
+    random_generator = np.random.default_rng(seed)
+    trajectory = [start]
+    current = start
+    current_plan = compute_layer_one_plan(model, current, beta=beta)
+    active_subgoal = current if current in model.subgoals else None
+    physical_steps = 0
+    abstract_accesses = 0
+    frames = [
+        _HierarchicalRolloutFrame(
+            event="initial_plan",
+            coordinate=current,
+            trajectory=tuple(trajectory),
+            plan=current_plan,
+            active_subgoal=active_subgoal,
+            requested_subgoal=active_subgoal,
+            physical_steps=physical_steps,
+            abstract_accesses=abstract_accesses,
+        )
+    ]
+
+    while physical_steps < max_steps:
+        current_state = model.interior_state_by_coordinate[current]
+        transition_probabilities = current_plan.layer_one_controlled[
+            :, current_state
+        ].copy()
+
+        if current == active_subgoal:
+            active_subgoal_state = model.subgoals.index(active_subgoal)
+            access_row = len(model.interior_states) + active_subgoal_state
+            transition_probabilities[access_row] = 0.0
+            transition_probabilities /= transition_probabilities.sum()
+
+        next_state = int(
+            random_generator.choice(
+                current_plan.layer_one_controlled.shape[0],
+                p=transition_probabilities,
+            )
+        )
+        number_of_interior_states = len(model.interior_states)
+        if next_state < number_of_interior_states:
+            physical_state = int(model.interior_states[next_state])
+            current = model.maze.coordinate(physical_state)
+            trajectory.append(current)
+            physical_steps += 1
+            frames.append(
+                _HierarchicalRolloutFrame(
+                    event="physical_step",
+                    coordinate=current,
+                    trajectory=tuple(trajectory),
+                    plan=current_plan,
+                    active_subgoal=active_subgoal,
+                    requested_subgoal=None,
+                    physical_steps=physical_steps,
+                    abstract_accesses=abstract_accesses,
+                )
+            )
+            continue
+
+        boundary_state = next_state - number_of_interior_states
+        if boundary_state == len(model.subgoals):
+            trajectory.append(model.goal)
+            physical_steps += 1
+            frames.append(
+                _HierarchicalRolloutFrame(
+                    event="terminal",
+                    coordinate=model.goal,
+                    trajectory=tuple(trajectory),
+                    plan=current_plan,
+                    active_subgoal=active_subgoal,
+                    requested_subgoal=None,
+                    physical_steps=physical_steps,
+                    abstract_accesses=abstract_accesses,
+                    status="reached_goal",
+                )
+            )
+            return frames
+
+        requested_subgoal = model.subgoals[boundary_state]
+        if abstract_accesses >= max_abstract_accesses:
+            frames.append(
+                _HierarchicalRolloutFrame(
+                    event="terminal",
+                    coordinate=current,
+                    trajectory=tuple(trajectory),
+                    plan=current_plan,
+                    active_subgoal=active_subgoal,
+                    requested_subgoal=requested_subgoal,
+                    physical_steps=physical_steps,
+                    abstract_accesses=abstract_accesses,
+                    status="abstract_access_limit",
+                )
+            )
+            return frames
+
+        current = requested_subgoal
+        active_subgoal = current
+        abstract_accesses += 1
+        current_plan = compute_layer_one_plan(model, current, beta=beta)
+        frames.append(
+            _HierarchicalRolloutFrame(
+                event="subgoal_access",
+                coordinate=current,
+                trajectory=tuple(trajectory),
+                plan=current_plan,
+                active_subgoal=active_subgoal,
+                requested_subgoal=requested_subgoal,
+                physical_steps=physical_steps,
+                abstract_accesses=abstract_accesses,
+            )
+        )
+
+    frames.append(
+        _HierarchicalRolloutFrame(
+            event="terminal",
+            coordinate=current,
+            trajectory=tuple(trajectory),
+            plan=current_plan,
+            active_subgoal=active_subgoal,
+            requested_subgoal=None,
+            physical_steps=physical_steps,
+            abstract_accesses=abstract_accesses,
+            status="step_limit",
+        )
+    )
+    return frames
+
+
+def _target_labels(
+    model: TwoLayerModel,
+    subgoal_labels: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    if subgoal_labels is None:
+        if len(model.subgoals) <= 26:
+            labels = tuple(
+                chr(ord("A") + index)
+                for index in range(len(model.subgoals))
+            )
+        else:
+            labels = tuple(
+                f"S{index + 1}" for index in range(len(model.subgoals))
+            )
+    else:
+        if len(subgoal_labels) != len(model.subgoals):
+            raise ValueError("Subgoal labels must match the number of subgoals")
+        labels = tuple(str(label) for label in subgoal_labels)
+    return labels + ("goal",)
+
+
+def _desirability_norm(frames: list[_HierarchicalRolloutFrame]):
+    planned_values = [
+        frame.plan.physical_desirability
+        for frame in frames
+        if frame.plan is not None
+    ]
+    if not planned_values:
+        return Normalize(vmin=0.0, vmax=1.0)
+
+    values = np.concatenate(planned_values)
+    positive_values = values[values > 0.0]
+    if positive_values.size == 0:
+        return Normalize(vmin=0.0, vmax=1.0)
+
+    minimum = float(positive_values.min())
+    maximum = float(positive_values.max())
+    if minimum == maximum:
+        maximum = minimum * 1.01
+    return LogNorm(vmin=minimum, vmax=maximum)
+
+
+def _frame_desirability_grid(
+    maze: Maze,
+    frame: _HierarchicalRolloutFrame,
+) -> np.ndarray:
+    if frame.plan is None:
+        return np.full(maze.shape, np.nan, dtype=np.float64)
+    return desirability_grid(maze, frame.plan.physical_desirability)
+
+
+def _frame_task_weights(
+    frame: _HierarchicalRolloutFrame,
+    number_of_subgoals: int,
+) -> np.ndarray:
+    if frame.plan is None:
+        return np.zeros(number_of_subgoals, dtype=np.float64)
+    return frame.plan.weights[:number_of_subgoals]
+
+
+def _task_weight_limit(frames: list[_HierarchicalRolloutFrame]) -> float:
+    weights = [
+        frame.plan.weights[:-1]
+        for frame in frames
+        if frame.plan is not None
+    ]
+    if not weights:
+        return 1.0
+
+    maximum = float(np.concatenate(weights).max(initial=0.0))
+    return 1.0 if maximum == 0.0 else 1.05 * maximum
+
+
+def _event_title(event: str) -> str:
+    titles = {
+        "initial_plan": "initial request",
+        "physical_step": "physical step",
+        "subgoal_access": "new directions",
+        "terminal": "terminal",
+    }
+    return titles[event]
+
+
+def _communication_status(frame: _HierarchicalRolloutFrame) -> str:
+    if frame.event == "initial_plan":
+        return "Layer 1 requests an initial task from layer 2."
+    if frame.event == "subgoal_access":
+        return "Layer 1 reached a subgoal copy; layer 2 sends new directions."
+    if frame.event == "terminal" and frame.status == "reached_goal":
+        return "The physical goal boundary was reached."
+    if frame.event == "terminal":
+        return f"Rollout stopped: {frame.status}."
+    return "Layer 1 follows the currently programmed lower policy."
+
+
+def _communication_details(
+    frame: _HierarchicalRolloutFrame,
+    labels: tuple[str, ...],
+    model: TwoLayerModel,
+) -> str:
+    active_label = "none"
+    if frame.active_subgoal is not None:
+        active_index = model.subgoals.index(frame.active_subgoal)
+        active_label = labels[active_index]
+
+    request_label = "none"
+    if frame.requested_subgoal is not None:
+        request_index = model.subgoals.index(frame.requested_subgoal)
+        request_label = labels[request_index]
+
+    return (
+        f"physical steps:  {frame.physical_steps}\n"
+        f"abstract calls:  {frame.abstract_accesses}\n"
+        f"active subgoal:  {active_label}\n"
+        f"new request:     {request_label}\n"
+        f"current cell:    {frame.coordinate}\n"
+        f"goal reward:     {model.parameters.goal_reward:g} (fixed)"
+    )
