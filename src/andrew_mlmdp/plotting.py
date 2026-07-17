@@ -1,6 +1,7 @@
 """Direct plotting functions for inspecting maze LMDPs."""
 
 from dataclasses import dataclass
+from time import monotonic
 
 from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
@@ -9,6 +10,7 @@ from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
 from matplotlib.backend_bases import MouseButton
 from matplotlib.patches import Rectangle
+from matplotlib.widgets import Slider
 
 from andrew_mlmdp.hierarchy import (
     LayerOnePlan,
@@ -368,8 +370,8 @@ def plot_interactive_subgoal_desirability(
     """Explore the A-F task composition by dragging the current state.
 
     Layer 2 remains goal-conditioned, but the heatmap deliberately excludes
-    the final physical-goal basis column. The goal is shown spatially and its
-    heatmap cell is masked.
+    the final physical-goal basis column. The goal cell shows its fixed
+    boundary desirability.
     """
 
     model.maze.state_index(start)
@@ -384,6 +386,10 @@ def plot_interactive_subgoal_desirability(
     }
 
     goal_state = model.maze.state_index(model.goal)
+    goal_desirability = np.exp(
+        model.parameters.goal_reward
+        / model.parameters.lower_control_cost
+    )
     subtask_basis = model.task_basis.interior_desirability[:, :-1]
 
     def subgoal_grid(coordinate: Coordinate) -> np.ndarray:
@@ -396,7 +402,7 @@ def plot_interactive_subgoal_desirability(
         values[model.interior_states] = (
             subtask_basis @ plan.weights[:-1]
         )
-        values[goal_state] = np.nan
+        values[goal_state] = goal_desirability
         return desirability_grid(model.maze, values)
 
     grids = {coordinate: subgoal_grid(coordinate) for coordinate in coordinates}
@@ -410,6 +416,8 @@ def plot_interactive_subgoal_desirability(
             maximum = minimum * 1.01
         desirability_norm = LogNorm(vmin=minimum, vmax=maximum)
     else:
+        minimum = 1e-6
+        maximum = 1.0
         desirability_norm = Normalize(vmin=0.0, vmax=1.0)
 
     all_subgoal_weights = np.concatenate(
@@ -421,8 +429,14 @@ def plot_interactive_subgoal_desirability(
         1,
         3,
         figsize=figsize,
-        constrained_layout=True,
         gridspec_kw={"width_ratios": [1.0, 1.0, 0.72]},
+    )
+    figure.subplots_adjust(
+        left=0.055,
+        right=0.975,
+        bottom=0.22,
+        top=0.91,
+        wspace=0.34,
     )
 
     _draw_walls(model.maze, maze_ax, color="0.18")
@@ -487,7 +501,7 @@ def plot_interactive_subgoal_desirability(
     )
     desirability_image.set_gid("subgoal-desirability")
     _format_maze_axes(model.maze, desirability_ax, show_grid=False)
-    desirability_ax.set_title("Subgoal-only composed desirability")
+    desirability_ax.set_title("Subgoal composition (fixed goal boundary)")
     figure.colorbar(
         desirability_image,
         ax=desirability_ax,
@@ -520,19 +534,42 @@ def plot_interactive_subgoal_desirability(
     weights_ax.grid(axis="x", color="0.86", linewidth=0.6)
     weights_ax.set_axisbelow(True)
 
-    interaction = {"dragging": False, "current": start}
+    slider_ax = figure.add_axes([0.30, 0.07, 0.40, 0.035])
+    slider_ax.set_gid("color-maximum-slider")
+    slider_log_minimum = np.log10(minimum * (1.0 + 1e-6))
+    slider_log_maximum = np.log10(maximum)
+    color_scale_slider = Slider(
+        slider_ax,
+        "log10 color max",
+        slider_log_minimum,
+        slider_log_maximum,
+        valinit=slider_log_maximum,
+        valfmt="%1.1f",
+    )
+    color_scale_slider.drawon = False
 
-    def update_location(coordinate: Coordinate) -> None:
+    interaction = {
+        "dragging": False,
+        "current": start,
+        "last_draw_time": 0.0,
+        "color_scale_slider": color_scale_slider,
+    }
+
+    def request_draw(*, force: bool = False) -> None:
+        current_time = monotonic()
+        if force or current_time - interaction["last_draw_time"] >= 0.05:
+            interaction["last_draw_time"] = current_time
+            figure.canvas.draw_idle()
+
+    def update_location(coordinate: Coordinate) -> bool:
         if coordinate == interaction["current"]:
-            return
+            return False
         interaction["current"] = coordinate
-        row, column = coordinate
-        agent_marker.set_data([column], [row])
         desirability_image.set_data(grids[coordinate])
         for bar, weight in zip(bars, plans[coordinate].weights[:-1]):
             bar.set_width(weight)
         maze_ax.set_title(f"Current state: {coordinate}")
-        figure.canvas.draw_idle()
+        return True
 
     def coordinate_from_event(event) -> Coordinate | None:
         if (
@@ -550,21 +587,47 @@ def plot_interactive_subgoal_desirability(
         if event.button != MouseButton.LEFT or event.inaxes is not maze_ax:
             return
         contains_agent, _ = agent_marker.contains(event)
-        interaction["dragging"] = contains_agent
+        pressed_coordinate = coordinate_from_event(event)
+        interaction["dragging"] = (
+            contains_agent or pressed_coordinate == interaction["current"]
+        )
 
     def on_motion(event) -> None:
+        if not interaction["dragging"]:
+            return
+        if (
+            event.inaxes is not maze_ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+        agent_marker.set_data([event.xdata], [event.ydata])
+        coordinate = coordinate_from_event(event)
+        if coordinate is not None:
+            update_location(coordinate)
+        request_draw()
+
+    def on_release(event) -> None:
         if not interaction["dragging"]:
             return
         coordinate = coordinate_from_event(event)
         if coordinate is not None:
             update_location(coordinate)
-
-    def on_release(event) -> None:
         interaction["dragging"] = False
+        row, column = interaction["current"]
+        agent_marker.set_data([column], [row])
+        request_draw(force=True)
+
+    def on_color_scale_change(logarithmic_maximum: float) -> None:
+        desirability_image.set_clim(
+            vmax=10.0 ** logarithmic_maximum,
+        )
+        request_draw(force=True)
 
     figure.canvas.mpl_connect("button_press_event", on_press)
     figure.canvas.mpl_connect("motion_notify_event", on_motion)
     figure.canvas.mpl_connect("button_release_event", on_release)
+    color_scale_slider.on_changed(on_color_scale_change)
     return figure
 
 

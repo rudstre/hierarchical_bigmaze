@@ -104,7 +104,7 @@ def test_interactive_subgoal_desirability_renders_subtasks_only(
     desirability_ax = next(
         ax
         for ax in figure.axes
-        if ax.get_title() == "Subgoal-only composed desirability"
+        if ax.get_title() == "Subgoal composition (fixed goal boundary)"
     )
     displayed = np.asarray(desirability_ax.images[0].get_array())
     plan = compute_layer_one_plan(model, start)
@@ -113,9 +113,13 @@ def test_interactive_subgoal_desirability_renders_subtasks_only(
         model.task_basis.interior_desirability[:, :-1]
         @ plan.weights[:-1]
     )
+    expected[model.goal] = np.exp(
+        model.parameters.goal_reward
+        / model.parameters.lower_control_cost
+    )
 
     assert displayed == pytest.approx(expected, nan_ok=True)
-    assert np.isnan(displayed[model.goal])
+    assert displayed[model.goal] == pytest.approx(expected[model.goal])
     assert output_file.stat().st_size > 0
     plt.close(figure)
 
@@ -135,7 +139,7 @@ def test_interactive_subgoal_desirability_drag_updates_all_panels() -> None:
     desirability_ax = next(
         ax
         for ax in figure.axes
-        if ax.get_title() == "Subgoal-only composed desirability"
+        if ax.get_title() == "Subgoal composition (fixed goal boundary)"
     )
     weights_ax = next(
         ax
@@ -164,6 +168,38 @@ def test_interactive_subgoal_desirability_drag_updates_all_panels() -> None:
     plt.close(figure)
 
 
+def test_interactive_subgoal_desirability_previews_fractional_drag() -> None:
+    maze = Maze.from_ascii("....")
+    model = build_two_layer_model(
+        maze,
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 3),
+    )
+    start = (0, 1)
+    preview = (0.2, 1.25)
+    figure = plot_interactive_subgoal_desirability(model, start)
+    figure.canvas.draw()
+    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Current"))
+    agent = next(line for line in maze_ax.lines if line.get_gid() == "agent")
+
+    for name, coordinate in (
+        ("button_press_event", start),
+        ("motion_notify_event", preview),
+    ):
+        event = _mouse_event(name, figure, maze_ax, coordinate)
+        figure.canvas.callbacks.process(name, event)
+
+    assert agent.get_xdata() == pytest.approx([preview[1]])
+    assert agent.get_ydata() == pytest.approx([preview[0]])
+    assert maze_ax.get_title() == f"Current state: {start}"
+
+    release = _mouse_event("button_release_event", figure, maze_ax, preview)
+    figure.canvas.callbacks.process("button_release_event", release)
+    assert agent.get_xdata() == pytest.approx([start[1]])
+    assert agent.get_ydata() == pytest.approx([start[0]])
+    plt.close(figure)
+
+
 def test_interactive_subgoal_desirability_ignores_wall_and_goal() -> None:
     maze = Maze.from_ascii("....\n.#..")
     model = build_two_layer_model(
@@ -176,13 +212,55 @@ def test_interactive_subgoal_desirability_ignores_wall_and_goal() -> None:
     figure.canvas.draw()
     maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Current"))
 
-    press = _mouse_event("button_press_event", figure, maze_ax, start)
-    figure.canvas.callbacks.process("button_press_event", press)
     for invalid in ((1, 1), model.goal, (20, 20)):
+        press = _mouse_event("button_press_event", figure, maze_ax, start)
+        figure.canvas.callbacks.process("button_press_event", press)
         motion = _mouse_event("motion_notify_event", figure, maze_ax, invalid)
         figure.canvas.callbacks.process("motion_notify_event", motion)
+        release = _mouse_event("button_release_event", figure, maze_ax, invalid)
+        figure.canvas.callbacks.process("button_release_event", release)
 
-    assert maze_ax.get_title() == f"Current state: {start}"
+        agent = next(line for line in maze_ax.lines if line.get_gid() == "agent")
+        assert maze_ax.get_title() == f"Current state: {start}"
+        assert agent.get_xdata() == pytest.approx([start[1]])
+        assert agent.get_ydata() == pytest.approx([start[0]])
+    plt.close(figure)
+
+
+def test_interactive_subgoal_desirability_slider_changes_only_maximum() -> None:
+    maze = Maze.from_ascii("....")
+    model = build_two_layer_model(
+        maze,
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 3),
+    )
+    figure = plot_interactive_subgoal_desirability(model, (0, 1))
+    figure.canvas.draw()
+    desirability_ax = next(
+        ax
+        for ax in figure.axes
+        if ax.get_title() == "Subgoal composition (fixed goal boundary)"
+    )
+    slider_ax = next(
+        ax for ax in figure.axes if ax.get_gid() == "color-maximum-slider"
+    )
+    image = desirability_ax.images[0]
+    original_minimum = image.norm.vmin
+    logarithmic_maximum = sum(slider_ax.get_xlim()) / 2.0
+    x, y = slider_ax.transData.transform((logarithmic_maximum, 0.5))
+
+    for name in ("button_press_event", "button_release_event"):
+        event = MouseEvent(
+            name,
+            figure.canvas,
+            x,
+            y,
+            button=MouseButton.LEFT,
+        )
+        figure.canvas.callbacks.process(name, event)
+
+    assert image.norm.vmin == original_minimum
+    assert image.norm.vmax == pytest.approx(10.0 ** logarithmic_maximum)
     plt.close(figure)
 
 
