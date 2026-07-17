@@ -135,7 +135,7 @@ def test_interactive_subgoal_desirability_drag_updates_all_panels() -> None:
     target = (0, 2)
     figure = plot_interactive_subgoal_desirability(model, start)
     figure.canvas.draw()
-    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Current"))
+    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Start"))
     desirability_ax = next(
         ax
         for ax in figure.axes
@@ -162,7 +162,7 @@ def test_interactive_subgoal_desirability_drag_updates_all_panels() -> None:
     after_weights = np.asarray([bar.get_width() for bar in weights_ax.patches])
     assert agent.get_xdata() == pytest.approx([target[1]])
     assert agent.get_ydata() == pytest.approx([target[0]])
-    assert maze_ax.get_title() == f"Current state: {target}"
+    assert maze_ax.get_title() == f"Start: {target} | Goal: {model.goal}"
     assert not np.allclose(before_grid, after_grid, equal_nan=True)
     assert not np.allclose(before_weights, after_weights)
     plt.close(figure)
@@ -179,7 +179,7 @@ def test_interactive_subgoal_desirability_previews_fractional_drag() -> None:
     preview = (0.2, 1.25)
     figure = plot_interactive_subgoal_desirability(model, start)
     figure.canvas.draw()
-    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Current"))
+    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Start"))
     agent = next(line for line in maze_ax.lines if line.get_gid() == "agent")
 
     for name, coordinate in (
@@ -191,7 +191,7 @@ def test_interactive_subgoal_desirability_previews_fractional_drag() -> None:
 
     assert agent.get_xdata() == pytest.approx([preview[1]])
     assert agent.get_ydata() == pytest.approx([preview[0]])
-    assert maze_ax.get_title() == f"Current state: {start}"
+    assert maze_ax.get_title() == f"Start: {start} | Goal: {model.goal}"
 
     release = _mouse_event("button_release_event", figure, maze_ax, preview)
     figure.canvas.callbacks.process("button_release_event", release)
@@ -210,7 +210,7 @@ def test_interactive_subgoal_desirability_ignores_wall_and_goal() -> None:
     start = (1, 0)
     figure = plot_interactive_subgoal_desirability(model, start)
     figure.canvas.draw()
-    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Current"))
+    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Start"))
 
     for invalid in ((1, 1), model.goal, (20, 20)):
         press = _mouse_event("button_press_event", figure, maze_ax, start)
@@ -221,9 +221,93 @@ def test_interactive_subgoal_desirability_ignores_wall_and_goal() -> None:
         figure.canvas.callbacks.process("button_release_event", release)
 
         agent = next(line for line in maze_ax.lines if line.get_gid() == "agent")
-        assert maze_ax.get_title() == f"Current state: {start}"
+        assert maze_ax.get_title() == f"Start: {start} | Goal: {model.goal}"
         assert agent.get_xdata() == pytest.approx([start[1]])
         assert agent.get_ydata() == pytest.approx([start[0]])
+    plt.close(figure)
+
+
+def test_interactive_subgoal_desirability_drag_updates_goal() -> None:
+    maze = Maze.from_ascii(".....")
+    model = build_two_layer_model(
+        maze,
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 4),
+    )
+    start = (0, 1)
+    new_goal = (0, 3)
+    figure = plot_interactive_subgoal_desirability(model, start)
+    figure.canvas.draw()
+    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Start"))
+    desirability_ax = next(
+        ax
+        for ax in figure.axes
+        if ax.get_title() == "Subgoal composition (fixed goal boundary)"
+    )
+    weights_ax = next(
+        ax
+        for ax in figure.axes
+        if ax.get_title() == "Task blend commanded by layer 2"
+    )
+    before_grid = np.asarray(desirability_ax.images[0].get_array()).copy()
+    before_weights = np.asarray([bar.get_width() for bar in weights_ax.patches])
+
+    for name, coordinate in (
+        ("button_press_event", model.goal),
+        ("motion_notify_event", new_goal),
+        ("button_release_event", new_goal),
+    ):
+        event = _mouse_event(name, figure, maze_ax, coordinate)
+        figure.canvas.callbacks.process(name, event)
+
+    goal_marker = next(line for line in maze_ax.lines if line.get_gid() == "goal")
+    heatmap_goal = next(
+        line
+        for line in desirability_ax.lines
+        if line.get_gid() == "desirability-goal"
+    )
+    after_grid = np.asarray(desirability_ax.images[0].get_array())
+    after_weights = np.asarray([bar.get_width() for bar in weights_ax.patches])
+    expected_goal_desirability = np.exp(
+        model.parameters.goal_reward
+        / model.parameters.lower_control_cost
+    )
+
+    assert goal_marker.get_xdata() == pytest.approx([new_goal[1]])
+    assert goal_marker.get_ydata() == pytest.approx([new_goal[0]])
+    assert heatmap_goal.get_xdata() == pytest.approx([new_goal[1]])
+    assert heatmap_goal.get_ydata() == pytest.approx([new_goal[0]])
+    assert maze_ax.get_title() == f"Start: {start} | Goal: {new_goal}"
+    assert after_grid[new_goal] == pytest.approx(expected_goal_desirability)
+    assert not np.allclose(before_grid, after_grid, equal_nan=True)
+    assert not np.allclose(before_weights, after_weights)
+    plt.close(figure)
+
+
+def test_interactive_subgoal_desirability_rejects_invalid_goals() -> None:
+    maze = Maze.from_ascii(".....\n...#.")
+    model = build_two_layer_model(
+        maze,
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 4),
+    )
+    start = (0, 1)
+    figure = plot_interactive_subgoal_desirability(model, start)
+    figure.canvas.draw()
+    maze_ax = next(ax for ax in figure.axes if ax.get_title().startswith("Start"))
+    goal_marker = next(line for line in maze_ax.lines if line.get_gid() == "goal")
+
+    for invalid in ((1, 3), model.subgoals[1], start, (20, 20)):
+        press = _mouse_event("button_press_event", figure, maze_ax, model.goal)
+        figure.canvas.callbacks.process("button_press_event", press)
+        motion = _mouse_event("motion_notify_event", figure, maze_ax, invalid)
+        figure.canvas.callbacks.process("motion_notify_event", motion)
+        release = _mouse_event("button_release_event", figure, maze_ax, invalid)
+        figure.canvas.callbacks.process("button_release_event", release)
+
+        assert maze_ax.get_title() == f"Start: {start} | Goal: {model.goal}"
+        assert goal_marker.get_xdata() == pytest.approx([model.goal[1]])
+        assert goal_marker.get_ydata() == pytest.approx([model.goal[0]])
     plt.close(figure)
 
 

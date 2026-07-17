@@ -17,6 +17,7 @@ from andrew_mlmdp.hierarchy import (
     TwoLayerModel,
     _OnlineHierarchicalRolloutFrame,
     _trace_online_hierarchical_rollout,
+    build_two_layer_model,
     compute_layer_one_plan,
 )
 from andrew_mlmdp.lmdp import desirability_grid
@@ -367,7 +368,7 @@ def plot_interactive_subgoal_desirability(
     subgoal_labels: list[str] | tuple[str, ...] | None = None,
     figsize: tuple[float, float] = (14, 5.5),
 ) -> Figure:
-    """Explore the A-F task composition by dragging the current state.
+    """Explore the A-F task composition by dragging the start and goal.
 
     Layer 2 remains goal-conditioned, but the heatmap deliberately excludes
     the final physical-goal basis column. The goal cell shows its fixed
@@ -379,35 +380,54 @@ def plot_interactive_subgoal_desirability(
         raise ValueError("Start must be a non-goal free cell")
 
     labels = _target_labels(model, subgoal_labels)[:-1]
-    coordinates = tuple(model.interior_state_by_coordinate)
-    plans = {
-        coordinate: compute_layer_one_plan(model, coordinate, beta=beta)
-        for coordinate in coordinates
-    }
-
-    goal_state = model.maze.state_index(model.goal)
     goal_desirability = np.exp(
         model.parameters.goal_reward
         / model.parameters.lower_control_cost
     )
-    subtask_basis = model.task_basis.interior_desirability[:, :-1]
+    goal_locations = tuple(
+        coordinate
+        for coordinate in model.maze.free_cells
+        if coordinate not in model.subgoals
+    )
+    displays: dict[
+        tuple[Coordinate, Coordinate],
+        tuple[np.ndarray, np.ndarray],
+    ] = {}
 
-    def subgoal_grid(coordinate: Coordinate) -> np.ndarray:
-        plan = plans[coordinate]
-        values = np.full(
-            len(model.maze.free_cells),
-            np.nan,
-            dtype=np.float64,
+    for goal in goal_locations:
+        goal_model = (
+            model
+            if goal == model.goal
+            else build_two_layer_model(
+                model.maze,
+                model.subgoals,
+                goal,
+                parameters=model.parameters,
+            )
         )
-        values[model.interior_states] = (
-            subtask_basis @ plan.weights[:-1]
-        )
-        values[goal_state] = goal_desirability
-        return desirability_grid(model.maze, values)
+        subtask_basis = goal_model.task_basis.interior_desirability[:, :-1]
+        goal_state = model.maze.state_index(goal)
+        for current in goal_model.interior_state_by_coordinate:
+            plan = compute_layer_one_plan(goal_model, current, beta=beta)
+            values = np.full(
+                len(model.maze.free_cells),
+                np.nan,
+                dtype=np.float64,
+            )
+            values[goal_model.interior_states] = (
+                subtask_basis @ plan.weights[:-1]
+            )
+            values[goal_state] = goal_desirability
+            displays[(goal, current)] = (
+                desirability_grid(model.maze, values),
+                plan.weights[:-1].copy(),
+            )
 
-    grids = {coordinate: subgoal_grid(coordinate) for coordinate in coordinates}
     positive_values = np.concatenate(
-        [grid[np.isfinite(grid) & (grid > 0.0)] for grid in grids.values()]
+        [
+            grid[np.isfinite(grid) & (grid > 0.0)]
+            for grid, _ in displays.values()
+        ]
     )
     if positive_values.size:
         minimum = float(positive_values.min())
@@ -421,7 +441,7 @@ def plot_interactive_subgoal_desirability(
         desirability_norm = Normalize(vmin=0.0, vmax=1.0)
 
     all_subgoal_weights = np.concatenate(
-        [plan.weights[:-1] for plan in plans.values()]
+        [weights for _, weights in displays.values()]
     )
     positive_weights = all_subgoal_weights[all_subgoal_weights > 0.0]
 
@@ -463,17 +483,27 @@ def plot_interactive_subgoal_desirability(
         )
 
     goal_row, goal_column = model.goal
-    for ax in (maze_ax, desirability_ax):
-        ax.plot(
-            goal_column,
-            goal_row,
-            marker="*",
-            markersize=13,
-            markerfacecolor="#d1495b",
-            markeredgecolor="white",
-            markeredgewidth=0.8,
-            zorder=6,
-        )
+    goal_marker_style = {
+        "marker": "*",
+        "markersize": 13,
+        "markerfacecolor": "#d1495b",
+        "markeredgecolor": "white",
+        "markeredgewidth": 0.8,
+        "zorder": 6,
+    }
+    (goal_marker,) = maze_ax.plot(
+        goal_column,
+        goal_row,
+        picker=8,
+        **goal_marker_style,
+    )
+    goal_marker.set_gid("goal")
+    (desirability_goal_marker,) = desirability_ax.plot(
+        goal_column,
+        goal_row,
+        **goal_marker_style,
+    )
+    desirability_goal_marker.set_gid("desirability-goal")
 
     start_row, start_column = start
     (agent_marker,) = maze_ax.plot(
@@ -488,12 +518,12 @@ def plot_interactive_subgoal_desirability(
         zorder=7,
     )
     agent_marker.set_gid("agent")
-    maze_ax.set_title(f"Current state: {start}")
+    maze_ax.set_title(f"Start: {start} | Goal: {model.goal}")
 
     rows, columns = model.maze.shape
     color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
     desirability_image = desirability_ax.imshow(
-        grids[start],
+        displays[(model.goal, start)][0],
         cmap=color_map,
         norm=desirability_norm,
         origin="upper",
@@ -514,7 +544,7 @@ def plot_interactive_subgoal_desirability(
     bar_colors = plt.get_cmap("tab10").colors
     bars = weights_ax.barh(
         bar_positions,
-        plans[start].weights[:-1],
+        displays[(model.goal, start)][1],
         color=[bar_colors[index % len(bar_colors)] for index in bar_positions],
     )
     for label, bar in zip(labels, bars):
@@ -549,8 +579,9 @@ def plot_interactive_subgoal_desirability(
     color_scale_slider.drawon = False
 
     interaction = {
-        "dragging": False,
+        "dragging": None,
         "current": start,
+        "goal": model.goal,
         "last_draw_time": 0.0,
         "color_scale_slider": color_scale_slider,
     }
@@ -561,14 +592,31 @@ def plot_interactive_subgoal_desirability(
             interaction["last_draw_time"] = current_time
             figure.canvas.draw_idle()
 
-    def update_location(coordinate: Coordinate) -> bool:
-        if coordinate == interaction["current"]:
+    def update_location(kind: str, coordinate: Coordinate) -> bool:
+        if kind == "start":
+            if coordinate == interaction["goal"]:
+                return False
+            state_key = "current"
+        else:
+            if (
+                coordinate in model.subgoals
+                or coordinate == interaction["current"]
+            ):
+                return False
+            state_key = "goal"
+
+        if coordinate == interaction[state_key]:
             return False
-        interaction["current"] = coordinate
-        desirability_image.set_data(grids[coordinate])
-        for bar, weight in zip(bars, plans[coordinate].weights[:-1]):
+        interaction[state_key] = coordinate
+        display = displays[(interaction["goal"], interaction["current"])]
+        desirability_image.set_data(display[0])
+        for bar, weight in zip(bars, display[1]):
             bar.set_width(weight)
-        maze_ax.set_title(f"Current state: {coordinate}")
+        goal_row, goal_column = interaction["goal"]
+        desirability_goal_marker.set_data([goal_column], [goal_row])
+        maze_ax.set_title(
+            f"Start: {interaction['current']} | Goal: {interaction['goal']}"
+        )
         return True
 
     def coordinate_from_event(event) -> Coordinate | None:
@@ -579,7 +627,7 @@ def plot_interactive_subgoal_desirability(
         ):
             return None
         coordinate = (int(np.rint(event.ydata)), int(np.rint(event.xdata)))
-        if coordinate not in plans:
+        if not model.maze.is_free(coordinate):
             return None
         return coordinate
 
@@ -587,13 +635,16 @@ def plot_interactive_subgoal_desirability(
         if event.button != MouseButton.LEFT or event.inaxes is not maze_ax:
             return
         contains_agent, _ = agent_marker.contains(event)
+        contains_goal, _ = goal_marker.contains(event)
         pressed_coordinate = coordinate_from_event(event)
-        interaction["dragging"] = (
-            contains_agent or pressed_coordinate == interaction["current"]
-        )
+        if contains_agent or pressed_coordinate == interaction["current"]:
+            interaction["dragging"] = "start"
+        elif contains_goal or pressed_coordinate == interaction["goal"]:
+            interaction["dragging"] = "goal"
 
     def on_motion(event) -> None:
-        if not interaction["dragging"]:
+        kind = interaction["dragging"]
+        if kind is None:
             return
         if (
             event.inaxes is not maze_ax
@@ -601,21 +652,25 @@ def plot_interactive_subgoal_desirability(
             or event.ydata is None
         ):
             return
-        agent_marker.set_data([event.xdata], [event.ydata])
+        marker = agent_marker if kind == "start" else goal_marker
+        marker.set_data([event.xdata], [event.ydata])
         coordinate = coordinate_from_event(event)
         if coordinate is not None:
-            update_location(coordinate)
+            update_location(kind, coordinate)
         request_draw()
 
     def on_release(event) -> None:
-        if not interaction["dragging"]:
+        kind = interaction["dragging"]
+        if kind is None:
             return
         coordinate = coordinate_from_event(event)
         if coordinate is not None:
-            update_location(coordinate)
-        interaction["dragging"] = False
-        row, column = interaction["current"]
-        agent_marker.set_data([column], [row])
+            update_location(kind, coordinate)
+        interaction["dragging"] = None
+        selected = interaction["current" if kind == "start" else "goal"]
+        row, column = selected
+        marker = agent_marker if kind == "start" else goal_marker
+        marker.set_data([column], [row])
         request_draw(force=True)
 
     def on_color_scale_change(logarithmic_maximum: float) -> None:
