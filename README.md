@@ -93,7 +93,8 @@ expose the intermediate matrices used in the calculation.
 | --- | ---: |
 | Interior reward | `-0.1` |
 | Goal reward | `1.0` |
-| Control cost `lambda` | `0.15` |
+| Lower control cost `lambda_1` | `0.15` |
+| Upper control cost `lambda_2` | `0.3` |
 | Subgoal-access mass `alpha` | `1.0` |
 | Off-target basis reward | `-2.0` |
 | Reward-inpainting scale `beta` | `10.0` |

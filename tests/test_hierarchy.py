@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -111,7 +112,8 @@ def test_layer_two_dynamics_and_bellman_equation(corridor_model) -> None:
     assert np.all(np.diag(model.upper_dynamics.interior_passive) > 0.0)
 
     q_interior = np.exp(
-        model.parameters.interior_reward / model.parameters.control_cost
+        model.parameters.interior_reward
+        / model.parameters.upper_control_cost
     )
     expected = q_interior * (
         model.upper_dynamics.passive.T @ model.upper_desirability
@@ -124,6 +126,46 @@ def test_layer_two_dynamics_and_bellman_equation(corridor_model) -> None:
     )
     direct_controlled /= direct_controlled.sum(axis=0)
     assert model.upper_controlled == pytest.approx(direct_controlled)
+
+
+def test_control_costs_are_routed_to_their_own_layers() -> None:
+    maze = Maze.from_ascii("....")
+    subgoals = ((0, 0), (0, 2))
+    goal = (0, 3)
+    parameters = ModelParameters()
+    baseline = build_two_layer_model(
+        maze, subgoals, goal, parameters=parameters
+    )
+
+    different_upper = build_two_layer_model(
+        maze,
+        subgoals,
+        goal,
+        parameters=replace(parameters, upper_control_cost=0.6),
+    )
+    assert different_upper.task_basis.boundary_desirability == pytest.approx(
+        baseline.task_basis.boundary_desirability
+    )
+    assert different_upper.task_basis.interior_desirability == pytest.approx(
+        baseline.task_basis.interior_desirability
+    )
+    assert not np.allclose(
+        different_upper.upper_controlled, baseline.upper_controlled
+    )
+
+    different_lower = build_two_layer_model(
+        maze,
+        subgoals,
+        goal,
+        parameters=replace(parameters, lower_control_cost=0.25),
+    )
+    assert different_lower.upper_controlled == pytest.approx(
+        baseline.upper_controlled
+    )
+    assert not np.allclose(
+        different_lower.task_basis.interior_desirability,
+        baseline.task_basis.interior_desirability,
+    )
 
 
 def test_first_hit_probabilities_match_monte_carlo(corridor_model) -> None:
@@ -168,7 +210,8 @@ def test_task_basis_composition_matches_direct_solve(corridor_model) -> None:
     composed = model.task_basis.interior_desirability @ weights
 
     q_interior = np.exp(
-        model.parameters.interior_reward / model.parameters.control_cost
+        model.parameters.interior_reward
+        / model.parameters.lower_control_cost
     )
     boundary_passive = model.lower_dynamics.boundary_passive
     coefficient_matrix = np.eye(len(model.interior_states))
@@ -199,7 +242,9 @@ def test_reward_inpainting_and_projection(corridor_model) -> None:
     )
     assert plan.inpainted_rewards[-1] == model.parameters.goal_reward
     assert plan.target_boundary_desirability == pytest.approx(
-        np.exp(plan.inpainted_rewards / model.parameters.control_cost)
+        np.exp(
+            plan.inpainted_rewards / model.parameters.lower_control_cost
+        )
     )
     assert plan.raw_weights == pytest.approx(
         np.linalg.pinv(model.task_basis.boundary_desirability)
@@ -284,7 +329,8 @@ def test_hierarchical_rollout_limits_and_terminal_start(corridor_model) -> None:
         model.goal,
         parameters=ModelParameters(
             alpha=0.1,
-            control_cost=1.0,
+            lower_control_cost=1.0,
+            upper_control_cost=1.0,
             off_target_reward=-0.1,
         ),
     )

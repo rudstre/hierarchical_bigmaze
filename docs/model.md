@@ -26,7 +26,8 @@ conversion. This makes every matrix multiplication directly inspectable.
 
 ## 2. First-exit LMDP
 
-For state reward `r`, control cost `lambda`, value `V`, and desirability `z`,
+For state reward `r`, a layer's control cost `lambda`, value `V`, and
+desirability `z`,
 
 ```math
 q(s) = \exp(r(s)/\lambda), \qquad
@@ -35,7 +36,9 @@ z(s) = \exp(V(s)/\lambda).
 
 The project uses a uniform interior reward, although `solve_first_exit` also
 accepts one exponentiated reward per interior state. Boundary desirability is
-fixed by the terminal task.
+fixed by the terminal task. Flat and lower-layer calculations use
+`lower_control_cost`; the abstract calculation uses `upper_control_cost`.
+Tasks composed within a layer always share that layer's control cost.
 
 With this package's column-stochastic convention, paper Equation 4 is
 
@@ -120,8 +123,8 @@ P_{BI}^2 = \widetilde P_g^1 F \widetilde P_t^{1T}.
 
 They are stored in `model.upper_dynamics`. Upper columns follow subgoal order;
 the single upper boundary row is the selected physical goal. The upper layer
-uses the same interior reward and goal reward as the lower layer, matching the
-paper's stated simple implementation.
+uses the same interior reward and goal reward as the lower layer, but
+exponentiates them with `upper_control_cost`.
 
 `build_subgoal_passive_dynamics` performs the task-independent form of
 Equation 8 before adding a selected physical goal. This is the square graph
@@ -169,7 +172,8 @@ r_t^1 = \beta(a_i^2(\cdot|s) - P_i^2(\cdot|s)).
 The paper specifies proportionality but not the scale. This project uses
 `beta=10`. The signal applies to subgoal-copy rewards; the original physical
 goal retains its terminal reward. `compute_layer_one_plan` exponentiates the
-result, projects it through `Q_b`, and composes the lower desirability.
+result with `lower_control_cost`, projects it through `Q_b`, and composes the
+lower desirability.
 
 For a physical start that is not a subgoal, the implementation uses the
 corresponding column of `first_hit_probabilities` as a temporary upper passive

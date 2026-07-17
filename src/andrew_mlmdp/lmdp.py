@@ -16,23 +16,25 @@ from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
 class ModelParameters:
     """Numerical parameters shared by the flat and hierarchical models.
 
-    The defaults are the canonical values used by this project's four-room
-    examples. They are experimental choices, not values uniquely fixed by the
-    paper.
+    The lower cost governs flat and physical-layer calculations, including the
+    task basis and reward inpainting. The upper cost governs the abstract LMDP.
+    Defaults are canonical project choices, not values fixed by the paper.
     """
 
     interior_reward: float = -0.1
     goal_reward: float = 1.0
-    control_cost: float = 0.2
+    lower_control_cost: float = 0.15
+    upper_control_cost: float = 0.3
     alpha: float = 1.0
-    off_target_reward: float = -2.0
+    off_target_reward: float = -1.0
     beta: float = 10.0
 
     def __post_init__(self) -> None:
         values = (
             self.interior_reward,
             self.goal_reward,
-            self.control_cost,
+            self.lower_control_cost,
+            self.upper_control_cost,
             self.alpha,
             self.off_target_reward,
             self.beta,
@@ -41,8 +43,10 @@ class ModelParameters:
             raise ValueError("Model parameters must be finite")
         if self.interior_reward >= 0.0:
             raise ValueError("Interior reward must be negative")
-        if self.control_cost <= 0.0:
-            raise ValueError("Control cost must be positive")
+        if self.lower_control_cost <= 0.0:
+            raise ValueError("Lower control cost must be positive")
+        if self.upper_control_cost <= 0.0:
+            raise ValueError("Upper control cost must be positive")
         if self.alpha <= 0.0:
             raise ValueError("Alpha must be positive")
         if self.beta <= 0.0:
@@ -204,7 +208,7 @@ def solve_desirability(
 
     desirability = np.empty(len(maze.free_cells), dtype=np.float64)
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.control_cost
+        parameters.goal_reward / parameters.lower_control_cost
     )
     desirability[goal_state] = goal_desirability
     if len(interior_states) == 0:
@@ -215,7 +219,7 @@ def solve_desirability(
         boundary_passive=passive[goal_state, interior_states][np.newaxis, :],
     )
     q_interior = np.exp(
-        parameters.interior_reward / parameters.control_cost
+        parameters.interior_reward / parameters.lower_control_cost
     )
     desirability[interior_states] = solve_first_exit(
         dynamics,

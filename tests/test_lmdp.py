@@ -41,7 +41,7 @@ def test_one_cell_maze_contains_only_goal_desirability() -> None:
     desirability = solve_desirability(
         maze,
         goal=(0, 0),
-        parameters=ModelParameters(control_cost=1.0),
+        parameters=ModelParameters(lower_control_cost=1.0),
     )
 
     assert desirability.dtype == np.float64
@@ -58,7 +58,7 @@ def test_corridor_desirability_increases_toward_goal() -> None:
 def test_solution_satisfies_linear_bellman_equation() -> None:
     maze = Maze.from_ascii("...\n.#.\n...")
     goal = (2, 2)
-    parameters = ModelParameters(control_cost=1.0)
+    parameters = ModelParameters(lower_control_cost=1.0)
     desirability = solve_desirability(maze, goal, parameters=parameters)
     passive_dynamics = build_passive_dynamics(maze)
 
@@ -95,7 +95,8 @@ def test_goal_must_be_a_free_cell(goal: tuple[int, int]) -> None:
     ("parameter_values", "message"),
     [
         ({"interior_reward": 0.0}, "negative"),
-        ({"control_cost": 0.0}, "positive"),
+        ({"lower_control_cost": 0.0}, "Lower control cost must be positive"),
+        ({"upper_control_cost": 0.0}, "Upper control cost must be positive"),
     ],
 )
 def test_solver_parameters_must_define_a_well_posed_problem(
@@ -109,7 +110,7 @@ def test_solver_parameters_must_define_a_well_posed_problem(
 def test_four_rooms_desirability_and_grid_view() -> None:
     maze = Maze.from_file(FOUR_ROOMS_FILE)
     goal = (10, 9)
-    parameters = ModelParameters(control_cost=1.0)
+    parameters = ModelParameters(lower_control_cost=1.0)
     desirability = solve_desirability(maze, goal, parameters=parameters)
     grid = desirability_grid(maze, desirability)
 
@@ -169,10 +170,10 @@ def test_generic_first_exit_helpers_match_maze_solution() -> None:
         passive[goal_state, interior_states][np.newaxis, :],
     )
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.control_cost
+        parameters.goal_reward / parameters.lower_control_cost
     )
     q_interior = np.exp(
-        parameters.interior_reward / parameters.control_cost
+        parameters.interior_reward / parameters.lower_control_cost
     )
 
     interior = solve_first_exit(
@@ -194,7 +195,8 @@ def test_canonical_parameter_defaults() -> None:
     parameters = ModelParameters()
 
     assert parameters.alpha == 1.0
-    assert parameters.control_cost == 0.15
+    assert parameters.lower_control_cost == 0.15
+    assert parameters.upper_control_cost == 0.3
     assert parameters.off_target_reward == -2.0
     assert parameters.beta == 10.0
 

@@ -234,7 +234,7 @@ def compute_layer_one_plan(
     )
     inpainted_rewards[-1] = model.parameters.goal_reward
     target_boundary_desirability = np.exp(
-        inpainted_rewards / model.parameters.control_cost
+        inpainted_rewards / model.parameters.lower_control_cost
     )
 
     # Paper Equation 7, using its stated pseudoinverse-and-clipping
@@ -502,10 +502,10 @@ def _solve_upper_layer(
     parameters: ModelParameters,
 ) -> tuple[np.ndarray, np.ndarray]:
     q_interior = np.exp(
-        parameters.interior_reward / parameters.control_cost
+        parameters.interior_reward / parameters.upper_control_cost
     )
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.control_cost
+        parameters.goal_reward / parameters.upper_control_cost
     )
     interior_desirability = solve_first_exit(
         dynamics,
@@ -529,10 +529,10 @@ def _build_task_basis(
     number_of_subgoals = lower.number_of_boundary_states - 1
     number_of_targets = lower.number_of_boundary_states
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.control_cost
+        parameters.goal_reward / parameters.lower_control_cost
     )
     off_target_desirability = np.exp(
-        parameters.off_target_reward / parameters.control_cost
+        parameters.off_target_reward / parameters.lower_control_cost
     )
 
     # The paper's augmented basis is block diagonal: reusable subgoal tasks
@@ -551,7 +551,7 @@ def _build_task_basis(
     boundary_basis[-1, -1] = goal_desirability
 
     q_interior = np.exp(
-        parameters.interior_reward / parameters.control_cost
+        parameters.interior_reward / parameters.lower_control_cost
     )
     interior_basis = np.column_stack(
         [

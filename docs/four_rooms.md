@@ -43,7 +43,8 @@ The canonical configuration is exactly `ModelParameters()`:
 ModelParameters(
     interior_reward=-0.1,
     goal_reward=1.0,
-    control_cost=0.15,
+    lower_control_cost=0.15,
+    upper_control_cost=0.3,
     alpha=1.0,
     off_target_reward=-2.0,
     beta=10.0,
@@ -51,8 +52,8 @@ ModelParameters(
 ```
 
 The paper states small negative interior rewards, positive goal reward, and the
-form of the abstraction and inpainting equations. The precise control cost,
-off-target reward, and inpainting proportionality used here are project
+form of the abstraction and inpainting equations. The layer-dependent control
+costs, off-target reward, and inpainting proportionality used here are project
 choices. `alpha=1` is also the canonical value for this codebase even though
 the paper and supplement discuss other examples.
 
