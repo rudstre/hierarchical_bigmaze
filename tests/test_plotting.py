@@ -12,12 +12,19 @@ from andrew_mlmdp import (  # noqa: E402
     Maze,
     ModelParameters,
     animate_hierarchical_rollout,
+    animate_soft_hierarchical_rollout,
+    build_goal_task_ensemble,
+    build_soft_two_layer_model,
     build_two_layer_model,
     build_subgoal_passive_dynamics,
     compute_layer_one_plan,
     controlled_dynamics,
+    evaluate_soft_subtask_ranks,
+    factorize_soft_subtasks,
     plot_controlled_dynamics,
     plot_interactive_subgoal_desirability,
+    plot_soft_subtask_rank_diagnostics,
+    plot_soft_subtasks,
     plot_subgoal_passive_dynamics,
     plot_trajectory,
     sample_rollout,
@@ -366,6 +373,107 @@ def test_interactive_subgoal_desirability_validates_inputs() -> None:
         )
 
 
+def test_soft_subtask_discovery_plots_render(tmp_path) -> None:
+    ensemble = build_goal_task_ensemble(Maze.from_ascii("...."))
+    discovery = factorize_soft_subtasks(ensemble, 2, seed=0)
+    diagnostics = evaluate_soft_subtask_ranks(ensemble, (1, 2), seed=0)
+
+    profiles_figure = plot_soft_subtasks(
+        discovery,
+        labels=("S1", "S2"),
+    )
+    diagnostics_figure = plot_soft_subtask_rank_diagnostics(diagnostics)
+    profiles_file = tmp_path / "soft-profiles.png"
+    diagnostics_file = tmp_path / "soft-ranks.png"
+    profiles_figure.savefig(profiles_file)
+    diagnostics_figure.savefig(diagnostics_file)
+
+    assert profiles_file.stat().st_size > 0
+    assert diagnostics_file.stat().st_size > 0
+    assert [ax.get_title() for ax in profiles_figure.axes[:2]] == [
+        "S1",
+        "S2",
+    ]
+    plt.close(profiles_figure)
+    plt.close(diagnostics_figure)
+
+
+def test_soft_hierarchical_animation_renders_access_frame() -> None:
+    maze = Maze.from_ascii(".....")
+    profiles = np.asarray(
+        [
+            [1.0, 0.2],
+            [1.0, 0.3],
+            [0.4, 0.7],
+            [0.2, 1.0],
+            [0.1, 1.0],
+        ]
+    )
+    model = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 4),
+        parameters=ModelParameters(alpha=2.0),
+    )
+    animation = animate_soft_hierarchical_rollout(
+        model,
+        (0, 0),
+        seed=2,
+        max_steps=100,
+    )
+    assert isinstance(animation, FuncAnimation)
+    access_index = next(
+        index
+        for index, frame in enumerate(animation._soft_frames)
+        if frame.event == "subtask_access"
+    )
+    animation._fig.canvas.draw()
+    animation._func(access_index)
+    profile_ax = next(
+        ax
+        for ax in animation._fig.axes
+        if ax.get_title().startswith("Lower access")
+    )
+
+    assert np.nanmax(profile_ax.images[0].get_array()) == pytest.approx(1.0)
+    command_index = next(
+        index
+        for index, frame in enumerate(animation._soft_frames)
+        if frame.event in {"upper_command", "upper_termination"}
+    )
+    assert command_index == access_index + 1
+    assert (
+        animation._soft_frames[command_index].entered_subtask
+        == animation._soft_frames[access_index].entered_subtask
+    )
+    assert (
+        animation._soft_frames[command_index].profile_subtask
+        == animation._soft_frames[access_index].profile_subtask
+    )
+    animation._func(command_index)
+    assert profile_ax.get_title().startswith(
+        ("Layer 2 command from", "Layer 2 terminated from")
+    )
+    diagnostic_text = "\n".join(
+        text.get_text()
+        for ax in animation._fig.axes
+        for text in ax.texts
+    )
+    assert "upper outcome:" in diagnostic_text
+    assert "sampled state:" not in diagnostic_text
+    animation._draw_was_started = True
+    plt.close(animation._fig)
+
+
+def test_soft_subtask_plot_validates_labels() -> None:
+    discovery = factorize_soft_subtasks(
+        build_goal_task_ensemble(Maze.from_ascii("...")),
+        2,
+    )
+    with pytest.raises(ValueError, match="Labels"):
+        plot_soft_subtasks(discovery, labels=("only one",))
+
+
 def test_hierarchical_rollout_animation_returns_func_animation() -> None:
     maze = Maze.from_ascii("....")
     model = build_two_layer_model(
@@ -407,7 +515,11 @@ def test_hierarchical_rollout_animation_draws_first_frame() -> None:
         for ax in animation._fig.axes
         if ax.get_title() == "Task blend commanded by layer 2"
     )
-    assert [line.get_label() for line in weights_ax.lines] == ["A", "B"]
+    assert [line.get_label() for line in weights_ax.lines] == [
+        "A",
+        "B",
+        "goal",
+    ]
 
     animation._draw_was_started = True
     plt.close(animation._fig)
@@ -447,8 +559,10 @@ def test_hierarchical_rollout_trace_records_subgoal_access() -> None:
     for frame in frames[1:]:
         if frame.event == "physical_step":
             assert frame.plan is previous_plan
-        elif frame.event == "subgoal_access":
+        elif frame.event == "upper_command":
             assert frame.plan is not previous_plan
+        elif frame.event == "subgoal_access":
+            assert frame.plan is previous_plan
         previous_plan = frame.plan
 
 

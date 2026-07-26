@@ -11,6 +11,7 @@ from andrew_mlmdp import (
     controlled_from_desirability,
     controlled_dynamics,
     desirability_grid,
+    paper_hierarchy_parameters,
     sample_rollout,
     solve_desirability,
     solve_first_exit,
@@ -19,6 +20,18 @@ from andrew_mlmdp import (
 
 
 FOUR_ROOMS_FILE = Path(__file__).parents[1] / "mazes" / "four_rooms.txt"
+
+
+def test_paper_hierarchy_parameter_preset() -> None:
+    assert paper_hierarchy_parameters() == ModelParameters(
+        interior_reward=-0.1,
+        goal_reward=1.0,
+        lower_control_cost=1.0,
+        upper_control_cost=1.0,
+        alpha=0.1,
+        off_target_reward=-1.0,
+        beta=1.0,
+    )
 
 
 def test_passive_dynamics_are_column_stochastic() -> None:

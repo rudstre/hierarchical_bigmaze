@@ -225,8 +225,8 @@
       6
     ],
     [
-      2,
-      7
+      3,
+      6
     ],
     [
       3,
@@ -239,10 +239,6 @@
     [
       4,
       7
-    ],
-    [
-      4,
-      8
     ],
     [
       4,
@@ -253,11 +249,15 @@
       8
     ],
     [
-      6,
-      8
+      5,
+      7
     ],
     [
-      6,
+      5,
+      7
+    ],
+    [
+      5,
       8
     ],
     [
@@ -271,10 +271,6 @@
     [
       7,
       8
-    ],
-    [
-      7,
-      9
     ],
     [
       7,
@@ -307,7 +303,36 @@
       9
     ]
   ],
-  "hierarchical_steps": 26,
+  "hierarchical_upper_transitions": [
+    {
+      "entered_state": 2,
+      "terminated": false,
+      "coordinate": [
+        2,
+        3
+      ],
+      "physical_steps": 6
+    },
+    {
+      "entered_state": 3,
+      "terminated": false,
+      "coordinate": [
+        3,
+        7
+      ],
+      "physical_steps": 12
+    },
+    {
+      "entered_state": 5,
+      "terminated": true,
+      "coordinate": [
+        7,
+        9
+      ],
+      "physical_steps": 22
+    }
+  ],
+  "hierarchical_steps": 25,
   "hierarchical_status": "reached_goal",
   "flat_trajectory": [
     [

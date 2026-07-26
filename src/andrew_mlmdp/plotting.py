@@ -12,10 +12,16 @@ from matplotlib.backend_bases import MouseButton
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import Slider
 
+from andrew_mlmdp.discovery import NMFRankDiagnostics, SoftSubtaskDiscovery
 from andrew_mlmdp.hierarchy import (
     LayerOnePlan,
+    SoftHierarchicalRollout,
+    SoftSubtaskAccess,
+    SoftTwoLayerModel,
     TwoLayerModel,
+    _HierarchyEvent,
     _OnlineHierarchicalRolloutFrame,
+    _trace_hierarchy_events,
     _trace_online_hierarchical_rollout,
     build_two_layer_model,
     compute_layer_one_plan,
@@ -36,6 +42,27 @@ class _HierarchicalRolloutFrame:
     requested_subgoal: Coordinate | None
     physical_steps: int
     abstract_accesses: int
+    passive_access_probability: float | None = None
+    controlled_access_probability: float | None = None
+    refractory: bool = False
+    status: str | None = None
+
+
+@dataclass(frozen=True)
+class _SoftRolloutFrame:
+    """One drawable physical or distributed-access event."""
+
+    event: str
+    coordinate: Coordinate
+    trajectory: tuple[Coordinate, ...]
+    plan: LayerOnePlan | None
+    profile_subtask: int | None
+    entered_subtask: int | None
+    physical_steps: int
+    abstract_accesses: int
+    passive_access_probability: float | None = None
+    controlled_access_probability: float | None = None
+    refractory: bool = False
     status: str | None = None
 
 
@@ -707,8 +734,9 @@ def animate_hierarchical_rollout(
     ``goal_learning="exact"`` uses the precomputed goal basis column.
     ``goal_learning="online"`` starts from a supplied or zero goal vector and
     applies Equation 5 after physical transitions. The task-blend panel shows
-    unnormalized subgoal weights only; they remain held between hierarchy
-    calls in both modes. The returned object is a Matplotlib ``FuncAnimation``.
+    normalized fractions for every basis task, including the physical goal;
+    they remain held between hierarchy calls in both modes. The returned
+    object is a Matplotlib ``FuncAnimation``.
     """
 
     if goal_learning == "exact":
@@ -738,7 +766,11 @@ def animate_hierarchical_rollout(
     else:
         raise ValueError("Goal learning must be 'exact' or 'online'")
     labels = _target_labels(model, subgoal_labels)
-    desirability_norm = _desirability_norm(frames)
+    desirability_norm = _desirability_norm(
+        frames,
+        maze=model.maze,
+        goal=model.goal,
+    )
 
     figure, axes = plt.subplot_mosaic(
         [["maze", "desirability"], ["weights", "communication"]],
@@ -832,7 +864,11 @@ def animate_hierarchical_rollout(
     )
 
     rows, columns = model.maze.shape
-    first_grid = _frame_desirability_grid(model.maze, frames[0])
+    first_grid = _frame_desirability_grid(
+        model.maze,
+        frames[0],
+        goal=model.goal,
+    )
     color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
     desirability_image = desirability_ax.imshow(
         first_grid,
@@ -868,9 +904,10 @@ def animate_hierarchical_rollout(
     )
 
     number_of_subgoals = len(model.subgoals)
+    number_of_tasks = number_of_subgoals + 1
     weight_colors = plt.get_cmap("tab10").colors
     weight_lines = []
-    for index, label in enumerate(labels[:-1]):
+    for index, label in enumerate(labels):
         (line,) = weights_ax.plot(
             [],
             [],
@@ -885,13 +922,13 @@ def animate_hierarchical_rollout(
 
     final_physical_step = max(frame.physical_steps for frame in frames)
     weights_ax.set_xlim(0.0, max(1, final_physical_step))
-    weights_ax.set_ylim(0.0, _task_weight_limit(frames))
+    weights_ax.set_ylim(0.0, 1.0)
     weights_ax.set_xlabel("physical steps")
-    weights_ax.set_ylabel("weight")
+    weights_ax.set_ylabel("normalized blend fraction")
     weights_ax.set_title("Task blend commanded by layer 2")
     weights_ax.legend(
         loc="upper left",
-        ncols=min(3, number_of_subgoals),
+        ncols=min(3, number_of_tasks),
         frameon=False,
         fontsize=8,
     )
@@ -929,13 +966,13 @@ def animate_hierarchical_rollout(
             request_marker.set_data([column], [row])
 
         desirability_image.set_data(
-            _frame_desirability_grid(model.maze, frame)
+            _frame_desirability_grid(model.maze, frame, goal=model.goal)
         )
         frame_history = frames[: frame_index + 1]
         history_steps = [item.physical_steps for item in frame_history]
         history_weights = np.vstack(
             [
-                _frame_task_weights(item, number_of_subgoals)
+                _normalized_frame_task_weights(item, number_of_tasks)
                 for item in frame_history
             ]
         )
@@ -979,155 +1016,45 @@ def _trace_hierarchical_rollout(
     max_abstract_accesses: int,
     seed: int | None,
 ) -> list[_HierarchicalRolloutFrame]:
-    """Sample rollout dynamics with extra moments for animation."""
+    """Return fixed-subgoal frames emitted by the shared rollout engine."""
 
-    model.maze.state_index(start)
-    if max_steps < 0:
-        raise ValueError("Maximum steps must be non-negative")
-    if max_abstract_accesses < 0:
-        raise ValueError("Maximum abstract accesses must be non-negative")
-
-    if start == model.goal:
-        return [
-            _HierarchicalRolloutFrame(
-                event="terminal",
-                coordinate=start,
-                trajectory=(start,),
-                plan=None,
-                active_subgoal=None,
-                requested_subgoal=None,
-                physical_steps=0,
-                abstract_accesses=0,
-                status="reached_goal",
-            )
-        ]
-
-    random_generator = np.random.default_rng(seed)
-    trajectory = [start]
-    current = start
-    current_plan = compute_layer_one_plan(model, current, beta=beta)
-    active_subgoal = current if current in model.subgoals else None
-    physical_steps = 0
-    abstract_accesses = 0
-    frames = [
-        _HierarchicalRolloutFrame(
-            event="initial_plan",
-            coordinate=current,
-            trajectory=tuple(trajectory),
-            plan=current_plan,
-            active_subgoal=active_subgoal,
-            requested_subgoal=active_subgoal,
-            physical_steps=physical_steps,
-            abstract_accesses=abstract_accesses,
-        )
-    ]
-
-    while physical_steps < max_steps:
-        current_state = model.interior_state_by_coordinate[current]
-        transition_probabilities = current_plan.layer_one_controlled[
-            :, current_state
-        ].copy()
-
-        if current == active_subgoal:
-            active_subgoal_state = model.subgoals.index(active_subgoal)
-            access_row = len(model.interior_states) + active_subgoal_state
-            transition_probabilities[access_row] = 0.0
-            transition_probabilities /= transition_probabilities.sum()
-
-        next_state = int(
-            random_generator.choice(
-                current_plan.layer_one_controlled.shape[0],
-                p=transition_probabilities,
-            )
-        )
-        number_of_interior_states = len(model.interior_states)
-        if next_state < number_of_interior_states:
-            physical_state = int(model.interior_states[next_state])
-            current = model.maze.coordinate(physical_state)
-            trajectory.append(current)
-            physical_steps += 1
-            frames.append(
-                _HierarchicalRolloutFrame(
-                    event="physical_step",
-                    coordinate=current,
-                    trajectory=tuple(trajectory),
-                    plan=current_plan,
-                    active_subgoal=active_subgoal,
-                    requested_subgoal=None,
-                    physical_steps=physical_steps,
-                    abstract_accesses=abstract_accesses,
-                )
-            )
-            continue
-
-        boundary_state = next_state - number_of_interior_states
-        if boundary_state == len(model.subgoals):
-            trajectory.append(model.goal)
-            physical_steps += 1
-            frames.append(
-                _HierarchicalRolloutFrame(
-                    event="terminal",
-                    coordinate=model.goal,
-                    trajectory=tuple(trajectory),
-                    plan=current_plan,
-                    active_subgoal=active_subgoal,
-                    requested_subgoal=None,
-                    physical_steps=physical_steps,
-                    abstract_accesses=abstract_accesses,
-                    status="reached_goal",
-                )
-            )
-            return frames
-
-        requested_subgoal = model.subgoals[boundary_state]
-        if abstract_accesses >= max_abstract_accesses:
-            frames.append(
-                _HierarchicalRolloutFrame(
-                    event="terminal",
-                    coordinate=current,
-                    trajectory=tuple(trajectory),
-                    plan=current_plan,
-                    active_subgoal=active_subgoal,
-                    requested_subgoal=requested_subgoal,
-                    physical_steps=physical_steps,
-                    abstract_accesses=abstract_accesses,
-                    status="abstract_access_limit",
-                )
-            )
-            return frames
-
-        current = requested_subgoal
-        active_subgoal = current
-        abstract_accesses += 1
-        current_plan = compute_layer_one_plan(model, current, beta=beta)
-        frames.append(
-            _HierarchicalRolloutFrame(
-                event="subgoal_access",
-                coordinate=current,
-                trajectory=tuple(trajectory),
-                plan=current_plan,
-                active_subgoal=active_subgoal,
-                requested_subgoal=requested_subgoal,
-                physical_steps=physical_steps,
-                abstract_accesses=abstract_accesses,
-            )
-        )
-
-    frames.append(
-        _HierarchicalRolloutFrame(
-            event="terminal",
-            coordinate=current,
-            trajectory=tuple(trajectory),
-            plan=current_plan,
-            active_subgoal=active_subgoal,
-            requested_subgoal=None,
-            physical_steps=physical_steps,
-            abstract_accesses=abstract_accesses,
-            status="step_limit",
-        )
+    _, events = _trace_hierarchy_events(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
     )
-    return frames
-
+    return [
+        _HierarchicalRolloutFrame(
+            event=(
+                "subgoal_access"
+                if event.event == "lower_access"
+                else event.event
+            ),
+            coordinate=event.coordinate,
+            trajectory=event.trajectory,
+            plan=event.plan,
+            active_subgoal=(
+                None
+                if event.plan is None or event.plan.upper_state is None
+                else model.subgoals[event.plan.upper_state]
+            ),
+            requested_subgoal=(
+                None
+                if event.entered_state is None
+                else model.subgoals[event.entered_state]
+            ),
+            physical_steps=event.physical_steps,
+            abstract_accesses=event.abstract_accesses,
+            passive_access_probability=event.passive_access_probability,
+            controlled_access_probability=event.controlled_access_probability,
+            refractory=event.refractory,
+            status=event.status,
+        )
+        for event in events
+    ]
 
 def _target_labels(
     model: TwoLayerModel,
@@ -1150,12 +1077,27 @@ def _target_labels(
     return labels + ("goal",)
 
 
-def _desirability_norm(frames: list[_RolloutFrame]):
-    planned_values = [
-        frame.plan.physical_desirability
-        for frame in frames
-        if frame.plan is not None
-    ]
+def _desirability_norm(
+    frames: list[_RolloutFrame] | list[_SoftRolloutFrame],
+    *,
+    maze: Maze | None = None,
+    goal: Coordinate | None = None,
+):
+    if (maze is None) != (goal is None):
+        raise ValueError("Maze and goal must be supplied together")
+    planned_values = []
+    for frame in frames:
+        if frame.plan is None:
+            continue
+        values = frame.plan.physical_desirability.copy()
+        if goal is not None:
+            assert maze is not None
+            goal_state = maze.state_index(goal)
+            goal_value = values[goal_state]
+            if np.isfinite(goal_value) and goal_value > 0.0:
+                values /= goal_value
+            values[goal_state] = np.nan
+        planned_values.append(values)
     if not planned_values:
         return Normalize(vmin=0.0, vmax=1.0)
 
@@ -1173,33 +1115,37 @@ def _desirability_norm(frames: list[_RolloutFrame]):
 
 def _frame_desirability_grid(
     maze: Maze,
-    frame: _RolloutFrame,
+    frame: _RolloutFrame | _SoftRolloutFrame,
+    *,
+    goal: Coordinate | None = None,
 ) -> np.ndarray:
     if frame.plan is None:
         return np.full(maze.shape, np.nan, dtype=np.float64)
-    return desirability_grid(maze, frame.plan.physical_desirability)
+    values = frame.plan.physical_desirability.copy()
+    if goal is not None:
+        goal_state = maze.state_index(goal)
+        goal_value = values[goal_state]
+        if np.isfinite(goal_value) and goal_value > 0.0:
+            values /= goal_value
+        values[goal_state] = np.nan
+    return desirability_grid(maze, values)
 
 
-def _frame_task_weights(
-    frame: _RolloutFrame,
-    number_of_subgoals: int,
+def _normalized_frame_task_weights(
+    frame: _RolloutFrame | _SoftRolloutFrame,
+    number_of_tasks: int,
 ) -> np.ndarray:
     if frame.plan is None:
-        return np.zeros(number_of_subgoals, dtype=np.float64)
-    return frame.plan.weights[:number_of_subgoals]
+        return np.zeros(number_of_tasks, dtype=np.float64)
+    weights = frame.plan.weights[:number_of_tasks].copy()
+    total = weights.sum()
+    if total > 0.0:
+        weights /= total
+    return weights
 
 
-def _task_weight_limit(frames: list[_RolloutFrame]) -> float:
-    weights = [
-        frame.plan.weights[:-1]
-        for frame in frames
-        if frame.plan is not None
-    ]
-    if not weights:
-        return 1.0
-
-    maximum = float(np.concatenate(weights).max(initial=0.0))
-    return 1.0 if maximum == 0.0 else 1.05 * maximum
+def _format_probability(value: float | None) -> str:
+    return "n/a" if value is None else f"{value: .4f}"
 
 
 def _event_title(event: str) -> str:
@@ -1207,6 +1153,10 @@ def _event_title(event: str) -> str:
         "initial_plan": "initial request",
         "physical_step": "physical step",
         "subgoal_access": "new directions",
+        "subtask_access": "new soft directions",
+        "lower_access": "lower access",
+        "upper_command": "upper command",
+        "upper_termination": "upper termination",
         "terminal": "terminal",
     }
     return titles[event]
@@ -1215,8 +1165,12 @@ def _event_title(event: str) -> str:
 def _communication_status(frame: _RolloutFrame) -> str:
     if frame.event == "initial_plan":
         return "Layer 1 requests an initial task from layer 2."
-    if frame.event == "subgoal_access":
-        return "Layer 1 reached a subgoal copy; layer 2 sends new directions."
+    if frame.event == "lower_access":
+        return "Layer 1 entered a subgoal copy and invoked layer 2."
+    if frame.event in {"subgoal_access", "upper_command"}:
+        return "Layer 2 sends directions from the entered upper state."
+    if frame.event == "upper_termination":
+        return "Layer 2 terminated; layer 1 now follows the goal-only task."
     if frame.event == "terminal" and frame.status == "reached_goal":
         return "The physical goal boundary was reached."
     if frame.event == "terminal":
@@ -1229,27 +1183,499 @@ def _communication_details(
     labels: tuple[str, ...],
     model: TwoLayerModel,
 ) -> str:
-    active_label = "none"
-    if frame.active_subgoal is not None:
-        active_index = model.subgoals.index(frame.active_subgoal)
-        active_label = labels[active_index]
-
     request_label = "none"
     if frame.requested_subgoal is not None:
         request_index = model.subgoals.index(frame.requested_subgoal)
         request_label = labels[request_index]
+    upper_outcome = {
+        "subgoal_access": "continue",
+        "upper_command": "continue",
+        "upper_termination": "terminate",
+    }.get(frame.event, "n/a")
 
     z_iterations = getattr(frame, "z_iterations", None)
     learning_detail = ""
     if z_iterations is not None:
         learning_detail = f"\nZ sweeps:        {z_iterations}"
 
+    passive_access = getattr(frame, "passive_access_probability", None)
+    controlled_access = getattr(frame, "controlled_access_probability", None)
+    refractory = getattr(frame, "refractory", False)
     return (
         f"physical steps:  {frame.physical_steps}\n"
         f"abstract calls:  {frame.abstract_accesses}\n"
-        f"active subgoal:  {active_label}\n"
-        f"new request:     {request_label}\n"
+        f"entered state:   {request_label}\n"
+        f"upper outcome:   {upper_outcome}\n"
+        f"passive access:  {_format_probability(passive_access)}\n"
+        f"controlled access:{_format_probability(controlled_access)}\n"
+        f"refractory:      {'yes' if refractory else 'no'}\n"
         f"current cell:    {frame.coordinate}\n"
         f"goal reward:     {model.parameters.goal_reward:g} (fixed)"
         f"{learning_detail}"
     )
+
+
+def plot_soft_subtasks(
+    discovery: SoftSubtaskDiscovery,
+    *,
+    labels: list[str] | tuple[str, ...] | None = None,
+    figsize: tuple[float, float] | None = None,
+) -> Figure:
+    """Plot the discovered columns of D as shared-scale maze heatmaps."""
+
+    maze = discovery.ensemble.maze
+    number_of_subtasks = discovery.number_of_subtasks
+    subtask_labels = _soft_subtask_labels(number_of_subtasks, labels)
+    columns = int(np.ceil(np.sqrt(number_of_subtasks)))
+    rows = int(np.ceil(number_of_subtasks / columns))
+    if figsize is None:
+        figsize = (3.4 * columns, 3.1 * rows)
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=figsize,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    images = []
+    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    for subtask, (ax, label) in enumerate(
+        zip(axes.flat, subtask_labels)
+    ):
+        image = ax.imshow(
+            desirability_grid(maze, discovery.display_profiles[:, subtask]),
+            cmap=color_map,
+            norm=Normalize(vmin=0.0, vmax=1.0),
+            origin="upper",
+        )
+        images.append(image)
+        _format_maze_axes(maze, ax, show_grid=False)
+        ax.set_title(label)
+    for ax in tuple(axes.flat)[number_of_subtasks:]:
+        ax.set_visible(False)
+    figure.colorbar(
+        images[0],
+        ax=list(axes.flat[:number_of_subtasks]),
+        label="soft access profile",
+        fraction=0.025,
+        pad=0.03,
+    )
+    figure.suptitle("NMF-discovered soft subtasks")
+    return figure
+
+
+def plot_soft_subtask_rank_diagnostics(
+    diagnostics: NMFRankDiagnostics,
+    *,
+    figsize: tuple[float, float] = (6.5, 4.0),
+) -> Figure:
+    """Plot normalized KL reconstruction error against NMF rank."""
+
+    figure, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    ax.plot(
+        diagnostics.ranks,
+        diagnostics.reconstruction_errors,
+        color="#286f9b",
+        marker="o",
+        linewidth=2.0,
+    )
+    ax.set_xlabel("number of soft subtasks (k)")
+    ax.set_ylabel("normalized KL reconstruction error")
+    ax.set_title("Soft-subtask rank diagnostics")
+    ax.set_xticks(diagnostics.ranks)
+    ax.grid(color="0.86", linewidth=0.6)
+    ax.set_axisbelow(True)
+    return figure
+
+
+def animate_soft_hierarchical_rollout(
+    model: SoftTwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+    subtask_labels: list[str] | tuple[str, ...] | None = None,
+    interval: int = 500,
+    repeat: bool = False,
+    figsize: tuple[float, float] = (14, 8),
+) -> FuncAnimation:
+    """Animate physical motion and distributed subtask accesses."""
+
+    engine_result, engine_events = _trace_hierarchy_events(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+    )
+    rollout = SoftHierarchicalRollout(
+        trajectory=engine_result.trajectory,
+        subtask_accesses=[
+            SoftSubtaskAccess(
+                subtask=transition.entered_state,
+                coordinate=transition.coordinate,
+                physical_steps=transition.physical_steps,
+            )
+            for transition in engine_result.upper_transitions
+        ],
+        upper_transitions=engine_result.upper_transitions,
+        weight_history=engine_result.weight_history,
+        physical_steps=engine_result.physical_steps,
+        abstract_accesses=len(engine_result.upper_transitions),
+        reached_goal=engine_result.reached_goal,
+        status=engine_result.status,
+    )
+    frames = _soft_rollout_frames(engine_events)
+    labels = _soft_subtask_labels(
+        model.number_of_subtasks,
+        subtask_labels,
+    )
+    desirability_norm = _desirability_norm(
+        frames,
+        maze=model.maze,
+        goal=model.goal,
+    )
+
+    figure, axes = plt.subplot_mosaic(
+        [
+            ["maze", "profile", "desirability"],
+            ["weights", "weights", "communication"],
+        ],
+        figsize=figsize,
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [1.2, 0.9]},
+    )
+    maze_ax = axes["maze"]
+    profile_ax = axes["profile"]
+    desirability_ax = axes["desirability"]
+    weights_ax = axes["weights"]
+    communication_ax = axes["communication"]
+
+    _draw_walls(model.maze, maze_ax, color="0.18")
+    _format_maze_axes(model.maze, maze_ax, show_grid=True)
+    start_row, start_column = start
+    goal_row, goal_column = model.goal
+    maze_ax.plot(
+        start_column,
+        start_row,
+        marker="o",
+        markersize=8,
+        markerfacecolor="#4c956c",
+        markeredgecolor="white",
+        markeredgewidth=0.8,
+        zorder=6,
+    )
+    maze_ax.plot(
+        goal_column,
+        goal_row,
+        marker="*",
+        markersize=13,
+        markerfacecolor="#d1495b",
+        markeredgecolor="white",
+        markeredgewidth=0.8,
+        zorder=6,
+    )
+    (path_line,) = maze_ax.plot(
+        [],
+        [],
+        color="#286f9b",
+        linewidth=2.0,
+        marker="o",
+        markersize=3.0,
+        markeredgewidth=0.0,
+        alpha=0.85,
+        zorder=5,
+    )
+    (agent_marker,) = maze_ax.plot(
+        [],
+        [],
+        marker="o",
+        markersize=10,
+        markerfacecolor="#f2cc8f",
+        markeredgecolor="#2d3142",
+        markeredgewidth=1.2,
+        zorder=7,
+    )
+
+    rows, columns = model.maze.shape
+    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    empty_profile = np.zeros(len(model.maze.free_cells))
+    profile_image = profile_ax.imshow(
+        desirability_grid(model.maze, empty_profile),
+        cmap=color_map,
+        norm=Normalize(vmin=0.0, vmax=1.0),
+        origin="upper",
+        extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
+    )
+    _format_maze_axes(model.maze, profile_ax, show_grid=False)
+    profile_ax.set_title("Active soft subtask: none")
+    figure.colorbar(
+        profile_image,
+        ax=profile_ax,
+        label="access profile",
+        fraction=0.046,
+        pad=0.04,
+    )
+
+    desirability_image = desirability_ax.imshow(
+        _frame_desirability_grid(
+            model.maze,
+            frames[0],
+            goal=model.goal,
+        ),
+        cmap=color_map,
+        norm=desirability_norm,
+        origin="upper",
+        extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
+    )
+    _format_maze_axes(model.maze, desirability_ax, show_grid=False)
+    desirability_ax.plot(
+        goal_column,
+        goal_row,
+        marker="*",
+        markersize=11,
+        markerfacecolor="#d1495b",
+        markeredgecolor="white",
+        markeredgewidth=0.8,
+        zorder=4,
+    )
+    desirability_ax.set_title(
+        "Lower desirability / goal desirability (goal omitted)"
+    )
+    figure.colorbar(
+        desirability_image,
+        ax=desirability_ax,
+        label="desirability",
+        fraction=0.046,
+        pad=0.04,
+    )
+
+    weight_colors = plt.get_cmap("tab10").colors
+    weight_lines = []
+    blend_labels = labels + ("goal",)
+    for subtask, label in enumerate(blend_labels):
+        (line,) = weights_ax.plot(
+            [],
+            [],
+            color=weight_colors[subtask % len(weight_colors)],
+            marker="o",
+            markersize=3.0,
+            linewidth=2.0,
+            drawstyle="steps-post",
+            label=label,
+        )
+        weight_lines.append(line)
+    weights_ax.set_xlim(0, max(1, rollout.abstract_accesses))
+    weights_ax.set_ylim(0.0, 1.0)
+    weights_ax.set_xlabel("abstract calls")
+    weights_ax.set_ylabel("normalized blend fraction")
+    weights_ax.set_title("Task blend commanded by layer 2")
+    weights_ax.legend(
+        frameon=False,
+        ncols=min(3, len(blend_labels)),
+        fontsize=8,
+    )
+    weights_ax.grid(color="0.88", linewidth=0.6)
+    weights_ax.set_axisbelow(True)
+
+    communication_ax.axis("off")
+    status_text = communication_ax.text(
+        0.02,
+        0.95,
+        "",
+        transform=communication_ax.transAxes,
+        verticalalignment="top",
+        fontsize=11,
+    )
+    detail_text = communication_ax.text(
+        0.02,
+        0.72,
+        "",
+        transform=communication_ax.transAxes,
+        verticalalignment="top",
+        fontsize=10,
+        family="monospace",
+    )
+
+    def update(frame_index: int):
+        frame = frames[frame_index]
+        path_line.set_data(
+            [coordinate[1] for coordinate in frame.trajectory],
+            [coordinate[0] for coordinate in frame.trajectory],
+        )
+        agent_marker.set_data([frame.coordinate[1]], [frame.coordinate[0]])
+        display_profiles = model.subtask_profiles / model.subtask_profiles.max(
+            axis=0,
+            keepdims=True,
+        )
+        if frame.profile_subtask is None:
+            profile_image.set_data(
+                desirability_grid(model.maze, empty_profile)
+            )
+            profile_ax.set_title("Layer 2 command: none")
+        else:
+            profile_image.set_data(
+                desirability_grid(
+                    model.maze,
+                    display_profiles[:, frame.profile_subtask],
+                )
+            )
+            if frame.event == "subtask_access":
+                profile_ax.set_title(
+                    f"Lower access: entered {labels[frame.profile_subtask]}"
+                )
+            elif frame.event == "upper_command":
+                profile_ax.set_title(
+                    "Layer 2 command from "
+                    f"{labels[frame.profile_subtask]}"
+                )
+            elif frame.event == "upper_termination":
+                profile_ax.set_title(
+                    "Layer 2 terminated from "
+                    f"{labels[frame.profile_subtask]}"
+                )
+            else:
+                profile_ax.set_title(
+                    "Current command from "
+                    f"{labels[frame.profile_subtask]}"
+                )
+        desirability_image.set_data(
+            _frame_desirability_grid(
+                model.maze,
+                frame,
+                goal=model.goal,
+            )
+        )
+
+        history = frames[: frame_index + 1]
+        access_frames = [
+            item
+            for item in history
+            if item.event
+            in {"initial_plan", "upper_command", "upper_termination"}
+        ]
+        history_x = [item.abstract_accesses for item in access_frames]
+        history_weights = np.vstack(
+            [
+                _normalized_frame_task_weights(
+                    item,
+                    model.number_of_subtasks + 1,
+                )
+                for item in access_frames
+            ]
+        )
+        for subtask, line in enumerate(weight_lines):
+            line.set_data(history_x, history_weights[:, subtask])
+
+        maze_ax.set_title(
+            f"Physical state: {_event_title(frame.event)} "
+            f"({frame_index + 1}/{len(frames)})"
+        )
+        status_text.set_text(_soft_communication_status(frame))
+        entered = (
+            "none"
+            if frame.entered_subtask is None
+            else labels[frame.entered_subtask]
+        )
+        upper_outcome = {
+            "upper_command": "continue",
+            "upper_termination": "terminate",
+        }.get(frame.event, "n/a")
+        detail_text.set_text(
+            f"physical steps:  {frame.physical_steps}\n"
+            f"abstract calls:  {frame.abstract_accesses}\n"
+            f"entered state:   {entered}\n"
+            f"upper outcome:   {upper_outcome}\n"
+            f"passive access:  {_format_probability(frame.passive_access_probability)}\n"
+            f"controlled access:{_format_probability(frame.controlled_access_probability)}\n"
+            f"refractory:      {'yes' if frame.refractory else 'no'}\n"
+            f"current cell:    {frame.coordinate}\n"
+            f"goal:            {model.goal}"
+        )
+        return (
+            path_line,
+            agent_marker,
+            profile_image,
+            desirability_image,
+            *weight_lines,
+            status_text,
+            detail_text,
+        )
+
+    animation = FuncAnimation(
+        figure,
+        update,
+        frames=len(frames),
+        interval=interval,
+        repeat=repeat,
+        blit=False,
+    )
+    animation._soft_rollout = rollout
+    animation._soft_frames = frames
+    return animation
+
+
+def _soft_rollout_frames(
+    events: list[_HierarchyEvent],
+) -> list[_SoftRolloutFrame]:
+    """Translate engine events without reconstructing or resampling plans."""
+
+    return [
+        _SoftRolloutFrame(
+            event=(
+                "subtask_access"
+                if event.event == "lower_access"
+                else event.event
+            ),
+            coordinate=event.coordinate,
+            trajectory=event.trajectory,
+            plan=event.plan,
+            profile_subtask=(
+                event.entered_state
+                if event.entered_state is not None
+                else (
+                    None
+                    if event.plan is None
+                    else event.plan.upper_state
+                )
+            ),
+            entered_subtask=event.entered_state,
+            physical_steps=event.physical_steps,
+            abstract_accesses=event.abstract_accesses,
+            passive_access_probability=event.passive_access_probability,
+            controlled_access_probability=event.controlled_access_probability,
+            refractory=event.refractory,
+            status=event.status,
+        )
+        for event in events
+    ]
+
+
+def _soft_subtask_labels(
+    number_of_subtasks: int,
+    labels: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    if labels is None:
+        return tuple(f"S{index + 1}" for index in range(number_of_subtasks))
+    if len(labels) != number_of_subtasks:
+        raise ValueError("Labels must match the number of soft subtasks")
+    return tuple(str(label) for label in labels)
+
+
+def _soft_communication_status(frame: _SoftRolloutFrame) -> str:
+    if frame.event == "initial_plan":
+        return "Layer 1 requests an initial task from layer 2."
+    if frame.event == "subtask_access":
+        return "A distributed lower subtask fired and invoked layer 2."
+    if frame.event == "upper_command":
+        return "Layer 2 programmed layer 1 from the entered upper state."
+    if frame.event == "upper_termination":
+        return "Layer 2 terminated; only the physical goal remains enabled."
+    if frame.event == "terminal" and frame.status == "reached_goal":
+        return "The physical goal boundary was reached."
+    if frame.event == "terminal":
+        return f"Rollout stopped: {frame.status}."
+    return "Layer 1 follows the currently programmed lower policy."

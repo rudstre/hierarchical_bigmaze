@@ -70,6 +70,15 @@ def test_canonical_seeded_rollouts(canonical_case) -> None:
         tuple(coordinate)
         for coordinate in reference["hierarchical_subgoal_accesses"]
     ]
+    assert [
+        {
+            "entered_state": transition.entered_state,
+            "terminated": transition.terminated,
+            "coordinate": list(transition.coordinate),
+            "physical_steps": transition.physical_steps,
+        }
+        for transition in hierarchical.upper_transitions
+    ] == reference["hierarchical_upper_transitions"]
     assert flat == [
         tuple(coordinate) for coordinate in reference["flat_trajectory"]
     ]

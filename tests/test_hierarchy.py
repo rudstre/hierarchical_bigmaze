@@ -7,6 +7,7 @@ import pytest
 from andrew_mlmdp import (
     Maze,
     ModelParameters,
+    UpperLayerTransition,
     build_passive_dynamics,
     build_subgoal_passive_dynamics,
     build_two_layer_model,
@@ -15,7 +16,13 @@ from andrew_mlmdp import (
     sample_online_hierarchical_rollout,
     z_iteration_step,
 )
-from andrew_mlmdp.hierarchy import _trace_online_hierarchical_rollout
+from andrew_mlmdp.hierarchy import (
+    _trace_hierarchy_events,
+    _trace_online_hierarchical_rollout,
+    build_soft_two_layer_model,
+    compute_soft_layer_one_plan,
+    sample_soft_hierarchical_rollout,
+)
 
 
 FOUR_ROOMS_FILE = Path(__file__).parents[1] / "mazes" / "four_rooms.txt"
@@ -593,3 +600,365 @@ def test_two_layer_configuration_errors(subgoals, goal, message) -> None:
 
     with pytest.raises(ValueError, match=message):
         build_two_layer_model(maze, subgoals, goal)
+
+
+def test_one_hot_soft_subtasks_reproduce_hard_model() -> None:
+    maze = Maze.from_ascii("....")
+    subgoals = ((0, 0), (0, 2))
+    goal = (0, 3)
+    hard = build_two_layer_model(maze, subgoals, goal)
+    profiles = np.zeros((len(maze.free_cells), len(subgoals)))
+    for subtask, coordinate in enumerate(subgoals):
+        profiles[maze.state_index(coordinate), subtask] = 1.0
+    soft = build_soft_two_layer_model(maze, profiles, goal)
+
+    assert soft.lower_dynamics.passive == pytest.approx(
+        hard.lower_dynamics.passive
+    )
+    assert soft.first_hit_probabilities == pytest.approx(
+        hard.first_hit_probabilities
+    )
+    assert soft.task_basis.boundary_desirability == pytest.approx(
+        hard.task_basis.boundary_desirability
+    )
+    assert soft.task_basis.interior_desirability == pytest.approx(
+        hard.task_basis.interior_desirability
+    )
+    assert soft.upper_dynamics.passive == pytest.approx(
+        hard.upper_dynamics.passive
+    )
+
+
+def test_soft_access_profiles_follow_equation_three() -> None:
+    maze = Maze.from_ascii("...")
+    profiles = np.asarray(
+        [[1.0, 0.2], [0.5, 0.4], [0.1, 1.0]]
+    )
+    parameters = ModelParameters(alpha=0.25)
+    model = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 2),
+        parameters=parameters,
+    )
+    interior = model.interior_states
+    raw_access = parameters.alpha * profiles[interior].T
+    physical = build_passive_dynamics(maze)
+    raw_physical = physical[np.ix_(interior, interior)]
+    goal_state = maze.state_index(model.goal)
+    raw_goal = physical[goal_state, interior][None, :]
+    normalizers = np.vstack(
+        [raw_physical, raw_access, raw_goal]
+    ).sum(axis=0)
+
+    assert model.lower_subtask_passive == pytest.approx(
+        raw_access / normalizers[None, :]
+    )
+    assert np.allclose(model.lower_dynamics.passive.sum(axis=0), 1.0)
+
+
+def test_alpha_monotonically_controls_passive_soft_access_mass() -> None:
+    maze = Maze.from_ascii("...")
+    profiles = np.asarray(
+        [[0.25, 0.75], [0.4, 0.6], [0.5, 0.5]]
+    )
+    small = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 2),
+        parameters=ModelParameters(alpha=0.1),
+    )
+    large = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 2),
+        parameters=ModelParameters(alpha=0.5),
+    )
+    state = small.interior_state_by_coordinate[(0, 0)]
+
+    assert small.lower_subtask_passive[:, state].sum() == pytest.approx(
+        0.1 / 1.1
+    )
+    assert large.lower_subtask_passive[:, state].sum() == pytest.approx(
+        0.5 / 1.5
+    )
+    assert (
+        small.lower_subtask_passive[:, state].sum()
+        < large.lower_subtask_passive[:, state].sum()
+    )
+
+
+def test_soft_plan_uses_first_hit_then_active_upper_state() -> None:
+    maze = Maze.from_ascii("....")
+    profiles = np.asarray(
+        [[1.0, 0.0], [0.6, 0.2], [0.2, 0.6], [0.0, 1.0]]
+    )
+    model = build_soft_two_layer_model(maze, profiles, goal=(0, 3))
+    current = (0, 1)
+    initial = compute_soft_layer_one_plan(model, current)
+    accessed = compute_soft_layer_one_plan(
+        model,
+        current,
+        upper_state=1,
+    )
+    interior_state = model.interior_state_by_coordinate[current]
+
+    assert initial.passive_abstract == pytest.approx(
+        model.first_hit_probabilities[:, interior_state]
+    )
+    assert accessed.passive_abstract == pytest.approx(
+        model.upper_dynamics.passive[:, 1]
+    )
+    assert accessed.controlled_abstract == pytest.approx(
+        model.upper_controlled[:, 1]
+    )
+    assert accessed.upper_state == 1
+
+
+def test_rollout_command_uses_entered_upper_state() -> None:
+    model = build_two_layer_model(
+        Maze.from_ascii("...."),
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 3),
+        parameters=ModelParameters(
+            alpha=100.0,
+            lower_control_cost=1.0,
+            upper_control_cost=1.0,
+            beta=1.0,
+        ),
+    )
+    controlled_upper = np.zeros_like(model.upper_controlled)
+    controlled_upper[:, 0] = (0.25, 0.75, 0.0)
+    controlled_upper[:, 1] = (0.9, 0.1, 0.0)
+    model = replace(model, upper_controlled=controlled_upper)
+
+    result, events = _trace_hierarchy_events(
+        model,
+        (0, 0),
+        beta=None,
+        max_steps=2,
+        max_abstract_accesses=5,
+        seed=0,
+    )
+    transition = result.upper_transitions[0]
+    command = next(event for event in events if event.event == "upper_command")
+
+    assert transition.entered_state == 0
+    assert not transition.terminated
+    assert command.plan is not None
+    assert command.plan.upper_state == transition.entered_state
+    assert command.plan.passive_abstract == pytest.approx(
+        model.upper_dynamics.passive[:, transition.entered_state]
+    )
+    assert command.plan.controlled_abstract == pytest.approx(
+        controlled_upper[:, transition.entered_state]
+    )
+    expected_rewards = model.parameters.beta * (
+        controlled_upper[:-1, transition.entered_state]
+        - model.upper_dynamics.passive[:-1, transition.entered_state]
+    )
+    assert command.plan.inpainted_rewards[:-1] == pytest.approx(
+        expected_rewards
+    )
+    expected_target = np.exp(
+        command.plan.inpainted_rewards
+        / model.parameters.lower_control_cost
+    )
+    expected_raw_weights = (
+        np.linalg.pinv(model.task_basis.boundary_desirability)
+        @ expected_target
+    )
+    expected_weights = np.maximum(0.0, expected_raw_weights)
+    assert command.plan.target_boundary_desirability == pytest.approx(
+        expected_target
+    )
+    assert command.plan.raw_weights == pytest.approx(expected_raw_weights)
+    assert command.plan.weights == pytest.approx(expected_weights)
+    assert command.plan.weights == pytest.approx(
+        compute_layer_one_plan(
+            model,
+            transition.coordinate,
+            upper_state=transition.entered_state,
+        ).weights
+    )
+    assert "sampled_state" not in UpperLayerTransition.__dataclass_fields__
+
+
+def test_upper_termination_selects_goal_only_without_teleporting() -> None:
+    model = build_two_layer_model(
+        Maze.from_ascii("...."),
+        subgoals=((0, 0), (0, 2)),
+        goal=(0, 3),
+        parameters=ModelParameters(
+            alpha=100.0,
+            lower_control_cost=1.0,
+            upper_control_cost=1.0,
+            beta=1.0,
+        ),
+    )
+    deterministic_upper = np.zeros_like(model.upper_controlled)
+    deterministic_upper[-1, :] = 1.0
+    model = replace(model, upper_controlled=deterministic_upper)
+    result, events = _trace_hierarchy_events(
+        model,
+        (0, 0),
+        beta=None,
+        max_steps=20,
+        max_abstract_accesses=20,
+        seed=0,
+    )
+
+    assert len(result.upper_transitions) == 1
+    transition = result.upper_transitions[0]
+    assert transition.terminated
+    assert result.trajectory[transition.physical_steps] == transition.coordinate
+    termination = next(
+        event for event in events if event.event == "upper_termination"
+    )
+    assert termination.plan is not None
+    assert termination.plan.weights[:-1] == pytest.approx(0.0)
+    assert termination.plan.weights[-1] == pytest.approx(1.0)
+    assert all(
+        event.refractory
+        for event in events
+        if event.event == "physical_step"
+    )
+    assert result.reached_goal
+
+
+def test_one_hot_soft_and_fixed_rollouts_share_rng_and_execution() -> None:
+    maze = Maze.from_ascii("....")
+    subgoals = ((0, 0), (0, 2))
+    parameters = ModelParameters(
+        alpha=10.0,
+        lower_control_cost=1.0,
+        upper_control_cost=1.0,
+        beta=1.0,
+    )
+    hard = build_two_layer_model(
+        maze,
+        subgoals,
+        goal=(0, 3),
+        parameters=parameters,
+    )
+    profiles = np.zeros((len(maze.free_cells), len(subgoals)))
+    for subtask, coordinate in enumerate(subgoals):
+        profiles[maze.state_index(coordinate), subtask] = 1.0
+    soft = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 3),
+        parameters=parameters,
+    )
+
+    hard_rollout = sample_hierarchical_rollout(
+        hard,
+        (0, 1),
+        seed=0,
+        max_steps=50,
+    )
+    soft_rollout = sample_soft_hierarchical_rollout(
+        soft,
+        (0, 1),
+        seed=0,
+        max_steps=50,
+    )
+
+    assert hard_rollout.trajectory == soft_rollout.trajectory
+    assert hard_rollout.upper_transitions == soft_rollout.upper_transitions
+    assert hard_rollout.status == soft_rollout.status
+
+
+
+def test_soft_rollout_is_reproducible_and_does_not_teleport() -> None:
+    maze = Maze.from_ascii(".....")
+    profiles = np.asarray(
+        [
+            [1.0, 0.2],
+            [1.0, 0.3],
+            [0.4, 0.7],
+            [0.2, 1.0],
+            [0.1, 1.0],
+        ]
+    )
+    model = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 4),
+        parameters=ModelParameters(alpha=2.0),
+    )
+    first = sample_soft_hierarchical_rollout(
+        model,
+        (0, 0),
+        seed=2,
+        max_steps=100,
+        max_abstract_accesses=500,
+    )
+    second = sample_soft_hierarchical_rollout(
+        model,
+        (0, 0),
+        seed=2,
+        max_steps=100,
+        max_abstract_accesses=500,
+    )
+
+    assert first.trajectory == second.trajectory
+    assert first.subtask_accesses == second.subtask_accesses
+    assert first.status == second.status
+    assert len(first.weight_history) == len(second.weight_history)
+    for first_weights, second_weights in zip(
+        first.weight_history,
+        second.weight_history,
+    ):
+        assert first_weights == pytest.approx(second_weights)
+    assert first.reached_goal
+    assert first.subtask_accesses
+    assert len(first.weight_history) == first.abstract_accesses + 1
+    for access in first.subtask_accesses:
+        assert access.coordinate == first.trajectory[access.physical_steps]
+        assert 0 <= access.subtask < model.number_of_subtasks
+    for previous, following in zip(
+        first.subtask_accesses,
+        first.subtask_accesses[1:],
+    ):
+        if previous.subtask == following.subtask:
+            assert previous.physical_steps != following.physical_steps
+    for current, following in zip(first.trajectory, first.trajectory[1:]):
+        distance = abs(current[0] - following[0]) + abs(
+            current[1] - following[1]
+        )
+        assert distance <= 1
+
+
+@pytest.mark.parametrize(
+    ("profiles", "message"),
+    [
+        (np.ones((2, 1)), "shape"),
+        (np.empty((3, 0)), "At least one"),
+        (np.asarray([[1.0], [-1.0], [0.0]]), "finite and non-negative"),
+        (np.zeros((3, 1)), "nonempty"),
+        (np.asarray([[0.0], [0.0], [1.0]]), "outside the goal"),
+    ],
+)
+def test_soft_two_layer_model_validates_profiles(profiles, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_soft_two_layer_model(
+            Maze.from_ascii("..."),
+            profiles,
+            goal=(0, 2),
+        )
+
+
+def test_soft_plan_validates_upper_state() -> None:
+    maze = Maze.from_ascii("...")
+    model = build_soft_two_layer_model(
+        maze,
+        np.ones((3, 1)),
+        goal=(0, 2),
+    )
+    with pytest.raises(ValueError, match="out of range"):
+        compute_soft_layer_one_plan(
+            model,
+            (0, 0),
+            upper_state=1,
+        )

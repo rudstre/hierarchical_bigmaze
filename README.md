@@ -8,6 +8,7 @@ The repository implements:
 - exact first-exit LMDP solutions;
 - closed-form controlled dynamics;
 - multitask desirability composition;
+- KL-NMF discovery of distributed soft subtasks;
 - a two-layer abstraction built from lower-layer first-hit probabilities;
 - top-down reward inpainting and task blending;
 - seeded flat and hierarchical rollouts; and
@@ -85,6 +86,34 @@ hierarchical_rollout = sample_hierarchical_rollout(
 `model.lower_dynamics`, `model.task_basis`, `model.upper_dynamics`, and `plan`
 expose the intermediate matrices used in the calculation.
 
+Soft subtasks follow the same construction, replacing point access rows with
+the paper's distributed `P_t = alpha * D.T` profiles:
+
+```python
+from andrew_mlmdp import (
+    build_goal_task_ensemble,
+    build_soft_two_layer_model,
+    factorize_soft_subtasks,
+    paper_hierarchy_parameters,
+    sample_soft_hierarchical_rollout,
+)
+
+soft_parameters = paper_hierarchy_parameters()
+ensemble = build_goal_task_ensemble(maze, parameters=soft_parameters)
+discovery = factorize_soft_subtasks(ensemble, n_subtasks=4, seed=0)
+soft_model = build_soft_two_layer_model(
+    maze,
+    discovery.profiles,
+    goal,
+    parameters=soft_parameters,
+)
+soft_rollout = sample_soft_hierarchical_rollout(
+    soft_model,
+    start=(1, 0),
+    seed=3,
+)
+```
+
 ## Canonical parameters
 
 `ModelParameters()` uses the project's established four-room regime:
@@ -108,6 +137,7 @@ Construct another `ModelParameters` instance to study a different regime.
 src/andrew_mlmdp/
 |-- maze.py       geometry and coordinate/state conversion
 |-- lmdp.py       first-exit dynamics, Equations 4 and 6, flat solver
+|-- discovery.py  goal-task ensembles and KL-NMF soft subtasks
 |-- hierarchy.py  two-layer construction, composition, and rollout
 `-- plotting.py   direct visualizations of policies and trajectories
 

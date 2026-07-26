@@ -26,7 +26,7 @@ class ModelParameters:
     lower_control_cost: float = 0.15
     upper_control_cost: float = 0.3
     alpha: float = 1.0
-    off_target_reward: float = -1.0
+    off_target_reward: float = -2.0
     beta: float = 10.0
 
     def __post_init__(self) -> None:
@@ -51,6 +51,20 @@ class ModelParameters:
             raise ValueError("Alpha must be positive")
         if self.beta <= 0.0:
             raise ValueError("Beta must be positive")
+
+
+def paper_hierarchy_parameters() -> ModelParameters:
+    """Return the paper-scale parameter regime for hierarchy experiments."""
+
+    return ModelParameters(
+        interior_reward=-0.1,
+        goal_reward=1.0,
+        lower_control_cost=1.0,
+        upper_control_cost=1.0,
+        alpha=0.1,
+        off_target_reward=-1.0,
+        beta=1.0,
+    )
 
 
 @dataclass(frozen=True)

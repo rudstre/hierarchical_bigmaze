@@ -96,6 +96,49 @@ where `N` normalizes each column. In `TwoLayerModel`:
 
 The boundary order is always the supplied subgoal order followed by the goal.
 
+### Distributed soft subtasks
+
+The discovery extension first solves a goal-task ensemble and collects the
+full physical desirabilities as columns of `Z`. KL-NMF gives
+
+```math
+Z \approx D W, \qquad D,W\geq 0.
+```
+
+`factorize_soft_subtasks` factorizes the actual `Z` and fixes only one global
+NMF gauge,
+
+```math
+c=\operatorname{median}_s\sum_j D_{sj},\qquad D\leftarrow D/c,\quad
+W\leftarrow cW.
+```
+
+This leaves `D @ W` and relative component strengths unchanged.
+`display_profiles` independently peak-normalizes columns for plotting only.
+`build_soft_two_layer_model` then replaces the one-hot access rows with
+
+```math
+P_t = \alpha D^T.
+```
+
+The complete augmented passive columns are then normalized. Thus `alpha`
+controls passive hierarchy-access mass; controlled access can differ after
+desirability reweighting. The physical-goal row, first-hit abstraction, upper
+solve, task basis, and reward inpainting are otherwise identical.
+
+After a lower access into upper state \(j\), the entered column programs the
+next lower plan:
+
+```math
+r_t^1 \propto a_i^2(\cdot\mid j)-p_i^2(\cdot\mid j).
+```
+
+Because this implementation has exactly two layers, it samples only the
+terminal versus nonterminal upper outcome. A terminal outcome permanently
+selects the physical-goal-only task without teleporting. All subtask rows are
+refractory until one physical transition has occurred, preventing zero-time
+cycles between overlapping distributed profiles.
+
 ## 5. First-hit abstraction and upper layer
 
 Let
