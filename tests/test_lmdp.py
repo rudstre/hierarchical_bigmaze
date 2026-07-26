@@ -12,6 +12,7 @@ from andrew_mlmdp import (
     controlled_dynamics,
     desirability_grid,
     paper_hierarchy_parameters,
+    soft_hierarchy_parameters,
     sample_rollout,
     solve_desirability,
     solve_first_exit,
@@ -32,6 +33,47 @@ def test_paper_hierarchy_parameter_preset() -> None:
         off_target_reward=-1.0,
         beta=1.0,
     )
+
+
+def test_soft_hierarchy_parameters_use_k8_defaults() -> None:
+    assert soft_hierarchy_parameters() == ModelParameters()
+
+
+def test_soft_hierarchy_parameters_scale_with_rank() -> None:
+    parameters = soft_hierarchy_parameters(32)
+
+    assert parameters.upper_control_cost == pytest.approx(0.6)
+    assert parameters.alpha == pytest.approx(0.0025)
+    assert parameters.interior_reward == -0.075
+    assert parameters.goal_reward == 1.0
+    assert parameters.lower_control_cost == 0.15
+    assert parameters.off_target_reward == -1.0
+    assert parameters.beta == 3.0
+
+
+def test_soft_hierarchy_parameters_accept_individual_overrides() -> None:
+    parameters = soft_hierarchy_parameters(
+        4,
+        alpha=0.02,
+        beta=5.0,
+        interior_reward=-0.05,
+    )
+
+    assert parameters.alpha == 0.02
+    assert parameters.beta == 5.0
+    assert parameters.interior_reward == -0.05
+    assert parameters.upper_control_cost == pytest.approx(
+        0.3 * np.sqrt(4.0 / 8.0)
+    )
+
+
+@pytest.mark.parametrize("k", [0, -1, 1.5, True])
+def test_soft_hierarchy_parameters_reject_invalid_rank(k) -> None:
+    with pytest.raises(
+        ValueError,
+        match="Soft hierarchy rank k must be a positive integer",
+    ):
+        soft_hierarchy_parameters(k)
 
 
 def test_passive_dynamics_are_column_stochastic() -> None:
@@ -82,7 +124,9 @@ def test_solution_satisfies_linear_bellman_equation() -> None:
         if state != goal_state:
             interior_states.append(state)
 
-    q_interior = np.exp(-0.1)
+    q_interior = np.exp(
+        parameters.interior_reward / parameters.lower_control_cost
+    )
     expected = q_interior * (
         passive_dynamics[:, interior_states].T @ desirability
     )
@@ -288,11 +332,13 @@ def test_z_iteration_rejects_invalid_values(
 def test_canonical_parameter_defaults() -> None:
     parameters = ModelParameters()
 
-    assert parameters.alpha == 1.0
+    assert parameters.interior_reward == -0.075
+    assert parameters.goal_reward == 1.0
+    assert parameters.alpha == 0.005
     assert parameters.lower_control_cost == 0.15
     assert parameters.upper_control_cost == 0.3
-    assert parameters.off_target_reward == -2.0
-    assert parameters.beta == 10.0
+    assert parameters.off_target_reward == -1.0
+    assert parameters.beta == 3.0
 
 
 def test_controlled_dynamics_prefer_movement_toward_goal() -> None:

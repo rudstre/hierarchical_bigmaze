@@ -21,13 +21,13 @@ class ModelParameters:
     Defaults are canonical project choices, not values fixed by the paper.
     """
 
-    interior_reward: float = -0.1
+    interior_reward: float = -0.075
     goal_reward: float = 1.0
     lower_control_cost: float = 0.15
     upper_control_cost: float = 0.3
-    alpha: float = 1.0
-    off_target_reward: float = -2.0
-    beta: float = 10.0
+    alpha: float = 0.005
+    off_target_reward: float = -1.0
+    beta: float = 3.0
 
     def __post_init__(self) -> None:
         values = (
@@ -65,6 +65,66 @@ def paper_hierarchy_parameters() -> ModelParameters:
         off_target_reward=-1.0,
         beta=1.0,
     )
+
+
+def soft_hierarchy_parameters(
+    k: int = 8,
+    *,
+    interior_reward: float | None = None,
+    goal_reward: float | None = None,
+    lower_control_cost: float | None = None,
+    upper_control_cost: float | None = None,
+    alpha: float | None = None,
+    off_target_reward: float | None = None,
+    beta: float | None = None,
+) -> ModelParameters:
+    """Return empirically balanced soft-hierarchy parameters for rank ``k``.
+
+    The defaults use the validated eight-component regime.  For other ranks,
+    the heuristic keeps the physical-layer and inpainting parameters fixed
+    while applying ``alpha ~ 1 / sqrt(k)`` and
+    ``upper_control_cost ~ sqrt(k)``.  This compensates for the expected
+    square-root growth of abstract path length in a spatial two-dimensional
+    decomposition; it is an empirical starting point, not a paper identity.
+
+    Any explicitly supplied parameter replaces its default or derived value.
+    """
+
+    if (
+        isinstance(k, (bool, np.bool_))
+        or not isinstance(k, (int, np.integer))
+        or k < 1
+    ):
+        raise ValueError("Soft hierarchy rank k must be a positive integer")
+
+    reference = ModelParameters()
+    rank_scale = float(np.sqrt(float(k) / 8.0))
+    derived = {
+        "interior_reward": reference.interior_reward,
+        "goal_reward": reference.goal_reward,
+        "lower_control_cost": reference.lower_control_cost,
+        "upper_control_cost": reference.upper_control_cost * rank_scale,
+        "alpha": reference.alpha / rank_scale,
+        "off_target_reward": reference.off_target_reward,
+        "beta": reference.beta,
+    }
+    overrides = {
+        "interior_reward": interior_reward,
+        "goal_reward": goal_reward,
+        "lower_control_cost": lower_control_cost,
+        "upper_control_cost": upper_control_cost,
+        "alpha": alpha,
+        "off_target_reward": off_target_reward,
+        "beta": beta,
+    }
+    derived.update(
+        {
+            name: value
+            for name, value in overrides.items()
+            if value is not None
+        }
+    )
+    return ModelParameters(**derived)
 
 
 @dataclass(frozen=True)

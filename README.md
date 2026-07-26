@@ -94,13 +94,18 @@ from andrew_mlmdp import (
     build_goal_task_ensemble,
     build_soft_two_layer_model,
     factorize_soft_subtasks,
-    paper_hierarchy_parameters,
     sample_soft_hierarchical_rollout,
+    soft_hierarchy_parameters,
 )
 
-soft_parameters = paper_hierarchy_parameters()
+number_of_subtasks = 8
+soft_parameters = soft_hierarchy_parameters(k=number_of_subtasks)
 ensemble = build_goal_task_ensemble(maze, parameters=soft_parameters)
-discovery = factorize_soft_subtasks(ensemble, n_subtasks=4, seed=0)
+discovery = factorize_soft_subtasks(
+    ensemble,
+    n_subtasks=number_of_subtasks,
+    seed=0,
+)
 soft_model = build_soft_two_layer_model(
     maze,
     discovery.profiles,
@@ -116,20 +121,32 @@ soft_rollout = sample_soft_hierarchical_rollout(
 
 ## Canonical parameters
 
-`ModelParameters()` uses the project's established four-room regime:
+`ModelParameters()` uses the balanced eight-component soft-hierarchy regime:
 
 | Parameter | Default |
 | --- | ---: |
-| Interior reward | `-0.1` |
+| Interior reward | `-0.075` |
 | Goal reward | `1.0` |
 | Lower control cost `lambda_1` | `0.15` |
 | Upper control cost `lambda_2` | `0.3` |
-| Subgoal-access mass `alpha` | `1.0` |
-| Off-target basis reward | `-2.0` |
-| Reward-inpainting scale `beta` | `10.0` |
+| Subgoal-access mass `alpha` | `0.005` |
+| Off-target basis reward | `-1.0` |
+| Reward-inpainting scale `beta` | `3.0` |
 
-These are project choices rather than values uniquely determined by the paper.
-Construct another `ModelParameters` instance to study a different regime.
+These are empirical project choices rather than values uniquely determined by
+the paper. `soft_hierarchy_parameters(k)` scales `alpha` and the upper control
+cost for another NMF rank:
+
+```python
+parameters = soft_hierarchy_parameters(
+    k=12,
+    beta=5.0,  # optional explicit override
+)
+```
+
+Every `ModelParameters` field is available as an optional keyword override.
+Use `paper_hierarchy_parameters()` when the paper-scale constants are desired
+without the rank heuristic.
 
 ## Repository map
 

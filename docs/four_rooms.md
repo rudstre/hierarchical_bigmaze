@@ -37,25 +37,26 @@ the documented first-hit initialization in `docs/model.md`.
 
 ## Parameters
 
-The canonical configuration is exactly `ModelParameters()`:
+The default configuration is the balanced eight-component soft-hierarchy
+regime:
 
 ```python
 ModelParameters(
-    interior_reward=-0.1,
+    interior_reward=-0.075,
     goal_reward=1.0,
     lower_control_cost=0.15,
     upper_control_cost=0.3,
-    alpha=1.0,
-    off_target_reward=-2.0,
-    beta=10.0,
+    alpha=0.005,
+    off_target_reward=-1.0,
+    beta=3.0,
 )
 ```
 
 The paper states small negative interior rewards, positive goal reward, and the
 form of the abstraction and inpainting equations. The layer-dependent control
 costs, off-target reward, and inpainting proportionality used here are project
-choices. `alpha=1` is also the canonical value for this codebase even though
-the paper and supplement discuss other examples.
+choices. Use `soft_hierarchy_parameters(k)` to apply the rank heuristic or
+`paper_hierarchy_parameters()` for the paper-scale preset.
 
 ## Passive movement
 
@@ -70,12 +71,12 @@ The figure scripts use fixed seeds:
 
 | Figure | Start | Seed | Canonical result |
 | --- | ---: | ---: | --- |
-| Flat sample rollout | `(0, 0)` | `7` | goal reached in 31 steps |
-| Hierarchical rollout | `(1, 0)` | `28` | goal reached in 26 steps |
+| Flat sample rollout | `(0, 0)` | `7` | generated from current defaults |
+| Hierarchical rollout | `(1, 0)` | `28` | generated from current defaults |
 
-The hierarchical rollout accesses C, D, and F in that order. The full paths and
-canonical matrices are stored in the readable regression fixture
-`tests/data/four_rooms_regression.json`.
+The readable regression fixture `tests/data/four_rooms_regression.json`
+retains the repository's historical fixed-subgoal regime explicitly. It no
+longer relies on global defaults.
 
 These individual trajectories are diagnostics, not estimates of expected
 performance. A statistical comparison would require a separate, explicitly

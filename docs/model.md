@@ -212,8 +212,9 @@ controlled and passive upper dynamics:
 r_t^1 = \beta(a_i^2(\cdot|s) - P_i^2(\cdot|s)).
 ```
 
-The paper specifies proportionality but not the scale. This project uses
-`beta=10`. The signal applies to subgoal-copy rewards; the original physical
+The paper specifies proportionality but not the scale. The balanced
+eight-component soft-hierarchy default uses `beta=3`. The signal applies to
+subgoal-copy rewards; the original physical
 goal retains its terminal reward. `compute_layer_one_plan` exponentiates the
 result with `lower_control_cost`, projects it through `Q_b`, and composes the
 lower desirability.

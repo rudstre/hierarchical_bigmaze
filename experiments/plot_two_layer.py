@@ -117,7 +117,10 @@ def main() -> None:
     )
 
     figure.suptitle(
-        "Exact two-layer MLMDP (beta = 10, implementation convention)",
+        (
+            "Exact two-layer MLMDP "
+            f"(beta = {parameters.beta:g}, implementation convention)"
+        ),
         fontsize=14,
     )
     figure.subplots_adjust(

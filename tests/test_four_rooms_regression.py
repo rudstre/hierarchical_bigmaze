@@ -8,6 +8,7 @@ import pytest
 
 from andrew_mlmdp import (
     Maze,
+    ModelParameters,
     build_subgoal_passive_dynamics,
     build_two_layer_model,
     compute_layer_one_plan,
@@ -28,7 +29,21 @@ def canonical_case():
     reference_file = Path(__file__).parent / "data" / "four_rooms_regression.json"
     reference = json.loads(reference_file.read_text(encoding="utf-8"))
     maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
-    model = build_two_layer_model(maze, SUBGOALS, GOAL)
+    parameters = ModelParameters(
+        interior_reward=-0.1,
+        goal_reward=1.0,
+        lower_control_cost=0.15,
+        upper_control_cost=0.3,
+        alpha=1.0,
+        off_target_reward=-2.0,
+        beta=10.0,
+    )
+    model = build_two_layer_model(
+        maze,
+        SUBGOALS,
+        GOAL,
+        parameters=parameters,
+    )
     return reference, maze, model
 
 
@@ -36,7 +51,11 @@ def test_canonical_matrices_and_initial_plan(canonical_case) -> None:
     reference, maze, model = canonical_case
     plan = compute_layer_one_plan(model, current=(1, 0))
 
-    assert build_subgoal_passive_dynamics(maze, SUBGOALS) == pytest.approx(
+    assert build_subgoal_passive_dynamics(
+        maze,
+        SUBGOALS,
+        parameters=model.parameters,
+    ) == pytest.approx(
         np.asarray(reference["subgoal_passive"]), abs=1e-11
     )
     assert model.upper_dynamics.passive == pytest.approx(
@@ -57,7 +76,11 @@ def test_canonical_seeded_rollouts(canonical_case) -> None:
     reference, maze, model = canonical_case
     hierarchical = sample_hierarchical_rollout(model, (1, 0), seed=28)
 
-    desirability = solve_desirability(maze, GOAL)
+    desirability = solve_desirability(
+        maze,
+        GOAL,
+        parameters=model.parameters,
+    )
     flat_policy = controlled_dynamics(maze, desirability)
     flat = sample_rollout(maze, flat_policy, (0, 0), GOAL, seed=7)
 
