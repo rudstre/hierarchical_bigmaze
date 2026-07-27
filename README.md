@@ -131,6 +131,11 @@ online_soft_rollout = sample_online_soft_hierarchical_rollout(
 `factorize_soft_subtasks` peak-normalizes every profile column and absorbs its
 scale into the matching task-weight row. This leaves the NMF reconstruction
 unchanged and makes `alpha` the maximum local passive access strength.
+`build_soft_two_layer_model` then core-gates access at 25% of each profile
+peak by default. Values below the threshold become exactly zero; values above
+it are linearly rescaled to `[0, 1]`. Pass `core_threshold=None` for direct
+paper access `P_t = alpha * D.T`, or set `core_exponent` above one to sharpen
+the surviving core further.
 
 ## Reference parameters
 
@@ -149,29 +154,30 @@ normalization rank-eight validation:
 
 These are empirical project choices rather than values uniquely determined by
 the paper. The validation used all 96 non-goal starts, eight rollout seeds,
-and three NMF seeds (2,304 rollouts): 100% goal success, 20.71 mean physical
-steps, and 39 steps at the 90th percentile. The hierarchy controlled 88.7% of
-each rollout on average, made 86.9% normalized goalward progress while active,
-and remained active through goal arrival in 70.3% of episodes.
+and three NMF seeds (2,304 rollouts): 100% goal success, 20.44 mean physical
+steps, and 38 steps at the 90th percentile. The hierarchy controlled 89.9% of
+each rollout on average, made 88.0% normalized goalward progress while active,
+and remained active through goal arrival in 71.4% of episodes.
 
 The hierarchy materially changed the lower policy (mean total variation
-`0.382`). Its soft accesses were region-selective: one profile supplied 95.0%
-of local access membership on average. Signed Equation 10 commands assigned
-71.3% of their positive reward mass to the leading subtask on average, with
-an effective positive command size of 1.84 subtasks. These signed reward and
+`0.373`). Its core-gated accesses were region-selective: one profile supplied
+99.8% of local access membership on average, and no access occurred below the
+25% source-profile threshold. Signed Equation 10 commands assigned 70.3% of
+their positive reward mass to the leading subtask on average, with an
+effective positive command size of 1.89 subtasks. These signed reward and
 access-selectivity measures are used instead of raw desirability-component
 fractions, which are not meaningful activation measures after exponentiation.
 
-Immediate handoff occurred in 4.9% of episodes and termination within five
-physical steps in 5.2%. At the notebook demonstration start `(3, 2)`, none of
+Immediate handoff occurred in 5.3% of episodes and termination within five
+physical steps in 4.3%. At the notebook demonstration start `(3, 2)`, none of
 the 24 robust trials terminated within five steps and the median active phase
-was 31 steps. The soft policy averaged 3.98 steps longer than its flat
+was 28.5 steps. The soft policy averaged 3.71 steps longer than its flat
 solved-goal comparator; the preset deliberately favors sustained hierarchical
 guidance over matching the speed of an already solved exact goal policy.
 
-Nineteen of 29 one-factor perturbations passed the stricter sustained-use
-screen. The reproducible sweep and its signed-command selectivity,
-early-termination, and sensitivity criteria live in
+The earlier one-factor sensitivity count predates core gating and has not been
+carried forward as a current claim. The reproducible sweep and its
+signed-command selectivity and early-termination criteria live in
 `experiments/sweep_soft_k8.py`.
 
 `soft_hierarchy_parameters(k)` scales `alpha` and the upper control cost for

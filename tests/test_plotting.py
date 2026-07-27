@@ -458,6 +458,13 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
             expected_values[model.interior_states[state]]
         )
     assert np.ma.is_masked(displayed_values[model.goal])
+    expected_desirability_limits = (
+        min(0.0, float(np.min(expected_values))),
+        max(0.0, float(np.max(expected_values))),
+    )
+    assert desirability_ax.images[0].get_clim() == pytest.approx(
+        expected_desirability_limits
+    )
     reward_ax = next(
         ax
         for ax in animation._fig.axes
@@ -468,6 +475,13 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
     )
     expected_rewards = initial_frame.plan.inpainted_rewards[:-1]
     assert displayed_rewards == pytest.approx(expected_rewards)
+    expected_reward_limit = 1.25 * max(
+        0.1,
+        float(np.max(np.abs(expected_rewards))),
+    )
+    assert reward_ax.get_ylim() == pytest.approx(
+        (-expected_reward_limit, expected_reward_limit)
+    )
     upper_probability_changes = (
         initial_frame.plan.controlled_abstract[:-1]
         - initial_frame.plan.passive_abstract[:-1]
@@ -506,6 +520,27 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
     animation._func(command_index)
     assert profile_ax.get_title().startswith(
         ("Layer 2 command from", "Layer 2 terminated from")
+    )
+    command_frame = animation._soft_frames[command_index]
+    command_desirability = command_frame.plan.physical_desirability
+    command_goal_desirability = command_desirability[goal_state]
+    command_relative_values = (
+        model.parameters.lower_control_cost
+        * np.log(command_desirability / command_goal_desirability)
+    )
+    assert desirability_ax.images[0].get_clim() == pytest.approx(
+        (
+            min(0.0, float(np.min(command_relative_values))),
+            max(0.0, float(np.max(command_relative_values))),
+        )
+    )
+    command_rewards = command_frame.plan.inpainted_rewards[:-1]
+    command_reward_limit = 1.25 * max(
+        0.1,
+        float(np.max(np.abs(command_rewards))),
+    )
+    assert reward_ax.get_ylim() == pytest.approx(
+        (-command_reward_limit, command_reward_limit)
     )
     diagnostic_text = "\n".join(
         text.get_text()

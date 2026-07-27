@@ -791,7 +791,7 @@ def test_one_hot_soft_subtasks_reproduce_hard_model() -> None:
     )
 
 
-def test_soft_access_profiles_follow_equation_three() -> None:
+def test_soft_access_profiles_apply_core_gate_before_equation_three() -> None:
     maze = Maze.from_ascii("...")
     profiles = np.asarray(
         [[1.0, 0.2], [0.5, 0.4], [0.1, 1.0]]
@@ -803,8 +803,11 @@ def test_soft_access_profiles_follow_equation_three() -> None:
         goal=(0, 2),
         parameters=parameters,
     )
+    expected_profiles = np.asarray(
+        [[1.0, 0.0], [1.0 / 3.0, 0.2], [0.0, 1.0]]
+    )
     interior = model.interior_states
-    raw_access = parameters.alpha * profiles[interior].T
+    raw_access = parameters.alpha * expected_profiles[interior].T
     physical = build_passive_dynamics(maze)
     raw_physical = physical[np.ix_(interior, interior)]
     goal_state = maze.state_index(model.goal)
@@ -813,10 +816,38 @@ def test_soft_access_profiles_follow_equation_three() -> None:
         [raw_physical, raw_access, raw_goal]
     ).sum(axis=0)
 
+    assert model.subtask_profiles == pytest.approx(expected_profiles)
+    assert profiles == pytest.approx(
+        np.asarray([[1.0, 0.2], [0.5, 0.4], [0.1, 1.0]])
+    )
     assert model.lower_subtask_passive == pytest.approx(
         raw_access / normalizers[None, :]
     )
     assert np.allclose(model.lower_dynamics.passive.sum(axis=0), 1.0)
+
+
+def test_soft_core_gate_can_be_disabled_and_exponentiated() -> None:
+    maze = Maze.from_ascii("...")
+    profiles = np.asarray([[2.0], [1.0], [0.2]])
+    direct = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 2),
+        core_threshold=None,
+    )
+    sharpened = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 2),
+        core_threshold=0.25,
+        core_exponent=2.0,
+    )
+
+    assert direct.subtask_profiles == pytest.approx(profiles)
+    assert not np.shares_memory(direct.subtask_profiles, profiles)
+    assert sharpened.subtask_profiles[:, 0] == pytest.approx(
+        [1.0, 1.0 / 9.0, 0.0]
+    )
 
 
 def test_alpha_monotonically_controls_passive_soft_access_mass() -> None:
@@ -829,12 +860,14 @@ def test_alpha_monotonically_controls_passive_soft_access_mass() -> None:
         profiles,
         goal=(0, 2),
         parameters=ModelParameters(alpha=0.1),
+        core_threshold=None,
     )
     large = build_soft_two_layer_model(
         maze,
         profiles,
         goal=(0, 2),
         parameters=ModelParameters(alpha=0.5),
+        core_threshold=None,
     )
     state = small.interior_state_by_coordinate[(0, 0)]
 
@@ -1169,6 +1202,33 @@ def test_soft_two_layer_model_validates_profiles(profiles, message) -> None:
             Maze.from_ascii("..."),
             profiles,
             goal=(0, 2),
+        )
+
+
+@pytest.mark.parametrize(
+    ("threshold", "exponent", "message"),
+    [
+        (-0.1, 1.0, "threshold"),
+        (1.0, 1.0, "threshold"),
+        (np.nan, 1.0, "threshold"),
+        (True, 1.0, "threshold"),
+        (0.25, 0.0, "exponent"),
+        (0.25, np.inf, "exponent"),
+        (0.25, True, "exponent"),
+    ],
+)
+def test_soft_two_layer_model_validates_core_gate(
+    threshold,
+    exponent,
+    message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_soft_two_layer_model(
+            Maze.from_ascii("..."),
+            np.ones((3, 1)),
+            goal=(0, 2),
+            core_threshold=threshold,
+            core_exponent=exponent,
         )
 
 

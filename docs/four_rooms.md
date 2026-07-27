@@ -61,35 +61,35 @@ The post-normalization validation searched a broad range and a focused
 neighborhood, then evaluated finalists over all 96 non-goal starts, eight
 rollout seeds, and three NMF seeds. The rounded default reached the goal in all
 2,304 rollouts. Mean/median/90th-percentile physical steps were
-20.71/18/39; the flat solved-goal comparator averaged 16.73.
+20.44/18/38; the flat solved-goal comparator averaged 16.73.
 
-The hierarchy controlled 88.7% of each rollout on average and remained active
-through goal arrival in 70.3% of episodes. It made 86.9% normalized goalward
-progress while active, with positive progress in 98.5% of rollouts. Immediate
-handoff occurred in 4.9% of episodes and termination within five physical
-steps in 5.2%. At the notebook start `(3, 2)`, none of 24 robust trials
-terminated within five steps; the median active phase was 31 steps.
+The hierarchy controlled 89.9% of each rollout on average and remained active
+through goal arrival in 71.4% of episodes. It made 88.0% normalized goalward
+progress while active, with positive progress in 98.7% of rollouts. Immediate
+handoff occurred in 5.3% of episodes and termination within five physical
+steps in 4.3%. At the notebook start `(3, 2)`, none of 24 robust trials
+terminated within five steps; the median active phase was 28.5 steps.
 
-Soft accesses were spatially selective: the dominant profile supplied 95.0%
-of local access membership on average. Signed upper-layer reward commands put
-71.3% of their positive mass on the leading subtask and had an effective size
-of 1.84 positively rewarded subtasks. These replace raw desirability-component
+Core-gated accesses were spatially selective: the dominant profile supplied
+99.8% of local access membership on average, and no access occurred below the
+25% source-profile threshold. Signed upper-layer reward commands put 70.3% of
+their positive mass on the leading subtask and had an effective size of 1.89
+positively rewarded subtasks. These replace raw desirability-component
 fractions as selection criteria because positive basis coefficients do not
 mean positive rewards in exponentiated reward space. Initial-policy total
-variation from the goal-only policy was 0.382.
+variation from the goal-only policy was 0.373.
 
 Numerically, 0.89% of projected weights were clipped, maximum relative
-boundary projection error was `1.24e-7`, maximum command span was 4.95
-decades, and the mean path-length range across NMF seeds was 0.18 steps. There
+boundary projection error was `1.18e-7`, maximum command span was 4.69
+decades, and the mean path-length range across NMF seeds was 0.85 steps. There
 were no zero-policy, step-limit, or abstract-access-limit failures. The
-hierarchy added 3.98 mean steps relative to an already solved flat goal policy;
+hierarchy added 3.71 mean steps relative to an already solved flat goal policy;
 the preset deliberately prioritizes sustained hierarchical guidance rather
 than shorter solved-goal paths. Reproduce the screening and sensitivity
 analysis with `experiments/sweep_soft_k8.py`.
 
-Nineteen of 29 one-factor perturbations passed the stricter sustained-use
-criteria. The rejected factor-of-two changes generally caused long tails,
-early handoff, excessive command spans, or NMF sensitivity.
+The earlier one-factor sensitivity count predates core gating and is not
+reported as a current result.
 
 Use `soft_hierarchy_parameters(k)` to apply the heuristic rank scaling or
 `paper_hierarchy_parameters()` for the paper-scale preset. Ranks other than

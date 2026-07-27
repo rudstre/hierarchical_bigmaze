@@ -1167,23 +1167,20 @@ def _composed_log_desirability_grid(
 
 def _composed_log_desirability_norm(
     model: SoftTwoLayerModel,
-    frames: list[_SoftRolloutFrame],
+    frame: _SoftRolloutFrame,
 ) -> Normalize:
-    """Use one color scale for every composed-desirability animation frame."""
+    """Scale one frame without allowing future rollout states to affect it."""
 
-    values = np.concatenate(
-        [
-            _composed_log_desirability_grid(model, frame).ravel()
-            for frame in frames
-        ]
-    )
+    values = _composed_log_desirability_grid(model, frame).ravel()
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return Normalize(vmin=-1.0, vmax=0.0)
-    minimum = float(finite.min())
-    maximum = float(finite.max())
+    # Zero is the omitted goal's reference value. Keep it anchored while
+    # adapting the other limit to the current frame's policy contrast.
+    minimum = min(0.0, float(finite.min()))
+    maximum = max(0.0, float(finite.max()))
     if minimum == maximum:
-        maximum = minimum + 1.0
+        minimum -= 1.0
     return Normalize(vmin=minimum, vmax=maximum)
 
 
@@ -1457,12 +1454,16 @@ def animate_soft_hierarchical_rollout(
         pad=0.04,
     )
 
+    initial_desirability_grid = _composed_log_desirability_grid(
+        model,
+        frames[0],
+    )
     composed_desirability_norm = _composed_log_desirability_norm(
         model,
-        frames,
+        frames[0],
     )
     desirability_image = desirability_ax.imshow(
-        _composed_log_desirability_grid(model, frames[0]),
+        initial_desirability_grid,
         cmap=color_map,
         norm=composed_desirability_norm,
         origin="upper",
@@ -1510,7 +1511,7 @@ def animate_soft_hierarchical_rollout(
                 "alpha": 0.65,
             },
         )
-    figure.colorbar(
+    desirability_colorbar = figure.colorbar(
         desirability_image,
         ax=desirability_ax,
         label=r"$\lambda \log(z / z_{\mathrm{goal}})$",
@@ -1521,20 +1522,7 @@ def animate_soft_hierarchical_rollout(
         "Full composed desirability (log scale; goal omitted)"
     )
 
-    finite_reward_commands = [
-        frame.plan.inpainted_rewards[:-1]
-        for frame in frames
-        if frame.plan is not None
-        and np.all(np.isfinite(frame.plan.inpainted_rewards[:-1]))
-    ]
-    largest_reward = max(
-        (
-            float(np.max(np.abs(command)))
-            for command in finite_reward_commands
-        ),
-        default=0.1,
-    )
-    reward_limit = 1.25 * max(0.1, largest_reward)
+    reward_limit = 0.125
     reward_x = np.arange(model.number_of_subtasks)
     reward_bars = weights_ax.bar(
         reward_x,
@@ -1629,9 +1617,15 @@ def animate_soft_hierarchical_rollout(
                     "Current command from "
                     f"{labels[frame.profile_subtask]}"
                 )
-        desirability_image.set_data(
-            _composed_log_desirability_grid(model, frame)
+        desirability_grid_values = _composed_log_desirability_grid(
+            model,
+            frame,
         )
+        desirability_image.set_data(desirability_grid_values)
+        desirability_image.set_norm(
+            _composed_log_desirability_norm(model, frame)
+        )
+        desirability_colorbar.update_normal(desirability_image)
 
         reward_command_disabled = (
             frame.plan is None
@@ -1643,6 +1637,11 @@ def animate_soft_hierarchical_rollout(
             reward_command = np.zeros(model.number_of_subtasks)
         else:
             reward_command = frame.plan.inpainted_rewards[:-1]
+        reward_limit = 1.25 * max(
+            0.1,
+            float(np.max(np.abs(reward_command))),
+        )
+        weights_ax.set_ylim(-reward_limit, reward_limit)
         label_offset = 0.025 * reward_limit
         for bar, value_label, reward in zip(
             reward_bars,

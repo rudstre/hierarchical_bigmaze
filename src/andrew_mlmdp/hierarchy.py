@@ -395,10 +395,30 @@ def build_soft_two_layer_model(
     goal: Coordinate,
     *,
     parameters: ModelParameters = ModelParameters(),
+    core_threshold: float | None = 0.25,
+    core_exponent: float = 1.0,
 ) -> SoftTwoLayerModel:
-    """Construct a two-layer model with paper Equation 3 soft accesses."""
+    """Construct a two-layer model with core-gated soft accesses.
 
-    profiles = _validated_subtask_profiles(maze, subtask_profiles)
+    When ``core_threshold`` is not ``None``, each profile is first scaled by
+    its own peak and transformed as
+
+    ``max(0, (D - threshold) / (1 - threshold)) ** exponent``.
+
+    The transformed profiles are then used consistently to construct every
+    dependent lower- and upper-layer quantity. Set ``core_threshold=None`` to
+    recover direct paper Equation 3 access from the supplied profiles.
+    """
+
+    supplied_profiles = _validated_subtask_profiles(
+        maze,
+        subtask_profiles,
+    )
+    profiles = _soft_core_profiles(
+        supplied_profiles,
+        threshold=core_threshold,
+        exponent=core_exponent,
+    )
     maze.state_index(goal)
     interior_states, interior_by_coordinate = _interior_partition(maze, goal)
     raw_access = (
@@ -1466,6 +1486,43 @@ def _validated_subtask_profiles(
     if np.any(values.max(axis=0) <= 0.0):
         raise ValueError("Every soft subtask profile must be nonempty")
     return values
+
+
+def _soft_core_profiles(
+    profiles: np.ndarray,
+    *,
+    threshold: float | None,
+    exponent: float,
+) -> np.ndarray:
+    """Restrict soft access to the peak-relative core of each profile."""
+
+    values = np.asarray(profiles, dtype=np.float64)
+    if (
+        not np.isfinite(exponent)
+        or isinstance(exponent, (bool, np.bool_))
+        or exponent <= 0.0
+    ):
+        raise ValueError("Core exponent must be finite and positive")
+    if threshold is None:
+        return values.copy()
+    if (
+        isinstance(threshold, (bool, np.bool_))
+        or not np.isfinite(threshold)
+        or not 0.0 <= threshold < 1.0
+    ):
+        raise ValueError(
+            "Core threshold must be finite and in [0, 1), or None"
+        )
+
+    peaks = values.max(axis=0, keepdims=True)
+    normalized = values / peaks
+    core = np.maximum(
+        0.0,
+        (normalized - threshold) / (1.0 - threshold),
+    )
+    if exponent != 1.0:
+        core = core**exponent
+    return core
 
 
 def _interior_partition(

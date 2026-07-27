@@ -116,18 +116,28 @@ W_{j:}\leftarrow c_jW_{j:}.
 This leaves `D @ W` unchanged and makes every profile peak at one.
 `display_profiles` returns a separately allocated plotting view with the same
 peak convention.
-`build_soft_two_layer_model` then replaces the one-hot access rows with
+By default, `build_soft_two_layer_model` restricts access to a soft profile
+core before replacing the one-hot access rows:
 
 ```math
-P_t = \alpha D^T.
+\widehat D_{sj}
+=
+\left[
+\max\left(0,\frac{D_{sj}-\tau}{1-\tau}\right)
+\right]^\gamma,
+\qquad
+P_t = \alpha \widehat D^T,
 ```
 
-The complete augmented passive columns are then normalized. For discovered
-profiles, `alpha` is therefore the maximum local passive access strength;
-controlled access can differ after desirability reweighting. Custom profiles
-passed directly to `build_soft_two_layer_model` are used as supplied and are
-not implicitly normalized. The physical-goal row, first-hit abstraction,
-upper solve, task basis, and reward inpainting are otherwise identical.
+where every input column is first scaled by its own peak, and the defaults are
+`tau = 0.25` and `gamma = 1`. The complete augmented passive columns are then
+normalized. Because the transformed profiles still peak at one, `alpha`
+remains the maximum local passive access strength; controlled access can
+differ after desirability reweighting. Pass `core_threshold=None` to use
+custom profiles exactly as supplied and recover direct paper Equation 3
+access. The physical-goal row, first-hit abstraction, upper solve, task basis,
+and reward inpainting are all rebuilt from the same transformed access
+profiles.
 
 After a lower access into upper state \(j\), the entered column programs the
 next lower plan:
