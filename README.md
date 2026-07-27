@@ -91,6 +91,7 @@ the paper's distributed `P_t = alpha * D.T` profiles:
 
 ```python
 from andrew_mlmdp import (
+    NMFDiscoveryParameters,
     build_goal_task_ensemble,
     build_soft_two_layer_model,
     factorize_soft_subtasks,
@@ -100,8 +101,15 @@ from andrew_mlmdp import (
 )
 
 number_of_subtasks = 8
-soft_parameters = soft_hierarchy_parameters(k=number_of_subtasks)
-ensemble = build_goal_task_ensemble(maze, parameters=soft_parameters)
+discovery_parameters = NMFDiscoveryParameters()
+execution_parameters = soft_hierarchy_parameters(
+    k=number_of_subtasks,
+    # lower_control_cost=0.11,  # sharpen execution without rediscovery
+)
+ensemble = build_goal_task_ensemble(
+    maze,
+    discovery_parameters=discovery_parameters,
+)
 discovery = factorize_soft_subtasks(
     ensemble,
     n_subtasks=number_of_subtasks,
@@ -111,7 +119,7 @@ soft_model = build_soft_two_layer_model(
     maze,
     discovery.profiles,
     goal,
-    parameters=soft_parameters,
+    parameters=execution_parameters,
 )
 soft_rollout = sample_soft_hierarchical_rollout(
     soft_model,
@@ -131,6 +139,10 @@ online_soft_rollout = sample_online_soft_hierarchical_rollout(
 `factorize_soft_subtasks` peak-normalizes every profile column and absorbs its
 scale into the matching task-weight row. This leaves the NMF reconstruction
 unchanged and makes `alpha` the maximum local passive access strength.
+`NMFDiscoveryParameters` is frozen into the ensemble and is independent of
+the execution `ModelParameters`. Reuse the resulting `discovery.profiles`
+when changing `lower_control_cost`; rebuilding the ensemble would intentionally
+learn a different subtask library.
 `build_soft_two_layer_model` then core-gates access at 25% of each profile
 peak by default. Values below the threshold become exactly zero; values above
 it are linearly rescaled to `[0, 1]`. Pass `core_threshold=None` for direct
@@ -139,8 +151,11 @@ the surviving core further.
 
 ## Reference parameters
 
-`ModelParameters()` uses the sustained-hierarchy regime from the post-peak-
-normalization rank-eight validation:
+`NMFDiscoveryParameters()` fixes the NMF task family at
+`interior_reward=-0.05`, `goal_reward=0.65`, and `control_cost=0.12`.
+`ModelParameters()` independently configures execution using the
+sustained-hierarchy regime from the post-peak-normalization rank-eight
+validation:
 
 | Parameter | Default |
 | --- | ---: |
@@ -180,8 +195,8 @@ carried forward as a current claim. The reproducible sweep and its
 signed-command selectivity and early-termination criteria live in
 `experiments/sweep_soft_k8.py`.
 
-`soft_hierarchy_parameters(k)` scales `alpha` and the upper control cost for
-another NMF rank:
+`soft_hierarchy_parameters(k)` scales the execution `alpha` and upper control
+cost for another NMF rank:
 
 ```python
 parameters = soft_hierarchy_parameters(

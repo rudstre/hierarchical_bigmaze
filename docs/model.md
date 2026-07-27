@@ -105,6 +105,15 @@ full physical desirabilities as columns of `Z`. KL-NMF gives
 Z \approx D W, \qquad D,W\geq 0.
 ```
 
+The ensemble uses an immutable `NMFDiscoveryParameters` object containing only
+its interior reward, goal reward, and control cost. These are not execution
+parameters. Once `D` is learned, the same profiles are reused while
+`ModelParameters` controls hierarchy execution. In particular, changing
+execution `lower_control_cost` does not require or trigger NMF rediscovery.
+Passing a legacy `ModelParameters` object to `build_goal_task_ensemble`
+remains supported, but the three discovery fields are copied into a separate
+`NMFDiscoveryParameters` object.
+
 `factorize_soft_subtasks` factorizes the actual `Z` and fixes the independent
 gauge of every NMF component,
 

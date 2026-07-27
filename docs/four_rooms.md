@@ -37,8 +37,18 @@ the documented first-hit initialization in `docs/model.md`.
 
 ## Parameters
 
-The default configuration is the sustained-hierarchy rank-eight regime selected
-after component-wise NMF peak normalization:
+NMF discovery uses a separate frozen task family:
+
+```python
+NMFDiscoveryParameters(
+    interior_reward=-0.05,
+    goal_reward=0.65,
+    control_cost=0.12,
+)
+```
+
+The default execution configuration is the sustained-hierarchy rank-eight
+regime selected after component-wise NMF peak normalization:
 
 ```python
 ModelParameters(
@@ -51,6 +61,10 @@ ModelParameters(
     beta=13.5,
 )
 ```
+
+Changing execution `lower_control_cost` reuses the profiles learned with the
+discovery configuration above. The ensemble and NMF should be rebuilt only
+when intentionally learning a new subtask library.
 
 The paper states small negative interior rewards, positive goal reward, and the
 form of the abstraction and inpainting equations. The layer-dependent control

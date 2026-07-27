@@ -14,11 +14,13 @@ from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
 
 @dataclass(frozen=True)
 class ModelParameters:
-    """Numerical parameters shared by the flat and hierarchical models.
+    """Numerical parameters for flat and hierarchical execution.
 
     The lower cost governs flat and physical-layer calculations, including the
     task basis and reward inpainting. The upper cost governs the abstract LMDP.
-    Defaults are canonical project choices, not values fixed by the paper.
+    NMF task discovery has separate frozen parameters in
+    ``NMFDiscoveryParameters``. Defaults are canonical project choices, not
+    values fixed by the paper.
     """
 
     interior_reward: float = -0.05
@@ -78,7 +80,7 @@ def soft_hierarchy_parameters(
     off_target_reward: float | None = None,
     beta: float | None = None,
 ) -> ModelParameters:
-    """Return soft-hierarchy parameters for rank ``k``.
+    """Return soft-hierarchy execution parameters for rank ``k``.
 
     The rank-eight reference was validated after component-wise NMF peak
     normalization. For ranks other than eight, the heuristic keeps the

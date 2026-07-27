@@ -2,6 +2,7 @@
 
 from andrew_mlmdp.discovery import (
     GoalTaskEnsemble,
+    NMFDiscoveryParameters,
     NMFRankDiagnostics,
     SoftSubtaskDiscovery,
     build_goal_task_ensemble,
@@ -63,6 +64,7 @@ __all__ = [
     "LayerOnePlan",
     "Maze",
     "ModelParameters",
+    "NMFDiscoveryParameters",
     "NMFRankDiagnostics",
     "OnlineHierarchicalRollout",
     "OnlineSoftHierarchicalRollout",

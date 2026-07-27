@@ -10,17 +10,57 @@ from andrew_mlmdp.maze import Coordinate, Maze
 
 
 @dataclass(frozen=True)
+class NMFDiscoveryParameters:
+    """Task-family parameters used only to discover soft subtask profiles.
+
+    These values define the fixed desirability ensemble supplied to NMF.
+    They are intentionally separate from ``ModelParameters`` so execution
+    tuning cannot silently rediscover a different hierarchy.
+    """
+
+    interior_reward: float = -0.05
+    goal_reward: float = 0.65
+    control_cost: float = 0.12
+
+    def __post_init__(self) -> None:
+        values = (
+            self.interior_reward,
+            self.goal_reward,
+            self.control_cost,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("NMF discovery parameters must be finite")
+        if self.interior_reward >= 0.0:
+            raise ValueError("Discovery interior reward must be negative")
+        if self.control_cost <= 0.0:
+            raise ValueError("Discovery control cost must be positive")
+
+    @classmethod
+    def from_model_parameters(
+        cls,
+        parameters: ModelParameters,
+    ) -> "NMFDiscoveryParameters":
+        """Extract legacy discovery settings from model parameters."""
+
+        return cls(
+            interior_reward=parameters.interior_reward,
+            goal_reward=parameters.goal_reward,
+            control_cost=parameters.lower_control_cost,
+        )
+
+
+@dataclass(frozen=True)
 class GoalTaskEnsemble:
     """Flat goal tasks whose state-by-task desirabilities form ``Z``."""
 
     maze: Maze
     goals: tuple[Coordinate, ...]
-    parameters: ModelParameters
+    parameters: NMFDiscoveryParameters
     desirability: np.ndarray
 
     def __post_init__(self) -> None:
         goals = tuple(self.goals)
-        values = np.asarray(self.desirability, dtype=np.float64)
+        values = np.array(self.desirability, dtype=np.float64, copy=True)
         expected_shape = (len(self.maze.free_cells), len(goals))
         if not goals:
             raise ValueError("A task ensemble must contain at least one goal")
@@ -36,7 +76,14 @@ class GoalTaskEnsemble:
         if np.any(values.max(axis=0) <= 0.0):
             raise ValueError("Every task must have positive desirability")
         object.__setattr__(self, "goals", goals)
+        values.flags.writeable = False
         object.__setattr__(self, "desirability", values)
+
+    @property
+    def discovery_parameters(self) -> NMFDiscoveryParameters:
+        """Return the parameters frozen into this discovery ensemble."""
+
+        return self.parameters
 
     @property
     def normalized_desirability(self) -> np.ndarray:
@@ -61,9 +108,13 @@ class SoftSubtaskDiscovery:
     converged: bool
 
     def __post_init__(self) -> None:
-        profiles = np.asarray(self.profiles, dtype=np.float64)
-        weights = np.asarray(self.task_weights, dtype=np.float64)
-        reconstruction = np.asarray(self.reconstruction, dtype=np.float64)
+        profiles = np.array(self.profiles, dtype=np.float64, copy=True)
+        weights = np.array(self.task_weights, dtype=np.float64, copy=True)
+        reconstruction = np.array(
+            self.reconstruction,
+            dtype=np.float64,
+            copy=True,
+        )
         number_of_states, number_of_tasks = (
             self.ensemble.desirability.shape
         )
@@ -90,6 +141,9 @@ class SoftSubtaskDiscovery:
             raise ValueError("NMF factors must be finite and non-negative")
         if not np.isfinite(self.reconstruction_error):
             raise ValueError("Reconstruction error must be finite")
+        profiles.flags.writeable = False
+        weights.flags.writeable = False
+        reconstruction.flags.writeable = False
         object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "task_weights", weights)
         object.__setattr__(self, "reconstruction", reconstruction)
@@ -136,9 +190,34 @@ def build_goal_task_ensemble(
     maze: Maze,
     *,
     goals: list[Coordinate] | tuple[Coordinate, ...] | None = None,
-    parameters: ModelParameters = ModelParameters(),
+    discovery_parameters: NMFDiscoveryParameters | None = None,
+    parameters: ModelParameters | NMFDiscoveryParameters | None = None,
 ) -> GoalTaskEnsemble:
-    """Solve one flat first-exit task for every requested physical goal."""
+    """Solve the fixed flat-task family supplied to NMF.
+
+    ``discovery_parameters`` is the preferred explicit API. ``parameters``
+    remains as a backward-compatible alias; passing ``ModelParameters`` there
+    extracts only its three discovery-relevant fields.
+    """
+
+    if discovery_parameters is not None and parameters is not None:
+        raise ValueError(
+            "Pass discovery_parameters or legacy parameters, not both"
+        )
+    if discovery_parameters is not None:
+        selected_parameters = discovery_parameters
+    elif parameters is not None:
+        selected_parameters = parameters
+    else:
+        selected_parameters = NMFDiscoveryParameters()
+    if isinstance(selected_parameters, ModelParameters):
+        selected_parameters = NMFDiscoveryParameters.from_model_parameters(
+            selected_parameters
+        )
+    if not isinstance(selected_parameters, NMFDiscoveryParameters):
+        raise TypeError(
+            "Discovery parameters must be NMFDiscoveryParameters"
+        )
 
     ordered_goals = tuple(maze.free_cells if goals is None else goals)
     if not ordered_goals:
@@ -148,16 +227,25 @@ def build_goal_task_ensemble(
     for goal in ordered_goals:
         maze.state_index(goal)
 
+    solver_parameters = ModelParameters(
+        interior_reward=selected_parameters.interior_reward,
+        goal_reward=selected_parameters.goal_reward,
+        lower_control_cost=selected_parameters.control_cost,
+    )
     desirability = np.column_stack(
         [
-            solve_desirability(maze, goal, parameters=parameters)
+            solve_desirability(
+                maze,
+                goal,
+                parameters=solver_parameters,
+            )
             for goal in ordered_goals
         ]
     )
     return GoalTaskEnsemble(
         maze=maze,
         goals=ordered_goals,
-        parameters=parameters,
+        parameters=selected_parameters,
         desirability=desirability,
     )
 

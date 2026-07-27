@@ -26,6 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from andrew_mlmdp import (  # noqa: E402
     Maze,
     ModelParameters,
+    NMFDiscoveryParameters,
     build_goal_task_ensemble,
     build_soft_two_layer_model,
     controlled_dynamics,
@@ -46,6 +47,7 @@ GOAL = (10, 9)
 DEMONSTRATION_START = (3, 2)
 K = 8
 MAX_STEPS = 250
+DISCOVERY_PARAMETERS = NMFDiscoveryParameters()
 PATHOLOGY_THRESHOLDS = {
     "minimum_success_rate": 0.95,
     "minimum_worst_start_success_rate": 0.80,
@@ -206,6 +208,7 @@ def main() -> None:
         "method": {
             "k": K,
             "goal": GOAL,
+            "discovery_parameters": asdict(DISCOVERY_PARAMETERS),
             "max_steps": MAX_STEPS,
             "broad_candidates": len(candidates),
             "focused_candidates": args.focused_samples,
@@ -552,7 +555,7 @@ def evaluate_parameter_set(
             warnings.simplefilter("error", RuntimeWarning)
             ensemble = build_goal_task_ensemble(
                 maze,
-                parameters=parameters,
+                discovery_parameters=DISCOVERY_PARAMETERS,
             )
             flat_goal = solve_desirability(
                 maze,
@@ -1704,9 +1707,13 @@ def write_report(
         "# Peak-normalized soft K=8 parameter validation",
         "",
         "This sweep evaluates the solved-goal soft hierarchy after component-wise "
-        "NMF peak normalization. Candidates are screened on navigation, active-"
+        "NMF peak normalization using one frozen discovery task family. "
+        "Candidates are screened on navigation, active-"
         "hierarchy productivity, policy influence, access behavior, numerical "
         "conditioning, and sensitivity to three NMF initializations.",
+        "",
+        "Discovery parameters: "
+        f"`{summary['method']['discovery_parameters']}`.",
         "",
         f"Robust evaluation used {summary['method']['robust_starts']} starts, "
         f"{summary['method']['robust_rollout_seeds']} rollout seeds per start, "

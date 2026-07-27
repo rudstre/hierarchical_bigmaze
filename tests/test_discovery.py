@@ -1,15 +1,19 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from sklearn.exceptions import ConvergenceWarning
 
 from andrew_mlmdp.discovery import (
     GoalTaskEnsemble,
+    NMFDiscoveryParameters,
     _peak_normalize_nmf_factors,
     build_goal_task_ensemble,
     evaluate_soft_subtask_ranks,
     factorize_soft_subtasks,
 )
-from andrew_mlmdp.lmdp import solve_desirability
+from andrew_mlmdp.hierarchy import build_soft_two_layer_model
+from andrew_mlmdp.lmdp import ModelParameters, solve_desirability
 from andrew_mlmdp.maze import Maze
 
 
@@ -24,6 +28,66 @@ def test_goal_task_ensemble_matches_flat_solutions() -> None:
             solve_desirability(maze, goal)
         )
     assert ensemble.normalized_desirability.max(axis=0) == pytest.approx(1.0)
+
+
+def test_goal_task_ensemble_freezes_separate_discovery_parameters() -> None:
+    maze = Maze.from_ascii("...")
+    discovery_parameters = NMFDiscoveryParameters(
+        interior_reward=-0.08,
+        goal_reward=0.7,
+        control_cost=0.2,
+    )
+    ensemble = build_goal_task_ensemble(
+        maze,
+        discovery_parameters=discovery_parameters,
+    )
+    solver_parameters = ModelParameters(
+        interior_reward=-0.08,
+        goal_reward=0.7,
+        lower_control_cost=0.2,
+    )
+
+    assert ensemble.discovery_parameters is discovery_parameters
+    for task, goal in enumerate(ensemble.goals):
+        assert ensemble.desirability[:, task] == pytest.approx(
+            solve_desirability(
+                maze,
+                goal,
+                parameters=solver_parameters,
+            )
+        )
+    assert not ensemble.desirability.flags.writeable
+
+
+def test_goal_task_ensemble_converts_legacy_model_parameters() -> None:
+    legacy = ModelParameters(
+        interior_reward=-0.2,
+        goal_reward=0.8,
+        lower_control_cost=0.3,
+        upper_control_cost=9.0,
+        alpha=0.7,
+        off_target_reward=-4.0,
+        beta=20.0,
+    )
+    ensemble = build_goal_task_ensemble(
+        Maze.from_ascii("..."),
+        parameters=legacy,
+    )
+
+    assert ensemble.discovery_parameters == NMFDiscoveryParameters(
+        interior_reward=-0.2,
+        goal_reward=0.8,
+        control_cost=0.3,
+    )
+
+
+def test_goal_task_ensemble_rejects_overlapping_parameter_apis() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        build_goal_task_ensemble(
+            Maze.from_ascii("..."),
+            discovery_parameters=NMFDiscoveryParameters(),
+            parameters=ModelParameters(),
+        )
 
 
 def test_soft_subtask_factorization_is_reproducible_and_peak_gauged() -> None:
@@ -47,6 +111,45 @@ def test_soft_subtask_factorization_is_reproducible_and_peak_gauged() -> None:
     assert first.task_weights == pytest.approx(second.task_weights)
     assert first.reconstruction_error == pytest.approx(
         second.reconstruction_error
+    )
+    assert not first.profiles.flags.writeable
+    assert not first.task_weights.flags.writeable
+    assert not first.reconstruction.flags.writeable
+
+
+def test_execution_cost_does_not_rediscover_or_modify_profiles() -> None:
+    maze = Maze.from_ascii(".....")
+    discovery = factorize_soft_subtasks(
+        build_goal_task_ensemble(
+            maze,
+            discovery_parameters=NMFDiscoveryParameters(control_cost=0.12),
+        ),
+        2,
+    )
+    original_profiles = discovery.profiles.copy()
+    execution = ModelParameters(lower_control_cost=0.12)
+    base_model = build_soft_two_layer_model(
+        maze,
+        discovery.profiles,
+        goal=(0, 4),
+        parameters=execution,
+    )
+    sharper_model = build_soft_two_layer_model(
+        maze,
+        discovery.profiles,
+        goal=(0, 4),
+        parameters=replace(execution, lower_control_cost=0.11),
+    )
+
+    assert discovery.ensemble.discovery_parameters.control_cost == 0.12
+    assert discovery.profiles == pytest.approx(original_profiles)
+    assert base_model.subtask_profiles == pytest.approx(
+        sharper_model.subtask_profiles
+    )
+    assert base_model.parameters.lower_control_cost == 0.12
+    assert sharper_model.parameters.lower_control_cost == 0.11
+    assert base_model.task_basis.interior_desirability != pytest.approx(
+        sharper_model.task_basis.interior_desirability
     )
 
 
@@ -161,3 +264,16 @@ def test_goal_task_ensemble_validates_values() -> None:
             build_goal_task_ensemble(maze).parameters,
             np.asarray([[1.0], [np.nan]]),
         )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"interior_reward": 0.0}, "negative"),
+        ({"control_cost": 0.0}, "positive"),
+        ({"goal_reward": np.nan}, "finite"),
+    ],
+)
+def test_nmf_discovery_parameters_validate_values(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        NMFDiscoveryParameters(**kwargs)
