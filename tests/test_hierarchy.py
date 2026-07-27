@@ -7,6 +7,7 @@ import pytest
 from andrew_mlmdp import (
     Maze,
     ModelParameters,
+    OnlineSoftHierarchicalRollout,
     UpperLayerTransition,
     build_passive_dynamics,
     build_subgoal_passive_dynamics,
@@ -14,9 +15,11 @@ from andrew_mlmdp import (
     compute_layer_one_plan,
     sample_hierarchical_rollout,
     sample_online_hierarchical_rollout,
+    sample_online_soft_hierarchical_rollout,
     z_iteration_step,
 )
 from andrew_mlmdp.hierarchy import (
+    _run_hierarchical_rollout,
     _trace_hierarchy_events,
     _trace_online_hierarchical_rollout,
     build_soft_two_layer_model,
@@ -485,6 +488,163 @@ def test_online_rollout_reports_zero_policy(corridor_model) -> None:
     assert rollout.z_iterations == 0
 
 
+def test_online_soft_initial_plan_does_not_use_exact_goal_column() -> None:
+    maze = Maze.from_ascii("....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [
+                [1.0, 0.1],
+                [0.8, 0.3],
+                [0.3, 0.8],
+                [0.1, 1.0],
+            ]
+        ),
+        goal=(0, 3),
+    )
+    result = _run_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        beta=None,
+        max_steps=0,
+        max_abstract_accesses=10,
+        seed=0,
+        z_sweeps_per_step=1,
+    )
+    plan = result.events[0].plan
+
+    assert plan is not None
+    assert result.goal_desirability_history is not None
+    assert result.goal_desirability_history[0] == pytest.approx(0.0)
+    expected_interior = (
+        model.task_basis.interior_desirability[:, :-1]
+        @ plan.weights[:-1]
+    )
+    assert plan.physical_desirability[model.interior_states] == pytest.approx(
+        expected_interior
+    )
+    assert np.any(model.task_basis.interior_desirability[:, -1] > 0.0)
+
+
+def test_online_soft_rollout_copies_initial_goal_and_validates_inputs() -> None:
+    maze = Maze.from_ascii("....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [
+                [1.0, 0.0],
+                [0.7, 0.3],
+                [0.3, 0.7],
+                [0.0, 1.0],
+            ]
+        ),
+        goal=(0, 3),
+    )
+    initial = np.full(len(model.interior_states), 0.25)
+    stopped = sample_online_soft_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        initial_goal_desirability=initial,
+        max_steps=0,
+        seed=1,
+    )
+    initial[:] = 99.0
+
+    assert isinstance(stopped, OnlineSoftHierarchicalRollout)
+    assert stopped.status == "step_limit"
+    assert stopped.z_iterations == 0
+    assert stopped.goal_desirability_history[0] == pytest.approx(0.25)
+    assert not np.shares_memory(
+        stopped.goal_desirability_history[0],
+        initial,
+    )
+    first = sample_online_soft_hierarchical_rollout(
+        model,
+        start=(0, 1),
+        initial_goal_desirability=stopped.final_goal_desirability,
+        max_steps=1,
+        seed=2,
+    )
+    second = sample_online_soft_hierarchical_rollout(
+        model,
+        start=first.trajectory[-1],
+        initial_goal_desirability=first.final_goal_desirability,
+        max_steps=1,
+        seed=3,
+    )
+    assert first.z_iterations == 1
+    assert second.z_iterations == 1
+    assert second.goal_desirability_history[0] == pytest.approx(
+        first.final_goal_desirability
+    )
+    assert np.linalg.norm(second.final_goal_desirability) > np.linalg.norm(
+        first.final_goal_desirability
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        sample_online_soft_hierarchical_rollout(
+            model,
+            start=(0, 1),
+            z_sweeps_per_step=0,
+        )
+    with pytest.raises(ValueError, match="shape"):
+        sample_online_soft_hierarchical_rollout(
+            model,
+            start=(0, 1),
+            initial_goal_desirability=np.ones(2),
+        )
+    for invalid in (
+        np.asarray([1.0, -1.0, 1.0]),
+        np.asarray([1.0, np.inf, 1.0]),
+    ):
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            sample_online_soft_hierarchical_rollout(
+                model,
+                start=(0, 1),
+                initial_goal_desirability=invalid,
+            )
+
+
+def test_online_soft_terminal_start_and_zero_policy() -> None:
+    maze = Maze.from_ascii("....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [
+                [1.0, 0.0],
+                [0.7, 0.3],
+                [0.3, 0.7],
+                [0.0, 1.0],
+            ]
+        ),
+        goal=(0, 3),
+    )
+    terminal = sample_online_soft_hierarchical_rollout(
+        model,
+        start=model.goal,
+        seed=0,
+    )
+    empty_basis = replace(
+        model.task_basis,
+        interior_desirability=np.zeros_like(
+            model.task_basis.interior_desirability
+        ),
+    )
+    unguided = replace(model, task_basis=empty_basis)
+    zero_policy = sample_online_soft_hierarchical_rollout(
+        unguided,
+        start=(0, 1),
+        seed=0,
+    )
+
+    assert terminal.reached_goal
+    assert terminal.status == "reached_goal"
+    assert terminal.physical_steps == 0
+    assert terminal.goal_desirability_history[0] == pytest.approx(0.0)
+    assert zero_policy.status == "zero_policy"
+    assert zero_policy.physical_steps == 0
+    assert zero_policy.z_iterations == 0
+
+
 def test_hierarchical_rollout_limits_and_terminal_start(corridor_model) -> None:
     model = corridor_model
 
@@ -871,6 +1031,59 @@ def test_one_hot_soft_and_fixed_rollouts_share_rng_and_execution() -> None:
     assert hard_rollout.status == soft_rollout.status
 
 
+def test_one_hot_soft_and_fixed_online_rollouts_match() -> None:
+    maze = Maze.from_ascii("....")
+    subgoals = ((0, 0), (0, 2))
+    parameters = ModelParameters(
+        alpha=10.0,
+        lower_control_cost=1.0,
+        upper_control_cost=1.0,
+        beta=1.0,
+    )
+    hard = build_two_layer_model(
+        maze,
+        subgoals,
+        goal=(0, 3),
+        parameters=parameters,
+    )
+    profiles = np.zeros((len(maze.free_cells), len(subgoals)))
+    for subtask, coordinate in enumerate(subgoals):
+        profiles[maze.state_index(coordinate), subtask] = 1.0
+    soft = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 3),
+        parameters=parameters,
+    )
+
+    hard_rollout = sample_online_hierarchical_rollout(
+        hard,
+        (0, 1),
+        seed=0,
+        max_steps=50,
+    )
+    soft_rollout = sample_online_soft_hierarchical_rollout(
+        soft,
+        (0, 1),
+        seed=0,
+        max_steps=50,
+    )
+
+    assert hard_rollout.trajectory == soft_rollout.trajectory
+    assert hard_rollout.upper_transitions == soft_rollout.upper_transitions
+    assert np.vstack(hard_rollout.weight_history) == pytest.approx(
+        np.vstack(soft_rollout.weight_history)
+    )
+    assert np.vstack(
+        hard_rollout.goal_desirability_history
+    ) == pytest.approx(
+        np.vstack(soft_rollout.goal_desirability_history)
+    )
+    assert hard_rollout.z_iterations == soft_rollout.z_iterations
+    assert hard_rollout.status == soft_rollout.status
+    assert hard_rollout.reached_goal == soft_rollout.reached_goal
+
+
 
 def test_soft_rollout_is_reproducible_and_does_not_teleport() -> None:
     maze = Maze.from_ascii(".....")
@@ -887,7 +1100,15 @@ def test_soft_rollout_is_reproducible_and_does_not_teleport() -> None:
         maze,
         profiles,
         goal=(0, 4),
-        parameters=ModelParameters(alpha=2.0),
+        parameters=ModelParameters(
+            interior_reward=-0.075,
+            goal_reward=1.0,
+            lower_control_cost=0.15,
+            upper_control_cost=0.3,
+            alpha=2.0,
+            off_target_reward=-1.0,
+            beta=3.0,
+        ),
     )
     first = sample_soft_hierarchical_rollout(
         model,

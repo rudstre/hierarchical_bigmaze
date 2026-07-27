@@ -105,26 +105,29 @@ full physical desirabilities as columns of `Z`. KL-NMF gives
 Z \approx D W, \qquad D,W\geq 0.
 ```
 
-`factorize_soft_subtasks` factorizes the actual `Z` and fixes only one global
-NMF gauge,
+`factorize_soft_subtasks` factorizes the actual `Z` and fixes the independent
+gauge of every NMF component,
 
 ```math
-c=\operatorname{median}_s\sum_j D_{sj},\qquad D\leftarrow D/c,\quad
-W\leftarrow cW.
+c_j=\max_s D_{sj},\qquad D_{:j}\leftarrow D_{:j}/c_j,\quad
+W_{j:}\leftarrow c_jW_{j:}.
 ```
 
-This leaves `D @ W` and relative component strengths unchanged.
-`display_profiles` independently peak-normalizes columns for plotting only.
+This leaves `D @ W` unchanged and makes every profile peak at one.
+`display_profiles` returns a separately allocated plotting view with the same
+peak convention.
 `build_soft_two_layer_model` then replaces the one-hot access rows with
 
 ```math
 P_t = \alpha D^T.
 ```
 
-The complete augmented passive columns are then normalized. Thus `alpha`
-controls passive hierarchy-access mass; controlled access can differ after
-desirability reweighting. The physical-goal row, first-hit abstraction, upper
-solve, task basis, and reward inpainting are otherwise identical.
+The complete augmented passive columns are then normalized. For discovered
+profiles, `alpha` is therefore the maximum local passive access strength;
+controlled access can differ after desirability reweighting. Custom profiles
+passed directly to `build_soft_two_layer_model` are used as supplied and are
+not implicitly normalized. The physical-goal row, first-hit abstraction,
+upper solve, task basis, and reward inpainting are otherwise identical.
 
 After a lower access into upper state \(j\), the entered column programs the
 next lower plan:
@@ -212,7 +215,7 @@ controlled and passive upper dynamics:
 r_t^1 = \beta(a_i^2(\cdot|s) - P_i^2(\cdot|s)).
 ```
 
-The paper specifies proportionality but not the scale. The balanced
+The paper specifies proportionality but not the scale. The historical
 eight-component soft-hierarchy default uses `beta=3`. The signal applies to
 subgoal-copy rewards; the original physical
 goal retains its terminal reward. `compute_layer_one_plan` exponentiates the
@@ -238,6 +241,14 @@ Immediately re-accessing the subgoal that supplied the active plan changes no
 state, reward, or weight. The sampler removes that outcome and renormalizes,
 analytically marginalizing repeated zero-time no-ops. Both physical-step and
 abstract-access limits return explicit status values.
+
+For online goal learning, `sample_online_hierarchical_rollout` and
+`sample_online_soft_hierarchical_rollout` replace the exact physical-goal
+interior basis column with a learned vector. It starts at zero unless an
+initial vector is supplied and receives the requested number of full
+Z-iteration sweeps after each nonterminal physical transition. Abstract
+accesses consume no physical time and do not advance goal learning. The soft
+result records distributed accesses as `SoftSubtaskAccess` values.
 
 ## 9. Reading order
 

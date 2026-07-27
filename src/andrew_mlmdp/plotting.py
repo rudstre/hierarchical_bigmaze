@@ -1144,6 +1144,49 @@ def _normalized_frame_task_weights(
     return weights
 
 
+def _composed_log_desirability_grid(
+    model: SoftTwoLayerModel,
+    frame: _SoftRolloutFrame,
+) -> np.ndarray:
+    """Map the full composed desirability on a readable logarithmic scale."""
+
+    if frame.plan is None:
+        return np.full(model.maze.shape, np.nan, dtype=np.float64)
+    desirability = frame.plan.physical_desirability
+    goal_state = model.maze.state_index(model.goal)
+    goal_desirability = desirability[goal_state]
+    relative_value = np.full_like(desirability, np.nan)
+    positive = desirability > 0.0
+    relative_value[positive] = (
+        model.parameters.lower_control_cost
+        * np.log(desirability[positive] / goal_desirability)
+    )
+    relative_value[goal_state] = np.nan
+    return desirability_grid(model.maze, relative_value)
+
+
+def _composed_log_desirability_norm(
+    model: SoftTwoLayerModel,
+    frames: list[_SoftRolloutFrame],
+) -> Normalize:
+    """Use one color scale for every composed-desirability animation frame."""
+
+    values = np.concatenate(
+        [
+            _composed_log_desirability_grid(model, frame).ravel()
+            for frame in frames
+        ]
+    )
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return Normalize(vmin=-1.0, vmax=0.0)
+    minimum = float(finite.min())
+    maximum = float(finite.max())
+    if minimum == maximum:
+        maximum = minimum + 1.0
+    return Normalize(vmin=minimum, vmax=maximum)
+
+
 def _format_probability(value: float | None) -> str:
     return "n/a" if value is None else f"{value: .4f}"
 
@@ -1333,12 +1376,6 @@ def animate_soft_hierarchical_rollout(
         model.number_of_subtasks,
         subtask_labels,
     )
-    desirability_norm = _desirability_norm(
-        frames,
-        maze=model.maze,
-        goal=model.goal,
-    )
-
     figure, axes = plt.subplot_mosaic(
         [
             ["maze", "profile", "desirability"],
@@ -1411,7 +1448,7 @@ def animate_soft_hierarchical_rollout(
         extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
     )
     _format_maze_axes(model.maze, profile_ax, show_grid=False)
-    profile_ax.set_title("Active soft subtask: none")
+    profile_ax.set_title("Soft access profile: none yet")
     figure.colorbar(
         profile_image,
         ax=profile_ax,
@@ -1420,14 +1457,14 @@ def animate_soft_hierarchical_rollout(
         pad=0.04,
     )
 
+    composed_desirability_norm = _composed_log_desirability_norm(
+        model,
+        frames,
+    )
     desirability_image = desirability_ax.imshow(
-        _frame_desirability_grid(
-            model.maze,
-            frames[0],
-            goal=model.goal,
-        ),
+        _composed_log_desirability_grid(model, frames[0]),
         cmap=color_map,
-        norm=desirability_norm,
+        norm=composed_desirability_norm,
         origin="upper",
         extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
     )
@@ -1442,43 +1479,89 @@ def animate_soft_hierarchical_rollout(
         markeredgewidth=0.8,
         zorder=4,
     )
-    desirability_ax.set_title(
-        "Lower desirability / goal desirability (goal omitted)"
+    (desirability_agent_marker,) = desirability_ax.plot(
+        [],
+        [],
+        marker="o",
+        markersize=9,
+        markerfacecolor="none",
+        markeredgecolor="white",
+        markeredgewidth=1.5,
+        zorder=7,
     )
+    for subtask, label in enumerate(labels):
+        profile_peak = int(
+            np.argmax(model.subtask_profiles[:, subtask])
+        )
+        peak_row, peak_column = model.maze.coordinate(profile_peak)
+        desirability_ax.text(
+            peak_column,
+            peak_row,
+            label,
+            color="white",
+            horizontalalignment="center",
+            verticalalignment="center",
+            fontsize=8,
+            zorder=6,
+            bbox={
+                "boxstyle": "round,pad=0.12",
+                "facecolor": "0.10",
+                "edgecolor": "none",
+                "alpha": 0.65,
+            },
+        )
     figure.colorbar(
         desirability_image,
         ax=desirability_ax,
-        label="desirability",
+        label=r"$\lambda \log(z / z_{\mathrm{goal}})$",
         fraction=0.046,
         pad=0.04,
     )
-
-    weight_colors = plt.get_cmap("tab10").colors
-    weight_lines = []
-    blend_labels = labels + ("goal",)
-    for subtask, label in enumerate(blend_labels):
-        (line,) = weights_ax.plot(
-            [],
-            [],
-            color=weight_colors[subtask % len(weight_colors)],
-            marker="o",
-            markersize=3.0,
-            linewidth=2.0,
-            drawstyle="steps-post",
-            label=label,
-        )
-        weight_lines.append(line)
-    weights_ax.set_xlim(0, max(1, rollout.abstract_accesses))
-    weights_ax.set_ylim(0.0, 1.0)
-    weights_ax.set_xlabel("abstract calls")
-    weights_ax.set_ylabel("normalized blend fraction")
-    weights_ax.set_title("Task blend commanded by layer 2")
-    weights_ax.legend(
-        frameon=False,
-        ncols=min(3, len(blend_labels)),
-        fontsize=8,
+    desirability_ax.set_title(
+        "Full composed desirability (log scale; goal omitted)"
     )
-    weights_ax.grid(color="0.88", linewidth=0.6)
+
+    finite_reward_commands = [
+        frame.plan.inpainted_rewards[:-1]
+        for frame in frames
+        if frame.plan is not None
+        and np.all(np.isfinite(frame.plan.inpainted_rewards[:-1]))
+    ]
+    largest_reward = max(
+        (
+            float(np.max(np.abs(command)))
+            for command in finite_reward_commands
+        ),
+        default=0.1,
+    )
+    reward_limit = 1.25 * max(0.1, largest_reward)
+    reward_x = np.arange(model.number_of_subtasks)
+    reward_bars = weights_ax.bar(
+        reward_x,
+        np.zeros(model.number_of_subtasks),
+        color="0.55",
+        width=0.72,
+    )
+    reward_value_labels = [
+        weights_ax.text(
+            x,
+            0.0,
+            "",
+            horizontalalignment="center",
+            fontsize=8,
+        )
+        for x in reward_x
+    ]
+    weights_ax.axhline(0.0, color="0.25", linewidth=0.9)
+    weights_ax.set_xlim(-0.6, model.number_of_subtasks - 0.4)
+    weights_ax.set_ylim(-reward_limit, reward_limit)
+    weights_ax.set_xticks(reward_x, labels)
+    weights_ax.set_ylabel("inpainted reward")
+    weights_ax.set_title(
+        "Layer-2 subtask reward command "
+        f"(physical goal fixed at +{model.parameters.goal_reward:g})"
+    )
+    weights_ax.grid(axis="y", color="0.88", linewidth=0.6)
     weights_ax.set_axisbelow(True)
 
     communication_ax.axis("off")
@@ -1507,6 +1590,10 @@ def animate_soft_hierarchical_rollout(
             [coordinate[0] for coordinate in frame.trajectory],
         )
         agent_marker.set_data([frame.coordinate[1]], [frame.coordinate[0]])
+        desirability_agent_marker.set_data(
+            [frame.coordinate[1]],
+            [frame.coordinate[0]],
+        )
         display_profiles = model.subtask_profiles / model.subtask_profiles.max(
             axis=0,
             keepdims=True,
@@ -1515,7 +1602,7 @@ def animate_soft_hierarchical_rollout(
             profile_image.set_data(
                 desirability_grid(model.maze, empty_profile)
             )
-            profile_ax.set_title("Layer 2 command: none")
+            profile_ax.set_title("Soft access profile: none yet")
         else:
             profile_image.set_data(
                 desirability_grid(
@@ -1543,32 +1630,47 @@ def animate_soft_hierarchical_rollout(
                     f"{labels[frame.profile_subtask]}"
                 )
         desirability_image.set_data(
-            _frame_desirability_grid(
-                model.maze,
-                frame,
-                goal=model.goal,
-            )
+            _composed_log_desirability_grid(model, frame)
         )
 
-        history = frames[: frame_index + 1]
-        access_frames = [
-            item
-            for item in history
-            if item.event
-            in {"initial_plan", "upper_command", "upper_termination"}
-        ]
-        history_x = [item.abstract_accesses for item in access_frames]
-        history_weights = np.vstack(
-            [
-                _normalized_frame_task_weights(
-                    item,
-                    model.number_of_subtasks + 1,
-                )
-                for item in access_frames
-            ]
+        reward_command_disabled = (
+            frame.plan is None
+            or not np.all(
+                np.isfinite(frame.plan.inpainted_rewards[:-1])
+            )
         )
-        for subtask, line in enumerate(weight_lines):
-            line.set_data(history_x, history_weights[:, subtask])
+        if reward_command_disabled:
+            reward_command = np.zeros(model.number_of_subtasks)
+        else:
+            reward_command = frame.plan.inpainted_rewards[:-1]
+        label_offset = 0.025 * reward_limit
+        for bar, value_label, reward in zip(
+            reward_bars,
+            reward_value_labels,
+            reward_command,
+        ):
+            bar.set_height(reward)
+            if reward_command_disabled:
+                bar.set_color("0.55")
+                value_label.set_text("off" if frame.plan is not None else "")
+            elif reward > 0.0:
+                bar.set_color("#4c956c")
+                value_label.set_text(f"{reward:+.2f}")
+            elif reward < 0.0:
+                bar.set_color("#d1495b")
+                value_label.set_text(f"{reward:+.2f}")
+            else:
+                bar.set_color("0.55")
+                value_label.set_text("0")
+            value_label.set_position(
+                (
+                    bar.get_x() + 0.5 * bar.get_width(),
+                    reward + (label_offset if reward >= 0.0 else -label_offset),
+                )
+            )
+            value_label.set_verticalalignment(
+                "bottom" if reward >= 0.0 else "top"
+            )
 
         maze_ax.set_title(
             f"Physical state: {_event_title(frame.event)} "
@@ -1600,7 +1702,9 @@ def animate_soft_hierarchical_rollout(
             agent_marker,
             profile_image,
             desirability_image,
-            *weight_lines,
+            desirability_agent_marker,
+            *reward_bars,
+            *reward_value_labels,
             status_text,
             detail_text,
         )

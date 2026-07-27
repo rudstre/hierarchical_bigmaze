@@ -42,13 +42,13 @@ def test_soft_hierarchy_parameters_use_k8_defaults() -> None:
 def test_soft_hierarchy_parameters_scale_with_rank() -> None:
     parameters = soft_hierarchy_parameters(32)
 
-    assert parameters.upper_control_cost == pytest.approx(0.6)
-    assert parameters.alpha == pytest.approx(0.0025)
-    assert parameters.interior_reward == -0.075
-    assert parameters.goal_reward == 1.0
-    assert parameters.lower_control_cost == 0.15
-    assert parameters.off_target_reward == -1.0
-    assert parameters.beta == 3.0
+    assert parameters.upper_control_cost == pytest.approx(2.3)
+    assert parameters.alpha == pytest.approx(0.04)
+    assert parameters.interior_reward == -0.05
+    assert parameters.goal_reward == 0.65
+    assert parameters.lower_control_cost == 0.12
+    assert parameters.off_target_reward == -1.3
+    assert parameters.beta == 13.5
 
 
 def test_soft_hierarchy_parameters_accept_individual_overrides() -> None:
@@ -63,7 +63,7 @@ def test_soft_hierarchy_parameters_accept_individual_overrides() -> None:
     assert parameters.beta == 5.0
     assert parameters.interior_reward == -0.05
     assert parameters.upper_control_cost == pytest.approx(
-        0.3 * np.sqrt(4.0 / 8.0)
+        1.15 * np.sqrt(4.0 / 8.0)
     )
 
 
@@ -97,7 +97,10 @@ def test_one_cell_maze_contains_only_goal_desirability() -> None:
     desirability = solve_desirability(
         maze,
         goal=(0, 0),
-        parameters=ModelParameters(lower_control_cost=1.0),
+        parameters=ModelParameters(
+            goal_reward=1.0,
+            lower_control_cost=1.0,
+        ),
     )
 
     assert desirability.dtype == np.float64
@@ -114,7 +117,10 @@ def test_corridor_desirability_increases_toward_goal() -> None:
 def test_solution_satisfies_linear_bellman_equation() -> None:
     maze = Maze.from_ascii("...\n.#.\n...")
     goal = (2, 2)
-    parameters = ModelParameters(lower_control_cost=1.0)
+    parameters = ModelParameters(
+        goal_reward=1.0,
+        lower_control_cost=1.0,
+    )
     desirability = solve_desirability(maze, goal, parameters=parameters)
     passive_dynamics = build_passive_dynamics(maze)
 
@@ -168,7 +174,10 @@ def test_solver_parameters_must_define_a_well_posed_problem(
 def test_four_rooms_desirability_and_grid_view() -> None:
     maze = Maze.from_file(FOUR_ROOMS_FILE)
     goal = (10, 9)
-    parameters = ModelParameters(lower_control_cost=1.0)
+    parameters = ModelParameters(
+        goal_reward=1.0,
+        lower_control_cost=1.0,
+    )
     desirability = solve_desirability(maze, goal, parameters=parameters)
     grid = desirability_grid(maze, desirability)
 
@@ -332,13 +341,13 @@ def test_z_iteration_rejects_invalid_values(
 def test_canonical_parameter_defaults() -> None:
     parameters = ModelParameters()
 
-    assert parameters.interior_reward == -0.075
-    assert parameters.goal_reward == 1.0
-    assert parameters.alpha == 0.005
-    assert parameters.lower_control_cost == 0.15
-    assert parameters.upper_control_cost == 0.3
-    assert parameters.off_target_reward == -1.0
-    assert parameters.beta == 3.0
+    assert parameters.interior_reward == -0.05
+    assert parameters.goal_reward == 0.65
+    assert parameters.alpha == 0.08
+    assert parameters.lower_control_cost == 0.12
+    assert parameters.upper_control_cost == 1.15
+    assert parameters.off_target_reward == -1.3
+    assert parameters.beta == 13.5
 
 
 def test_controlled_dynamics_prefer_movement_toward_goal() -> None:

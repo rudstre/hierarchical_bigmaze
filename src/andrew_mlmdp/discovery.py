@@ -100,11 +100,11 @@ class SoftSubtaskDiscovery:
 
     @property
     def display_profiles(self) -> np.ndarray:
-        """Return independently peak-normalized profiles for visualization.
+        """Return a peak-normalized copy of the profiles for visualization.
 
-        The model-facing :attr:`profiles` retain the single global NMF gauge
-        used to construct hierarchy-access dynamics.  Plotting must not change
-        that scale, so this view is computed separately.
+        Factorization outputs already use this component-wise gauge. The
+        normalization remains here so manually constructed discovery objects
+        receive the same plotting behavior without mutating model inputs.
         """
 
         return self.profiles / self.profiles.max(axis=0, keepdims=True)
@@ -189,17 +189,10 @@ def factorize_soft_subtasks(
     raw_profiles = factorization.fit_transform(target)
     raw_weights = factorization.components_
 
-    if np.any(raw_profiles.max(axis=0) <= 0.0):
-        raise ValueError("NMF produced an empty subtask profile")
-
-    # NMF has a global gauge freedom D -> D/c, W -> cW.  Fix only that
-    # global gauge so relative component strengths remain intact and the one
-    # scalar alpha in P_t = alpha D^T has a consistent interpretation.
-    gauge = float(np.median(raw_profiles.sum(axis=1)))
-    if not np.isfinite(gauge) or gauge <= 0.0:
-        raise ValueError("NMF produced a degenerate global profile gauge")
-    profiles = raw_profiles / gauge
-    task_weights = raw_weights * gauge
+    profiles, task_weights = _peak_normalize_nmf_factors(
+        raw_profiles,
+        raw_weights,
+    )
     reconstruction = profiles @ task_weights
 
     return SoftSubtaskDiscovery(
@@ -214,6 +207,42 @@ def factorize_soft_subtasks(
         n_iter=int(factorization.n_iter_),
         converged=factorization.n_iter_ < max_iter,
     )
+
+
+def _peak_normalize_nmf_factors(
+    profiles: np.ndarray,
+    task_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fix every NMF component gauge without changing its reconstruction.
+
+    Each profile column is scaled to peak at one and its scale is absorbed by
+    the corresponding task-weight row. This makes ``alpha`` in
+    ``P_t = alpha D.T`` the maximum local passive access strength.
+    """
+
+    profile_values = np.asarray(profiles, dtype=np.float64)
+    weight_values = np.asarray(task_weights, dtype=np.float64)
+    if profile_values.ndim != 2 or weight_values.ndim != 2:
+        raise ValueError("NMF factors must be matrices")
+    expected_weight_rows = profile_values.shape[1]
+    if weight_values.shape[0] != expected_weight_rows:
+        raise ValueError(
+            "NMF task weights must have one row per profile column"
+        )
+    if (
+        np.any(profile_values < 0.0)
+        or np.any(weight_values < 0.0)
+        or not np.all(np.isfinite(profile_values))
+        or not np.all(np.isfinite(weight_values))
+    ):
+        raise ValueError("NMF factors must be finite and non-negative")
+
+    component_scales = profile_values.max(axis=0)
+    if np.any(component_scales <= 0.0):
+        raise ValueError("NMF produced an empty subtask profile")
+    normalized_profiles = profile_values / component_scales[np.newaxis, :]
+    normalized_weights = weight_values * component_scales[:, np.newaxis]
+    return normalized_profiles, normalized_weights
 
 
 def evaluate_soft_subtask_ranks(

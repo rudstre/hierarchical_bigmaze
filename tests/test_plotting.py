@@ -413,7 +413,15 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
         maze,
         profiles,
         goal=(0, 4),
-        parameters=ModelParameters(alpha=2.0),
+        parameters=ModelParameters(
+            interior_reward=-0.075,
+            goal_reward=1.0,
+            lower_control_cost=0.15,
+            upper_control_cost=0.3,
+            alpha=2.0,
+            off_target_reward=-1.0,
+            beta=3.0,
+        ),
     )
     animation = animate_soft_hierarchical_rollout(
         model,
@@ -422,6 +430,51 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
         max_steps=100,
     )
     assert isinstance(animation, FuncAnimation)
+    animation._func(0)
+    desirability_ax = next(
+        ax
+        for ax in animation._fig.axes
+        if ax.get_title().startswith("Full composed desirability")
+    )
+    displayed_values = desirability_ax.images[0].get_array()
+    initial_frame = animation._soft_frames[0]
+    goal_state = model.maze.state_index(model.goal)
+    goal_desirability = initial_frame.plan.physical_desirability[
+        goal_state
+    ]
+    expected_values = (
+        model.parameters.lower_control_cost
+        * np.log(
+            initial_frame.plan.physical_desirability
+            / goal_desirability
+        )
+    )
+    for state, coordinate in enumerate(
+        cell
+        for cell in model.maze.free_cells
+        if cell != model.goal
+    ):
+        assert displayed_values[coordinate] == pytest.approx(
+            expected_values[model.interior_states[state]]
+        )
+    assert np.ma.is_masked(displayed_values[model.goal])
+    reward_ax = next(
+        ax
+        for ax in animation._fig.axes
+        if ax.get_title().startswith("Layer-2 subtask reward command")
+    )
+    displayed_rewards = np.asarray(
+        [bar.get_height() for bar in reward_ax.patches]
+    )
+    expected_rewards = initial_frame.plan.inpainted_rewards[:-1]
+    assert displayed_rewards == pytest.approx(expected_rewards)
+    upper_probability_changes = (
+        initial_frame.plan.controlled_abstract[:-1]
+        - initial_frame.plan.passive_abstract[:-1]
+    )
+    assert np.sign(displayed_rewards) == pytest.approx(
+        np.sign(upper_probability_changes)
+    )
     access_index = next(
         index
         for index, frame in enumerate(animation._soft_frames)

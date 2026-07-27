@@ -94,6 +94,7 @@ from andrew_mlmdp import (
     build_goal_task_ensemble,
     build_soft_two_layer_model,
     factorize_soft_subtasks,
+    sample_online_soft_hierarchical_rollout,
     sample_soft_hierarchical_rollout,
     soft_hierarchy_parameters,
 )
@@ -117,34 +118,75 @@ soft_rollout = sample_soft_hierarchical_rollout(
     start=(1, 0),
     seed=3,
 )
+
+# Replace the exact goal solution with a zero-initialized solution that
+# advances by one full Z-iteration after every nonterminal physical step.
+online_soft_rollout = sample_online_soft_hierarchical_rollout(
+    soft_model,
+    start=(1, 0),
+    seed=3,
+)
 ```
 
-## Canonical parameters
+`factorize_soft_subtasks` peak-normalizes every profile column and absorbs its
+scale into the matching task-weight row. This leaves the NMF reconstruction
+unchanged and makes `alpha` the maximum local passive access strength.
 
-`ModelParameters()` uses the balanced eight-component soft-hierarchy regime:
+## Reference parameters
+
+`ModelParameters()` uses the sustained-hierarchy regime from the post-peak-
+normalization rank-eight validation:
 
 | Parameter | Default |
 | --- | ---: |
-| Interior reward | `-0.075` |
-| Goal reward | `1.0` |
-| Lower control cost `lambda_1` | `0.15` |
-| Upper control cost `lambda_2` | `0.3` |
-| Subgoal-access mass `alpha` | `0.005` |
-| Off-target basis reward | `-1.0` |
-| Reward-inpainting scale `beta` | `3.0` |
+| Interior reward | `-0.05` |
+| Goal reward | `0.65` |
+| Lower control cost `lambda_1` | `0.12` |
+| Upper control cost `lambda_2` | `1.15` |
+| Subgoal-access mass `alpha` | `0.08` |
+| Off-target basis reward | `-1.3` |
+| Reward-inpainting scale `beta` | `13.5` |
 
 These are empirical project choices rather than values uniquely determined by
-the paper. `soft_hierarchy_parameters(k)` scales `alpha` and the upper control
-cost for another NMF rank:
+the paper. The validation used all 96 non-goal starts, eight rollout seeds,
+and three NMF seeds (2,304 rollouts): 100% goal success, 20.71 mean physical
+steps, and 39 steps at the 90th percentile. The hierarchy controlled 88.7% of
+each rollout on average, made 86.9% normalized goalward progress while active,
+and remained active through goal arrival in 70.3% of episodes.
+
+The hierarchy materially changed the lower policy (mean total variation
+`0.382`). Its soft accesses were region-selective: one profile supplied 95.0%
+of local access membership on average. Signed Equation 10 commands assigned
+71.3% of their positive reward mass to the leading subtask on average, with
+an effective positive command size of 1.84 subtasks. These signed reward and
+access-selectivity measures are used instead of raw desirability-component
+fractions, which are not meaningful activation measures after exponentiation.
+
+Immediate handoff occurred in 4.9% of episodes and termination within five
+physical steps in 5.2%. At the notebook demonstration start `(3, 2)`, none of
+the 24 robust trials terminated within five steps and the median active phase
+was 31 steps. The soft policy averaged 3.98 steps longer than its flat
+solved-goal comparator; the preset deliberately favors sustained hierarchical
+guidance over matching the speed of an already solved exact goal policy.
+
+Nineteen of 29 one-factor perturbations passed the stricter sustained-use
+screen. The reproducible sweep and its signed-command selectivity,
+early-termination, and sensitivity criteria live in
+`experiments/sweep_soft_k8.py`.
+
+`soft_hierarchy_parameters(k)` scales `alpha` and the upper control cost for
+another NMF rank:
 
 ```python
 parameters = soft_hierarchy_parameters(
     k=12,
-    beta=5.0,  # optional explicit override
+    beta=10.0,  # optional explicit override
 )
 ```
 
-Every `ModelParameters` field is available as an optional keyword override.
+Only the rank-eight reference received this behavioral validation; the rank
+scaling remains a heuristic. Every `ModelParameters` field is available as an
+optional keyword override.
 Use `paper_hierarchy_parameters()` when the paper-scale constants are desired
 without the rank heuristic.
 

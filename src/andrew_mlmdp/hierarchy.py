@@ -227,6 +227,30 @@ class SoftHierarchicalRollout:
 
 
 @dataclass(frozen=True)
+class OnlineSoftHierarchicalRollout:
+    """A soft-subtask rollout with an incrementally learned goal solution."""
+
+    trajectory: list[Coordinate]
+    subtask_accesses: list[SoftSubtaskAccess]
+    weight_history: list[np.ndarray]
+    goal_desirability_history: list[np.ndarray]
+    physical_steps: int
+    abstract_accesses: int
+    z_iterations: int
+    reached_goal: bool
+    status: str
+    upper_transitions: list[UpperLayerTransition] = field(
+        default_factory=list
+    )
+
+    @property
+    def final_goal_desirability(self) -> np.ndarray:
+        """Return the learned goal vector after the final Z sweep."""
+
+        return self.goal_desirability_history[-1]
+
+
+@dataclass(frozen=True)
 class _OnlineHierarchicalRolloutFrame:
     """One drawable moment in an online hierarchical rollout."""
 
@@ -680,6 +704,18 @@ def _compose_lower_policy(
     return physical_desirability, controlled
 
 
+def _task_desirability_contributions(
+    model: TwoLayerModel | SoftTwoLayerModel,
+    plan: LayerOnePlan,
+) -> np.ndarray:
+    """Return each task column's additive interior-desirability contribution."""
+
+    return (
+        model.task_basis.interior_desirability
+        * plan.weights[np.newaxis, :]
+    )
+
+
 def _validated_goal_desirability(
     model: TwoLayerModel | SoftTwoLayerModel,
     values: np.ndarray,
@@ -702,7 +738,7 @@ def _validated_goal_desirability(
 
 
 def _plan_with_goal_desirability(
-    model: TwoLayerModel,
+    model: TwoLayerModel | SoftTwoLayerModel,
     plan: LayerOnePlan,
     goal_desirability: np.ndarray,
 ) -> LayerOnePlan:
@@ -822,6 +858,57 @@ def sample_online_hierarchical_rollout(
         seed=seed,
     )
     return rollout
+
+
+def sample_online_soft_hierarchical_rollout(
+    model: SoftTwoLayerModel,
+    start: Coordinate,
+    *,
+    initial_goal_desirability: np.ndarray | None = None,
+    z_sweeps_per_step: int = 1,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+) -> OnlineSoftHierarchicalRollout:
+    """Sample a soft-subtask rollout while learning the physical-goal solution.
+
+    The distributed subtask basis and layer 2 remain exact. The physical-goal
+    basis column is replaced by the current learned desirability, initialized
+    to zero by default and updated after each nonterminal physical transition.
+    """
+
+    result = _run_hierarchical_rollout(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+        initial_goal_desirability=initial_goal_desirability,
+        z_sweeps_per_step=z_sweeps_per_step,
+    )
+    assert result.goal_desirability_history is not None
+    accesses = [
+        SoftSubtaskAccess(
+            subtask=transition.entered_state,
+            coordinate=transition.coordinate,
+            physical_steps=transition.physical_steps,
+        )
+        for transition in result.upper_transitions
+    ]
+    return OnlineSoftHierarchicalRollout(
+        trajectory=result.trajectory,
+        subtask_accesses=accesses,
+        upper_transitions=result.upper_transitions,
+        weight_history=result.weight_history,
+        goal_desirability_history=result.goal_desirability_history,
+        physical_steps=result.physical_steps,
+        abstract_accesses=len(result.upper_transitions),
+        z_iterations=result.z_iterations,
+        reached_goal=result.reached_goal,
+        status=result.status,
+    )
 
 
 def _trace_online_hierarchical_rollout(
@@ -945,8 +1032,6 @@ def _run_hierarchical_rollout(
 
     online = z_sweeps_per_step is not None
     if online:
-        if not isinstance(model, TwoLayerModel):
-            raise ValueError("Online goal learning requires fixed subgoals")
         if (
             isinstance(z_sweeps_per_step, (bool, np.bool_))
             or not isinstance(z_sweeps_per_step, (int, np.integer))

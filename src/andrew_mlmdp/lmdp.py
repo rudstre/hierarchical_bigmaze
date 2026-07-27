@@ -21,13 +21,13 @@ class ModelParameters:
     Defaults are canonical project choices, not values fixed by the paper.
     """
 
-    interior_reward: float = -0.075
-    goal_reward: float = 1.0
-    lower_control_cost: float = 0.15
-    upper_control_cost: float = 0.3
-    alpha: float = 0.005
-    off_target_reward: float = -1.0
-    beta: float = 3.0
+    interior_reward: float = -0.05
+    goal_reward: float = 0.65
+    lower_control_cost: float = 0.12
+    upper_control_cost: float = 1.15
+    alpha: float = 0.08
+    off_target_reward: float = -1.3
+    beta: float = 13.5
 
     def __post_init__(self) -> None:
         values = (
@@ -78,14 +78,13 @@ def soft_hierarchy_parameters(
     off_target_reward: float | None = None,
     beta: float | None = None,
 ) -> ModelParameters:
-    """Return empirically balanced soft-hierarchy parameters for rank ``k``.
+    """Return soft-hierarchy parameters for rank ``k``.
 
-    The defaults use the validated eight-component regime.  For other ranks,
-    the heuristic keeps the physical-layer and inpainting parameters fixed
-    while applying ``alpha ~ 1 / sqrt(k)`` and
-    ``upper_control_cost ~ sqrt(k)``.  This compensates for the expected
-    square-root growth of abstract path length in a spatial two-dimensional
-    decomposition; it is an empirical starting point, not a paper identity.
+    The rank-eight reference was validated after component-wise NMF peak
+    normalization. For ranks other than eight, the heuristic keeps the
+    physical-layer and inpainting parameters fixed while applying
+    ``alpha ~ 1 / sqrt(k)`` and ``upper_control_cost ~ sqrt(k)``; those derived
+    ranks have not received the same behavioral validation.
 
     Any explicitly supplied parameter replaces its default or derived value.
     """

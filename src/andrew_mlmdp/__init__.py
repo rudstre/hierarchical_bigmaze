@@ -12,6 +12,7 @@ from andrew_mlmdp.hierarchy import (
     HierarchicalRollout,
     LayerOnePlan,
     OnlineHierarchicalRollout,
+    OnlineSoftHierarchicalRollout,
     SoftHierarchicalRollout,
     SoftSubtaskAccess,
     SoftTwoLayerModel,
@@ -25,6 +26,7 @@ from andrew_mlmdp.hierarchy import (
     compute_layer_one_plan,
     sample_hierarchical_rollout,
     sample_online_hierarchical_rollout,
+    sample_online_soft_hierarchical_rollout,
     sample_soft_hierarchical_rollout,
 )
 from andrew_mlmdp.lmdp import (
@@ -63,6 +65,7 @@ __all__ = [
     "ModelParameters",
     "NMFRankDiagnostics",
     "OnlineHierarchicalRollout",
+    "OnlineSoftHierarchicalRollout",
     "SoftHierarchicalRollout",
     "SoftSubtaskAccess",
     "SoftSubtaskDiscovery",
@@ -95,6 +98,7 @@ __all__ = [
     "sample_rollout",
     "sample_hierarchical_rollout",
     "sample_online_hierarchical_rollout",
+    "sample_online_soft_hierarchical_rollout",
     "sample_soft_hierarchical_rollout",
     "solve_desirability",
     "solve_first_exit",

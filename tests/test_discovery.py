@@ -4,6 +4,7 @@ from sklearn.exceptions import ConvergenceWarning
 
 from andrew_mlmdp.discovery import (
     GoalTaskEnsemble,
+    _peak_normalize_nmf_factors,
     build_goal_task_ensemble,
     evaluate_soft_subtask_ranks,
     factorize_soft_subtasks,
@@ -25,7 +26,7 @@ def test_goal_task_ensemble_matches_flat_solutions() -> None:
     assert ensemble.normalized_desirability.max(axis=0) == pytest.approx(1.0)
 
 
-def test_soft_subtask_factorization_is_reproducible_and_globally_gauged() -> None:
+def test_soft_subtask_factorization_is_reproducible_and_peak_gauged() -> None:
     ensemble = build_goal_task_ensemble(Maze.from_ascii("...."))
     first = factorize_soft_subtasks(ensemble, 2, seed=4)
     second = factorize_soft_subtasks(ensemble, 2, seed=4)
@@ -33,7 +34,7 @@ def test_soft_subtask_factorization_is_reproducible_and_globally_gauged() -> Non
     assert first.profiles.shape == (4, 2)
     assert first.task_weights.shape == (2, 4)
     assert first.reconstruction.shape == (4, 4)
-    assert np.median(first.profiles.sum(axis=1)) == pytest.approx(1.0)
+    assert first.profiles.max(axis=0) == pytest.approx(1.0)
     assert first.display_profiles.max(axis=0) == pytest.approx(1.0)
     assert not np.shares_memory(first.display_profiles, first.profiles)
     assert np.all(first.profiles >= 0.0)
@@ -46,6 +47,46 @@ def test_soft_subtask_factorization_is_reproducible_and_globally_gauged() -> Non
     assert first.task_weights == pytest.approx(second.task_weights)
     assert first.reconstruction_error == pytest.approx(
         second.reconstruction_error
+    )
+
+
+def test_peak_normalization_is_invariant_to_component_rescaling() -> None:
+    profiles = np.asarray(
+        [
+            [0.2, 3.0],
+            [1.0, 1.5],
+            [0.5, 0.3],
+        ]
+    )
+    weights = np.asarray(
+        [
+            [1.0, 2.0, 3.0],
+            [0.5, 0.25, 0.75],
+        ]
+    )
+    component_rescaling = np.asarray([100.0, 0.01])
+    equivalent_profiles = profiles * component_rescaling[np.newaxis, :]
+    equivalent_weights = weights / component_rescaling[:, np.newaxis]
+
+    normalized_profiles, normalized_weights = (
+        _peak_normalize_nmf_factors(profiles, weights)
+    )
+    equivalent_normalized_profiles, equivalent_normalized_weights = (
+        _peak_normalize_nmf_factors(
+            equivalent_profiles,
+            equivalent_weights,
+        )
+    )
+
+    assert normalized_profiles.max(axis=0) == pytest.approx(1.0)
+    assert normalized_profiles == pytest.approx(
+        equivalent_normalized_profiles
+    )
+    assert normalized_weights == pytest.approx(
+        equivalent_normalized_weights
+    )
+    assert normalized_profiles @ normalized_weights == pytest.approx(
+        profiles @ weights
     )
 
 
