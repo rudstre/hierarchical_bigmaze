@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from time import monotonic
+from typing import Callable
 
 from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
@@ -64,6 +65,61 @@ class _SoftRolloutFrame:
     controlled_access_probability: float | None = None
     refractory: bool = False
     status: str | None = None
+
+
+@dataclass(frozen=True)
+class SoftHierarchicalRolloutPlayer:
+    """A paused notebook player for inspecting one rollout frame at a time."""
+
+    figure: Figure
+    controls: object
+    rollout: SoftHierarchicalRollout
+    frame_count: int
+    _frame_slider: object
+    _goal_component_checkbox: object
+
+    @property
+    def frame_index(self) -> int:
+        """Return the currently displayed zero-based frame index."""
+
+        return int(self._frame_slider.value)
+
+    def show_frame(self, frame_index: int) -> None:
+        """Display one frame, validating it against the recorded rollout."""
+
+        if (
+            isinstance(frame_index, bool)
+            or not isinstance(frame_index, (int, np.integer))
+            or not 0 <= int(frame_index) < self.frame_count
+        ):
+            raise ValueError(
+                f"frame_index must be between 0 and {self.frame_count - 1}"
+            )
+        self._frame_slider.value = int(frame_index)
+
+    @property
+    def goal_component_visible(self) -> bool:
+        """Return whether the heatmap includes the exact goal-basis column."""
+
+        return bool(self._goal_component_checkbox.value)
+
+    def show_goal_component(self, visible: bool) -> None:
+        """Include or remove the exact goal-basis column in the heatmap."""
+
+        if not isinstance(visible, (bool, np.bool_)):
+            raise ValueError("visible must be a boolean")
+        self._goal_component_checkbox.value = bool(visible)
+
+
+@dataclass(frozen=True)
+class _SoftRolloutRenderer:
+    """Shared soft-rollout figure state used by players and animations."""
+
+    figure: Figure
+    rollout: SoftHierarchicalRollout
+    frames: list[_SoftRolloutFrame]
+    update: Callable[[int], tuple[object, ...]]
+    set_goal_component: Callable[[bool], None]
 
 
 _RolloutFrame = _HierarchicalRolloutFrame | _OnlineHierarchicalRolloutFrame
@@ -1147,20 +1203,38 @@ def _normalized_frame_task_weights(
 def _composed_log_desirability_grid(
     model: SoftTwoLayerModel,
     frame: _SoftRolloutFrame,
+    *,
+    include_goal_component: bool = True,
 ) -> np.ndarray:
     """Map the full composed desirability on a readable logarithmic scale."""
 
     if frame.plan is None:
         return np.full(model.maze.shape, np.nan, dtype=np.float64)
-    desirability = frame.plan.physical_desirability
+    if include_goal_component:
+        desirability = frame.plan.physical_desirability
+    else:
+        desirability = np.zeros(
+            len(model.maze.free_cells),
+            dtype=np.float64,
+        )
+        desirability[model.interior_states] = (
+            model.task_basis.interior_desirability[:, :-1]
+            @ frame.plan.weights[:-1]
+        )
+        goal_state = model.maze.state_index(model.goal)
+        # Non-goal basis tasks have zero desirability at the exact goal
+        # boundary. Retain the full plan's goal value only as a shared display
+        # reference so toggling the component changes no other scale factor.
+        desirability[goal_state] = frame.plan.physical_desirability[goal_state]
     goal_state = model.maze.state_index(model.goal)
     goal_desirability = desirability[goal_state]
     relative_value = np.full_like(desirability, np.nan)
-    positive = desirability > 0.0
-    relative_value[positive] = (
-        model.parameters.lower_control_cost
-        * np.log(desirability[positive] / goal_desirability)
-    )
+    if np.isfinite(goal_desirability) and goal_desirability > 0.0:
+        positive = desirability > 0.0
+        relative_value[positive] = (
+            model.parameters.lower_control_cost
+            * np.log(desirability[positive] / goal_desirability)
+        )
     relative_value[goal_state] = np.nan
     return desirability_grid(model.maze, relative_value)
 
@@ -1168,10 +1242,16 @@ def _composed_log_desirability_grid(
 def _composed_log_desirability_norm(
     model: SoftTwoLayerModel,
     frame: _SoftRolloutFrame,
+    *,
+    include_goal_component: bool = True,
 ) -> Normalize:
     """Scale one frame without allowing future rollout states to affect it."""
 
-    values = _composed_log_desirability_grid(model, frame).ravel()
+    values = _composed_log_desirability_grid(
+        model,
+        frame,
+        include_goal_component=include_goal_component,
+    ).ravel()
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         return Normalize(vmin=-1.0, vmax=0.0)
@@ -1328,7 +1408,7 @@ def plot_soft_subtask_rank_diagnostics(
     return figure
 
 
-def animate_soft_hierarchical_rollout(
+def _build_soft_hierarchical_rollout_renderer(
     model: SoftTwoLayerModel,
     start: Coordinate,
     *,
@@ -1337,11 +1417,9 @@ def animate_soft_hierarchical_rollout(
     max_abstract_accesses: int = 500,
     seed: int | None = None,
     subtask_labels: list[str] | tuple[str, ...] | None = None,
-    interval: int = 500,
-    repeat: bool = False,
     figsize: tuple[float, float] = (14, 8),
-) -> FuncAnimation:
-    """Animate physical motion and distributed subtask accesses."""
+) -> _SoftRolloutRenderer:
+    """Build shared soft-rollout artists without starting a render timer."""
 
     engine_result, engine_events = _trace_hierarchy_events(
         model,
@@ -1454,13 +1532,16 @@ def animate_soft_hierarchical_rollout(
         pad=0.04,
     )
 
+    goal_component_state = {"included": True}
     initial_desirability_grid = _composed_log_desirability_grid(
         model,
         frames[0],
+        include_goal_component=goal_component_state["included"],
     )
     composed_desirability_norm = _composed_log_desirability_norm(
         model,
         frames[0],
+        include_goal_component=goal_component_state["included"],
     )
     desirability_image = desirability_ax.imshow(
         initial_desirability_grid,
@@ -1519,7 +1600,7 @@ def animate_soft_hierarchical_rollout(
         pad=0.04,
     )
     desirability_ax.set_title(
-        "Full composed desirability (log scale; goal omitted)"
+        "Full composed desirability (log scale; goal cell masked)"
     )
 
     reward_limit = 0.125
@@ -1620,12 +1701,27 @@ def animate_soft_hierarchical_rollout(
         desirability_grid_values = _composed_log_desirability_grid(
             model,
             frame,
+            include_goal_component=goal_component_state["included"],
         )
         desirability_image.set_data(desirability_grid_values)
         desirability_image.set_norm(
-            _composed_log_desirability_norm(model, frame)
+            _composed_log_desirability_norm(
+                model,
+                frame,
+                include_goal_component=goal_component_state["included"],
+            )
         )
         desirability_colorbar.update_normal(desirability_image)
+        if goal_component_state["included"]:
+            desirability_ax.set_title(
+                "Full composed desirability "
+                "(log scale; goal cell masked)"
+            )
+        else:
+            desirability_ax.set_title(
+                "Subtask-only desirability "
+                "(exact goal basis removed)"
+            )
 
         reward_command_disabled = (
             frame.plan is None
@@ -1708,17 +1804,175 @@ def animate_soft_hierarchical_rollout(
             detail_text,
         )
 
+    def set_goal_component(visible: bool) -> None:
+        goal_component_state["included"] = bool(visible)
+
+    return _SoftRolloutRenderer(
+        figure=figure,
+        rollout=rollout,
+        frames=frames,
+        update=update,
+        set_goal_component=set_goal_component,
+    )
+
+
+def animate_soft_hierarchical_rollout(
+    model: SoftTwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+    subtask_labels: list[str] | tuple[str, ...] | None = None,
+    interval: int = 500,
+    repeat: bool = False,
+    figsize: tuple[float, float] = (14, 8),
+) -> FuncAnimation:
+    """Animate physical motion and distributed subtask accesses."""
+
+    renderer = _build_soft_hierarchical_rollout_renderer(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+        subtask_labels=subtask_labels,
+        figsize=figsize,
+    )
     animation = FuncAnimation(
-        figure,
-        update,
-        frames=len(frames),
+        renderer.figure,
+        renderer.update,
+        frames=len(renderer.frames),
         interval=interval,
         repeat=repeat,
         blit=False,
     )
-    animation._soft_rollout = rollout
-    animation._soft_frames = frames
+    animation._soft_rollout = renderer.rollout
+    animation._soft_frames = renderer.frames
     return animation
+
+
+def plot_interactive_soft_hierarchical_rollout(
+    model: SoftTwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+    subtask_labels: list[str] | tuple[str, ...] | None = None,
+    figsize: tuple[float, float] = (14, 8),
+) -> SoftHierarchicalRolloutPlayer:
+    """Build a paused ipywidgets player for manual rollout inspection.
+
+    The rollout and figure are created once. Moving the slider or pressing a
+    step button updates the existing Matplotlib artists without starting a
+    background animation timer. Call ``display(player.controls)`` followed by
+    ``plt.show()`` in a notebook using the ``ipympl`` widget backend.
+    """
+
+    try:
+        import ipywidgets as widgets
+    except ImportError as error:  # pragma: no cover - environment dependent
+        raise ImportError(
+            "Interactive rollout controls require the notebook extra: "
+            "pip install 'andrew-mlmdp[notebook]'"
+        ) from error
+
+    renderer = _build_soft_hierarchical_rollout_renderer(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+        subtask_labels=subtask_labels,
+        figsize=figsize,
+    )
+    frame_count = len(renderer.frames)
+    frame_slider = widgets.IntSlider(
+        value=0,
+        min=0,
+        max=frame_count - 1,
+        step=1,
+        description="Frame",
+        continuous_update=False,
+        readout=True,
+        layout=widgets.Layout(width="min(720px, 70vw)"),
+    )
+    previous_button = widgets.Button(
+        description="Previous",
+        icon="step-backward",
+        tooltip="Show the previous rollout event",
+    )
+    next_button = widgets.Button(
+        description="Next",
+        icon="step-forward",
+        tooltip="Show the next rollout event",
+    )
+    goal_component_checkbox = widgets.Checkbox(
+        value=True,
+        description="Include exact goal component",
+        indent=False,
+        tooltip=(
+            "Toggle the final goal-basis column in the displayed "
+            "desirability composition"
+        ),
+    )
+
+    def update_button_state(frame_index: int) -> None:
+        previous_button.disabled = frame_index == 0
+        next_button.disabled = frame_index == frame_count - 1
+
+    def render_selected_frame(change) -> None:
+        frame_index = int(change["new"])
+        renderer.update(frame_index)
+        update_button_state(frame_index)
+        renderer.figure.canvas.draw_idle()
+
+    def show_previous(_button) -> None:
+        frame_slider.value = max(frame_slider.min, frame_slider.value - 1)
+
+    def show_next(_button) -> None:
+        frame_slider.value = min(frame_slider.max, frame_slider.value + 1)
+
+    def toggle_goal_component(change) -> None:
+        renderer.set_goal_component(bool(change["new"]))
+        renderer.update(frame_slider.value)
+        renderer.figure.canvas.draw_idle()
+
+    frame_slider.observe(render_selected_frame, names="value")
+    goal_component_checkbox.observe(
+        toggle_goal_component,
+        names="value",
+    )
+    previous_button.on_click(show_previous)
+    next_button.on_click(show_next)
+    renderer.update(0)
+    update_button_state(0)
+
+    controls = widgets.VBox(
+        [
+            widgets.HBox(
+                [
+                    previous_button,
+                    next_button,
+                    goal_component_checkbox,
+                ]
+            ),
+            frame_slider,
+        ]
+    )
+    return SoftHierarchicalRolloutPlayer(
+        figure=renderer.figure,
+        controls=controls,
+        rollout=renderer.rollout,
+        frame_count=frame_count,
+        _frame_slider=frame_slider,
+        _goal_component_checkbox=goal_component_checkbox,
+    )
 
 
 def _soft_rollout_frames(

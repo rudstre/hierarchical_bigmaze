@@ -95,6 +95,7 @@ from andrew_mlmdp import (
     build_goal_task_ensemble,
     build_soft_two_layer_model,
     factorize_soft_subtasks,
+    plot_interactive_soft_hierarchical_rollout,
     sample_online_soft_hierarchical_rollout,
     sample_soft_hierarchical_rollout,
     soft_hierarchy_parameters,
@@ -135,6 +136,30 @@ online_soft_rollout = sample_online_soft_hierarchical_rollout(
     seed=3,
 )
 ```
+
+For notebook inspection, prefer the paused frame player over serializing a
+`FuncAnimation`. With `%matplotlib widget` active, it computes the rollout
+once and redraws only when the slider or a step button changes:
+
+```python
+from IPython.display import display
+import matplotlib.pyplot as plt
+
+player = plot_interactive_soft_hierarchical_rollout(
+    soft_model,
+    start=(1, 0),
+    seed=3,
+)
+display(player.controls)
+plt.show()
+```
+
+The slider uses `continuous_update=False`, so dragging it does not queue
+intermediate figure renders. The “Include exact goal component” checkbox
+switches the heatmap between the full composition and the same weighted basis
+with its final goal column removed; it does not change the sampled rollout.
+`animate_soft_hierarchical_rollout` remains the export-oriented API for HTML,
+GIF, or video output.
 
 `factorize_soft_subtasks` peak-normalizes every profile column and absorbs its
 scale into the matching task-weight row. This leaves the NMF reconstruction

@@ -46,10 +46,12 @@ from andrew_mlmdp.lmdp import (
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting import (
+    SoftHierarchicalRolloutPlayer,
     animate_hierarchical_rollout,
     animate_soft_hierarchical_rollout,
     plot_controlled_dynamics,
     plot_interactive_subgoal_desirability,
+    plot_interactive_soft_hierarchical_rollout,
     plot_soft_subtask_rank_diagnostics,
     plot_soft_subtasks,
     plot_subgoal_passive_dynamics,
@@ -69,6 +71,7 @@ __all__ = [
     "OnlineHierarchicalRollout",
     "OnlineSoftHierarchicalRollout",
     "SoftHierarchicalRollout",
+    "SoftHierarchicalRolloutPlayer",
     "SoftSubtaskAccess",
     "SoftSubtaskDiscovery",
     "SoftTwoLayerModel",
@@ -91,6 +94,7 @@ __all__ = [
     "factorize_soft_subtasks",
     "plot_controlled_dynamics",
     "plot_interactive_subgoal_desirability",
+    "plot_interactive_soft_hierarchical_rollout",
     "plot_soft_subtask_rank_diagnostics",
     "plot_soft_subtasks",
     "plot_subgoal_passive_dynamics",
