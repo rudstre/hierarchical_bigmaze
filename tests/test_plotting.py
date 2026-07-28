@@ -453,21 +453,24 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
             / goal_desirability
         )
     )
+    expected_interior_values = expected_values[model.interior_states]
+    expected_normalized_values = (
+        expected_interior_values - np.min(expected_interior_values)
+    ) / (
+        np.max(expected_interior_values)
+        - np.min(expected_interior_values)
+    )
     for state, coordinate in enumerate(
         cell
         for cell in model.maze.free_cells
         if cell != model.goal
     ):
         assert displayed_values[coordinate] == pytest.approx(
-            expected_values[model.interior_states[state]]
+            expected_normalized_values[state]
         )
     assert np.ma.is_masked(displayed_values[model.goal])
-    expected_desirability_limits = (
-        min(0.0, float(np.min(expected_values))),
-        max(0.0, float(np.max(expected_values))),
-    )
     assert desirability_ax.images[0].get_clim() == pytest.approx(
-        expected_desirability_limits
+        (0.0, 1.0)
     )
     reward_ax = next(
         ax
@@ -526,17 +529,8 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
         ("Layer 2 command from", "Layer 2 terminated from")
     )
     command_frame = animation._soft_frames[command_index]
-    command_desirability = command_frame.plan.physical_desirability
-    command_goal_desirability = command_desirability[goal_state]
-    command_relative_values = (
-        model.parameters.lower_control_cost
-        * np.log(command_desirability / command_goal_desirability)
-    )
     assert desirability_ax.images[0].get_clim() == pytest.approx(
-        (
-            min(0.0, float(np.min(command_relative_values))),
-            max(0.0, float(np.max(command_relative_values))),
-        )
+        (0.0, 1.0)
     )
     command_rewards = command_frame.plan.inpainted_rewards[:-1]
     command_reward_limit = 1.25 * max(
@@ -585,12 +579,19 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
     assert player.frame_count > 1
     assert player.frame_index == 0
     button_row, frame_slider = player.controls.children
-    previous_button, next_button, goal_checkbox = button_row.children
+    (
+        previous_button,
+        next_button,
+        goal_checkbox,
+        frame_normalization_checkbox,
+    ) = button_row.children
     assert frame_slider.continuous_update is False
     assert previous_button.disabled
     assert not next_button.disabled
     assert player.goal_component_visible
     assert goal_checkbox.value
+    assert player.framewise_normalization
+    assert frame_normalization_checkbox.value
 
     desirability_ax = next(
         ax
@@ -608,6 +609,12 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
         model.parameters.lower_control_cost
         * np.log(subtask_desirability / subtask_goal_reference)
     )
+    expected_normalized_subtask_values = (
+        expected_subtask_values - np.min(expected_subtask_values)
+    ) / (
+        np.max(expected_subtask_values)
+        - np.min(expected_subtask_values)
+    )
     player.show_goal_component(False)
     assert not player.goal_component_visible
     assert desirability_ax.get_title().startswith(
@@ -617,9 +624,27 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
     for state, physical_state in enumerate(model.interior_states):
         coordinate = model.maze.coordinate(int(physical_state))
         assert displayed_subtask_values[coordinate] == pytest.approx(
-            expected_subtask_values[state]
+            expected_normalized_subtask_values[state]
         )
     assert np.ma.is_masked(displayed_subtask_values[model.goal])
+    assert desirability_ax.images[0].get_clim() == pytest.approx((0.0, 1.0))
+
+    player.show_framewise_normalization(False)
+    assert not player.framewise_normalization
+    displayed_anchored_values = desirability_ax.images[0].get_array()
+    for state, physical_state in enumerate(model.interior_states):
+        coordinate = model.maze.coordinate(int(physical_state))
+        assert displayed_anchored_values[coordinate] == pytest.approx(
+            expected_subtask_values[state]
+        )
+    assert desirability_ax.images[0].get_clim() == pytest.approx(
+        (
+            min(0.0, float(np.min(expected_subtask_values))),
+            max(0.0, float(np.max(expected_subtask_values))),
+        )
+    )
+    assert "goal-anchored log scale" in desirability_ax.get_title()
+    player.show_framewise_normalization(True)
     player.show_goal_component(True)
     assert desirability_ax.get_title().startswith(
         "Full composed desirability"
@@ -647,6 +672,8 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
         player.show_frame(True)
     with pytest.raises(ValueError, match="visible"):
         player.show_goal_component(1)
+    with pytest.raises(ValueError, match="enabled"):
+        player.show_framewise_normalization(1)
     plt.close(player.figure)
 
 

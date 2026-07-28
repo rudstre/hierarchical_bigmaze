@@ -77,6 +77,7 @@ class SoftHierarchicalRolloutPlayer:
     frame_count: int
     _frame_slider: object
     _goal_component_checkbox: object
+    _frame_normalization_checkbox: object
 
     @property
     def frame_index(self) -> int:
@@ -110,6 +111,19 @@ class SoftHierarchicalRolloutPlayer:
             raise ValueError("visible must be a boolean")
         self._goal_component_checkbox.value = bool(visible)
 
+    @property
+    def framewise_normalization(self) -> bool:
+        """Return whether the heatmap spans its finite range in every frame."""
+
+        return bool(self._frame_normalization_checkbox.value)
+
+    def show_framewise_normalization(self, enabled: bool) -> None:
+        """Toggle framewise normalization of the desirability heatmap."""
+
+        if not isinstance(enabled, (bool, np.bool_)):
+            raise ValueError("enabled must be a boolean")
+        self._frame_normalization_checkbox.value = bool(enabled)
+
 
 @dataclass(frozen=True)
 class _SoftRolloutRenderer:
@@ -120,6 +134,7 @@ class _SoftRolloutRenderer:
     frames: list[_SoftRolloutFrame]
     update: Callable[[int], tuple[object, ...]]
     set_goal_component: Callable[[bool], None]
+    set_framewise_normalization: Callable[[bool], None]
 
 
 _RolloutFrame = _HierarchicalRolloutFrame | _OnlineHierarchicalRolloutFrame
@@ -1309,6 +1324,29 @@ def _framewise_normalized_composed_desirability_grid(
     return normalized
 
 
+def _goal_anchored_composed_desirability_norm(
+    model: SoftTwoLayerModel,
+    frame: _SoftRolloutFrame,
+    *,
+    include_goal_component: bool = True,
+) -> Normalize:
+    """Anchor the omitted goal at zero while adapting the lower limit."""
+
+    values = _composed_log_desirability_grid(
+        model,
+        frame,
+        include_goal_component=include_goal_component,
+    )
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return Normalize(vmin=-1.0, vmax=0.0)
+    minimum = min(0.0, float(np.min(finite)))
+    maximum = max(0.0, float(np.max(finite)))
+    if minimum == maximum:
+        minimum -= 1.0
+    return Normalize(vmin=minimum, vmax=maximum)
+
+
 def _format_probability(value: float | None) -> str:
     return "n/a" if value is None else f"{value: .4f}"
 
@@ -1578,6 +1616,7 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
     goal_component_state = {"included": True}
+    frame_normalization_state = {"enabled": True}
     initial_desirability_grid = (
         _framewise_normalized_composed_desirability_grid(
             model,
@@ -1634,10 +1673,10 @@ def _build_soft_hierarchical_rollout_renderer(
                 "alpha": 0.65,
             },
         )
-    figure.colorbar(
+    desirability_colorbar = figure.colorbar(
         desirability_image,
         ax=desirability_ax,
-        label="relative desirability within frame",
+        label="normalized relative value within frame",
         fraction=0.046,
         pad=0.04,
     )
@@ -1749,28 +1788,51 @@ def _build_soft_hierarchical_rollout_renderer(
                     "Current command from "
                     f"{labels[frame.profile_subtask]}"
                 )
-        desirability_grid_values = (
-            _framewise_normalized_composed_desirability_grid(
+        if frame_normalization_state["enabled"]:
+            desirability_grid_values = (
+                _framewise_normalized_composed_desirability_grid(
+                    model,
+                    frame,
+                    include_goal_component=goal_component_state["included"],
+                )
+            )
+            desirability_norm = Normalize(vmin=0.0, vmax=1.0)
+            scale_description = "frame-normalized"
+            desirability_colorbar.set_label(
+                "normalized relative value within frame"
+            )
+        else:
+            desirability_grid_values = _composed_log_desirability_grid(
                 model,
                 frame,
                 include_goal_component=goal_component_state["included"],
             )
-        )
+            desirability_norm = _goal_anchored_composed_desirability_norm(
+                model,
+                frame,
+                include_goal_component=goal_component_state["included"],
+            )
+            scale_description = "goal-anchored log scale"
+            desirability_colorbar.set_label(
+                r"$\lambda \log(z / z_{\mathrm{goal}})$"
+            )
         desirability_image.set_data(desirability_grid_values)
+        desirability_image.set_norm(desirability_norm)
+        desirability_colorbar.update_normal(desirability_image)
         if goal_only:
             desirability_ax.set_title(
                 "Goal-only desirability after layer-2 termination "
-                "(frame-normalized)"
+                f"({scale_description})"
             )
         elif goal_component_state["included"]:
             desirability_ax.set_title(
                 "Full composed desirability "
-                "(frame-normalized; goal cell masked)"
+                f"({scale_description}; goal cell masked)"
             )
         else:
             desirability_ax.set_title(
                 "Subtask-only desirability "
-                "(frame-normalized; exact goal basis removed)"
+                f"({scale_description}; exact goal basis removed)"
             )
 
         reward_command_disabled = (
@@ -1859,12 +1921,16 @@ def _build_soft_hierarchical_rollout_renderer(
     def set_goal_component(visible: bool) -> None:
         goal_component_state["included"] = bool(visible)
 
+    def set_framewise_normalization(enabled: bool) -> None:
+        frame_normalization_state["enabled"] = bool(enabled)
+
     return _SoftRolloutRenderer(
         figure=figure,
         rollout=rollout,
         frames=frames,
         update=update,
         set_goal_component=set_goal_component,
+        set_framewise_normalization=set_framewise_normalization,
     )
 
 
@@ -1974,6 +2040,15 @@ def plot_interactive_soft_hierarchical_rollout(
             "policy is always shown"
         ),
     )
+    frame_normalization_checkbox = widgets.Checkbox(
+        value=True,
+        description="Normalize desirability within each frame",
+        indent=False,
+        tooltip=(
+            "When enabled, map the current frame's finite relative values to "
+            "0–1; disable it to keep the omitted goal anchored at zero"
+        ),
+    )
 
     def update_button_state(frame_index: int) -> None:
         previous_button.disabled = frame_index == 0
@@ -1996,14 +2071,26 @@ def plot_interactive_soft_hierarchical_rollout(
         renderer.update(frame_slider.value)
         renderer.figure.canvas.draw_idle()
 
+    def toggle_framewise_normalization(change) -> None:
+        renderer.set_framewise_normalization(bool(change["new"]))
+        renderer.update(frame_slider.value)
+        renderer.figure.canvas.draw_idle()
+
     frame_slider.observe(render_selected_frame, names="value")
     goal_component_checkbox.observe(
         toggle_goal_component,
         names="value",
     )
+    frame_normalization_checkbox.observe(
+        toggle_framewise_normalization,
+        names="value",
+    )
     previous_button.on_click(show_previous)
     next_button.on_click(show_next)
     renderer.set_goal_component(goal_component_checkbox.value)
+    renderer.set_framewise_normalization(
+        frame_normalization_checkbox.value
+    )
     renderer.update(0)
     update_button_state(0)
 
@@ -2014,6 +2101,7 @@ def plot_interactive_soft_hierarchical_rollout(
                     previous_button,
                     next_button,
                     goal_component_checkbox,
+                    frame_normalization_checkbox,
                 ]
             ),
             frame_slider,
@@ -2026,6 +2114,7 @@ def plot_interactive_soft_hierarchical_rollout(
         frame_count=frame_count,
         _frame_slider=frame_slider,
         _goal_component_checkbox=goal_component_checkbox,
+        _frame_normalization_checkbox=frame_normalization_checkbox,
     )
 
 

@@ -160,7 +160,10 @@ intermediate figure renders. The “Include goal component while hierarchy is
 active” checkbox switches the active-phase heatmap between the executed
 subtask-only composition and a counterfactual composition containing the
 fitted goal column. After upper termination, the actual goal-only policy is
-always shown. The checkbox does not change the sampled rollout.
+always shown. “Normalize desirability within each frame” maps the finite
+relative-value range in the current frame to 0–1; turning it off restores the
+goal-anchored log scale, where the omitted goal has value zero. Both checkboxes
+change only the visualization, not the sampled rollout.
 `animate_soft_hierarchical_rollout` remains the export-oriented API for HTML,
 GIF, or video output.
 
