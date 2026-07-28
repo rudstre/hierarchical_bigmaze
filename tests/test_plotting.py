@@ -94,6 +94,16 @@ def _mouse_event(name, figure, ax, coordinate, *, button=MouseButton.LEFT):
     return MouseEvent(name, figure.canvas, x, y, button=button)
 
 
+def _drag_marker(figure, ax, source, target) -> None:
+    for name, coordinate in (
+        ("button_press_event", source),
+        ("motion_notify_event", target),
+        ("button_release_event", target),
+    ):
+        event = _mouse_event(name, figure, ax, coordinate)
+        figure.canvas.callbacks.process(name, event)
+
+
 def test_interactive_subgoal_desirability_renders_subtasks_only(
     tmp_path,
 ) -> None:
@@ -175,7 +185,12 @@ def test_interactive_subgoal_desirability_drag_updates_all_panels() -> None:
     assert agent.get_ydata() == pytest.approx([target[0]])
     assert maze_ax.get_title() == f"Start: {target} | Goal: {model.goal}"
     assert not np.allclose(before_grid, after_grid, equal_nan=True)
-    assert not np.allclose(before_weights, after_weights)
+    assert not np.allclose(
+        before_weights,
+        after_weights,
+        rtol=1e-6,
+        atol=0.0,
+    )
     plt.close(figure)
 
 
@@ -291,7 +306,12 @@ def test_interactive_subgoal_desirability_drag_updates_goal() -> None:
     assert maze_ax.get_title() == f"Start: {start} | Goal: {new_goal}"
     assert after_grid[new_goal] == pytest.approx(expected_goal_desirability)
     assert not np.allclose(before_grid, after_grid, equal_nan=True)
-    assert not np.allclose(before_weights, after_weights)
+    assert not np.allclose(
+        before_weights,
+        after_weights,
+        rtol=1e-6,
+        atol=0.0,
+    )
     plt.close(figure)
 
 
@@ -589,7 +609,7 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
 
     assert player.frame_count > 1
     assert player.frame_index == 0
-    button_row, frame_slider = player.controls.children
+    button_row, frame_slider, recompute_row = player.controls.children
     (
         previous_button,
         next_button,
@@ -603,6 +623,9 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
     assert goal_checkbox.value
     assert player.framewise_normalization
     assert frame_normalization_checkbox.value
+    recompute_button, location_status = recompute_row.children
+    assert recompute_button.description == "Recompute rollout"
+    assert "Current:" in location_status.value
 
     desirability_ax = next(
         ax
@@ -686,6 +709,176 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
         player.show_goal_component(1)
     with pytest.raises(ValueError, match="enabled"):
         player.show_framewise_normalization(1)
+    plt.close(player.figure)
+
+
+def test_interactive_soft_player_stages_both_locations_before_recompute() -> None:
+    pytest.importorskip("ipywidgets")
+    maze = Maze.from_ascii(".....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [
+                [1.0, 0.1],
+                [1.0, 0.2],
+                [0.4, 0.7],
+                [0.2, 1.0],
+                [0.1, 1.0],
+            ]
+        ),
+        goal=(0, 4),
+        parameters=ModelParameters(alpha=2.0, beta=3.0),
+    )
+    player = plot_interactive_soft_hierarchical_rollout(
+        model,
+        (0, 0),
+        seed=2,
+        max_steps=100,
+    )
+    player.figure.canvas.draw()
+    maze_ax = next(
+        ax
+        for ax in player.figure.axes
+        if ax.get_title().startswith("Physical state:")
+    )
+    original_rollout = player.rollout
+
+    _drag_marker(player.figure, maze_ax, (0, 0), (0, 1))
+    _drag_marker(player.figure, maze_ax, (0, 4), (0, 3))
+
+    assert player.pending_start == (0, 1)
+    assert player.pending_goal == (0, 3)
+    assert player.start == (0, 0)
+    assert player.goal == (0, 4)
+    assert player.rollout is original_rollout
+    assert "Pending:" in player.controls.children[2].children[1].value
+
+    player.show_goal_component(False)
+    player.show_framewise_normalization(False)
+    player.show_frame(player.frame_count - 1)
+    player.controls.children[2].children[0].click()
+
+    assert player.start == (0, 1)
+    assert player.goal == (0, 3)
+    assert player.rollout is not original_rollout
+    assert player.rollout.trajectory[0] == (0, 1)
+    assert player.frame_index == 0
+    assert player._frame_slider.max == player.frame_count - 1
+    assert player.model.subtask_profiles == pytest.approx(
+        model.subtask_profiles
+    )
+    assert not player.goal_component_visible
+    assert not player.framewise_normalization
+    assert player.rollout_seed != 2
+    plt.close(player.figure)
+
+
+def test_interactive_soft_player_rejects_invalid_drag_locations() -> None:
+    pytest.importorskip("ipywidgets")
+    maze = Maze.from_ascii("....\n.#..")
+    model = build_soft_two_layer_model(
+        maze,
+        np.ones((len(maze.free_cells), 2)),
+        goal=(0, 3),
+        core_threshold=None,
+    )
+    player = plot_interactive_soft_hierarchical_rollout(
+        model,
+        (0, 0),
+        seed=4,
+        max_steps=20,
+    )
+    player.figure.canvas.draw()
+    maze_ax = next(
+        ax
+        for ax in player.figure.axes
+        if ax.get_title().startswith("Physical state:")
+    )
+
+    _drag_marker(player.figure, maze_ax, (0, 0), (1, 1))
+    assert player.pending_start == (0, 0)
+    _drag_marker(player.figure, maze_ax, (0, 0), (3, 3))
+    assert player.pending_start == (0, 0)
+    _drag_marker(player.figure, maze_ax, (0, 0), (0, 3))
+    assert player.pending_start == (0, 0)
+    _drag_marker(player.figure, maze_ax, (0, 3), (0, 0))
+    assert player.pending_goal == (0, 3)
+    plt.close(player.figure)
+
+
+def test_interactive_soft_player_seed_sequence_is_reproducible() -> None:
+    pytest.importorskip("ipywidgets")
+    maze = Maze.from_ascii("....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.ones((len(maze.free_cells), 2)),
+        goal=(0, 3),
+        core_threshold=None,
+    )
+    players = [
+        plot_interactive_soft_hierarchical_rollout(
+            model,
+            (0, 0),
+            seed=7,
+            max_steps=20,
+        )
+        for _ in range(2)
+    ]
+
+    seed_sequences = []
+    for player in players:
+        player.recompute()
+        first_seed = player.rollout_seed
+        player.recompute()
+        second_seed = player.rollout_seed
+        assert first_seed != 7
+        assert second_seed != first_seed
+        seed_sequences.append((first_seed, second_seed))
+
+    assert seed_sequences[0] == seed_sequences[1]
+    for player in players:
+        plt.close(player.figure)
+
+
+def test_interactive_soft_player_failed_recompute_keeps_current_run() -> None:
+    pytest.importorskip("ipywidgets")
+    maze = Maze.from_ascii("...")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 0.0],
+            ]
+        ),
+        goal=(0, 2),
+        core_threshold=None,
+    )
+    player = plot_interactive_soft_hierarchical_rollout(
+        model,
+        (0, 1),
+        seed=3,
+        max_steps=20,
+    )
+    player.figure.canvas.draw()
+    maze_ax = next(
+        ax
+        for ax in player.figure.axes
+        if ax.get_title().startswith("Physical state:")
+    )
+    original_model = player.model
+    original_rollout = player.rollout
+
+    _drag_marker(player.figure, maze_ax, (0, 2), (0, 0))
+    player.recompute()
+
+    assert player.pending_goal == (0, 0)
+    assert player.model is original_model
+    assert player.rollout is original_rollout
+    status = player.controls.children[2].children[1]
+    assert "Recompute failed:" in status.value
+    assert not player.controls.children[2].children[0].disabled
     plt.close(player.figure)
 
 

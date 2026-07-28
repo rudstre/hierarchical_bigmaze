@@ -26,7 +26,7 @@ class ModelParameters:
     interior_reward: float = -0.1
     goal_reward: float = 1.1
     lower_control_cost: float = 0.1
-    upper_control_cost: float = 2.0
+    upper_control_cost: float = 0.25
     alpha: float = 0.2
     off_target_reward: float = -0.7
     beta: float = 16.0

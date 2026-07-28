@@ -1,6 +1,7 @@
 """Direct plotting functions for inspecting maze LMDPs."""
 
 from dataclasses import dataclass
+from html import escape
 from time import monotonic
 from typing import Callable
 
@@ -24,6 +25,7 @@ from andrew_mlmdp.hierarchy import (
     _OnlineHierarchicalRolloutFrame,
     _trace_hierarchy_events,
     _trace_online_hierarchical_rollout,
+    build_soft_two_layer_model,
     build_two_layer_model,
     compute_layer_one_plan,
 )
@@ -73,11 +75,60 @@ class SoftHierarchicalRolloutPlayer:
 
     figure: Figure
     controls: object
-    rollout: SoftHierarchicalRollout
-    frame_count: int
+    _renderer: "_SoftRolloutRenderer"
     _frame_slider: object
     _goal_component_checkbox: object
     _frame_normalization_checkbox: object
+    _recompute_callback: Callable[[], None]
+    _location_state: dict[str, object]
+
+    @property
+    def model(self) -> SoftTwoLayerModel:
+        """Return the model used by the currently displayed rollout."""
+
+        return self._renderer.model
+
+    @property
+    def rollout(self) -> SoftHierarchicalRollout:
+        """Return the currently displayed rollout."""
+
+        return self._renderer.rollout
+
+    @property
+    def frame_count(self) -> int:
+        """Return the number of diagnostic frames in the current rollout."""
+
+        return len(self._renderer.frames)
+
+    @property
+    def start(self) -> Coordinate:
+        """Return the committed rollout start."""
+
+        return self._renderer.start
+
+    @property
+    def goal(self) -> Coordinate:
+        """Return the committed rollout goal."""
+
+        return self._renderer.model.goal
+
+    @property
+    def pending_start(self) -> Coordinate:
+        """Return the staged start selected by dragging."""
+
+        return self._location_state["pending_start"]
+
+    @property
+    def pending_goal(self) -> Coordinate:
+        """Return the staged goal selected by dragging."""
+
+        return self._location_state["pending_goal"]
+
+    @property
+    def rollout_seed(self) -> int | None:
+        """Return the seed used for the currently displayed rollout."""
+
+        return self._location_state["rollout_seed"]
 
     @property
     def frame_index(self) -> int:
@@ -124,17 +175,42 @@ class SoftHierarchicalRolloutPlayer:
             raise ValueError("enabled must be a boolean")
         self._frame_normalization_checkbox.value = bool(enabled)
 
+    def recompute(self) -> None:
+        """Recompute from the staged locations with a fresh rollout seed."""
+
+        self._recompute_callback()
+
 
 @dataclass(frozen=True)
 class _SoftRolloutRenderer:
     """Shared soft-rollout figure state used by players and animations."""
 
     figure: Figure
-    rollout: SoftHierarchicalRollout
-    frames: list[_SoftRolloutFrame]
+    _run_state: dict[str, object]
     update: Callable[[int], tuple[object, ...]]
+    replace_run: Callable[[SoftTwoLayerModel, Coordinate, int | None], None]
     set_goal_component: Callable[[bool], None]
     set_framewise_normalization: Callable[[bool], None]
+    maze_ax: object
+    start_marker: object
+    goal_marker: object
+    desirability_goal_marker: object
+
+    @property
+    def model(self) -> SoftTwoLayerModel:
+        return self._run_state["model"]
+
+    @property
+    def start(self) -> Coordinate:
+        return self._run_state["start"]
+
+    @property
+    def rollout(self) -> SoftHierarchicalRollout:
+        return self._run_state["rollout"]
+
+    @property
+    def frames(self) -> list[_SoftRolloutFrame]:
+        return self._run_state["frames"]
 
 
 _RolloutFrame = _HierarchicalRolloutFrame | _OnlineHierarchicalRolloutFrame
@@ -1491,18 +1567,16 @@ def plot_soft_subtask_rank_diagnostics(
     return figure
 
 
-def _build_soft_hierarchical_rollout_renderer(
+def _trace_soft_hierarchical_rollout(
     model: SoftTwoLayerModel,
     start: Coordinate,
     *,
-    beta: float | None = None,
-    max_steps: int = 500,
-    max_abstract_accesses: int = 500,
-    seed: int | None = None,
-    subtask_labels: list[str] | tuple[str, ...] | None = None,
-    figsize: tuple[float, float] = (14, 8),
-) -> _SoftRolloutRenderer:
-    """Build shared soft-rollout artists without starting a render timer."""
+    beta: float | None,
+    max_steps: int,
+    max_abstract_accesses: int,
+    seed: int | None,
+) -> tuple[SoftHierarchicalRollout, list[_SoftRolloutFrame]]:
+    """Trace one soft rollout and translate its recorded engine events."""
 
     engine_result, engine_events = _trace_hierarchy_events(
         model,
@@ -1529,7 +1603,36 @@ def _build_soft_hierarchical_rollout_renderer(
         reached_goal=engine_result.reached_goal,
         status=engine_result.status,
     )
-    frames = _soft_rollout_frames(engine_events)
+    return rollout, _soft_rollout_frames(engine_events)
+
+
+def _build_soft_hierarchical_rollout_renderer(
+    model: SoftTwoLayerModel,
+    start: Coordinate,
+    *,
+    beta: float | None = None,
+    max_steps: int = 500,
+    max_abstract_accesses: int = 500,
+    seed: int | None = None,
+    subtask_labels: list[str] | tuple[str, ...] | None = None,
+    figsize: tuple[float, float] = (14, 8),
+) -> _SoftRolloutRenderer:
+    """Build shared soft-rollout artists without starting a render timer."""
+
+    rollout, frames = _trace_soft_hierarchical_rollout(
+        model,
+        start,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+    )
+    run_state = {
+        "model": model,
+        "start": start,
+        "rollout": rollout,
+        "frames": frames,
+    }
     labels = _soft_subtask_labels(
         model.number_of_subtasks,
         subtask_labels,
@@ -1553,7 +1656,7 @@ def _build_soft_hierarchical_rollout_renderer(
     _format_maze_axes(model.maze, maze_ax, show_grid=True)
     start_row, start_column = start
     goal_row, goal_column = model.goal
-    maze_ax.plot(
+    (start_marker,) = maze_ax.plot(
         start_column,
         start_row,
         marker="o",
@@ -1561,9 +1664,11 @@ def _build_soft_hierarchical_rollout_renderer(
         markerfacecolor="#4c956c",
         markeredgecolor="white",
         markeredgewidth=0.8,
+        picker=8,
         zorder=6,
     )
-    maze_ax.plot(
+    start_marker.set_gid("rollout-start")
+    (goal_marker,) = maze_ax.plot(
         goal_column,
         goal_row,
         marker="*",
@@ -1571,8 +1676,10 @@ def _build_soft_hierarchical_rollout_renderer(
         markerfacecolor="#d1495b",
         markeredgecolor="white",
         markeredgewidth=0.8,
+        picker=8,
         zorder=6,
     )
+    goal_marker.set_gid("rollout-goal")
     (path_line,) = maze_ax.plot(
         [],
         [],
@@ -1632,7 +1739,7 @@ def _build_soft_hierarchical_rollout_renderer(
         extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
     )
     _format_maze_axes(model.maze, desirability_ax, show_grid=False)
-    desirability_ax.plot(
+    (desirability_goal_marker,) = desirability_ax.plot(
         goal_column,
         goal_row,
         marker="*",
@@ -1735,7 +1842,10 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
     def update(frame_index: int):
-        frame = frames[frame_index]
+        current_model = run_state["model"]
+        current_rollout = run_state["rollout"]
+        current_frames = run_state["frames"]
+        frame = current_frames[frame_index]
         goal_only = _is_goal_only_plan(frame)
         path_line.set_data(
             [coordinate[1] for coordinate in frame.trajectory],
@@ -1746,26 +1856,29 @@ def _build_soft_hierarchical_rollout_renderer(
             [frame.coordinate[1]],
             [frame.coordinate[0]],
         )
-        display_profiles = model.subtask_profiles / model.subtask_profiles.max(
-            axis=0,
-            keepdims=True,
+        display_profiles = (
+            current_model.subtask_profiles
+            / current_model.subtask_profiles.max(
+                axis=0,
+                keepdims=True,
+            )
         )
         if goal_only and frame.event != "upper_termination":
             profile_image.set_data(
-                desirability_grid(model.maze, empty_profile)
+                desirability_grid(current_model.maze, empty_profile)
             )
             profile_ax.set_title(
                 "Goal-only policy after layer-2 termination"
             )
         elif frame.profile_subtask is None:
             profile_image.set_data(
-                desirability_grid(model.maze, empty_profile)
+                desirability_grid(current_model.maze, empty_profile)
             )
             profile_ax.set_title("Soft access profile: none yet")
         else:
             profile_image.set_data(
                 desirability_grid(
-                    model.maze,
+                    current_model.maze,
                     display_profiles[:, frame.profile_subtask],
                 )
             )
@@ -1791,7 +1904,7 @@ def _build_soft_hierarchical_rollout_renderer(
         if frame_normalization_state["enabled"]:
             desirability_grid_values = (
                 _framewise_normalized_composed_desirability_grid(
-                    model,
+                    current_model,
                     frame,
                     include_goal_component=goal_component_state["included"],
                 )
@@ -1803,12 +1916,12 @@ def _build_soft_hierarchical_rollout_renderer(
             )
         else:
             desirability_grid_values = _composed_log_desirability_grid(
-                model,
+                current_model,
                 frame,
                 include_goal_component=goal_component_state["included"],
             )
             desirability_norm = _goal_anchored_composed_desirability_norm(
-                model,
+                current_model,
                 frame,
                 include_goal_component=goal_component_state["included"],
             )
@@ -1842,7 +1955,7 @@ def _build_soft_hierarchical_rollout_renderer(
             )
         )
         if reward_command_disabled:
-            reward_command = np.zeros(model.number_of_subtasks)
+            reward_command = np.zeros(current_model.number_of_subtasks)
         else:
             reward_command = frame.plan.inpainted_rewards[:-1]
         reward_limit = 1.25 * max(
@@ -1881,7 +1994,7 @@ def _build_soft_hierarchical_rollout_renderer(
 
         maze_ax.set_title(
             f"Physical state: {_event_title(frame.event)} "
-            f"(move {frame.physical_steps}/{rollout.physical_steps})"
+            f"(move {frame.physical_steps}/{current_rollout.physical_steps})"
         )
         status_text.set_text(_soft_communication_status(frame))
         entered = (
@@ -1900,11 +2013,13 @@ def _build_soft_hierarchical_rollout_renderer(
             f"{'goal-only' if goal_only else 'hierarchy active'}\n"
             f"entered state:   {entered}\n"
             f"upper outcome:   {upper_outcome}\n"
-            f"passive access:  {_format_probability(frame.passive_access_probability)}\n"
-            f"controlled access:{_format_probability(frame.controlled_access_probability)}\n"
+            "passive access:  "
+            f"{_format_probability(frame.passive_access_probability)}\n"
+            "controlled access:"
+            f"{_format_probability(frame.controlled_access_probability)}\n"
             f"refractory:      {'yes' if frame.refractory else 'no'}\n"
             f"current cell:    {frame.coordinate}\n"
-            f"goal:            {model.goal}"
+            f"goal:            {current_model.goal}"
         )
         return (
             path_line,
@@ -1924,13 +2039,44 @@ def _build_soft_hierarchical_rollout_renderer(
     def set_framewise_normalization(enabled: bool) -> None:
         frame_normalization_state["enabled"] = bool(enabled)
 
+    def replace_run(
+        new_model: SoftTwoLayerModel,
+        new_start: Coordinate,
+        new_seed: int | None,
+    ) -> None:
+        new_rollout, new_frames = _trace_soft_hierarchical_rollout(
+            new_model,
+            new_start,
+            beta=beta,
+            max_steps=max_steps,
+            max_abstract_accesses=max_abstract_accesses,
+            seed=new_seed,
+        )
+        run_state.update(
+            {
+                "model": new_model,
+                "start": new_start,
+                "rollout": new_rollout,
+                "frames": new_frames,
+            }
+        )
+        start_row, start_column = new_start
+        goal_row, goal_column = new_model.goal
+        start_marker.set_data([start_column], [start_row])
+        goal_marker.set_data([goal_column], [goal_row])
+        desirability_goal_marker.set_data([goal_column], [goal_row])
+
     return _SoftRolloutRenderer(
         figure=figure,
-        rollout=rollout,
-        frames=frames,
+        _run_state=run_state,
         update=update,
+        replace_run=replace_run,
         set_goal_component=set_goal_component,
         set_framewise_normalization=set_framewise_normalization,
+        maze_ax=maze_ax,
+        start_marker=start_marker,
+        goal_marker=goal_marker,
+        desirability_goal_marker=desirability_goal_marker,
     )
 
 
@@ -1985,10 +2131,12 @@ def plot_interactive_soft_hierarchical_rollout(
 ) -> SoftHierarchicalRolloutPlayer:
     """Build a paused ipywidgets player for manual rollout inspection.
 
-    The rollout and figure are created once. Moving the slider or pressing a
-    step button updates the existing Matplotlib artists without starting a
-    background animation timer. Call ``display(player.controls)`` followed by
-    ``plt.show()`` in a notebook using the ``ipympl`` widget backend.
+    The figure is created once. Moving the slider or pressing a step button
+    updates the existing Matplotlib artists without starting a background
+    animation timer. Dragging the start or goal marker stages a free cell;
+    pressing Recompute applies both locations and samples a fresh rollout.
+    Call ``display(player.controls)`` followed by ``plt.show()`` in a notebook
+    using the ``ipympl`` widget backend.
     """
 
     try:
@@ -2009,11 +2157,10 @@ def plot_interactive_soft_hierarchical_rollout(
         subtask_labels=subtask_labels,
         figsize=figsize,
     )
-    frame_count = len(renderer.frames)
     frame_slider = widgets.IntSlider(
         value=0,
         min=0,
-        max=frame_count - 1,
+        max=len(renderer.frames) - 1,
         step=1,
         description="Frame",
         continuous_update=False,
@@ -2049,10 +2196,33 @@ def plot_interactive_soft_hierarchical_rollout(
             "0–1; disable it to keep the omitted goal anchored at zero"
         ),
     )
+    recompute_button = widgets.Button(
+        description="Recompute rollout",
+        icon="refresh",
+        button_style="primary",
+        tooltip=(
+            "Apply the staged start and goal, then sample a fresh rollout"
+        ),
+    )
+    location_status = widgets.HTML()
+    base_profiles = model.subtask_profiles.copy()
+    model_by_goal = {model.goal: model}
+    seed_generator = np.random.default_rng(seed)
+    used_recompute_seeds: set[int] = set()
+    if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
+        used_recompute_seeds.add(int(seed))
+    location_state: dict[str, object] = {
+        "pending_start": start,
+        "pending_goal": model.goal,
+        "rollout_seed": seed,
+        "dragging": None,
+        "last_draw_time": 0.0,
+        "error": None,
+    }
 
     def update_button_state(frame_index: int) -> None:
         previous_button.disabled = frame_index == 0
-        next_button.disabled = frame_index == frame_count - 1
+        next_button.disabled = frame_index == len(renderer.frames) - 1
 
     def render_selected_frame(change) -> None:
         frame_index = int(change["new"])
@@ -2076,6 +2246,171 @@ def plot_interactive_soft_hierarchical_rollout(
         renderer.update(frame_slider.value)
         renderer.figure.canvas.draw_idle()
 
+    def next_rollout_seed() -> int:
+        while True:
+            candidate = int(
+                seed_generator.integers(
+                    0,
+                    np.iinfo(np.uint64).max,
+                    dtype=np.uint64,
+                )
+            )
+            if candidate not in used_recompute_seeds:
+                used_recompute_seeds.add(candidate)
+                return candidate
+
+    def update_location_status() -> None:
+        pending_start = location_state["pending_start"]
+        pending_goal = location_state["pending_goal"]
+        error = location_state["error"]
+        if error is not None:
+            location_status.value = (
+                "<span style='color:#b42318'><b>Recompute failed:</b> "
+                f"{escape(str(error))}</span>"
+            )
+        elif (
+            pending_start != renderer.start
+            or pending_goal != renderer.model.goal
+        ):
+            location_status.value = (
+                "<span style='color:#9a6700'><b>Pending:</b> "
+                f"start {pending_start}, goal {pending_goal}. "
+                "Click <b>Recompute rollout</b>.</span>"
+            )
+        else:
+            location_status.value = (
+                "<span><b>Current:</b> "
+                f"start {renderer.start}, goal {renderer.model.goal}, "
+                f"seed {location_state['rollout_seed']}.</span>"
+            )
+
+    def request_draw(*, force: bool = False) -> None:
+        current_time = monotonic()
+        last_draw_time = float(location_state["last_draw_time"])
+        if force or current_time - last_draw_time >= 0.05:
+            location_state["last_draw_time"] = current_time
+            renderer.figure.canvas.draw_idle()
+
+    def coordinate_from_event(event) -> Coordinate | None:
+        if (
+            event.inaxes is not renderer.maze_ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return None
+        coordinate = (int(np.rint(event.ydata)), int(np.rint(event.xdata)))
+        if not renderer.model.maze.is_free(coordinate):
+            return None
+        return coordinate
+
+    def marker_for(kind: str):
+        return (
+            renderer.start_marker
+            if kind == "start"
+            else renderer.goal_marker
+        )
+
+    def restore_pending_marker(kind: str) -> None:
+        coordinate = location_state[f"pending_{kind}"]
+        row, column = coordinate
+        marker_for(kind).set_data([column], [row])
+        if kind == "goal":
+            renderer.desirability_goal_marker.set_data([column], [row])
+
+    def stage_location(kind: str, coordinate: Coordinate) -> bool:
+        other_kind = "goal" if kind == "start" else "start"
+        if coordinate == location_state[f"pending_{other_kind}"]:
+            return False
+        location_state[f"pending_{kind}"] = coordinate
+        location_state["error"] = None
+        restore_pending_marker(kind)
+        update_location_status()
+        return True
+
+    def on_press(event) -> None:
+        if (
+            event.button != MouseButton.LEFT
+            or event.inaxes is not renderer.maze_ax
+        ):
+            return
+        contains_start, _ = renderer.start_marker.contains(event)
+        contains_goal, _ = renderer.goal_marker.contains(event)
+        pressed_coordinate = coordinate_from_event(event)
+        if (
+            contains_start
+            or pressed_coordinate == location_state["pending_start"]
+        ):
+            location_state["dragging"] = "start"
+        elif (
+            contains_goal
+            or pressed_coordinate == location_state["pending_goal"]
+        ):
+            location_state["dragging"] = "goal"
+
+    def on_motion(event) -> None:
+        kind = location_state["dragging"]
+        if kind is None:
+            return
+        if (
+            event.inaxes is not renderer.maze_ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+        marker_for(kind).set_data([event.xdata], [event.ydata])
+        request_draw()
+
+    def on_release(event) -> None:
+        kind = location_state["dragging"]
+        if kind is None:
+            return
+        coordinate = coordinate_from_event(event)
+        if coordinate is None or not stage_location(kind, coordinate):
+            restore_pending_marker(kind)
+        location_state["dragging"] = None
+        request_draw(force=True)
+
+    def recompute_rollout() -> None:
+        recompute_button.disabled = True
+        recompute_button.description = "Computing…"
+        location_state["error"] = None
+        update_location_status()
+        try:
+            pending_start = location_state["pending_start"]
+            pending_goal = location_state["pending_goal"]
+            new_seed = next_rollout_seed()
+            new_model = model_by_goal.get(pending_goal)
+            if new_model is None:
+                new_model = build_soft_two_layer_model(
+                    model.maze,
+                    base_profiles,
+                    pending_goal,
+                    parameters=model.parameters,
+                    core_threshold=None,
+                    include_goal_component_while_active=(
+                        model.include_goal_component_while_active
+                    ),
+                )
+                model_by_goal[pending_goal] = new_model
+            renderer.replace_run(new_model, pending_start, new_seed)
+            location_state["rollout_seed"] = new_seed
+            frame_slider.max = len(renderer.frames) - 1
+            frame_slider.value = 0
+            renderer.update(0)
+            update_button_state(0)
+            update_location_status()
+            request_draw(force=True)
+        except (TypeError, ValueError, np.linalg.LinAlgError) as error:
+            location_state["error"] = error
+            update_location_status()
+            request_draw(force=True)
+        finally:
+            recompute_button.disabled = False
+            recompute_button.description = "Recompute rollout"
+
+    def on_recompute_click(_button) -> None:
+        recompute_rollout()
+
     frame_slider.observe(render_selected_frame, names="value")
     goal_component_checkbox.observe(
         toggle_goal_component,
@@ -2087,12 +2422,17 @@ def plot_interactive_soft_hierarchical_rollout(
     )
     previous_button.on_click(show_previous)
     next_button.on_click(show_next)
+    recompute_button.on_click(on_recompute_click)
+    renderer.figure.canvas.mpl_connect("button_press_event", on_press)
+    renderer.figure.canvas.mpl_connect("motion_notify_event", on_motion)
+    renderer.figure.canvas.mpl_connect("button_release_event", on_release)
     renderer.set_goal_component(goal_component_checkbox.value)
     renderer.set_framewise_normalization(
         frame_normalization_checkbox.value
     )
     renderer.update(0)
     update_button_state(0)
+    update_location_status()
 
     controls = widgets.VBox(
         [
@@ -2105,16 +2445,18 @@ def plot_interactive_soft_hierarchical_rollout(
                 ]
             ),
             frame_slider,
+            widgets.HBox([recompute_button, location_status]),
         ]
     )
     return SoftHierarchicalRolloutPlayer(
         figure=renderer.figure,
         controls=controls,
-        rollout=renderer.rollout,
-        frame_count=frame_count,
+        _renderer=renderer,
         _frame_slider=frame_slider,
         _goal_component_checkbox=goal_component_checkbox,
         _frame_normalization_checkbox=frame_normalization_checkbox,
+        _recompute_callback=recompute_rollout,
+        _location_state=location_state,
     )
 
 

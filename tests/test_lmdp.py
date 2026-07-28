@@ -42,7 +42,7 @@ def test_soft_hierarchy_parameters_use_k8_defaults() -> None:
 def test_soft_hierarchy_parameters_scale_with_rank() -> None:
     parameters = soft_hierarchy_parameters(32)
 
-    assert parameters.upper_control_cost == pytest.approx(4.0)
+    assert parameters.upper_control_cost == pytest.approx(0.5)
     assert parameters.alpha == pytest.approx(0.1)
     assert parameters.interior_reward == -0.1
     assert parameters.goal_reward == 1.1
@@ -63,7 +63,7 @@ def test_soft_hierarchy_parameters_accept_individual_overrides() -> None:
     assert parameters.beta == 5.0
     assert parameters.interior_reward == -0.05
     assert parameters.upper_control_cost == pytest.approx(
-        2.0 * np.sqrt(4.0 / 8.0)
+        0.25 * np.sqrt(4.0 / 8.0)
     )
 
 
@@ -345,7 +345,7 @@ def test_canonical_parameter_defaults() -> None:
     assert parameters.goal_reward == 1.1
     assert parameters.alpha == 0.2
     assert parameters.lower_control_cost == 0.1
-    assert parameters.upper_control_cost == 2.0
+    assert parameters.upper_control_cost == 0.25
     assert parameters.off_target_reward == -0.7
     assert parameters.beta == 16.0
 

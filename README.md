@@ -156,14 +156,19 @@ plt.show()
 ```
 
 The slider uses `continuous_update=False`, so dragging it does not queue
-intermediate figure renders. The “Include goal component while hierarchy is
-active” checkbox switches the active-phase heatmap between the executed
-subtask-only composition and a counterfactual composition containing the
-fitted goal column. After upper termination, the actual goal-only policy is
-always shown. “Normalize desirability within each frame” maps the finite
-relative-value range in the current frame to 0–1; turning it off restores the
-goal-anchored log scale, where the omitted goal has value zero. Both checkboxes
-change only the visualization, not the sampled rollout.
+intermediate figure renders. Drag the green start circle and red goal star to
+stage new free cells, then press **Recompute rollout** to apply both locations
+and sample a fresh rollout. Dragging does not recompute, and pressing the
+button without moving either marker resamples the current pair.
+
+The “Include goal component while hierarchy is active” checkbox switches the
+active-phase heatmap between the executed subtask-only composition and a
+counterfactual composition containing the fitted goal column. After upper
+termination, the actual goal-only policy is always shown. “Normalize
+desirability within each frame” maps the finite relative-value range in the
+current frame to 0–1; turning it off restores the goal-anchored log scale,
+where the omitted goal has value zero. Both checkboxes change only the
+visualization, not the sampled rollout.
 `animate_soft_hierarchical_rollout` remains the export-oriented API for HTML,
 GIF, or video output.
 
@@ -193,7 +198,7 @@ validation:
 | Interior reward | `-0.1` |
 | Goal reward | `1.1` |
 | Lower control cost `lambda_1` | `0.1` |
-| Upper control cost `lambda_2` | `2.0` |
+| Upper control cost `lambda_2` | `0.25` |
 | Subgoal-access mass `alpha` | `0.2` |
 | Off-target basis reward | `-0.7` |
 | Reward-inpainting scale `beta` | `16.0` |
@@ -203,17 +208,18 @@ the paper. The 80% access core removes incidental abstract transitions at
 profile fringes and doorway cells. `alpha=0.2` retains deliberate hierarchy
 access after that narrowing. Active soft plans exclude the final exact-goal
 basis column; explicit upper termination restores the goal-only task.
-`upper_control_cost=2.0` and `beta=16.0` were jointly selected for that
-execution regime.
+`upper_control_cost=0.25` makes upper termination substantially more
+decisive, while `beta=16.0` retains the established lower-task modulation.
 
-Verification used all 96 non-goal starts, 32 rollout seeds, and three frozen
-NMF libraries (9,216 rollouts): 100% goal success, 16.78 mean steps, p90 28,
-p95 32, p99 39, and maximum 57. The hierarchy controlled 77.7% of each
-rollout and made 64.2% normalized goalward progress while active. Immediate
-handoff occurred in 9.4% of episodes, termination within five steps in 15.5%,
-and the hierarchy averaged 3.65 continuing upper commands. Overall, 95.8% of
-upper handoffs occurred within four shortest-path steps of the goal; the
-goal-only cleanup phase averaged 2.88 physical steps.
+The archived reference verification used `upper_control_cost=2.0`, all 96
+non-goal starts, 32 rollout seeds, and three frozen NMF libraries (9,216
+rollouts): 100% goal success, 16.78 mean steps, p90 28, p95 32, p99 39, and
+maximum 57. The hierarchy controlled 77.7% of each rollout and made 64.2%
+normalized goalward progress while active. Immediate handoff occurred in 9.4%
+of episodes, termination within five steps in 15.5%, and the hierarchy
+averaged 3.65 continuing upper commands. Overall, 95.8% of upper handoffs
+occurred within four shortest-path steps of the goal; the goal-only cleanup
+phase averaged 2.88 physical steps.
 
 At `(3, 2)`, a separate 15,000-rollout tail validation gave 100% success,
 23.91 mean steps, p90 31, p95 34, p99 41, and maximum 59. Immediate handoff

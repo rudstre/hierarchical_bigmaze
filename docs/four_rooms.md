@@ -55,7 +55,7 @@ ModelParameters(
     interior_reward=-0.1,
     goal_reward=1.1,
     lower_control_cost=0.1,
-    upper_control_cost=2.0,
+    upper_control_cost=0.25,
     alpha=0.2,
     off_target_reward=-0.7,
     beta=16.0,
