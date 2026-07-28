@@ -503,6 +503,11 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
     )
     animation._fig.canvas.draw()
     animation._func(access_index)
+    maze_ax = next(
+        ax
+        for ax in animation._fig.axes
+        if ax.get_title().startswith("Physical state:")
+    )
     profile_ax = next(
         ax
         for ax in animation._fig.axes
@@ -510,6 +515,7 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
     )
 
     assert np.nanmax(profile_ax.images[0].get_array()) == pytest.approx(1.0)
+    access_move_title = maze_ax.get_title().rsplit("(", maxsplit=1)[-1]
     command_index = next(
         index
         for index, frame in enumerate(animation._soft_frames)
@@ -527,6 +533,11 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
     animation._func(command_index)
     assert profile_ax.get_title().startswith(
         ("Layer 2 command from", "Layer 2 terminated from")
+    )
+    assert maze_ax.get_title().endswith(f"({access_move_title}")
+    assert (
+        animation._soft_frames[command_index].physical_steps
+        == animation._soft_frames[access_index].physical_steps
     )
     command_frame = animation._soft_frames[command_index]
     assert desirability_ax.images[0].get_clim() == pytest.approx(
@@ -659,7 +670,8 @@ def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None
         if ax.get_title().startswith("Physical state:")
     )
     assert maze_ax.get_title().endswith(
-        f"({player.frame_count}/{player.frame_count})"
+        f"(move {player.rollout.physical_steps}/"
+        f"{player.rollout.physical_steps})"
     )
 
     previous_button.click()

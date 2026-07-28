@@ -1053,7 +1053,7 @@ def animate_hierarchical_rollout(
         event_title = _event_title(frame.event)
         maze_ax.set_title(
             f"Layer-1 physical state: {event_title} "
-            f"({frame_index + 1}/{len(frames)})"
+            f"(move {frame.physical_steps}/{final_physical_step})"
         )
         status_text.set_text(_communication_status(frame))
         detail_text.set_text(_communication_details(frame, labels, model))
@@ -1881,7 +1881,7 @@ def _build_soft_hierarchical_rollout_renderer(
 
         maze_ax.set_title(
             f"Physical state: {_event_title(frame.event)} "
-            f"({frame_index + 1}/{len(frames)})"
+            f"(move {frame.physical_steps}/{rollout.physical_steps})"
         )
         status_text.set_text(_soft_communication_status(frame))
         entered = (
