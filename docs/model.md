@@ -114,6 +114,23 @@ Passing a legacy `ModelParameters` object to `build_goal_task_ensemble`
 remains supported, but the three discovery fields are copied into a separate
 `NMFDiscoveryParameters` object.
 
+For an ensemble in which every task uses the same terminal reward, discovery
+has only one profile-shaping degree of freedom. The task solutions depend on
+reward/control-cost ratios; a shared terminal reward additionally multiplies
+every column of `Z` by the same scalar. After the component-wise gauge below,
+the ideal profile geometry therefore depends only on
+`-interior_reward / control_cost`. The sweep fixes the other values at a
+numerically safe scale and searches this ratio broadly.
+
+The execution equations have a related common gauge: multiplying
+`interior_reward`, `goal_reward`, both control costs, `off_target_reward`, and
+`beta` by one positive constant leaves every exponentiated reward ratio
+unchanged. `alpha` is excluded because it is literal passive access mass. The
+defaults jointly use a narrow 80% execution core, `alpha=0.2`, and
+`beta=13.0`. The core removes incidental fringe accesses, while the increased
+access strength preserves deliberate upper-level transitions on the reduced
+support.
+
 `factorize_soft_subtasks` factorizes the actual `Z` and fixes the independent
 gauge of every NMF component,
 
@@ -139,7 +156,7 @@ P_t = \alpha \widehat D^T,
 ```
 
 where every input column is first scaled by its own peak, and the defaults are
-`tau = 0.25` and `gamma = 1`. The complete augmented passive columns are then
+`tau = 0.8` and `gamma = 1`. The complete augmented passive columns are then
 normalized. Because the transformed profiles still peak at one, `alpha`
 remains the maximum local passive access strength; controlled access can
 differ after desirability reweighting. Pass `core_threshold=None` to use
@@ -147,6 +164,12 @@ custom profiles exactly as supplied and recover direct paper Equation 3
 access. The physical-goal row, first-hit abstraction, upper solve, task basis,
 and reward inpainting are all rebuilt from the same transformed access
 profiles.
+
+The 80% threshold is an execution choice, not an NMF discovery constraint.
+It excludes weak profile fringes that can otherwise fire while the agent is
+merely crossing a doorway en route to a different commanded region. The
+discovery sweep continues to measure broader 25% profile support separately;
+changing execution gating does not refactorize or otherwise alter `D`.
 
 After a lower access into upper state \(j\), the entered column programs the
 next lower plan:

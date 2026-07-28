@@ -143,7 +143,7 @@ unchanged and makes `alpha` the maximum local passive access strength.
 the execution `ModelParameters`. Reuse the resulting `discovery.profiles`
 when changing `lower_control_cost`; rebuilding the ensemble would intentionally
 learn a different subtask library.
-`build_soft_two_layer_model` then core-gates access at 25% of each profile
+`build_soft_two_layer_model` then core-gates access at 80% of each profile
 peak by default. Values below the threshold become exactly zero; values above
 it are linearly rescaled to `[0, 1]`. Pass `core_threshold=None` for direct
 paper access `P_t = alpha * D.T`, or set `core_exponent` above one to sharpen
@@ -152,48 +152,71 @@ the surviving core further.
 ## Reference parameters
 
 `NMFDiscoveryParameters()` fixes the NMF task family at
-`interior_reward=-0.05`, `goal_reward=0.65`, and `control_cost=0.12`.
+`interior_reward=-0.4`, `goal_reward=6.5`, and `control_cost=1.2`.
 `ModelParameters()` independently configures execution using the
 sustained-hierarchy regime from the post-peak-normalization rank-eight
 validation:
 
 | Parameter | Default |
 | --- | ---: |
-| Interior reward | `-0.05` |
-| Goal reward | `0.65` |
-| Lower control cost `lambda_1` | `0.12` |
-| Upper control cost `lambda_2` | `1.15` |
-| Subgoal-access mass `alpha` | `0.08` |
-| Off-target basis reward | `-1.3` |
-| Reward-inpainting scale `beta` | `13.5` |
+| Interior reward | `-0.1` |
+| Goal reward | `1.1` |
+| Lower control cost `lambda_1` | `0.1` |
+| Upper control cost `lambda_2` | `1.8` |
+| Subgoal-access mass `alpha` | `0.2` |
+| Off-target basis reward | `-0.7` |
+| Reward-inpainting scale `beta` | `13.0` |
 
 These are empirical project choices rather than values uniquely determined by
-the paper. The validation used all 96 non-goal starts, eight rollout seeds,
-and three NMF seeds (2,304 rollouts): 100% goal success, 20.44 mean physical
-steps, and 38 steps at the 90th percentile. The hierarchy controlled 89.9% of
-each rollout on average, made 88.0% normalized goalward progress while active,
-and remained active through goal arrival in 71.4% of episodes.
+the paper. The 80% access core removes incidental abstract transitions at
+profile fringes and doorway cells. `alpha=0.2` retains deliberate hierarchy
+access after that narrowing, while `beta=13.0` keeps commands selective
+without approaching the numerical span limit.
 
-The hierarchy materially changed the lower policy (mean total variation
-`0.373`). Its core-gated accesses were region-selective: one profile supplied
-99.8% of local access membership on average, and no access occurred below the
-25% source-profile threshold. Signed Equation 10 commands assigned 70.3% of
-their positive reward mass to the leading subtask on average, with an
-effective positive command size of 1.89 subtasks. These signed reward and
-access-selectivity measures are used instead of raw desirability-component
-fractions, which are not meaningful activation measures after exponentiation.
+Verification used all 96 non-goal starts, 32 rollout seeds, and three frozen
+NMF libraries (9,216 rollouts): 100% goal success, 13.45 mean steps, p90 24,
+p95 27, p99 34, and maximum 49. The hierarchy controlled 94.2% of each
+rollout and made 93.6% normalized goalward progress while active. Immediate
+handoff occurred in 4.2% of episodes and termination within five steps in
+4.4%. It averaged 2.05 continuing upper commands, and the mean command-policy
+total variation from the goal-only policy was `0.499`.
 
-Immediate handoff occurred in 5.3% of episodes and termination within five
-physical steps in 4.3%. At the notebook demonstration start `(3, 2)`, none of
-the 24 robust trials terminated within five steps and the median active phase
-was 28.5 steps. The soft policy averaged 3.71 steps longer than its flat
-solved-goal comparator; the preset deliberately favors sustained hierarchical
-guidance over matching the speed of an already solved exact goal policy.
+A larger 36,864-rollout all-start stress test gave p99/p99.9 of 34/43 and a
+maximum of 68. Because rollout actions are sampled from a stochastic policy,
+the observed maximum is not a hard bound and grows with sample count. At
+`(3, 2)`, 18,000 additional rollouts gave mean/p90/p95/p99 steps of
+20.54/24/26/29, maximum 42, and 0.4% immediate handoff. The preset passed
+every declared pathology criterion.
 
-The earlier one-factor sensitivity count predates core gating and has not been
-carried forward as a current claim. The reproducible sweep and its
-signed-command selectivity and early-termination criteria live in
-`experiments/sweep_soft_k8.py`.
+The sweep is now tiered. It first scans
+`-discovery_interior_reward / discovery_control_cost` from `1e-3` to `10`
+and measures KL reconstruction, NMF-seed stability, profile overlap, core
+coverage, connectivity, and task-ensemble dynamic range. This is the only
+discovery ratio that changes the ideal peak-normalized profile geometry:
+scaling all discovery rewards and control cost together leaves `Z` unchanged,
+while the shared goal reward multiplies every task column by one common
+factor. The goal reward and control cost are therefore held at numerically
+safe reporting values rather than treated as two extra identifiable search
+dimensions.
+
+After selecting the first stable profile-localization knee, the script
+factorizes NMF seeds 0, 1, and 2 once and reuses those exact profile libraries.
+Execution then uses a deliberately wide log-stratified search, an
+evidence-driven factor-of-four neighborhood around broad-stage survivors, an
+all-start robust check, and a separate 2,000-seed tail check at `(3, 2)`.
+Refinement is allowed to cross an initial broad bound when a survivor lies
+near that edge; much wider numerical safety limits prevent a boundary hit
+from masquerading as an optimum. One-factor sensitivity is run around the
+current default, the balanced recommendation, and the fastest clean finalist.
+Run the complete funnel with:
+
+```bash
+.venv/bin/python experiments/sweep_soft_k8.py
+```
+
+The output directory contains `discovery.csv`, `broad.csv`, `focused.csv`,
+`robust.csv`, `demonstration_tail.csv`, `sensitivity.csv`, `summary.json`, and
+`report.md`.
 
 `soft_hierarchy_parameters(k)` scales the execution `alpha` and upper control
 cost for another NMF rank:
@@ -201,7 +224,7 @@ cost for another NMF rank:
 ```python
 parameters = soft_hierarchy_parameters(
     k=12,
-    beta=10.0,  # optional explicit override
+    beta=13.0,  # optional explicit override
 )
 ```
 

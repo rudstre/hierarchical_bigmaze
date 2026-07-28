@@ -501,6 +501,7 @@ def test_online_soft_initial_plan_does_not_use_exact_goal_column() -> None:
             ]
         ),
         goal=(0, 3),
+        core_threshold=0.25,
     )
     result = _run_hierarchical_rollout(
         model,
@@ -539,6 +540,7 @@ def test_online_soft_rollout_copies_initial_goal_and_validates_inputs() -> None:
             ]
         ),
         goal=(0, 3),
+        core_threshold=0.25,
     )
     initial = np.full(len(model.interior_states), 0.25)
     stopped = sample_online_soft_hierarchical_rollout(
@@ -617,6 +619,7 @@ def test_online_soft_terminal_start_and_zero_policy() -> None:
             ]
         ),
         goal=(0, 3),
+        core_threshold=0.25,
     )
     terminal = sample_online_soft_hierarchical_rollout(
         model,
@@ -663,6 +666,7 @@ def test_hierarchical_rollout_limits_and_terminal_start(corridor_model) -> None:
         model.goal,
         parameters=ModelParameters(
             interior_reward=-0.1,
+            goal_reward=0.65,
             alpha=0.1,
             lower_control_cost=1.0,
             upper_control_cost=1.0,
@@ -802,6 +806,7 @@ def test_soft_access_profiles_apply_core_gate_before_equation_three() -> None:
         profiles,
         goal=(0, 2),
         parameters=parameters,
+        core_threshold=0.25,
     )
     expected_profiles = np.asarray(
         [[1.0, 0.0], [1.0 / 3.0, 0.2], [0.0, 1.0]]
@@ -824,6 +829,25 @@ def test_soft_access_profiles_apply_core_gate_before_equation_three() -> None:
         raw_access / normalizers[None, :]
     )
     assert np.allclose(model.lower_dynamics.passive.sum(axis=0), 1.0)
+
+
+def test_soft_access_profiles_default_to_validated_eighty_percent_core() -> None:
+    maze = Maze.from_ascii("....")
+    profiles = np.asarray(
+        [[1.0, 0.1], [0.9, 0.2], [0.1, 1.0], [0.1, 0.1]]
+    )
+
+    model = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 3),
+    )
+
+    assert model.subtask_profiles == pytest.approx(
+        np.asarray(
+            [[1.0, 0.0], [0.5, 0.0], [0.0, 1.0], [0.0, 0.0]]
+        )
+    )
 
 
 def test_soft_core_gate_can_be_disabled_and_exponentiated() -> None:
@@ -888,7 +912,12 @@ def test_soft_plan_uses_first_hit_then_active_upper_state() -> None:
     profiles = np.asarray(
         [[1.0, 0.0], [0.6, 0.2], [0.2, 0.6], [0.0, 1.0]]
     )
-    model = build_soft_two_layer_model(maze, profiles, goal=(0, 3))
+    model = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 3),
+        core_threshold=0.25,
+    )
     current = (0, 1)
     initial = compute_soft_layer_one_plan(model, current)
     accessed = compute_soft_layer_one_plan(

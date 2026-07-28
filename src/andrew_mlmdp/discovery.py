@@ -18,9 +18,9 @@ class NMFDiscoveryParameters:
     tuning cannot silently rediscover a different hierarchy.
     """
 
-    interior_reward: float = -0.05
-    goal_reward: float = 0.65
-    control_cost: float = 0.12
+    interior_reward: float = -0.4
+    goal_reward: float = 6.5
+    control_cost: float = 1.2
 
     def __post_init__(self) -> None:
         values = (

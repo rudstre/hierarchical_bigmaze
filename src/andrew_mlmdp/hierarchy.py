@@ -395,7 +395,7 @@ def build_soft_two_layer_model(
     goal: Coordinate,
     *,
     parameters: ModelParameters = ModelParameters(),
-    core_threshold: float | None = 0.25,
+    core_threshold: float | None = 0.8,
     core_exponent: float = 1.0,
 ) -> SoftTwoLayerModel:
     """Construct a two-layer model with core-gated soft accesses.

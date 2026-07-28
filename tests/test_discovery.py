@@ -20,12 +20,21 @@ from andrew_mlmdp.maze import Maze
 def test_goal_task_ensemble_matches_flat_solutions() -> None:
     maze = Maze.from_ascii("...\n.#.\n...")
     ensemble = build_goal_task_ensemble(maze)
+    solver_parameters = ModelParameters(
+        interior_reward=ensemble.parameters.interior_reward,
+        goal_reward=ensemble.parameters.goal_reward,
+        lower_control_cost=ensemble.parameters.control_cost,
+    )
 
     assert ensemble.goals == maze.free_cells
     assert ensemble.desirability.shape == (8, 8)
     for task, goal in enumerate(ensemble.goals):
         assert ensemble.desirability[:, task] == pytest.approx(
-            solve_desirability(maze, goal)
+            solve_desirability(
+                maze,
+                goal,
+                parameters=solver_parameters,
+            )
         )
     assert ensemble.normalized_desirability.max(axis=0) == pytest.approx(1.0)
 

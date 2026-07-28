@@ -23,13 +23,13 @@ class ModelParameters:
     values fixed by the paper.
     """
 
-    interior_reward: float = -0.05
-    goal_reward: float = 0.65
-    lower_control_cost: float = 0.12
-    upper_control_cost: float = 1.15
-    alpha: float = 0.08
-    off_target_reward: float = -1.3
-    beta: float = 13.5
+    interior_reward: float = -0.1
+    goal_reward: float = 1.1
+    lower_control_cost: float = 0.1
+    upper_control_cost: float = 1.8
+    alpha: float = 0.2
+    off_target_reward: float = -0.7
+    beta: float = 13.0
 
     def __post_init__(self) -> None:
         values = (

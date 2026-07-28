@@ -621,6 +621,7 @@ def test_hierarchical_rollout_trace_records_subgoal_access() -> None:
         goal=(0, 3),
         parameters=ModelParameters(
             interior_reward=-0.1,
+            goal_reward=0.65,
             alpha=0.1,
             lower_control_cost=1.0,
             upper_control_cost=1.0,

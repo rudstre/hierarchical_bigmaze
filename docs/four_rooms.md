@@ -41,9 +41,9 @@ NMF discovery uses a separate frozen task family:
 
 ```python
 NMFDiscoveryParameters(
-    interior_reward=-0.05,
-    goal_reward=0.65,
-    control_cost=0.12,
+    interior_reward=-0.4,
+    goal_reward=6.5,
+    control_cost=1.2,
 )
 ```
 
@@ -52,13 +52,13 @@ regime selected after component-wise NMF peak normalization:
 
 ```python
 ModelParameters(
-    interior_reward=-0.05,
-    goal_reward=0.65,
-    lower_control_cost=0.12,
-    upper_control_cost=1.15,
-    alpha=0.08,
-    off_target_reward=-1.3,
-    beta=13.5,
+    interior_reward=-0.1,
+    goal_reward=1.1,
+    lower_control_cost=0.1,
+    upper_control_cost=1.8,
+    alpha=0.2,
+    off_target_reward=-0.7,
+    beta=13.0,
 )
 ```
 
@@ -71,36 +71,31 @@ form of the abstraction and inpainting equations. The layer-dependent control
 costs, off-target reward, and inpainting proportionality used here are project
 choices.
 
-The post-normalization validation searched a broad range and a focused
-neighborhood, then evaluated finalists over all 96 non-goal starts, eight
-rollout seeds, and three NMF seeds. The rounded default reached the goal in all
-2,304 rollouts. Mean/median/90th-percentile physical steps were
-20.44/18/38; the flat solved-goal comparator averaged 16.73.
+Execution uses an 80%-of-peak soft core. This excludes weak profile fringes,
+including a doorway cell that previously caused an S5 command to be
+interrupted by an unintended S7 access. The larger `alpha=0.2` compensates
+for the narrower support so deliberate access remains frequent.
 
-The hierarchy controlled 89.9% of each rollout on average and remained active
-through goal arrival in 71.4% of episodes. It made 88.0% normalized goalward
-progress while active, with positive progress in 98.7% of rollouts. Immediate
-handoff occurred in 5.3% of episodes and termination within five physical
-steps in 4.3%. At the notebook start `(3, 2)`, none of 24 robust trials
-terminated within five steps; the median active phase was 28.5 steps.
+The rounded regime was checked over all 96 non-goal starts, 32 rollout seeds,
+and three frozen NMF libraries (9,216 rollouts). It reached the goal in every
+rollout, with mean/median/p90/p95/p99/maximum steps of
+13.45/13/24/27/34/49. The hierarchy was active for 94.2% of each rollout,
+made 93.6% normalized goalward progress while active, averaged 2.05
+continuing upper commands, and had 4.2% immediate handoff and 4.4%
+termination within five steps.
 
-Core-gated accesses were spatially selective: the dominant profile supplied
-99.8% of local access membership on average, and no access occurred below the
-25% source-profile threshold. Signed upper-layer reward commands put 70.3% of
-their positive mass on the leading subtask and had an effective size of 1.89
-positively rewarded subtasks. These replace raw desirability-component
-fractions as selection criteria because positive basis coefficients do not
-mean positive rewards in exponentiated reward space. Initial-policy total
-variation from the goal-only policy was 0.373.
+A 36,864-rollout all-start stress test gave p99/p99.9 of 34/43 and maximum
+68. This maximum is an observed stochastic sample, not a guaranteed horizon.
+At `(3, 2)`, 18,000 additional rollouts gave mean/p90/p95/p99/maximum steps
+of 20.54/24/26/29/42 and 0.4% immediate handoff. The regime passed all
+declared pathology criteria.
 
-Numerically, 0.89% of projected weights were clipped, maximum relative
-boundary projection error was `1.18e-7`, maximum command span was 4.69
-decades, and the mean path-length range across NMF seeds was 0.85 steps. There
-were no zero-policy, step-limit, or abstract-access-limit failures. The
-hierarchy added 3.71 mean steps relative to an already solved flat goal policy;
-the preset deliberately prioritizes sustained hierarchical guidance rather
-than shorter solved-goal paths. Reproduce the screening and sensitivity
-analysis with `experiments/sweep_soft_k8.py`.
+The current sweep implementation no longer assumes that focused neighborhood.
+It first searches the identifiable discovery profile-shaping ratio over four
+orders of magnitude, freezes the selected NMF libraries, searches execution
+over deliberately broad ranges, and derives refinement neighborhoods from the
+broad-stage survivors. It also reports per-start p90/p95 values and a separate
+high-seed-count tail analysis for `(3, 2)`.
 
 The earlier one-factor sensitivity count predates core gating and is not
 reported as a current result.
