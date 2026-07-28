@@ -1272,7 +1272,6 @@ def _frame_desirability_grid(
         goal_value = values[goal_state]
         if np.isfinite(goal_value) and goal_value > 0.0:
             values /= goal_value
-        values[goal_state] = np.nan
     return desirability_grid(maze, values)
 
 
@@ -1354,7 +1353,6 @@ def _composed_log_desirability_grid(
             model.parameters.lower_control_cost
             * np.log(desirability[positive] / goal_desirability)
         )
-    relative_value[goal_state] = np.nan
     return desirability_grid(model.maze, relative_value)
 
 
@@ -1769,7 +1767,7 @@ def _build_soft_hierarchical_rollout_renderer(
     )
     desirability_ax.set_title(
         "Full composed desirability "
-        "(frame-normalized; goal cell masked)"
+        "(frame-normalized; goal marked with star)"
     )
 
     reward_limit = 0.125
@@ -1920,7 +1918,7 @@ def _build_soft_hierarchical_rollout_renderer(
         elif goal_component_state["included"]:
             desirability_ax.set_title(
                 "Full composed desirability "
-                f"({scale_description}; goal cell masked)"
+                f"({scale_description}; goal marked with star)"
             )
         else:
             desirability_ax.set_title(

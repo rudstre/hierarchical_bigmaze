@@ -3,6 +3,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.backend_bases import MouseButton, MouseEvent
 
@@ -91,6 +92,14 @@ def test_fixed_animation_uses_unified_rollout_for_exact_and_online():
         )
         assert isinstance(animation, FuncAnimation)
         animation._func(0)
+        desirability_ax = next(
+            ax
+            for ax in animation._fig.axes
+            if ax.get_title().startswith("Layer-1 desirability")
+        )
+        assert np.isfinite(
+            desirability_ax.images[0].get_array()[0, 5]
+        )
         animation._draw_was_started = True
         plt.close(animation._fig)
 
@@ -174,4 +183,13 @@ def test_soft_player_controls_and_invalid_drops(soft_corridor_template):
     assert not player.goal_component_visible
     assert not player.framewise_normalization
     assert player.frame_index == player.frame_count - 1
+    desirability_ax = next(
+        ax
+        for ax in player.figure.axes
+        if "desirability" in ax.get_title().lower()
+    )
+    goal_row, goal_column = player.goal
+    assert np.isfinite(
+        desirability_ax.images[0].get_array()[goal_row, goal_column]
+    )
     plt.close(player.figure)
