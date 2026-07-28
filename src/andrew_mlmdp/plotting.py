@@ -1210,7 +1210,29 @@ def _composed_log_desirability_grid(
 
     if frame.plan is None:
         return np.full(model.maze.shape, np.nan, dtype=np.float64)
-    if include_goal_component:
+    include_goal_component = (
+        include_goal_component or _is_goal_only_plan(frame)
+    )
+    excluded_execution_goal = (
+        not model.include_goal_component_while_active
+        and frame.plan.weights[-1] == 0.0
+        and frame.plan.raw_weights[-1] > 0.0
+    )
+    if include_goal_component and excluded_execution_goal:
+        display_weights = frame.plan.weights.copy()
+        display_weights[-1] = frame.plan.raw_weights[-1]
+        desirability = np.empty(
+            len(model.maze.free_cells),
+            dtype=np.float64,
+        )
+        desirability[model.interior_states] = (
+            model.task_basis.interior_desirability @ display_weights
+        )
+        goal_state = model.maze.state_index(model.goal)
+        desirability[goal_state] = (
+            model.task_basis.boundary_desirability[-1] @ display_weights
+        )
+    elif include_goal_component:
         desirability = frame.plan.physical_desirability
     else:
         desirability = np.zeros(
@@ -1225,7 +1247,15 @@ def _composed_log_desirability_grid(
         # Non-goal basis tasks have zero desirability at the exact goal
         # boundary. Retain the full plan's goal value only as a shared display
         # reference so toggling the component changes no other scale factor.
-        desirability[goal_state] = frame.plan.physical_desirability[goal_state]
+        if excluded_execution_goal:
+            desirability[goal_state] = (
+                model.task_basis.boundary_desirability[-1, -1]
+                * frame.plan.raw_weights[-1]
+            )
+        else:
+            desirability[goal_state] = (
+                frame.plan.physical_desirability[goal_state]
+            )
     goal_state = model.maze.state_index(model.goal)
     goal_desirability = desirability[goal_state]
     relative_value = np.full_like(desirability, np.nan)
@@ -1239,29 +1269,44 @@ def _composed_log_desirability_grid(
     return desirability_grid(model.maze, relative_value)
 
 
-def _composed_log_desirability_norm(
+def _is_goal_only_plan(frame: _SoftRolloutFrame) -> bool:
+    """Return whether upper termination has selected the exact goal task."""
+
+    return bool(
+        frame.plan is not None
+        and frame.plan.weights[-1] > 0.0
+        and np.all(frame.plan.weights[:-1] == 0.0)
+    )
+
+
+def _framewise_normalized_composed_desirability_grid(
     model: SoftTwoLayerModel,
     frame: _SoftRolloutFrame,
     *,
     include_goal_component: bool = True,
-) -> Normalize:
-    """Scale one frame without allowing future rollout states to affect it."""
+) -> np.ndarray:
+    """Normalize the finite composed desirability range within one frame."""
 
     values = _composed_log_desirability_grid(
         model,
         frame,
         include_goal_component=include_goal_component,
-    ).ravel()
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return Normalize(vmin=-1.0, vmax=0.0)
-    # Zero is the omitted goal's reference value. Keep it anchored while
-    # adapting the other limit to the current frame's policy contrast.
-    minimum = min(0.0, float(finite.min()))
-    maximum = max(0.0, float(finite.max()))
-    if minimum == maximum:
-        minimum -= 1.0
-    return Normalize(vmin=minimum, vmax=maximum)
+    )
+    finite_mask = np.isfinite(values)
+    if not np.any(finite_mask):
+        return values
+
+    minimum = float(np.min(values[finite_mask]))
+    maximum = float(np.max(values[finite_mask]))
+    normalized = np.full_like(values, np.nan)
+    if maximum > minimum:
+        normalized[finite_mask] = (
+            values[finite_mask] - minimum
+        ) / (maximum - minimum)
+    else:
+        # A uniform frame has no relative contrast to display.
+        normalized[finite_mask] = 0.5
+    return normalized
 
 
 def _format_probability(value: float | None) -> str:
@@ -1533,20 +1578,17 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
     goal_component_state = {"included": True}
-    initial_desirability_grid = _composed_log_desirability_grid(
-        model,
-        frames[0],
-        include_goal_component=goal_component_state["included"],
-    )
-    composed_desirability_norm = _composed_log_desirability_norm(
-        model,
-        frames[0],
-        include_goal_component=goal_component_state["included"],
+    initial_desirability_grid = (
+        _framewise_normalized_composed_desirability_grid(
+            model,
+            frames[0],
+            include_goal_component=goal_component_state["included"],
+        )
     )
     desirability_image = desirability_ax.imshow(
         initial_desirability_grid,
         cmap=color_map,
-        norm=composed_desirability_norm,
+        norm=Normalize(vmin=0.0, vmax=1.0),
         origin="upper",
         extent=(-0.5, columns - 0.5, rows - 0.5, -0.5),
     )
@@ -1592,15 +1634,16 @@ def _build_soft_hierarchical_rollout_renderer(
                 "alpha": 0.65,
             },
         )
-    desirability_colorbar = figure.colorbar(
+    figure.colorbar(
         desirability_image,
         ax=desirability_ax,
-        label=r"$\lambda \log(z / z_{\mathrm{goal}})$",
+        label="relative desirability within frame",
         fraction=0.046,
         pad=0.04,
     )
     desirability_ax.set_title(
-        "Full composed desirability (log scale; goal cell masked)"
+        "Full composed desirability "
+        "(frame-normalized; goal cell masked)"
     )
 
     reward_limit = 0.125
@@ -1654,6 +1697,7 @@ def _build_soft_hierarchical_rollout_renderer(
 
     def update(frame_index: int):
         frame = frames[frame_index]
+        goal_only = _is_goal_only_plan(frame)
         path_line.set_data(
             [coordinate[1] for coordinate in frame.trajectory],
             [coordinate[0] for coordinate in frame.trajectory],
@@ -1667,7 +1711,14 @@ def _build_soft_hierarchical_rollout_renderer(
             axis=0,
             keepdims=True,
         )
-        if frame.profile_subtask is None:
+        if goal_only and frame.event != "upper_termination":
+            profile_image.set_data(
+                desirability_grid(model.maze, empty_profile)
+            )
+            profile_ax.set_title(
+                "Goal-only policy after layer-2 termination"
+            )
+        elif frame.profile_subtask is None:
             profile_image.set_data(
                 desirability_grid(model.maze, empty_profile)
             )
@@ -1698,29 +1749,28 @@ def _build_soft_hierarchical_rollout_renderer(
                     "Current command from "
                     f"{labels[frame.profile_subtask]}"
                 )
-        desirability_grid_values = _composed_log_desirability_grid(
-            model,
-            frame,
-            include_goal_component=goal_component_state["included"],
-        )
-        desirability_image.set_data(desirability_grid_values)
-        desirability_image.set_norm(
-            _composed_log_desirability_norm(
+        desirability_grid_values = (
+            _framewise_normalized_composed_desirability_grid(
                 model,
                 frame,
                 include_goal_component=goal_component_state["included"],
             )
         )
-        desirability_colorbar.update_normal(desirability_image)
-        if goal_component_state["included"]:
+        desirability_image.set_data(desirability_grid_values)
+        if goal_only:
+            desirability_ax.set_title(
+                "Goal-only desirability after layer-2 termination "
+                "(frame-normalized)"
+            )
+        elif goal_component_state["included"]:
             desirability_ax.set_title(
                 "Full composed desirability "
-                "(log scale; goal cell masked)"
+                "(frame-normalized; goal cell masked)"
             )
         else:
             desirability_ax.set_title(
                 "Subtask-only desirability "
-                "(exact goal basis removed)"
+                "(frame-normalized; exact goal basis removed)"
             )
 
         reward_command_disabled = (
@@ -1784,6 +1834,8 @@ def _build_soft_hierarchical_rollout_renderer(
         detail_text.set_text(
             f"physical steps:  {frame.physical_steps}\n"
             f"abstract calls:  {frame.abstract_accesses}\n"
+            f"control phase:   "
+            f"{'goal-only' if goal_only else 'hierarchy active'}\n"
             f"entered state:   {entered}\n"
             f"upper outcome:   {upper_outcome}\n"
             f"passive access:  {_format_probability(frame.passive_access_probability)}\n"
@@ -1913,12 +1965,13 @@ def plot_interactive_soft_hierarchical_rollout(
         tooltip="Show the next rollout event",
     )
     goal_component_checkbox = widgets.Checkbox(
-        value=True,
-        description="Include exact goal component",
+        value=model.include_goal_component_while_active,
+        description="Include goal component while hierarchy is active",
         indent=False,
         tooltip=(
-            "Toggle the final goal-basis column in the displayed "
-            "desirability composition"
+            "Toggle the counterfactual final goal-basis column during the "
+            "active hierarchy phase; after termination the actual goal-only "
+            "policy is always shown"
         ),
     )
 
@@ -1950,6 +2003,7 @@ def plot_interactive_soft_hierarchical_rollout(
     )
     previous_button.on_click(show_previous)
     next_button.on_click(show_next)
+    renderer.set_goal_component(goal_component_checkbox.value)
     renderer.update(0)
     update_button_state(0)
 
@@ -2023,6 +2077,10 @@ def _soft_subtask_labels(
 
 
 def _soft_communication_status(frame: _SoftRolloutFrame) -> str:
+    if frame.event == "terminal" and frame.status == "reached_goal":
+        return "The physical goal boundary was reached."
+    if frame.event == "terminal":
+        return f"Rollout stopped: {frame.status}."
     if frame.event == "initial_plan":
         return "Layer 1 requests an initial task from layer 2."
     if frame.event == "subtask_access":
@@ -2031,8 +2089,9 @@ def _soft_communication_status(frame: _SoftRolloutFrame) -> str:
         return "Layer 2 programmed layer 1 from the entered upper state."
     if frame.event == "upper_termination":
         return "Layer 2 terminated; only the physical goal remains enabled."
-    if frame.event == "terminal" and frame.status == "reached_goal":
-        return "The physical goal boundary was reached."
-    if frame.event == "terminal":
-        return f"Rollout stopped: {frame.status}."
+    if _is_goal_only_plan(frame):
+        return (
+            "Layer 2 is terminated; layer 1 follows the exact "
+            "goal-only policy."
+        )
     return "Layer 1 follows the currently programmed lower policy."

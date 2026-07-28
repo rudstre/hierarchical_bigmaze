@@ -1,9 +1,9 @@
-"""Reproducible parameter sweep for the eight-component soft hierarchy.
+"""Tiered parameter sweep for the eight-component soft hierarchy.
 
-The search varies every field in ``ModelParameters``.  Candidate generation is
-log-stratified because the LMDP equations depend mainly on reward/control-cost
-ratios and on ``beta / lower_control_cost``.  Results are deliberately reported
-as a set of behavioral diagnostics rather than collapsed into one opaque loss.
+The discovery tier first searches the single identifiable profile-shaping
+ratio in ``NMFDiscoveryParameters``.  It then freezes the selected rank-eight
+profile libraries.  Separate broad, locally refined, and robust behavioral
+tiers vary ``ModelParameters`` without rerunning NMF.
 """
 
 from __future__ import annotations
@@ -15,10 +15,11 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
-from typing import Iterable
+from typing import Iterable, Mapping
 import warnings
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -27,6 +28,7 @@ from andrew_mlmdp import (  # noqa: E402
     Maze,
     ModelParameters,
     NMFDiscoveryParameters,
+    SoftSubtaskDiscovery,
     build_goal_task_ensemble,
     build_soft_two_layer_model,
     controlled_dynamics,
@@ -47,7 +49,30 @@ GOAL = (10, 9)
 DEMONSTRATION_START = (3, 2)
 K = 8
 MAX_STEPS = 250
-DISCOVERY_PARAMETERS = NMFDiscoveryParameters()
+DISCOVERY_PROFILE_THRESHOLD = 0.25
+EXECUTION_CORE_THRESHOLD = 0.8
+INCLUDE_GOAL_COMPONENT_WHILE_ACTIVE = False
+DISCOVERY_CONTROL_COST = 1.2
+DISCOVERY_GOAL_REWARD = 6.5
+DISCOVERY_RATIO_BOUNDS = (1e-3, 10.0)
+EXECUTION_BOUNDS = {
+    "interior_magnitude": (0.1, 10.0),
+    "goal_reward": (1.0, 50.0),
+    "lower_control_cost": (0.3, 40.0),
+    "upper_control_cost": (0.3, 60.0),
+    "alpha": (5e-4, 5.0),
+    "off_target_magnitude": (0.1, 100.0),
+    "beta": (0.1, 400.0),
+}
+EXECUTION_SAFETY_LIMITS = {
+    "interior_magnitude": (0.02, 50.0),
+    "goal_reward": (0.2, 200.0),
+    "lower_control_cost": (0.1, 150.0),
+    "upper_control_cost": (0.1, 250.0),
+    "alpha": (1e-4, 20.0),
+    "off_target_magnitude": (0.02, 500.0),
+    "beta": (0.02, 2000.0),
+}
 PATHOLOGY_THRESHOLDS = {
     "minimum_success_rate": 0.95,
     "minimum_worst_start_success_rate": 0.80,
@@ -57,6 +82,8 @@ PATHOLOGY_THRESHOLDS = {
     "maximum_demonstration_immediate_handoff_rate": 0.15,
     "maximum_demonstration_termination_by_5_rate": 0.20,
     "maximum_termination_by_5_episode_rate": 0.20,
+    "minimum_termination_within_four_steps_rate": 0.85,
+    "maximum_mean_post_termination_steps": 5.0,
     "maximum_upper_terminal_probability": 0.50,
     "minimum_demonstration_median_active_steps": 10.0,
     "minimum_mean_active_phase_fraction": 0.70,
@@ -90,15 +117,390 @@ PARAMETER_FIELDS = (
 )
 
 
+def discovery_parameter_candidates(
+    count: int,
+    *,
+    seed: int,
+    ratio_bounds: tuple[float, float] = DISCOVERY_RATIO_BOUNDS,
+) -> list[NMFDiscoveryParameters]:
+    """Sample the only discovery ratio that changes peak-normalized profiles.
+
+    In the flat task family, multiplying interior reward, terminal reward, and
+    control cost by one common factor leaves ``Z`` unchanged.  Moreover, the
+    common terminal reward multiplies every column of ``Z`` by the same scalar,
+    which disappears from peak-normalized ``D``.  The profile geometry is
+    therefore controlled by ``-interior_reward / control_cost`` alone.
+    """
+
+    if count < 1:
+        raise ValueError("Discovery sample count must be positive")
+    low, high = ratio_bounds
+    if not 0.0 < low < high:
+        raise ValueError("Discovery ratio bounds must be positive and ordered")
+
+    rng = np.random.default_rng(seed)
+    strata = (np.arange(count) + rng.random(count)) / count
+    rng.shuffle(strata)
+    ratios = np.exp(np.log(low) + strata * (np.log(high) - np.log(low)))
+    candidates = [
+        NMFDiscoveryParameters(
+            interior_reward=-DISCOVERY_CONTROL_COST * float(ratio),
+            goal_reward=DISCOVERY_GOAL_REWARD,
+            control_cost=DISCOVERY_CONTROL_COST,
+        )
+        for ratio in ratios
+    ]
+    # Always retain the existing project setting and the paper-scale ratio so
+    # the broad search has auditable anchors.
+    candidates.extend(
+        [
+            NMFDiscoveryParameters(),
+            NMFDiscoveryParameters(
+                interior_reward=-0.1 * DISCOVERY_CONTROL_COST,
+                goal_reward=DISCOVERY_GOAL_REWARD,
+                control_cost=DISCOVERY_CONTROL_COST,
+            ),
+        ]
+    )
+    return candidates
+
+
+def evaluate_discovery_candidates(
+    maze: Maze,
+    candidates: Iterable[NMFDiscoveryParameters],
+    *,
+    nmf_seeds: Iterable[int],
+) -> list[dict[str, float | int | str]]:
+    """Measure NMF fidelity, seed stability, and spatial core quality."""
+
+    seeds = tuple(nmf_seeds)
+    if not seeds:
+        raise ValueError("At least one NMF seed is required")
+    rows: list[dict[str, float | int | str]] = []
+    for candidate_id, parameters in enumerate(candidates):
+        ratio = -parameters.interior_reward / parameters.control_cost
+        try:
+            ensemble = build_goal_task_ensemble(
+                maze,
+                discovery_parameters=parameters,
+            )
+            discoveries = [
+                factorize_soft_subtasks(
+                    ensemble,
+                    n_subtasks=K,
+                    seed=seed,
+                )
+                for seed in seeds
+            ]
+            metrics = discovery_quality_metrics(
+                maze,
+                ensemble.desirability,
+                discoveries,
+            )
+            row: dict[str, float | int | str] = {
+                "candidate_id": candidate_id,
+                **asdict(parameters),
+                "interior_penalty_ratio": ratio,
+                "goal_reward_ratio": (
+                    parameters.goal_reward / parameters.control_cost
+                ),
+                **metrics,
+            }
+        except (ValueError, np.linalg.LinAlgError, RuntimeWarning) as error:
+            row = {
+                "candidate_id": candidate_id,
+                **asdict(parameters),
+                "interior_penalty_ratio": ratio,
+                "goal_reward_ratio": (
+                    parameters.goal_reward / parameters.control_cost
+                ),
+                "valid": 0,
+                "invalid_reason": f"{type(error).__name__}: {error}",
+            }
+        rows.append(row)
+    return rows
+
+
+def discovery_quality_metrics(
+    maze: Maze,
+    desirability: np.ndarray,
+    discoveries: list[SoftSubtaskDiscovery],
+) -> dict[str, float | int | str]:
+    """Return behavior-free diagnostics for a frozen profile library."""
+
+    positive = desirability[desirability > 0.0]
+    reference = discoveries[0].profiles
+    core_sizes: list[int] = []
+    core_coverages: list[float] = []
+    core_overlap_rates: list[float] = []
+    connected_core_fractions: list[float] = []
+    effective_supports: list[float] = []
+    pairwise_cosines: list[float] = []
+    unique_peak_fractions: list[float] = []
+
+    for discovery in discoveries:
+        profiles = discovery.profiles
+        core = profiles >= DISCOVERY_PROFILE_THRESHOLD
+        core_sizes.extend(core.sum(axis=0).astype(int).tolist())
+        core_coverages.append(float(np.mean(core.any(axis=1))))
+        core_overlap_rates.append(float(np.mean(core.sum(axis=1) > 1)))
+        connected_core_fractions.extend(
+            dominant_core_component_fraction(maze, core[:, component])
+            for component in range(profiles.shape[1])
+        )
+        profile_mass = profiles.sum(axis=0)
+        normalized = profiles / profile_mass[np.newaxis, :]
+        effective_supports.extend(
+            (1.0 / np.sum(normalized**2, axis=0)).tolist()
+        )
+        cosine = cosine_similarity_columns(profiles, profiles)
+        off_diagonal = ~np.eye(profiles.shape[1], dtype=bool)
+        pairwise_cosines.extend(cosine[off_diagonal].tolist())
+        unique_peak_fractions.append(
+            len(set(np.argmax(profiles, axis=0).tolist()))
+            / profiles.shape[1]
+        )
+
+    matched_similarities: list[float] = []
+    for discovery in discoveries[1:]:
+        similarities = cosine_similarity_columns(
+            reference,
+            discovery.profiles,
+        )
+        reference_indices, candidate_indices = linear_sum_assignment(
+            -similarities
+        )
+        matched_similarities.extend(
+            similarities[reference_indices, candidate_indices].tolist()
+        )
+    if not matched_similarities:
+        matched_similarities = [1.0]
+
+    reconstruction_errors = [
+        discovery.reconstruction_error for discovery in discoveries
+    ]
+    normalized_target = desirability / desirability.max(
+        axis=0,
+        keepdims=True,
+    )
+    relative_errors = [
+        float(
+            np.linalg.norm(
+                discovery.reconstruction
+                / desirability.max(axis=0, keepdims=True)
+                - normalized_target
+            )
+            / np.linalg.norm(normalized_target)
+        )
+        for discovery in discoveries
+    ]
+    metrics: dict[str, float | int | str] = {
+        "valid": 1,
+        "invalid_reason": "",
+        "nmf_seeds": len(discoveries),
+        "convergence_rate": float(
+            np.mean([discovery.converged for discovery in discoveries])
+        ),
+        "mean_nmf_iterations": float(
+            np.mean([discovery.n_iter for discovery in discoveries])
+        ),
+        "mean_reconstruction_kl": float(np.mean(reconstruction_errors)),
+        "max_reconstruction_kl": float(np.max(reconstruction_errors)),
+        "mean_relative_reconstruction_error": float(
+            np.mean(relative_errors)
+        ),
+        "ensemble_log10_span": float(
+            np.log10(positive.max() / positive.min())
+        ),
+        "mean_core_size": float(np.mean(core_sizes)),
+        "min_core_size": int(np.min(core_sizes)),
+        "max_core_size": int(np.max(core_sizes)),
+        "mean_core_coverage": float(np.mean(core_coverages)),
+        "mean_core_overlap_rate": float(np.mean(core_overlap_rates)),
+        "mean_dominant_core_component_fraction": float(
+            np.mean(connected_core_fractions)
+        ),
+        "minimum_dominant_core_component_fraction": float(
+            np.min(connected_core_fractions)
+        ),
+        "mean_profile_effective_support": float(
+            np.mean(effective_supports)
+        ),
+        "mean_pairwise_profile_cosine": float(
+            np.mean(pairwise_cosines)
+        ),
+        "max_pairwise_profile_cosine": float(
+            np.max(pairwise_cosines)
+        ),
+        "mean_unique_peak_fraction": float(
+            np.mean(unique_peak_fractions)
+        ),
+        "mean_matched_seed_cosine": float(
+            np.mean(matched_similarities)
+        ),
+        "minimum_matched_seed_cosine": float(
+            np.min(matched_similarities)
+        ),
+    }
+    reasons = discovery_pathology_reasons(metrics)
+    metrics["pathological"] = int(bool(reasons))
+    metrics["pathology_reasons"] = "; ".join(reasons)
+    return metrics
+
+
+def cosine_similarity_columns(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> np.ndarray:
+    numerator = first.T @ second
+    first_norm = np.linalg.norm(first, axis=0)
+    second_norm = np.linalg.norm(second, axis=0)
+    return numerator / (first_norm[:, np.newaxis] * second_norm[np.newaxis, :])
+
+
+def dominant_core_component_fraction(
+    maze: Maze,
+    membership: np.ndarray,
+) -> float:
+    """Return the share of a profile core in its largest connected component."""
+
+    remaining = {
+        maze.coordinate(int(state))
+        for state in np.flatnonzero(membership)
+    }
+    if not remaining:
+        return 0.0
+    component_sizes: list[int] = []
+    while remaining:
+        pending = [remaining.pop()]
+        component_size = 0
+        while pending:
+            coordinate = pending.pop()
+            component_size += 1
+            for command in ("north", "south", "east", "west"):
+                neighbour = maze.command_outcome(coordinate, command)
+                if neighbour in remaining:
+                    remaining.remove(neighbour)
+                    pending.append(neighbour)
+        component_sizes.append(component_size)
+    return max(component_sizes) / sum(component_sizes)
+
+
+def discovery_pathology_reasons(
+    metrics: Mapping[str, float | int | str],
+) -> list[str]:
+    """Apply broad structural guardrails without choosing an optimum."""
+
+    reasons: list[str] = []
+    if float(metrics["convergence_rate"]) < 1.0:
+        reasons.append("NMF did not always converge")
+    if float(metrics["ensemble_log10_span"]) > 30.0:
+        reasons.append("task ensemble spans more than 30 decades")
+    if float(metrics["minimum_matched_seed_cosine"]) < 0.90:
+        reasons.append("profiles are initialization-sensitive")
+    if float(metrics["mean_core_coverage"]) < 0.80:
+        reasons.append("profile cores leave much of the maze uncovered")
+    if float(metrics["mean_core_overlap_rate"]) > 0.40:
+        reasons.append("profile cores overlap excessively")
+    if float(metrics["minimum_dominant_core_component_fraction"]) < 0.80:
+        reasons.append("at least one profile core is spatially fragmented")
+    return reasons
+
+
+def select_discovery_parameters(
+    rows: list[dict[str, float | int | str]],
+) -> dict[str, float | int | str]:
+    """Select the first stable localization knee in the discovery sweep."""
+
+    valid = [row for row in rows if int(row.get("valid", 0))]
+    if not valid:
+        raise ValueError("No valid discovery candidates")
+    eligible = [
+        row for row in valid if not int(row.get("pathological", 1))
+    ] or valid
+    localized = [
+        row
+        for row in eligible
+        if float(row["mean_core_overlap_rate"]) <= 0.10
+        and float(row["mean_pairwise_profile_cosine"]) <= 0.03
+        and float(row["minimum_matched_seed_cosine"]) >= 0.95
+    ]
+    if localized:
+        # Do not continue increasing the penalty once clean, stable cores have
+        # emerged; doing so only worsens dynamic range and eventually NMF
+        # initialization stability.
+        return min(
+            localized,
+            key=lambda row: (
+                float(row["ensemble_log10_span"]),
+                float(row["mean_reconstruction_kl"]),
+            ),
+        )
+    return min(
+        eligible,
+        key=lambda row: (
+            float(row["mean_core_overlap_rate"])
+            + float(row["mean_pairwise_profile_cosine"])
+            + (1.0 - float(row["minimum_matched_seed_cosine"])),
+            float(row["ensemble_log10_span"]),
+        ),
+    )
+
+
+def discovery_parameters_from_row(
+    row: Mapping[str, float | int | str],
+) -> NMFDiscoveryParameters:
+    return NMFDiscoveryParameters(
+        interior_reward=float(row["interior_reward"]),
+        goal_reward=float(row["goal_reward"]),
+        control_cost=float(row["control_cost"]),
+    )
+
+
+def precompute_discoveries(
+    maze: Maze,
+    parameters: NMFDiscoveryParameters,
+    *,
+    nmf_seeds: Iterable[int],
+) -> dict[int, SoftSubtaskDiscovery]:
+    """Build each frozen NMF library once for all execution candidates."""
+
+    ensemble = build_goal_task_ensemble(
+        maze,
+        discovery_parameters=parameters,
+    )
+    return {
+        seed: factorize_soft_subtasks(
+            ensemble,
+            n_subtasks=K,
+            seed=seed,
+        )
+        for seed in tuple(nmf_seeds)
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--broad-samples", type=int, default=256)
-    parser.add_argument("--focused-samples", type=int, default=128)
-    parser.add_argument("--broad-starts", type=int, default=16)
-    parser.add_argument("--broad-seeds", type=int, default=4)
-    parser.add_argument("--finalists", type=int, default=16)
-    parser.add_argument("--robust-seeds", type=int, default=8)
-    parser.add_argument("--sensitivity-seeds", type=int, default=4)
+    parser.add_argument("--discovery-samples", type=int, default=64)
+    parser.add_argument(
+        "--discovery-ratio-min",
+        type=float,
+        default=DISCOVERY_RATIO_BOUNDS[0],
+    )
+    parser.add_argument(
+        "--discovery-ratio-max",
+        type=float,
+        default=DISCOVERY_RATIO_BOUNDS[1],
+    )
+    parser.add_argument("--broad-samples", type=int, default=384)
+    parser.add_argument("--focused-samples", type=int, default=192)
+    parser.add_argument("--focus-centers", type=int, default=8)
+    parser.add_argument("--broad-starts", type=int, default=24)
+    parser.add_argument("--broad-seeds", type=int, default=8)
+    parser.add_argument("--finalists", type=int, default=12)
+    parser.add_argument("--robust-seeds", type=int, default=32)
+    parser.add_argument("--demo-tail-seeds", type=int, default=2000)
+    parser.add_argument("--sensitivity-seeds", type=int, default=8)
     parser.add_argument(
         "--output",
         type=Path,
@@ -116,38 +518,101 @@ def main() -> None:
     if DEMONSTRATION_START not in broad_starts:
         broad_starts.append(DEMONSTRATION_START)
 
-    candidates = named_baselines()
-    candidates.extend(
+    args.output.mkdir(parents=True, exist_ok=True)
+    nmf_seeds = (0, 1, 2)
+
+    print(
+        f"discovery: {args.discovery_samples + 2} profile-shaping ratios "
+        f"across NMF seeds {nmf_seeds}"
+    )
+    discovery_rows = evaluate_discovery_candidates(
+        maze,
+        discovery_parameter_candidates(
+            args.discovery_samples,
+            seed=20260725,
+            ratio_bounds=(
+                args.discovery_ratio_min,
+                args.discovery_ratio_max,
+            ),
+        ),
+        nmf_seeds=nmf_seeds,
+    )
+    write_csv(args.output / "discovery.csv", discovery_rows)
+    selected_discovery_row = select_discovery_parameters(discovery_rows)
+    selected_discovery = discovery_parameters_from_row(
+        selected_discovery_row
+    )
+    print(
+        "selected discovery: "
+        f"-interior/control="
+        f"{float(selected_discovery_row['interior_penalty_ratio']):.4g}, "
+        f"span={float(selected_discovery_row['ensemble_log10_span']):.2f} "
+        "decades, "
+        f"core overlap="
+        f"{float(selected_discovery_row['mean_core_overlap_rate']):.3f}, "
+        f"seed cosine="
+        f"{float(selected_discovery_row['minimum_matched_seed_cosine']):.3f}"
+    )
+    discoveries = precompute_discoveries(
+        maze,
+        selected_discovery,
+        nmf_seeds=nmf_seeds,
+    )
+
+    broad_candidates = named_baselines()
+    broad_candidates.extend(
         ("broad", parameters)
         for parameters in latin_hypercube_parameters(
             args.broad_samples,
             seed=20260726,
         )
     )
-    candidates.extend(
-        ("focused", parameters)
-        for parameters in focused_latin_hypercube_parameters(
-            args.focused_samples,
-            seed=20260727,
-        )
-    )
 
-    args.output.mkdir(parents=True, exist_ok=True)
     print(
-        f"broad: {len(candidates)} candidates, "
-        f"{len(broad_starts)} starts x {args.broad_seeds} seeds"
+        f"\nbroad execution: {len(broad_candidates)} candidates over the "
+        f"full declared ranges, {len(broad_starts)} starts x "
+        f"{args.broad_seeds} seeds"
     )
     broad_rows = evaluate_candidates(
         maze,
-        candidates,
+        broad_candidates,
         broad_starts,
         range(args.broad_seeds),
-        nmf_seeds=(0,),
+        discoveries={0: discoveries[0]},
         distances=distances,
     )
     write_csv(args.output / "broad.csv", broad_rows)
 
-    finalists = select_finalists(broad_rows, args.finalists)
+    focus_centers = select_finalists(broad_rows, args.focus_centers)
+    focused_candidates = unique_named_parameters(
+        [
+            (
+                f"focus_center_{index}",
+                parameters_from_row(row),
+            )
+            for index, row in enumerate(focus_centers)
+        ]
+        + local_refinement_parameters(
+            focus_centers,
+            args.focused_samples,
+            seed=20260727,
+        )
+    )
+    print(
+        f"\nfocused execution: {len(focused_candidates)} candidates derived "
+        f"from {len(focus_centers)} broad-stage centers"
+    )
+    focused_rows = evaluate_candidates(
+        maze,
+        focused_candidates,
+        broad_starts,
+        range(args.broad_seeds),
+        discoveries=discoveries,
+        distances=distances,
+    )
+    write_csv(args.output / "focused.csv", focused_rows)
+
+    finalists = select_finalists(focused_rows, args.finalists)
     print("finalists:")
     for row in finalists:
         print(
@@ -159,34 +624,68 @@ def main() -> None:
         )
 
     all_starts = [cell for cell in maze.free_cells if cell != GOAL]
-    robust_candidates = [
-        (
-            f"finalist_{int(row['candidate_id'])}",
-            parameters_from_row(row),
-        )
-        for row in finalists
-    ]
-    robust_candidates.extend(named_baselines())
+    robust_candidates = unique_named_parameters(
+        named_baselines()
+        + [
+            (
+                f"finalist_{int(row['candidate_id'])}",
+                parameters_from_row(row),
+            )
+            for row in finalists
+        ]
+    )
     robust_rows = evaluate_candidates(
         maze,
         robust_candidates,
         all_starts,
         range(args.robust_seeds),
-        nmf_seeds=(0, 1, 2),
+        discoveries=discoveries,
         distances=distances,
     )
     write_csv(args.output / "robust.csv", robust_rows)
 
     pareto = pareto_front(robust_rows)
     recommended = choose_recommendations(robust_rows)
-    sensitivity_candidates = one_factor_sensitivity(
-        "current_default",
-        ModelParameters(),
+    tail_candidates = unique_named_parameters(
+        [
+            (
+                f"tail_{label}",
+                parameters_from_row(row),
+            )
+            for label, row in recommended.items()
+        ]
     )
-    sensitivity_candidates.extend(
+    print(
+        f"\ndemonstration tail: {len(tail_candidates)} candidates, "
+        f"{args.demo_tail_seeds} seeds x {len(discoveries)} NMF libraries"
+    )
+    demonstration_tail_rows = evaluate_candidates(
+        maze,
+        tail_candidates,
+        [DEMONSTRATION_START],
+        range(args.demo_tail_seeds),
+        discoveries=discoveries,
+        distances=distances,
+    )
+    write_csv(
+        args.output / "demonstration_tail.csv",
+        demonstration_tail_rows,
+    )
+
+    sensitivity_candidates = unique_named_parameters(
         one_factor_sensitivity(
+            "current_default",
+            ModelParameters(),
+        )
+        + one_factor_sensitivity(
             "recommended",
             parameters_from_row(recommended["recommended"]),
+        )
+        + one_factor_sensitivity(
+            "fastest",
+            parameters_from_row(
+                recommended["fastest_nonpathological"]
+            ),
         )
     )
     print(
@@ -199,7 +698,7 @@ def main() -> None:
         sensitivity_candidates,
         all_starts,
         range(args.sensitivity_seeds),
-        nmf_seeds=(0, 1, 2),
+        discoveries=discoveries,
         distances=distances,
     )
     write_csv(args.output / "sensitivity.csv", sensitivity_rows)
@@ -208,19 +707,43 @@ def main() -> None:
         "method": {
             "k": K,
             "goal": GOAL,
-            "discovery_parameters": asdict(DISCOVERY_PARAMETERS),
+            "discovery_search": {
+                "sample_count": args.discovery_samples,
+                "interior_penalty_ratio_bounds": [
+                    args.discovery_ratio_min,
+                    args.discovery_ratio_max,
+                ],
+                "identified_dimension": (
+                    "-interior_reward / control_cost"
+                ),
+                "fixed_reporting_control_cost": DISCOVERY_CONTROL_COST,
+                "fixed_numerical_goal_reward": DISCOVERY_GOAL_REWARD,
+            },
+            "discovery_parameters": asdict(selected_discovery),
+            "discovery_metrics": selected_discovery_row,
+            "discovery_profile_threshold": DISCOVERY_PROFILE_THRESHOLD,
+            "execution_core_threshold": EXECUTION_CORE_THRESHOLD,
+            "include_goal_component_while_active": (
+                INCLUDE_GOAL_COMPONENT_WHILE_ACTIVE
+            ),
             "max_steps": MAX_STEPS,
-            "broad_candidates": len(candidates),
+            "broad_candidate_ranges": EXECUTION_BOUNDS,
+            "refinement_safety_limits": EXECUTION_SAFETY_LIMITS,
+            "refinement_multiplier_range": [0.25, 4.0],
+            "broad_candidates": len(broad_candidates),
             "focused_candidates": args.focused_samples,
+            "focus_centers": args.focus_centers,
             "broad_starts": broad_starts,
             "broad_rollout_seeds": args.broad_seeds,
             "robust_starts": len(all_starts),
             "robust_rollout_seeds": args.robust_seeds,
-            "robust_nmf_seeds": [0, 1, 2],
+            "robust_nmf_seeds": list(nmf_seeds),
+            "demonstration_tail_rollout_seeds": args.demo_tail_seeds,
             "sensitivity_rollout_seeds": args.sensitivity_seeds,
             "pathology_thresholds": PATHOLOGY_THRESHOLDS,
         },
         "recommended": recommended,
+        "demonstration_tail": demonstration_tail_rows,
         "sensitivity": sensitivity,
         "pareto_front": pareto,
     }
@@ -246,6 +769,13 @@ def named_baselines() -> list[tuple[str, ModelParameters]]:
     return [
         ("paper", paper_hierarchy_parameters()),
         ("current_default", ModelParameters()),
+        (
+            "pre_goal_exclusion_default",
+            ModelParameters(
+                upper_control_cost=1.8,
+                beta=13.0,
+            ),
+        ),
         (
             "former_project_default",
             ModelParameters(
@@ -331,17 +861,9 @@ def latin_hypercube_parameters(
     if count < 1:
         raise ValueError("Sample count must be positive")
     rng = np.random.default_rng(seed)
-    # Magnitudes are sampled in log space.  These ranges include the paper
-    # regime and the repository's historical/default regimes.
-    bounds = {
-        "interior_magnitude": (0.02, 0.5),
-        "goal_reward": (0.3, 3.0),
-        "lower_control_cost": (0.08, 2.5),
-        "upper_control_cost": (0.1, 2.5),
-        "alpha": (0.005, 3.0),
-        "off_target_magnitude": (0.05, 5.0),
-        "beta": (0.03, 15.0),
-    }
+    # These deliberately wide bounds cover much more than the historical
+    # presets. Refinement bounds are learned from the broad-stage survivors.
+    bounds = EXECUTION_BOUNDS
     sampled: dict[str, np.ndarray] = {}
     for name, (low, high) in bounds.items():
         strata = (np.arange(count) + rng.random(count)) / count
@@ -370,52 +892,96 @@ def latin_hypercube_parameters(
     ]
 
 
-def focused_latin_hypercube_parameters(
+def local_refinement_parameters(
+    centers: list[dict[str, float | int | str]],
     count: int,
     *,
     seed: int,
-) -> list[ModelParameters]:
-    """Search the numerically healthy neighborhood found by the broad sweep."""
+) -> list[tuple[str, ModelParameters]]:
+    """Perturb broad-stage survivors without a hand-written focused box."""
 
     if count < 0:
         raise ValueError("Focused sample count must be non-negative")
     if count == 0:
         return []
+    if not centers:
+        raise ValueError("Focused sampling requires at least one center")
+
     rng = np.random.default_rng(seed)
-    bounds = {
-        "interior_magnitude": (0.04, 0.12),
-        "goal_reward": (0.9, 2.2),
-        "lower_control_cost": (0.07, 0.22),
-        "upper_control_cost": (0.15, 0.8),
-        "alpha": (0.002, 0.03),
-        "off_target_magnitude": (0.5, 2.0),
-        "beta": (1.5, 8.0),
-    }
-    sampled: dict[str, np.ndarray] = {}
-    for name, (low, high) in bounds.items():
+    multipliers: dict[str, np.ndarray] = {}
+    # A factor-of-four neighborhood is intentionally generous. Refinement may
+    # cross an initial broad bound when a survivor lies near that edge; only
+    # much wider numerical safety limits are imposed. Thus a boundary hit
+    # triggers exploration beyond the initial box instead of becoming a
+    # silent, artificial optimum.
+    for name in EXECUTION_BOUNDS:
         strata = (np.arange(count) + rng.random(count)) / count
         rng.shuffle(strata)
-        sampled[name] = np.exp(
-            np.log(low) + strata * (np.log(high) - np.log(low))
+        multipliers[name] = np.exp(
+            np.log(0.25) + strata * (np.log(4.0) - np.log(0.25))
         )
-    return [
-        ModelParameters(
-            interior_reward=-float(sampled["interior_magnitude"][index]),
-            goal_reward=float(sampled["goal_reward"][index]),
-            lower_control_cost=float(
-                sampled["lower_control_cost"][index]
-            ),
-            upper_control_cost=float(
-                sampled["upper_control_cost"][index]
-            ),
-            alpha=float(sampled["alpha"][index]),
-            off_target_reward=-float(
-                sampled["off_target_magnitude"][index]
-            ),
-            beta=float(sampled["beta"][index]),
+
+    candidates: list[tuple[str, ModelParameters]] = []
+    for index in range(count):
+        center_index = index % len(centers)
+        center = parameter_magnitudes(
+            parameters_from_row(centers[center_index])
         )
-        for index in range(count)
-    ]
+        refined = {
+            name: float(
+                np.clip(
+                    center[name] * multipliers[name][index],
+                    EXECUTION_SAFETY_LIMITS[name][0],
+                    EXECUTION_SAFETY_LIMITS[name][1],
+                )
+            )
+            for name in EXECUTION_BOUNDS
+        }
+        candidates.append(
+            (
+                f"focused_from_{center_index}",
+                parameters_from_magnitudes(refined),
+            )
+        )
+    return candidates
+
+
+def parameter_magnitudes(
+    parameters: ModelParameters,
+) -> dict[str, float]:
+    return {
+        "interior_magnitude": -parameters.interior_reward,
+        "goal_reward": parameters.goal_reward,
+        "lower_control_cost": parameters.lower_control_cost,
+        "upper_control_cost": parameters.upper_control_cost,
+        "alpha": parameters.alpha,
+        "off_target_magnitude": -parameters.off_target_reward,
+        "beta": parameters.beta,
+    }
+
+
+def parameters_from_magnitudes(
+    values: Mapping[str, float],
+) -> ModelParameters:
+    return ModelParameters(
+        interior_reward=-values["interior_magnitude"],
+        goal_reward=values["goal_reward"],
+        lower_control_cost=values["lower_control_cost"],
+        upper_control_cost=values["upper_control_cost"],
+        alpha=values["alpha"],
+        off_target_reward=-values["off_target_magnitude"],
+        beta=values["beta"],
+    )
+
+
+def unique_named_parameters(
+    candidates: Iterable[tuple[str, ModelParameters]],
+) -> list[tuple[str, ModelParameters]]:
+    unique: dict[tuple[float, ...], tuple[str, ModelParameters]] = {}
+    for name, parameters in candidates:
+        key = tuple(asdict(parameters).values())
+        unique.setdefault(key, (name, parameters))
+    return list(unique.values())
 
 
 def one_factor_sensitivity(
@@ -445,19 +1011,20 @@ def evaluate_candidates(
     starts: list[tuple[int, int]],
     rollout_seeds: Iterable[int],
     *,
-    nmf_seeds: Iterable[int],
+    discoveries: Mapping[int, SoftSubtaskDiscovery],
     distances: dict[tuple[int, int], int],
 ) -> list[dict[str, float | int | str]]:
     rows: list[dict[str, float | int | str]] = []
     rollout_seeds = tuple(rollout_seeds)
-    nmf_seeds = tuple(nmf_seeds)
+    if not discoveries:
+        raise ValueError("At least one frozen NMF discovery is required")
     for candidate_id, (name, parameters) in enumerate(candidates):
         metrics = evaluate_parameter_set(
             maze,
             parameters,
             starts,
             rollout_seeds,
-            nmf_seeds=nmf_seeds,
+            discoveries=discoveries,
             distances=distances,
         )
         row: dict[str, float | int | str] = {
@@ -482,7 +1049,7 @@ def evaluate_parameter_set(
     starts: list[tuple[int, int]],
     rollout_seeds: tuple[int, ...],
     *,
-    nmf_seeds: tuple[int, ...],
+    discoveries: Mapping[int, SoftSubtaskDiscovery],
     distances: dict[tuple[int, int], int],
 ) -> dict[str, float | int | str]:
     successes: list[bool] = []
@@ -492,6 +1059,8 @@ def evaluate_parameter_set(
     access_localities: list[float] = []
     termination_episodes: list[bool] = []
     termination_steps: list[int] = []
+    termination_goal_distances: list[int] = []
+    post_termination_steps: list[int] = []
     first_access_steps: list[int] = []
     first_access_terminations: list[bool] = []
     immediate_handoff_episodes: list[bool] = []
@@ -505,6 +1074,7 @@ def evaluate_parameter_set(
     nonterminal_commands: list[int] = []
     flat_successes: list[bool] = []
     flat_capped_steps: list[int] = []
+    paired_excess_steps: list[int] = []
     passive_access_masses: list[float] = []
     controlled_access_masses: list[float] = []
     initial_policy_tvs: list[float] = []
@@ -533,6 +1103,9 @@ def evaluate_parameter_set(
     start_capped_steps: defaultdict[
         tuple[int, int], list[int]
     ] = defaultdict(list)
+    start_flat_capped_steps: defaultdict[
+        tuple[int, int], list[int]
+    ] = defaultdict(list)
     start_active_progress: defaultdict[
         tuple[int, int], list[float]
     ] = defaultdict(list)
@@ -553,22 +1126,17 @@ def evaluate_parameter_set(
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
-            ensemble = build_goal_task_ensemble(
-                maze,
-                discovery_parameters=DISCOVERY_PARAMETERS,
-            )
             flat_goal = solve_desirability(
                 maze,
                 GOAL,
                 parameters=parameters,
             )
             flat_controlled = controlled_dynamics(maze, flat_goal)
-            for nmf_seed in nmf_seeds:
-                discovery = factorize_soft_subtasks(
-                    ensemble,
-                    n_subtasks=K,
-                    seed=nmf_seed,
-                )
+            for nmf_seed, discovery in discoveries.items():
+                if discovery.ensemble.maze != maze:
+                    raise ValueError(
+                        "Frozen discovery maze does not match evaluation maze"
+                    )
                 reconstruction_errors.append(
                     discovery.reconstruction_error
                 )
@@ -577,6 +1145,10 @@ def evaluate_parameter_set(
                     discovery.profiles,
                     GOAL,
                     parameters=parameters,
+                    core_threshold=EXECUTION_CORE_THRESHOLD,
+                    include_goal_component_while_active=(
+                        INCLUDE_GOAL_COMPONENT_WHILE_ACTIVE
+                    ),
                 )
                 seed_successes: list[bool] = []
                 seed_capped_steps: list[int] = []
@@ -621,7 +1193,12 @@ def evaluate_parameter_set(
                         mean_soft_contribution(model, plan)
                     )
                     projection_relative_errors.append(
-                        relative_projection_error(plan)
+                        relative_projection_error(
+                            plan,
+                            ignore_goal_boundary=(
+                                not INCLUDE_GOAL_COMPONENT_WHILE_ACTIVE
+                            ),
+                        )
                     )
                     clipped_weight_counts += int(
                         np.count_nonzero(plan.raw_weights < -1e-12)
@@ -644,12 +1221,13 @@ def evaluate_parameter_set(
                         model,
                         start,
                     )
-                    access_dominant_profile_shares.append(
-                        access_selectivity[0]
-                    )
-                    access_effective_profiles.append(
-                        access_selectivity[1]
-                    )
+                    if access_selectivity is not None:
+                        access_dominant_profile_shares.append(
+                            access_selectivity[0]
+                        )
+                        access_effective_profiles.append(
+                            access_selectivity[1]
+                        )
                     initial_policy_tvs.append(
                         policy_total_variation(
                             initial_plan.layer_one_controlled,
@@ -674,7 +1252,12 @@ def evaluate_parameter_set(
                         float(np.mean(soft_fractions >= 0.10))
                     )
                     projection_relative_errors.append(
-                        relative_projection_error(initial_plan)
+                        relative_projection_error(
+                            initial_plan,
+                            ignore_goal_boundary=(
+                                not INCLUDE_GOAL_COMPONENT_WHILE_ACTIVE
+                            ),
+                        )
                     )
                     clipped_weight_counts += int(
                         np.count_nonzero(
@@ -737,6 +1320,13 @@ def evaluate_parameter_set(
                         if terminated is not None:
                             termination_steps.append(
                                 terminated.physical_steps
+                            )
+                            termination_goal_distances.append(
+                                distances[terminated.coordinate]
+                            )
+                            post_termination_steps.append(
+                                rollout.physical_steps
+                                - terminated.physical_steps
                             )
                             active_endpoint = terminated.coordinate
                             active_steps = terminated.physical_steps
@@ -838,10 +1428,17 @@ def evaluate_parameter_set(
                         )
                         flat_reached = flat_path[-1] == GOAL
                         flat_successes.append(flat_reached)
-                        flat_capped_steps.append(
+                        flat_capped_step_count = (
                             len(flat_path) - 1
                             if flat_reached
                             else MAX_STEPS
+                        )
+                        flat_capped_steps.append(flat_capped_step_count)
+                        start_flat_capped_steps[start].append(
+                            flat_capped_step_count
+                        )
+                        paired_excess_steps.append(
+                            capped_step_count - flat_capped_step_count
                         )
                 per_nmf_success_rates.append(
                     float(np.mean(seed_successes))
@@ -865,10 +1462,24 @@ def evaluate_parameter_set(
     start_mean_steps = [
         float(np.mean(values)) for values in start_capped_steps.values()
     ]
+    start_p90_steps = [
+        float(np.quantile(values, 0.90))
+        for values in start_capped_steps.values()
+    ]
+    start_p95_steps = [
+        float(np.quantile(values, 0.95))
+        for values in start_capped_steps.values()
+    ]
     start_mean_progress = [
         float(np.mean(values)) for values in start_active_progress.values()
     ]
     demo_active_steps = start_active_steps.get(DEMONSTRATION_START, [])
+    demo_successes = start_successes.get(DEMONSTRATION_START, [])
+    demo_capped_steps = start_capped_steps.get(DEMONSTRATION_START, [])
+    demo_flat_capped_steps = start_flat_capped_steps.get(
+        DEMONSTRATION_START,
+        [],
+    )
     demo_active_fractions = start_active_fractions.get(
         DEMONSTRATION_START,
         [],
@@ -889,11 +1500,16 @@ def evaluate_parameter_set(
         "mean_capped_steps": float(np.mean(capped_steps)),
         "median_capped_steps": float(np.median(capped_steps)),
         "p90_capped_steps": float(np.quantile(capped_steps, 0.90)),
+        "p95_capped_steps": float(np.quantile(capped_steps, 0.95)),
+        "p99_capped_steps": float(np.quantile(capped_steps, 0.99)),
+        "maximum_capped_steps": int(np.max(capped_steps)),
         "mean_normalized_steps": float(np.mean(normalized_steps)),
         "worst_start_success_rate": float(
             np.min(start_success_rates)
         ),
         "max_start_mean_capped_steps": float(np.max(start_mean_steps)),
+        "max_start_p90_capped_steps": float(np.max(start_p90_steps)),
+        "max_start_p95_capped_steps": float(np.max(start_p95_steps)),
         "worst_start_mean_active_progress": float(
             np.min(start_mean_progress)
         ),
@@ -904,6 +1520,44 @@ def evaluate_parameter_set(
         "flat_mean_capped_steps": float(np.mean(flat_capped_steps)),
         "soft_minus_flat_steps": float(
             np.mean(capped_steps) - np.mean(flat_capped_steps)
+        ),
+        "mean_paired_excess_steps": float(
+            np.mean(paired_excess_steps)
+        ),
+        "p90_paired_excess_steps": float(
+            np.quantile(paired_excess_steps, 0.90)
+        ),
+        "demonstration_mean_capped_steps": mean_or_nan(
+            demo_capped_steps
+        ),
+        "demonstration_success_rate": mean_or_nan(demo_successes),
+        "demonstration_median_capped_steps": (
+            float(np.median(demo_capped_steps))
+            if demo_capped_steps
+            else float("nan")
+        ),
+        "demonstration_p90_capped_steps": (
+            float(np.quantile(demo_capped_steps, 0.90))
+            if demo_capped_steps
+            else float("nan")
+        ),
+        "demonstration_p95_capped_steps": (
+            float(np.quantile(demo_capped_steps, 0.95))
+            if demo_capped_steps
+            else float("nan")
+        ),
+        "demonstration_p99_capped_steps": (
+            float(np.quantile(demo_capped_steps, 0.99))
+            if demo_capped_steps
+            else float("nan")
+        ),
+        "demonstration_maximum_capped_steps": (
+            int(np.max(demo_capped_steps))
+            if demo_capped_steps
+            else float("nan")
+        ),
+        "demonstration_flat_mean_capped_steps": mean_or_nan(
+            demo_flat_capped_steps
         ),
         "mean_accesses": float(access_array.mean()),
         "episodes_with_access_rate": float(np.mean(access_array > 0)),
@@ -927,6 +1581,27 @@ def evaluate_parameter_set(
             demo_termination_by_5
         ),
         "mean_termination_step": mean_or_nan(termination_steps),
+        "mean_termination_goal_distance": mean_or_nan(
+            termination_goal_distances
+        ),
+        "p90_termination_goal_distance": (
+            float(np.quantile(termination_goal_distances, 0.90))
+            if termination_goal_distances
+            else float("nan")
+        ),
+        "termination_within_four_steps_rate": (
+            float(np.mean(np.asarray(termination_goal_distances) <= 4))
+            if termination_goal_distances
+            else float("nan")
+        ),
+        "mean_post_termination_steps": mean_or_nan(
+            post_termination_steps
+        ),
+        "p90_post_termination_steps": (
+            float(np.quantile(post_termination_steps, 0.90))
+            if post_termination_steps
+            else float("nan")
+        ),
         "mean_first_access_step": mean_or_nan(first_access_steps),
         "mean_active_phase_steps": float(np.mean(active_phase_steps)),
         "median_active_phase_steps": float(
@@ -1093,14 +1768,19 @@ def positive_command_selectivity(
 def profile_access_selectivity(
     model: object,
     coordinate: tuple[int, int],
-) -> tuple[float, float]:
-    """Return dominant share and effective count of local access profiles."""
+) -> tuple[float, float] | None:
+    """Return local access selectivity, or ``None`` where access is absent.
+
+    A state outside every gated core has no competing access profiles. It
+    must therefore be excluded from overlap averages rather than counted as
+    maximally diffuse access.
+    """
 
     state = model.maze.state_index(coordinate)
     memberships = model.subtask_profiles[state]
     total = float(memberships.sum())
     if total <= 0.0:
-        return 0.0, float(model.number_of_subtasks)
+        return None
     fractions = memberships / total
     return (
         float(fractions.max()),
@@ -1108,7 +1788,11 @@ def profile_access_selectivity(
     )
 
 
-def relative_projection_error(plan: object) -> float:
+def relative_projection_error(
+    plan: object,
+    *,
+    ignore_goal_boundary: bool = False,
+) -> float:
     """Relative boundary reconstruction error for a layer-one plan."""
 
     target = np.asarray(
@@ -1119,6 +1803,9 @@ def relative_projection_error(plan: object) -> float:
         getattr(plan, "reconstructed_boundary_desirability"),
         dtype=np.float64,
     )
+    if ignore_goal_boundary:
+        target = target[:-1]
+        reconstructed = reconstructed[:-1]
     return float(
         np.linalg.norm(reconstructed - target)
         / max(np.linalg.norm(target), np.finfo(np.float64).tiny)
@@ -1136,14 +1823,29 @@ def invalid_metrics(reason: str) -> dict[str, float | int | str]:
         "mean_capped_steps",
         "median_capped_steps",
         "p90_capped_steps",
+        "p95_capped_steps",
+        "p99_capped_steps",
+        "maximum_capped_steps",
         "mean_normalized_steps",
         "worst_start_success_rate",
         "max_start_mean_capped_steps",
+        "max_start_p90_capped_steps",
+        "max_start_p95_capped_steps",
         "worst_start_mean_active_progress",
         "nonpositive_start_progress_fraction",
         "flat_success_rate",
         "flat_mean_capped_steps",
         "soft_minus_flat_steps",
+        "mean_paired_excess_steps",
+        "p90_paired_excess_steps",
+        "demonstration_success_rate",
+        "demonstration_mean_capped_steps",
+        "demonstration_median_capped_steps",
+        "demonstration_p90_capped_steps",
+        "demonstration_p95_capped_steps",
+        "demonstration_p99_capped_steps",
+        "demonstration_maximum_capped_steps",
+        "demonstration_flat_mean_capped_steps",
         "mean_accesses",
         "episodes_with_access_rate",
         "mean_accesses_per_100_steps",
@@ -1154,6 +1856,11 @@ def invalid_metrics(reason: str) -> dict[str, float | int | str]:
         "demonstration_immediate_handoff_rate",
         "demonstration_termination_by_5_rate",
         "mean_termination_step",
+        "mean_termination_goal_distance",
+        "p90_termination_goal_distance",
+        "termination_within_four_steps_rate",
+        "mean_post_termination_steps",
+        "p90_post_termination_steps",
         "mean_first_access_step",
         "mean_active_phase_steps",
         "median_active_phase_steps",
@@ -1239,6 +1946,16 @@ def pathology_reasons(
         > threshold["maximum_termination_by_5_episode_rate"]
     ):
         reasons.append("hierarchy usually terminates within five steps")
+    if (
+        value("termination_within_four_steps_rate")
+        < threshold["minimum_termination_within_four_steps_rate"]
+    ):
+        reasons.append("upper handoff occurs too far from the goal")
+    if (
+        value("mean_post_termination_steps")
+        > threshold["maximum_mean_post_termination_steps"]
+    ):
+        reasons.append("goal-only cleanup phase is too long")
     if (
         value("demonstration_immediate_handoff_rate")
         > threshold["maximum_demonstration_immediate_handoff_rate"]
@@ -1379,7 +2096,14 @@ def select_finalists(
         lambda row: (
             -float(row["success_rate"]),
             float(row["mean_capped_steps"]),
+            float(row["p95_capped_steps"]),
             abs(float(row["immediate_handoff_episode_rate"]) - 0.20),
+        ),
+        # Protect against a good global average hiding bad starts or long tails.
+        lambda row: (
+            float(row["max_start_p90_capped_steps"]),
+            float(row["p95_capped_steps"]),
+            float(row["mean_paired_excess_steps"]),
         ),
         # Behaviorally engaged but not overly dominant.
         lambda row: (
@@ -1407,9 +2131,43 @@ def select_finalists(
         for row in sorted(pool, key=ranking)[:per_ranking]:
             selected[int(row["candidate_id"])] = row
 
+    # A broad screen may have only a few candidates that pass every strict
+    # pathology guardrail.  Those should lead the refinement, but they must
+    # not collapse an eight-center search to one or two neighborhoods.
+    # Supplement them with diverse, least-pathological valid near misses.
+    if len(selected) < count:
+        for ranking in rankings:
+            added_for_ranking = 0
+            for row in sorted(
+                valid,
+                key=lambda item: (
+                    len(
+                        [
+                            reason
+                            for reason in str(
+                                item["pathology_reasons"]
+                            ).split(";")
+                            if reason.strip()
+                        ]
+                    ),
+                    ranking(item),
+                ),
+            ):
+                candidate_id = int(row["candidate_id"])
+                if candidate_id in selected:
+                    continue
+                selected[candidate_id] = row
+                added_for_ranking += 1
+                if len(selected) >= count:
+                    break
+                if added_for_ranking >= per_ranking:
+                    break
+            if len(selected) >= count:
+                break
+
     if len(selected) < count:
         for row in sorted(
-            pool,
+            valid,
             key=lambda item: (
                 int(item["pathological"]),
                 len(str(item["pathology_reasons"]).split(";")),
@@ -1489,6 +2247,7 @@ def choose_recommendations(
         key=lambda row: (
             float(row["mean_capped_steps"])
             + float(row["soft_minus_flat_steps"])
+            + 0.15 * float(row["p95_capped_steps"])
             - 6.0 * float(row["mean_active_goal_progress"]),
             -float(row["success_rate"]),
         ),
@@ -1650,6 +2409,8 @@ def write_report(
         "worst-start success",
         "steps",
         "p90 steps",
+        "p95 steps",
+        "worst-start p90",
         "active steps",
         "active fraction",
         "active progress",
@@ -1660,6 +2421,8 @@ def write_report(
         "nonpositive starts",
         "immediate handoff",
         "demo term. <=5",
+        "handoff <=4 from goal",
+        "post-handoff steps",
         "commands",
         "policy TV",
         "accesses/100",
@@ -1678,6 +2441,8 @@ def write_report(
             f"{float(row['worst_start_success_rate']):.3f}",
             f"{float(row['mean_capped_steps']):.1f}",
             f"{float(row['p90_capped_steps']):.1f}",
+            f"{float(row['p95_capped_steps']):.1f}",
+            f"{float(row['max_start_p90_capped_steps']):.1f}",
             f"{float(row['mean_active_phase_steps']):.1f}",
             f"{float(row['mean_active_phase_fraction']):.3f}",
             f"{float(row['mean_active_goal_progress']):+.3f}",
@@ -1690,6 +2455,8 @@ def write_report(
             f"{float(row['nonpositive_start_progress_fraction']):.3f}",
             f"{float(row['immediate_handoff_episode_rate']):.3f}",
             f"{float(row['demonstration_termination_by_5_rate']):.3f}",
+            f"{float(row['termination_within_four_steps_rate']):.3f}",
+            f"{float(row['mean_post_termination_steps']):.2f}",
             f"{float(row['mean_nonterminal_commands']):.2f}",
             f"{float(row['mean_command_policy_tv']):.3f}",
             f"{float(row['mean_accesses_per_100_steps']):.1f}",
@@ -1704,16 +2471,31 @@ def write_report(
         return "| " + " | ".join(values) + " |"
 
     lines = [
-        "# Peak-normalized soft K=8 parameter validation",
+        "# Tiered peak-normalized soft K=8 parameter validation",
         "",
-        "This sweep evaluates the solved-goal soft hierarchy after component-wise "
-        "NMF peak normalization using one frozen discovery task family. "
-        "Candidates are screened on navigation, active-"
+        "The first tier broadly searches the identifiable discovery ratio, "
+        "then freezes each selected NMF library. Broad and evidence-driven "
+        "local execution searches reuse those exact profiles. Candidates are "
+        "screened on navigation, active-"
         "hierarchy productivity, policy influence, access behavior, numerical "
         "conditioning, and sensitivity to three NMF initializations.",
         "",
+        "For this equal-terminal-reward task family, peak-normalized profile "
+        "geometry depends only on `-interior_reward / control_cost`; the "
+        "common goal reward changes only the global scale of `Z`. The search "
+        "therefore does not treat the three discovery fields as independently "
+        "identifiable.",
+        "",
         "Discovery parameters: "
         f"`{summary['method']['discovery_parameters']}`.",
+        "",
+        "Selected discovery diagnostics: "
+        f"ratio `{float(summary['method']['discovery_metrics']['interior_penalty_ratio']):.4g}`, "
+        f"task span `{float(summary['method']['discovery_metrics']['ensemble_log10_span']):.2f}` "
+        "decades, core overlap "
+        f"`{float(summary['method']['discovery_metrics']['mean_core_overlap_rate']):.3f}`, "
+        "minimum matched-seed cosine "
+        f"`{float(summary['method']['discovery_metrics']['minimum_matched_seed_cosine']):.3f}`.",
         "",
         f"Robust evaluation used {summary['method']['robust_starts']} starts, "
         f"{summary['method']['robust_rollout_seeds']} rollout seeds per start, "
@@ -1770,6 +2552,39 @@ def write_report(
     )
     for row in baselines:
         lines.append(table_row(str(row["name"]), row))
+    lines.extend(
+        [
+            "",
+            "## Demonstration-start tail validation",
+            "",
+            "The shortlisted behavioral regimes receive an independent, "
+            "high-seed-count check at `(3, 2)`. These tail values are not "
+            "inferred from the small broad screen.",
+            "",
+            "| candidate | trials | success | mean | p90 | p95 | p99 | max |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    demonstration_tail = summary["demonstration_tail"]
+    assert isinstance(demonstration_tail, list)
+    for row in demonstration_tail:
+        assert isinstance(row, dict)
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    str(row["name"]),
+                    str(int(row["n_rollouts"])),
+                    f"{float(row['success_rate']):.3f}",
+                    f"{float(row['mean_capped_steps']):.1f}",
+                    f"{float(row['p90_capped_steps']):.1f}",
+                    f"{float(row['p95_capped_steps']):.1f}",
+                    f"{float(row['p99_capped_steps']):.1f}",
+                    f"{float(row['maximum_capped_steps']):.0f}",
+                )
+            )
+            + " |"
+        )
     lines.extend(
         [
             "",

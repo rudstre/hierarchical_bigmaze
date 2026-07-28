@@ -127,7 +127,7 @@ The execution equations have a related common gauge: multiplying
 `beta` by one positive constant leaves every exponentiated reward ratio
 unchanged. `alpha` is excluded because it is literal passive access mass. The
 defaults jointly use a narrow 80% execution core, `alpha=0.2`, and
-`beta=13.0`. The core removes incidental fringe accesses, while the increased
+`beta=16.0`. The core removes incidental fringe accesses, while the increased
 access strength preserves deliberate upper-level transitions on the reduced
 support.
 
@@ -170,6 +170,15 @@ It excludes weak profile fringes that can otherwise fire while the agent is
 merely crossing a doorway en route to a different commanded region. The
 discovery sweep continues to measure broader 25% profile support separately;
 changing execution gating does not refactorize or otherwise alter `D`.
+
+The validated goal-excluded execution mode is selected with
+`include_goal_component_while_active=False`. In every initial or continuing
+active plan, the final exact-goal basis weight is set to zero after Equation 7
+is fitted. Consequently the physical goal cannot be reached through that
+component while layer 2 is active. An explicit upper terminal outcome uses the
+unchanged goal-only constructor, which sets all subtask weights to zero and the
+goal weight to one. The fitted raw goal coefficient remains available for
+diagnostic plots but does not affect the active policy.
 
 After a lower access into upper state \(j\), the entered column programs the
 next lower plan:

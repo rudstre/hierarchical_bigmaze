@@ -55,10 +55,10 @@ ModelParameters(
     interior_reward=-0.1,
     goal_reward=1.1,
     lower_control_cost=0.1,
-    upper_control_cost=1.8,
+    upper_control_cost=2.0,
     alpha=0.2,
     off_target_reward=-0.7,
-    beta=13.0,
+    beta=16.0,
 )
 ```
 
@@ -74,21 +74,25 @@ choices.
 Execution uses an 80%-of-peak soft core. This excludes weak profile fringes,
 including a doorway cell that previously caused an S5 command to be
 interrupted by an unintended S7 access. The larger `alpha=0.2` compensates
-for the narrower support so deliberate access remains frequent.
+for the narrower support so deliberate access remains frequent. The validated
+model is built with `include_goal_component_while_active=False`: active plans
+use only soft-subtask basis columns, and upper termination restores the exact
+goal-only task.
 
 The rounded regime was checked over all 96 non-goal starts, 32 rollout seeds,
 and three frozen NMF libraries (9,216 rollouts). It reached the goal in every
 rollout, with mean/median/p90/p95/p99/maximum steps of
-13.45/13/24/27/34/49. The hierarchy was active for 94.2% of each rollout,
-made 93.6% normalized goalward progress while active, averaged 2.05
-continuing upper commands, and had 4.2% immediate handoff and 4.4%
-termination within five steps.
+16.78/16/28/32/39/57. The hierarchy was active for 77.7% of each rollout,
+made 64.2% normalized goalward progress while active, averaged 3.65
+continuing upper commands, and had 9.4% immediate handoff and 15.5%
+termination within five steps. Across the same validation, 95.8% of upper
+handoffs occurred within four shortest-path steps of the goal and the
+goal-only cleanup phase averaged 2.88 physical steps.
 
-A 36,864-rollout all-start stress test gave p99/p99.9 of 34/43 and maximum
-68. This maximum is an observed stochastic sample, not a guaranteed horizon.
-At `(3, 2)`, 18,000 additional rollouts gave mean/p90/p95/p99/maximum steps
-of 20.54/24/26/29/42 and 0.4% immediate handoff. The regime passed all
-declared pathology criteria.
+At `(3, 2)`, 15,000 additional rollouts gave mean/p90/p95/p99/maximum steps
+of 23.91/31/34/41/59. Immediate handoff and termination within five steps
+were both below 0.5%. This maximum is an observed stochastic sample, not a
+guaranteed horizon. The regime passed all declared pathology criteria.
 
 The current sweep implementation no longer assumes that focused neighborhood.
 It first searches the identifiable discovery profile-shaping ratio over four

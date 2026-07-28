@@ -88,6 +88,7 @@ class SoftTwoLayerModel:
     subtask_profiles: np.ndarray
     goal: Coordinate
     parameters: ModelParameters
+    include_goal_component_while_active: bool
     interior_states: np.ndarray
     interior_state_by_coordinate: dict[Coordinate, int]
     lower_dynamics: FirstExitDynamics
@@ -98,6 +99,13 @@ class SoftTwoLayerModel:
     upper_controlled: np.ndarray
 
     def __post_init__(self) -> None:
+        if not isinstance(
+            self.include_goal_component_while_active,
+            (bool, np.bool_),
+        ):
+            raise ValueError(
+                "include_goal_component_while_active must be a boolean"
+            )
         profiles = np.asarray(self.subtask_profiles, dtype=np.float64)
         expected_rows = len(self.maze.free_cells)
         if profiles.ndim != 2 or profiles.shape[0] != expected_rows:
@@ -397,6 +405,7 @@ def build_soft_two_layer_model(
     parameters: ModelParameters = ModelParameters(),
     core_threshold: float | None = 0.8,
     core_exponent: float = 1.0,
+    include_goal_component_while_active: bool = True,
 ) -> SoftTwoLayerModel:
     """Construct a two-layer model with core-gated soft accesses.
 
@@ -408,6 +417,10 @@ def build_soft_two_layer_model(
     The transformed profiles are then used consistently to construct every
     dependent lower- and upper-layer quantity. Set ``core_threshold=None`` to
     recover direct paper Equation 3 access from the supplied profiles.
+
+    When ``include_goal_component_while_active`` is false, active layer-one
+    plans set the final exact-goal basis weight to zero. The exact goal-only
+    task is restored after an upper-layer termination.
     """
 
     supplied_profiles = _validated_subtask_profiles(
@@ -449,6 +462,9 @@ def build_soft_two_layer_model(
         subtask_profiles=profiles,
         goal=goal,
         parameters=parameters,
+        include_goal_component_while_active=(
+            include_goal_component_while_active
+        ),
         interior_states=interior_states,
         interior_state_by_coordinate=interior_by_coordinate,
         lower_dynamics=lower_dynamics,
@@ -607,6 +623,11 @@ def _plan_from_abstract_dynamics(
         @ target_boundary_desirability
     )
     weights = np.maximum(0.0, raw_weights)
+    if (
+        isinstance(model, SoftTwoLayerModel)
+        and not model.include_goal_component_while_active
+    ):
+        weights[-1] = 0.0
     reconstructed_boundary = (
         model.task_basis.boundary_desirability @ weights
     )

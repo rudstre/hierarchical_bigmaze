@@ -26,10 +26,10 @@ class ModelParameters:
     interior_reward: float = -0.1
     goal_reward: float = 1.1
     lower_control_cost: float = 0.1
-    upper_control_cost: float = 1.8
+    upper_control_cost: float = 2.0
     alpha: float = 0.2
     off_target_reward: float = -0.7
-    beta: float = 13.0
+    beta: float = 16.0
 
     def __post_init__(self) -> None:
         values = (
@@ -83,8 +83,9 @@ def soft_hierarchy_parameters(
     """Return soft-hierarchy execution parameters for rank ``k``.
 
     The rank-eight reference was validated after component-wise NMF peak
-    normalization. For ranks other than eight, the heuristic keeps the
-    physical-layer and inpainting parameters fixed while applying
+    normalization with the active exact-goal component disabled in
+    ``build_soft_two_layer_model``. For ranks other than eight, the heuristic
+    keeps the physical-layer and inpainting parameters fixed while applying
     ``alpha ~ 1 / sqrt(k)`` and ``upper_control_cost ~ sqrt(k)``; those derived
     ranks have not received the same behavioral validation.
 

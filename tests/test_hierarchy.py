@@ -939,6 +939,65 @@ def test_soft_plan_uses_first_hit_then_active_upper_state() -> None:
     assert accessed.upper_state == 1
 
 
+def test_soft_plan_can_exclude_goal_component_until_termination() -> None:
+    maze = Maze.from_ascii("....")
+    profiles = np.asarray(
+        [[1.0, 0.0], [0.6, 0.2], [0.2, 0.6], [0.0, 1.0]]
+    )
+    model = build_soft_two_layer_model(
+        maze,
+        profiles,
+        goal=(0, 3),
+        core_threshold=0.25,
+        include_goal_component_while_active=False,
+    )
+    plan = compute_soft_layer_one_plan(model, (0, 1))
+
+    assert plan.raw_weights[-1] > 0.0
+    assert plan.weights[-1] == 0.0
+    assert plan.reconstructed_boundary_desirability[-1] == 0.0
+    assert plan.physical_desirability[model.maze.state_index(model.goal)] == 0.0
+    assert plan.physical_desirability[model.interior_states] == pytest.approx(
+        model.task_basis.interior_desirability[:, :-1]
+        @ plan.weights[:-1]
+    )
+
+    deterministic_upper = np.zeros_like(model.upper_controlled)
+    deterministic_upper[-1, :] = 1.0
+    model = replace(model, upper_controlled=deterministic_upper)
+    result, events = _trace_hierarchy_events(
+        model,
+        (0, 1),
+        beta=None,
+        max_steps=20,
+        max_abstract_accesses=20,
+        seed=0,
+    )
+    termination = next(
+        event for event in events if event.event == "upper_termination"
+    )
+    assert termination.plan is not None
+    assert termination.plan.weights[:-1] == pytest.approx(0.0)
+    assert termination.plan.weights[-1] == 1.0
+    assert termination.plan.physical_desirability[
+        model.maze.state_index(model.goal)
+    ] > 0.0
+    assert result.reached_goal
+
+
+def test_soft_model_validates_active_goal_component_flag() -> None:
+    with pytest.raises(
+        ValueError,
+        match="include_goal_component_while_active",
+    ):
+        build_soft_two_layer_model(
+            Maze.from_ascii("..."),
+            np.asarray([[1.0], [1.0], [1.0]]),
+            goal=(0, 2),
+            include_goal_component_while_active="no",
+        )
+
+
 def test_rollout_command_uses_entered_upper_state() -> None:
     model = build_two_layer_model(
         Maze.from_ascii("...."),

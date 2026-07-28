@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -18,11 +20,13 @@ from andrew_mlmdp import (  # noqa: E402
     build_two_layer_model,
     build_subgoal_passive_dynamics,
     compute_layer_one_plan,
+    compute_soft_layer_one_plan,
     controlled_dynamics,
     evaluate_soft_subtask_ranks,
     factorize_soft_subtasks,
     plot_controlled_dynamics,
     plot_interactive_subgoal_desirability,
+    plot_interactive_soft_hierarchical_rollout,
     plot_soft_subtask_rank_diagnostics,
     plot_soft_subtasks,
     plot_subgoal_passive_dynamics,
@@ -551,6 +555,152 @@ def test_soft_hierarchical_animation_renders_access_frame() -> None:
     assert "sampled state:" not in diagnostic_text
     animation._draw_was_started = True
     plt.close(animation._fig)
+
+
+def test_interactive_soft_rollout_player_steps_without_animation_timer() -> None:
+    pytest.importorskip("ipywidgets")
+    maze = Maze.from_ascii(".....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [
+                [1.0, 0.1],
+                [1.0, 0.2],
+                [0.4, 0.7],
+                [0.2, 1.0],
+                [0.1, 1.0],
+            ]
+        ),
+        goal=(0, 4),
+        parameters=ModelParameters(alpha=2.0, beta=3.0),
+    )
+
+    player = plot_interactive_soft_hierarchical_rollout(
+        model,
+        (0, 0),
+        seed=2,
+        max_steps=100,
+    )
+
+    assert player.frame_count > 1
+    assert player.frame_index == 0
+    button_row, frame_slider = player.controls.children
+    previous_button, next_button, goal_checkbox = button_row.children
+    assert frame_slider.continuous_update is False
+    assert previous_button.disabled
+    assert not next_button.disabled
+    assert player.goal_component_visible
+    assert goal_checkbox.value
+
+    desirability_ax = next(
+        ax
+        for ax in player.figure.axes
+        if ax.get_title().startswith("Full composed desirability")
+    )
+    plan = compute_soft_layer_one_plan(model, (0, 0))
+    subtask_desirability = (
+        model.task_basis.interior_desirability[:, :-1]
+        @ plan.weights[:-1]
+    )
+    goal_state = model.maze.state_index(model.goal)
+    subtask_goal_reference = plan.physical_desirability[goal_state]
+    expected_subtask_values = (
+        model.parameters.lower_control_cost
+        * np.log(subtask_desirability / subtask_goal_reference)
+    )
+    player.show_goal_component(False)
+    assert not player.goal_component_visible
+    assert desirability_ax.get_title().startswith(
+        "Subtask-only desirability"
+    )
+    displayed_subtask_values = desirability_ax.images[0].get_array()
+    for state, physical_state in enumerate(model.interior_states):
+        coordinate = model.maze.coordinate(int(physical_state))
+        assert displayed_subtask_values[coordinate] == pytest.approx(
+            expected_subtask_values[state]
+        )
+    assert np.ma.is_masked(displayed_subtask_values[model.goal])
+    player.show_goal_component(True)
+    assert desirability_ax.get_title().startswith(
+        "Full composed desirability"
+    )
+
+    player.show_frame(player.frame_count - 1)
+    assert player.frame_index == player.frame_count - 1
+    assert next_button.disabled
+    maze_ax = next(
+        ax
+        for ax in player.figure.axes
+        if ax.get_title().startswith("Physical state:")
+    )
+    assert maze_ax.get_title().endswith(
+        f"({player.frame_count}/{player.frame_count})"
+    )
+
+    previous_button.click()
+    assert player.frame_index == player.frame_count - 2
+    with pytest.raises(ValueError, match="frame_index"):
+        player.show_frame(-1)
+    with pytest.raises(ValueError, match="frame_index"):
+        player.show_frame(player.frame_count)
+    with pytest.raises(ValueError, match="frame_index"):
+        player.show_frame(True)
+    with pytest.raises(ValueError, match="visible"):
+        player.show_goal_component(1)
+    plt.close(player.figure)
+
+
+def test_interactive_player_always_shows_goal_policy_after_termination() -> None:
+    pytest.importorskip("ipywidgets")
+    maze = Maze.from_ascii("....")
+    model = build_soft_two_layer_model(
+        maze,
+        np.asarray(
+            [[1.0, 0.0], [0.6, 0.2], [0.2, 0.6], [0.0, 1.0]]
+        ),
+        goal=(0, 3),
+        parameters=ModelParameters(
+            alpha=100.0,
+            lower_control_cost=1.0,
+            upper_control_cost=1.0,
+            beta=1.0,
+        ),
+        core_threshold=0.25,
+        include_goal_component_while_active=False,
+    )
+    deterministic_upper = np.zeros_like(model.upper_controlled)
+    deterministic_upper[-1, :] = 1.0
+    model = replace(model, upper_controlled=deterministic_upper)
+
+    player = plot_interactive_soft_hierarchical_rollout(
+        model,
+        (0, 1),
+        seed=0,
+        max_steps=20,
+    )
+    assert not player.goal_component_visible
+
+    desirability_ax = next(
+        ax
+        for ax in player.figure.axes
+        if ax.get_title().startswith("Subtask-only desirability")
+    )
+    for frame_index in range(player.frame_count):
+        player.show_frame(frame_index)
+        if desirability_ax.get_title().startswith("Goal-only desirability"):
+            break
+    else:
+        pytest.fail("No goal-only frame was displayed after termination")
+
+    displayed = desirability_ax.images[0].get_array()
+    assert np.count_nonzero(np.isfinite(displayed)) > 0
+    diagnostic_text = "\n".join(
+        text.get_text()
+        for ax in player.figure.axes
+        for text in ax.texts
+    )
+    assert "control phase:   goal-only" in diagnostic_text
+    plt.close(player.figure)
 
 
 def test_soft_subtask_plot_validates_labels() -> None:

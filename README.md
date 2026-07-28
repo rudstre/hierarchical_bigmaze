@@ -121,6 +121,7 @@ soft_model = build_soft_two_layer_model(
     discovery.profiles,
     goal,
     parameters=execution_parameters,
+    include_goal_component_while_active=False,
 )
 soft_rollout = sample_soft_hierarchical_rollout(
     soft_model,
@@ -155,9 +156,11 @@ plt.show()
 ```
 
 The slider uses `continuous_update=False`, so dragging it does not queue
-intermediate figure renders. The “Include exact goal component” checkbox
-switches the heatmap between the full composition and the same weighted basis
-with its final goal column removed; it does not change the sampled rollout.
+intermediate figure renders. The “Include goal component while hierarchy is
+active” checkbox switches the active-phase heatmap between the executed
+subtask-only composition and a counterfactual composition containing the
+fitted goal column. After upper termination, the actual goal-only policy is
+always shown. The checkbox does not change the sampled rollout.
 `animate_soft_hierarchical_rollout` remains the export-oriented API for HTML,
 GIF, or video output.
 
@@ -187,31 +190,33 @@ validation:
 | Interior reward | `-0.1` |
 | Goal reward | `1.1` |
 | Lower control cost `lambda_1` | `0.1` |
-| Upper control cost `lambda_2` | `1.8` |
+| Upper control cost `lambda_2` | `2.0` |
 | Subgoal-access mass `alpha` | `0.2` |
 | Off-target basis reward | `-0.7` |
-| Reward-inpainting scale `beta` | `13.0` |
+| Reward-inpainting scale `beta` | `16.0` |
 
 These are empirical project choices rather than values uniquely determined by
 the paper. The 80% access core removes incidental abstract transitions at
 profile fringes and doorway cells. `alpha=0.2` retains deliberate hierarchy
-access after that narrowing, while `beta=13.0` keeps commands selective
-without approaching the numerical span limit.
+access after that narrowing. Active soft plans exclude the final exact-goal
+basis column; explicit upper termination restores the goal-only task.
+`upper_control_cost=2.0` and `beta=16.0` were jointly selected for that
+execution regime.
 
 Verification used all 96 non-goal starts, 32 rollout seeds, and three frozen
-NMF libraries (9,216 rollouts): 100% goal success, 13.45 mean steps, p90 24,
-p95 27, p99 34, and maximum 49. The hierarchy controlled 94.2% of each
-rollout and made 93.6% normalized goalward progress while active. Immediate
-handoff occurred in 4.2% of episodes and termination within five steps in
-4.4%. It averaged 2.05 continuing upper commands, and the mean command-policy
-total variation from the goal-only policy was `0.499`.
+NMF libraries (9,216 rollouts): 100% goal success, 16.78 mean steps, p90 28,
+p95 32, p99 39, and maximum 57. The hierarchy controlled 77.7% of each
+rollout and made 64.2% normalized goalward progress while active. Immediate
+handoff occurred in 9.4% of episodes, termination within five steps in 15.5%,
+and the hierarchy averaged 3.65 continuing upper commands. Overall, 95.8% of
+upper handoffs occurred within four shortest-path steps of the goal; the
+goal-only cleanup phase averaged 2.88 physical steps.
 
-A larger 36,864-rollout all-start stress test gave p99/p99.9 of 34/43 and a
-maximum of 68. Because rollout actions are sampled from a stochastic policy,
-the observed maximum is not a hard bound and grows with sample count. At
-`(3, 2)`, 18,000 additional rollouts gave mean/p90/p95/p99 steps of
-20.54/24/26/29, maximum 42, and 0.4% immediate handoff. The preset passed
-every declared pathology criterion.
+At `(3, 2)`, a separate 15,000-rollout tail validation gave 100% success,
+23.91 mean steps, p90 31, p95 34, p99 41, and maximum 59. Immediate handoff
+and termination within five steps were both below 0.5%. Because actions are
+sampled from a stochastic policy, observed maxima remain audit fields rather
+than hard bounds. The preset passed every declared pathology criterion.
 
 The sweep is now tiered. It first scans
 `-discovery_interior_reward / discovery_control_cost` from `1e-3` to `10`
@@ -249,7 +254,7 @@ cost for another NMF rank:
 ```python
 parameters = soft_hierarchy_parameters(
     k=12,
-    beta=13.0,  # optional explicit override
+    beta=16.0,  # optional explicit override
 )
 ```
 
