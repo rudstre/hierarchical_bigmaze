@@ -139,6 +139,36 @@ def test_plan_composition_and_goal_exclusion():
     assert np.allclose(plan.layer_one_controlled.sum(axis=0), 1.0)
 
 
+def test_goal_exclusion_uses_passive_dynamics_for_isolated_columns(
+    four_room_environment,
+):
+    basis = SubgoalBasis.from_locations(
+        four_room_environment.maze,
+        (
+            (0, 0),
+            (9, 2),
+            (2, 3),
+            (3, 7),
+            (9, 7),
+            (7, 9),
+        ),
+    )
+    task = four_room_environment.hierarchy(
+        basis,
+        parameters=hard_hierarchy_parameters(upper_control_cost=0.65),
+        include_goal_component_while_active=False,
+    ).for_goal((2, 0))
+
+    plan = task.plan((0, 0))
+    isolated_state = task.interior_state_by_coordinate[(3, 0)]
+
+    assert plan.weights[-1] == 0.0
+    assert np.allclose(plan.layer_one_controlled.sum(axis=0), 1.0)
+    assert plan.layer_one_controlled[:, isolated_state] == pytest.approx(
+        task.lower_dynamics.passive[:, isolated_state]
+    )
+
+
 def test_exact_rollout_records_one_event_trace_without_teleporting(
     soft_corridor_template,
 ):

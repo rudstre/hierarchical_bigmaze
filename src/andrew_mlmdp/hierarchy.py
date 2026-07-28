@@ -574,6 +574,11 @@ def _plan_from_abstract_dynamics(
     weights = np.maximum(0.0, raw_weights)
     if not model.include_goal_component_while_active:
         weights[-1] = 0.0
+        if not np.any(weights[:-1] > 0.0):
+            weights = _best_single_subgoal_weights(
+                model.task_basis.boundary_desirability,
+                target_boundary_desirability,
+            )
     reconstructed_boundary = (
         model.task_basis.boundary_desirability @ weights
     )
@@ -596,6 +601,33 @@ def _plan_from_abstract_dynamics(
         physical_desirability=physical_desirability,
         layer_one_controlled=layer_one_controlled,
     )
+
+
+def _best_single_subgoal_weights(
+    boundary_basis: np.ndarray,
+    target_boundary: np.ndarray,
+) -> np.ndarray:
+    """Return the best one-column nonnegative fallback composition.
+
+    The paper's pseudoinverse-and-clipping approximation can rarely clip every
+    subgoal coefficient to zero. When the exact goal component is disabled,
+    choose the individual subgoal column with the smallest boundary
+    reconstruction error so the hierarchy still issues a meaningful command.
+    """
+
+    subgoal_columns = boundary_basis[:, :-1]
+    squared_norms = np.sum(subgoal_columns**2, axis=0)
+    scales = (subgoal_columns.T @ target_boundary) / squared_norms
+    scales = np.maximum(0.0, scales)
+    approximations = subgoal_columns * scales[np.newaxis, :]
+    residuals = np.linalg.norm(
+        approximations - target_boundary[:, np.newaxis],
+        axis=0,
+    )
+    selected = int(np.argmin(residuals))
+    weights = np.zeros(boundary_basis.shape[1], dtype=np.float64)
+    weights[selected] = scales[selected]
+    return weights
 
 
 def _goal_only_plan(
@@ -671,10 +703,26 @@ def _compose_lower_policy(
         [interior_desirability, reconstructed_boundary]
     )
     if goal_interior_desirability is None:
-        controlled = controlled_from_desirability(
-            model.lower_dynamics.passive,
-            complete_desirability,
-        )
+        if model.include_goal_component_while_active:
+            controlled = controlled_from_desirability(
+                model.lower_dynamics.passive,
+                complete_desirability,
+            )
+        else:
+            # A dragged goal can be an articulation point that isolates an
+            # interior cell from every subgoal. Equation 6 is undefined only
+            # for those zero-support columns; retain their physical passive
+            # dynamics without adding goal-directed controllability.
+            unnormalized = (
+                model.lower_dynamics.passive
+                * complete_desirability[:, np.newaxis]
+            )
+            normalizers = unnormalized.sum(axis=0)
+            controlled = model.lower_dynamics.passive.copy()
+            usable = np.isfinite(normalizers) & (normalizers > 0.0)
+            controlled[:, usable] = (
+                unnormalized[:, usable] / normalizers[usable]
+            )
     else:
         # Early online iterates may leave states with no usable desirability.
         # Keep those columns at zero so rollout code can report ``zero_policy``.
