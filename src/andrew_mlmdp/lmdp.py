@@ -19,8 +19,9 @@ class ModelParameters:
     The lower cost governs flat and physical-layer calculations, including the
     task basis and reward inpainting. The upper cost governs the abstract LMDP.
     NMF task discovery has separate frozen parameters in
-    ``NMFDiscoveryParameters``. Defaults are canonical project choices, not
-    values fixed by the paper.
+    ``NMFDiscoveryParameters``. The dataclass defaults are canonical project
+    choices for flat and generic calculations; hierarchy factories use
+    ``hard_hierarchy_parameters`` when no parameters are supplied.
     """
 
     interior_reward: float = -0.1
@@ -53,6 +54,34 @@ class ModelParameters:
             raise ValueError("Alpha must be positive")
         if self.beta <= 0.0:
             raise ValueError("Beta must be positive")
+
+
+def hard_hierarchy_parameters(
+    *,
+    interior_reward: float = -0.1,
+    goal_reward: float = 1.1,
+    lower_control_cost: float = 0.06,
+    upper_control_cost: float = 0.3,
+    alpha: float = 0.4,
+    off_target_reward: float = -1.0,
+    beta: float = 16.0,
+) -> ModelParameters:
+    """Return the validated defaults for one-hot subgoal hierarchies.
+
+    These defaults balance fixed-subgoal desirability structure, rollout
+    efficiency, online execution, and spatially selective termination. They
+    do not encode a particular maze shape, size, goal, or subgoal count.
+    """
+
+    return ModelParameters(
+        interior_reward=interior_reward,
+        goal_reward=goal_reward,
+        lower_control_cost=lower_control_cost,
+        upper_control_cost=upper_control_cost,
+        alpha=alpha,
+        off_target_reward=off_target_reward,
+        beta=beta,
+    )
 
 
 def soft_hierarchy_parameters(
@@ -237,13 +266,22 @@ class LMDPEnvironment:
         self,
         basis,
         *,
-        parameters: ModelParameters = ModelParameters(),
+        parameters: ModelParameters | None = None,
         include_goal_component_while_active: bool = True,
     ):
-        """Create a reusable hierarchy template for a supplied subgoal basis."""
+        """Create a reusable hierarchy template for a supplied subgoal basis.
+
+        Hierarchies use :func:`hard_hierarchy_parameters` when ``parameters``
+        is omitted. This preserves exact equivalence between a point basis and
+        the same one-hot profiles supplied through the distributed API.
+        Calibrated soft workflows should pass
+        :func:`soft_hierarchy_parameters` explicitly.
+        """
 
         from andrew_mlmdp.hierarchy import HierarchyTemplate
 
+        if parameters is None:
+            parameters = hard_hierarchy_parameters()
         return HierarchyTemplate(
             environment=self,
             basis=basis,

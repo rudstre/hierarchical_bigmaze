@@ -6,6 +6,7 @@ from andrew_mlmdp import (
     Maze,
     ModelParameters,
     SubgoalBasis,
+    hard_hierarchy_parameters,
 )
 
 
@@ -18,6 +19,56 @@ def test_point_basis_is_one_hot_and_validates_arbitrary_count():
     assert basis.access_profiles == pytest.approx(basis.profiles)
     assert basis.profiles.sum(axis=0) == pytest.approx(np.ones(3))
     assert basis.locations == locations
+
+
+def test_point_hierarchy_uses_swept_hard_defaults():
+    maze = Maze.from_ascii(".....")
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+
+    template = LMDPEnvironment(maze).hierarchy(basis)
+
+    expected = ModelParameters(
+        interior_reward=-0.1,
+        goal_reward=1.1,
+        lower_control_cost=0.06,
+        upper_control_cost=0.3,
+        alpha=0.4,
+        off_target_reward=-1.0,
+        beta=16.0,
+    )
+    assert hard_hierarchy_parameters() == expected
+    assert template.parameters == expected
+
+
+def test_profile_hierarchy_uses_same_default_as_point_hierarchy():
+    maze = Maze.from_ascii(".....")
+    profiles = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.8, 0.2],
+            [0.5, 0.5],
+            [0.2, 0.8],
+            [0.0, 1.0],
+        ]
+    )
+    basis = SubgoalBasis.from_profiles(maze, profiles)
+
+    template = LMDPEnvironment(maze).hierarchy(basis)
+
+    assert template.parameters == hard_hierarchy_parameters()
+
+
+def test_explicit_point_hierarchy_parameters_override_hard_defaults():
+    maze = Maze.from_ascii(".....")
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    supplied = ModelParameters(alpha=1.5)
+
+    template = LMDPEnvironment(maze).hierarchy(
+        basis,
+        parameters=supplied,
+    )
+
+    assert template.parameters is supplied
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,7 @@ from andrew_mlmdp.lmdp import (
     LMDPEnvironment,
     ModelParameters,
     controlled_from_desirability,
+    hard_hierarchy_parameters,
     solve_first_exit,
     z_iteration_step,
 )
@@ -142,7 +143,7 @@ class HierarchyTemplate:
         *,
         environment: LMDPEnvironment,
         basis: SubgoalBasis,
-        parameters: ModelParameters = ModelParameters(),
+        parameters: ModelParameters | None = None,
         include_goal_component_while_active: bool = True,
     ) -> None:
         if basis.maze != environment.maze:
@@ -156,6 +157,8 @@ class HierarchyTemplate:
             raise ValueError(
                 "include_goal_component_while_active must be a boolean"
             )
+        if parameters is None:
+            parameters = hard_hierarchy_parameters()
         self.environment = environment
         self.basis = basis
         self.parameters = parameters

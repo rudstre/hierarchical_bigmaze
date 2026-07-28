@@ -41,8 +41,8 @@ validation.
 from andrew_mlmdp import (
     LMDPEnvironment,
     Maze,
-    ModelParameters,
     SubgoalBasis,
+    hard_hierarchy_parameters,
 )
 
 maze = Maze.from_file("mazes/four_rooms.txt")
@@ -54,9 +54,11 @@ flat_rollout = flat.rollout((3, 0), seed=0)
 
 subgoals = ((0, 0), (9, 2), (2, 3), (3, 7), (9, 7), (7, 9))
 basis = SubgoalBasis.from_locations(maze, subgoals)
+hard_parameters = hard_hierarchy_parameters()
 hierarchy = environment.hierarchy(
     basis,
-    parameters=ModelParameters(),
+    parameters=hard_parameters,
+    include_goal_component_while_active=False,
 )
 task = hierarchy.for_goal(goal)
 
@@ -73,6 +75,8 @@ online = task.rollout(
 `HierarchyTemplate.for_goal` caches goal-conditioned tasks, while each
 `HierarchyTask` exposes its lower dynamics, first-hit probabilities, task
 basis, upper dynamics, upper policy, plans, and recorded rollout events.
+Point bases automatically use the validated `hard_hierarchy_parameters()`
+defaults when no explicit parameters are supplied.
 
 ## NMF soft subgoals
 
