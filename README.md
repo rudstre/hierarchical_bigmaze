@@ -1,24 +1,24 @@
-# Two-Layer Multitask LMDP Maze Navigation
+# Maze multitask LMDPs
 
-Readable research code for the four-room demonstration in Saxe, Earle, and
-Rosman (2017), *Hierarchy Through Composition with Multitask LMDPs*.
+Readable research code for flat and two-layer linearly solvable Markov
+decision processes in grid mazes. The implementation is dimension-agnostic:
+matrix sizes come from the supplied maze and subgoal basis rather than the
+included four-room example.
 
-The repository implements:
+The supported workflows are:
 
-- exact first-exit LMDP solutions;
-- closed-form controlled dynamics;
-- multitask desirability composition;
-- KL-NMF discovery of distributed soft subtasks;
-- a two-layer abstraction built from lower-layer first-hit probabilities;
-- top-down reward inpainting and task blending;
-- seeded flat and hierarchical rollouts; and
-- the current four-room diagnostic figures.
+1. parse rectangular ASCII mazes containing walls (`#`) and free cells (`.`);
+2. solve and sample a flat first-exit LMDP for any free start and goal;
+3. construct a reusable point-subgoal hierarchy and solve new goals with
+   exact or online Z-iteration;
+4. inspect and plot task-independent passive subgoal dynamics; and
+5. discover distributed subgoals with KL-NMF, core-gate their access profiles,
+   and explore a single rollout using draggable start and goal markers.
 
-The emphasis is transparency. Arrays remain inspectable, state ordering is
-explicit, and the main functions follow the order of the paper's equations.
-Additional paper experiments and learning curves are outside the current scope.
+The canonical, executable walkthrough is
+[`notebooks/maze_lmdp_workflows.ipynb`](notebooks/maze_lmdp_workflows.ipynb).
 
-## Install and test
+## Install and validate
 
 Python 3.11 or newer is required.
 
@@ -27,299 +27,104 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[test,notebook]"
 pytest -q
+ruff check src tests notebooks/maze_lmdp_workflows.ipynb
+vulture src/andrew_mlmdp --min-confidence 80
 ```
 
-The equivalent `uv` setup is:
+The test suite executes the canonical notebook in a clean kernel and exercises
+the widget controller, so the full extras are required for complete
+validation.
 
-```shell
-uv sync --extra test --extra notebook
-uv run pytest -q
-```
-
-## Quick start
+## Core API
 
 ```python
 from andrew_mlmdp import (
+    LMDPEnvironment,
     Maze,
     ModelParameters,
-    build_two_layer_model,
-    compute_layer_one_plan,
-    controlled_dynamics,
-    sample_hierarchical_rollout,
-    sample_rollout,
-    solve_desirability,
+    SubgoalBasis,
 )
 
 maze = Maze.from_file("mazes/four_rooms.txt")
-parameters = ModelParameters()
+environment = LMDPEnvironment(maze)
 goal = (10, 9)
 
-flat_desirability = solve_desirability(
-    maze,
-    goal,
-    parameters=parameters,
-)
-flat_policy = controlled_dynamics(maze, flat_desirability)
-flat_rollout = sample_rollout(
-    maze,
-    flat_policy,
-    start=(0, 0),
-    goal=goal,
-    seed=7,
-)
+flat = environment.solve_flat(goal)
+flat_rollout = flat.rollout((3, 0), seed=0)
 
 subgoals = ((0, 0), (9, 2), (2, 3), (3, 7), (9, 7), (7, 9))
-model = build_two_layer_model(
-    maze,
-    subgoals,
-    goal,
-    parameters=parameters,
+basis = SubgoalBasis.from_locations(maze, subgoals)
+hierarchy = environment.hierarchy(
+    basis,
+    parameters=ModelParameters(),
 )
-plan = compute_layer_one_plan(model, current=(1, 0))
-hierarchical_rollout = sample_hierarchical_rollout(
-    model,
-    start=(1, 0),
+task = hierarchy.for_goal(goal)
+
+exact = task.rollout((3, 2), seed=0)
+online = task.rollout(
+    (3, 2),
+    goal_learning="online",
+    z_sweeps_per_step=1,
     seed=28,
 )
 ```
 
-`model.lower_dynamics`, `model.task_basis`, `model.upper_dynamics`, and `plan`
-expose the intermediate matrices used in the calculation.
+`LMDPEnvironment` constructs the physical passive matrix once.
+`HierarchyTemplate.for_goal` caches goal-conditioned tasks, while each
+`HierarchyTask` exposes its lower dynamics, first-hit probabilities, task
+basis, upper dynamics, upper policy, plans, and recorded rollout events.
 
-Soft subtasks follow the same construction, replacing point access rows with
-the paper's distributed `P_t = alpha * D.T` profiles:
+## NMF soft subgoals
 
 ```python
 from andrew_mlmdp import (
     NMFDiscoveryParameters,
-    build_goal_task_ensemble,
-    build_soft_two_layer_model,
-    factorize_soft_subtasks,
-    plot_interactive_soft_hierarchical_rollout,
-    sample_online_soft_hierarchical_rollout,
-    sample_soft_hierarchical_rollout,
+    SubgoalBasis,
+    discover_soft_subgoals,
+    plotting,
     soft_hierarchy_parameters,
 )
 
-number_of_subtasks = 8
-discovery_parameters = NMFDiscoveryParameters()
-execution_parameters = soft_hierarchy_parameters(
-    k=number_of_subtasks,
-    # lower_control_cost=0.11,  # sharpen execution without rediscovery
-)
-ensemble = build_goal_task_ensemble(
-    maze,
-    discovery_parameters=discovery_parameters,
-)
-discovery = factorize_soft_subtasks(
-    ensemble,
-    n_subtasks=number_of_subtasks,
+study = discover_soft_subgoals(
+    environment,
+    ranks=range(2, 13),
+    parameters=NMFDiscoveryParameters(),
     seed=0,
 )
-soft_model = build_soft_two_layer_model(
+rank_eight = study.result(8)  # reuses the fit from the rank study
+
+soft_basis = SubgoalBasis.from_profiles(
     maze,
-    discovery.profiles,
-    goal,
-    parameters=execution_parameters,
+    rank_eight.profiles,
+    core_threshold=0.8,
+)
+soft_hierarchy = environment.hierarchy(
+    soft_basis,
+    parameters=soft_hierarchy_parameters(8),
     include_goal_component_while_active=False,
 )
-soft_rollout = sample_soft_hierarchical_rollout(
-    soft_model,
-    start=(1, 0),
-    seed=3,
-)
-
-# Replace the exact goal solution with a zero-initialized solution that
-# advances by one full Z-iteration after every nonterminal physical step.
-online_soft_rollout = sample_online_soft_hierarchical_rollout(
-    soft_model,
-    start=(1, 0),
-    seed=3,
+player = plotting.plot_interactive_soft_hierarchical_rollout(
+    soft_hierarchy,
+    start=(3, 2),
+    goal=goal,
+    seed=0,
 )
 ```
 
-For notebook inspection, prefer the paused frame player over serializing a
-`FuncAnimation`. With `%matplotlib widget` active, it computes the rollout
-once and redraws only when the slider or a step button changes:
-
-```python
-from IPython.display import display
-import matplotlib.pyplot as plt
-
-player = plot_interactive_soft_hierarchical_rollout(
-    soft_model,
-    start=(1, 0),
-    seed=3,
-)
-display(player.controls)
-plt.show()
-```
-
-The slider uses `continuous_update=False`, so dragging it does not queue
-intermediate figure renders. Drag the green start circle and red goal star to
-stage new free cells, then press **Recompute rollout** to apply both locations
-and sample a fresh rollout. Dragging does not recompute, and pressing the
-button without moving either marker resamples the current pair.
-
-The “Include goal component while hierarchy is active” checkbox switches the
-active-phase heatmap between the executed subtask-only composition and a
-counterfactual composition containing the fitted goal column. After upper
-termination, the actual goal-only policy is always shown. “Normalize
-desirability within each frame” maps the finite relative-value range in the
-current frame to 0–1; turning it off restores the goal-anchored log scale,
-where the omitted goal has value zero. Both checkboxes change only the
-visualization, not the sampled rollout.
-`animate_soft_hierarchical_rollout` remains the export-oriented API for HTML,
-GIF, or video output.
-
-`factorize_soft_subtasks` peak-normalizes every profile column and absorbs its
-scale into the matching task-weight row. This leaves the NMF reconstruction
-unchanged and makes `alpha` the maximum local passive access strength.
-`NMFDiscoveryParameters` is frozen into the ensemble and is independent of
-the execution `ModelParameters`. Reuse the resulting `discovery.profiles`
-when changing `lower_control_cost`; rebuilding the ensemble would intentionally
-learn a different subtask library.
-`build_soft_two_layer_model` then core-gates access at 80% of each profile
-peak by default. Values below the threshold become exactly zero; values above
-it are linearly rescaled to `[0, 1]`. Pass `core_threshold=None` for direct
-paper access `P_t = alpha * D.T`, or set `core_exponent` above one to sharpen
-the surviving core further.
-
-## Reference parameters
-
-`NMFDiscoveryParameters()` fixes the NMF task family at
-`interior_reward=-0.4`, `goal_reward=6.5`, and `control_cost=1.2`.
-`ModelParameters()` independently configures execution using the
-sustained-hierarchy regime from the post-peak-normalization rank-eight
-validation:
-
-| Parameter | Default |
-| --- | ---: |
-| Interior reward | `-0.1` |
-| Goal reward | `1.1` |
-| Lower control cost `lambda_1` | `0.1` |
-| Upper control cost `lambda_2` | `0.25` |
-| Subgoal-access mass `alpha` | `0.2` |
-| Off-target basis reward | `-0.7` |
-| Reward-inpainting scale `beta` | `16.0` |
-
-These are empirical project choices rather than values uniquely determined by
-the paper. The 80% access core removes incidental abstract transitions at
-profile fringes and doorway cells. `alpha=0.2` retains deliberate hierarchy
-access after that narrowing. Active soft plans exclude the final exact-goal
-basis column; explicit upper termination restores the goal-only task.
-`upper_control_cost=0.25` makes upper termination substantially more
-decisive, while `beta=16.0` retains the established lower-task modulation.
-
-The archived reference verification used `upper_control_cost=2.0`, all 96
-non-goal starts, 32 rollout seeds, and three frozen NMF libraries (9,216
-rollouts): 100% goal success, 16.78 mean steps, p90 28, p95 32, p99 39, and
-maximum 57. The hierarchy controlled 77.7% of each rollout and made 64.2%
-normalized goalward progress while active. Immediate handoff occurred in 9.4%
-of episodes, termination within five steps in 15.5%, and the hierarchy
-averaged 3.65 continuing upper commands. Overall, 95.8% of upper handoffs
-occurred within four shortest-path steps of the goal; the goal-only cleanup
-phase averaged 2.88 physical steps.
-
-At `(3, 2)`, a separate 15,000-rollout tail validation gave 100% success,
-23.91 mean steps, p90 31, p95 34, p99 41, and maximum 59. Immediate handoff
-and termination within five steps were both below 0.5%. Because actions are
-sampled from a stochastic policy, observed maxima remain audit fields rather
-than hard bounds. The preset passed every declared pathology criterion.
-
-The sweep is now tiered. It first scans
-`-discovery_interior_reward / discovery_control_cost` from `1e-3` to `10`
-and measures KL reconstruction, NMF-seed stability, profile overlap, core
-coverage, connectivity, and task-ensemble dynamic range. This is the only
-discovery ratio that changes the ideal peak-normalized profile geometry:
-scaling all discovery rewards and control cost together leaves `Z` unchanged,
-while the shared goal reward multiplies every task column by one common
-factor. The goal reward and control cost are therefore held at numerically
-safe reporting values rather than treated as two extra identifiable search
-dimensions.
-
-After selecting the first stable profile-localization knee, the script
-factorizes NMF seeds 0, 1, and 2 once and reuses those exact profile libraries.
-Execution then uses a deliberately wide log-stratified search, an
-evidence-driven factor-of-four neighborhood around broad-stage survivors, an
-all-start robust check, and a separate 2,000-seed tail check at `(3, 2)`.
-Refinement is allowed to cross an initial broad bound when a survivor lies
-near that edge; much wider numerical safety limits prevent a boundary hit
-from masquerading as an optimum. One-factor sensitivity is run around the
-current default, the balanced recommendation, and the fastest clean finalist.
-Run the complete funnel with:
-
-```bash
-.venv/bin/python experiments/sweep_soft_k8.py
-```
-
-The output directory contains `discovery.csv`, `broad.csv`, `focused.csv`,
-`robust.csv`, `demonstration_tail.csv`, `sensitivity.csv`, `summary.json`, and
-`report.md`.
-
-`soft_hierarchy_parameters(k)` scales the execution `alpha` and upper control
-cost for another NMF rank:
-
-```python
-parameters = soft_hierarchy_parameters(
-    k=12,
-    beta=16.0,  # optional explicit override
-)
-```
-
-Only the rank-eight reference received this behavioral validation; the rank
-scaling remains a heuristic. Every `ModelParameters` field is available as an
-optional keyword override.
-Use `paper_hierarchy_parameters()` when the paper-scale constants are desired
-without the rank heuristic.
-
-## Repository map
-
-```text
-src/andrew_mlmdp/
-|-- maze.py       geometry and coordinate/state conversion
-|-- lmdp.py       first-exit dynamics, Equations 4 and 6, flat solver
-|-- discovery.py  goal-task ensembles and KL-NMF soft subtasks
-|-- hierarchy.py  two-layer construction, composition, and rollout
-`-- plotting.py   direct visualizations of policies and trajectories
-
-experiments/      deterministic figure-producing scripts
-mazes/            text-only maze geometry
-notebooks/        an inspectable flat-to-hierarchical walkthrough
-tests/            equation, simulation, and four-room regression checks
-docs/             mathematical and experiment documentation
-```
+The original peak-normalized NMF profiles and their gated execution profiles
+are immutable. Changing the goal rebuilds only the goal-conditioned hierarchy;
+it does not rerun NMF or apply the gate again.
 
 ## Conventions
 
-- Coordinates are `(row, column)`, with `(0, 0)` at the upper left.
-- Physical states follow row-major `maze.free_cells` order.
-- Every transition matrix uses
-  `P[next_state, current_state] = P(next_state | current_state)`.
-- Transition columns, rather than rows, sum to one.
-- Lower boundary order is `[subgoals..., goal]`.
-- Upper interior-state order is the caller-supplied subgoal order.
-- A subgoal copy is an abstract boundary; its physical cell remains traversable.
-- Abstract accesses consume no physical time.
+- Coordinates are `(row, column)` from the upper left.
+- Matrices use `P[next_state, current_state]`, so probability columns sum to
+  one.
+- Passive physical motion chooses north, south, east, west, or stay uniformly.
+  Invalid moves become self-transitions.
+- Point subgoals are one-hot profile columns. Point and distributed subgoals
+  therefore share one hierarchy construction and rollout engine.
 
-See [docs/model.md](docs/model.md) for the derivation and code mapping, and
-[docs/four_rooms.md](docs/four_rooms.md) for the exact experiment protocol.
-
-## Figures and notebook
-
-```shell
-MPLBACKEND=Agg python experiments/plot_flat_policy.py
-MPLBACKEND=Agg python experiments/plot_sample_rollout.py
-MPLBACKEND=Agg python experiments/plot_passive_subgoal_graph.py
-MPLBACKEND=Agg python experiments/plot_two_layer.py
-jupyter lab notebooks/flat_lmdp_examples.ipynb
-```
-
-Figures are written to the ignored `output/` directory. The notebook is stored
-without outputs so its displayed results always come from the current code.
-
-## Reference
-
-Andrew M. Saxe, Adam C. Earle, and Benjamin Rosman. "Hierarchy Through
-Composition with Multitask LMDPs." *Proceedings of the 34th International
-Conference on Machine Learning*, PMLR 70, 2017.
+See [`docs/model.md`](docs/model.md) for the mathematical mapping and
+[`docs/four_rooms.md`](docs/four_rooms.md) for the included regression
+configuration.

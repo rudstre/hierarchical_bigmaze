@@ -5,7 +5,7 @@ All transition matrices use the convention
 distributions over the next state.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -55,20 +55,6 @@ class ModelParameters:
             raise ValueError("Beta must be positive")
 
 
-def paper_hierarchy_parameters() -> ModelParameters:
-    """Return the paper-scale parameter regime for hierarchy experiments."""
-
-    return ModelParameters(
-        interior_reward=-0.1,
-        goal_reward=1.0,
-        lower_control_cost=1.0,
-        upper_control_cost=1.0,
-        alpha=0.1,
-        off_target_reward=-1.0,
-        beta=1.0,
-    )
-
-
 def soft_hierarchy_parameters(
     k: int = 8,
     *,
@@ -83,8 +69,8 @@ def soft_hierarchy_parameters(
     """Return soft-hierarchy execution parameters for rank ``k``.
 
     The rank-eight reference was validated after component-wise NMF peak
-    normalization with the active exact-goal component disabled in
-    ``build_soft_two_layer_model``. For ranks other than eight, the heuristic
+    normalization with the active exact-goal component disabled in the
+    hierarchy template. For ranks other than eight, the heuristic
     keeps the physical-layer and inpainting parameters fixed while applying
     ``alpha ~ 1 / sqrt(k)`` and ``upper_control_cost ~ sqrt(k)``; those derived
     ranks have not received the same behavioral validation.
@@ -170,6 +156,102 @@ class FirstExitDynamics:
     @property
     def number_of_boundary_states(self) -> int:
         return self.boundary_passive.shape[0]
+
+
+@dataclass(frozen=True)
+class FlatSolution:
+    """A solved flat maze task with its policy and rollout convenience API."""
+
+    environment: "LMDPEnvironment"
+    goal: Coordinate
+    parameters: ModelParameters
+    desirability: np.ndarray
+    controlled: np.ndarray
+
+    def rollout(
+        self,
+        start: Coordinate,
+        *,
+        max_steps: int = 500,
+        seed: int | None = None,
+    ) -> list[Coordinate]:
+        """Sample one trajectory from ``start`` to this solution's goal."""
+
+        return sample_rollout(
+            self.environment.maze,
+            self.controlled,
+            start,
+            self.goal,
+            max_steps=max_steps,
+            seed=seed,
+        )
+
+
+@dataclass(frozen=True)
+class LMDPEnvironment:
+    """Maze dynamics shared by flat, discovery, and hierarchical tasks.
+
+    The physical passive matrix depends only on maze geometry, so it is built
+    once when the environment is created and reused for every goal and
+    subgoal basis. No assumption is made about maze dimensions or topology.
+    """
+
+    maze: Maze
+    passive: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        passive = build_passive_dynamics(self.maze)
+        passive.flags.writeable = False
+        object.__setattr__(self, "passive", passive)
+
+    def solve_flat(
+        self,
+        goal: Coordinate,
+        *,
+        parameters: ModelParameters = ModelParameters(),
+    ) -> FlatSolution:
+        """Solve a flat first-exit task while reusing physical dynamics."""
+
+        desirability = _solve_desirability_from_passive(
+            self.maze,
+            self.passive,
+            goal,
+            parameters,
+        )
+        unnormalized = self.passive * desirability[:, np.newaxis]
+        normalizers = unnormalized.sum(axis=0)
+        controlled = self.passive.copy()
+        usable = np.isfinite(normalizers) & (normalizers > 0.0)
+        controlled[:, usable] = (
+            unnormalized[:, usable] / normalizers[usable]
+        )
+        return FlatSolution(
+            environment=self,
+            goal=goal,
+            parameters=parameters,
+            desirability=desirability,
+            controlled=controlled,
+        )
+
+    def hierarchy(
+        self,
+        basis,
+        *,
+        parameters: ModelParameters = ModelParameters(),
+        include_goal_component_while_active: bool = True,
+    ):
+        """Create a reusable hierarchy template for a supplied subgoal basis."""
+
+        from andrew_mlmdp.hierarchy import HierarchyTemplate
+
+        return HierarchyTemplate(
+            environment=self,
+            basis=basis,
+            parameters=parameters,
+            include_goal_component_while_active=(
+                include_goal_component_while_active
+            ),
+        )
 
 
 def solve_first_exit(
@@ -318,20 +400,22 @@ def build_passive_dynamics(maze: Maze) -> np.ndarray:
     return passive_dynamics
 
 
-def solve_desirability(
+def _solve_desirability_from_passive(
     maze: Maze,
+    passive: np.ndarray,
     goal: Coordinate,
-    *,
-    parameters: ModelParameters = ModelParameters(),
+    parameters: ModelParameters,
 ) -> np.ndarray:
-    """Solve a flat first-exit LMDP with one absorbing goal.
-
-    The returned vector follows ``maze.free_cells`` order. The goal entry is
-    its boundary desirability; every other entry solves Equation 4.
-    """
+    """Solve a goal task from a validated, reusable physical matrix."""
 
     goal_state = maze.state_index(goal)
-    passive = build_passive_dynamics(maze)
+    passive_values = np.asarray(passive, dtype=np.float64)
+    expected_shape = (len(maze.free_cells), len(maze.free_cells))
+    if passive_values.shape != expected_shape:
+        raise ValueError(
+            f"Passive dynamics must have shape {expected_shape}, "
+            f"got {passive_values.shape}"
+        )
     interior_states = np.asarray(
         [state for state in range(len(maze.free_cells)) if state != goal_state],
         dtype=int,
@@ -346,8 +430,12 @@ def solve_desirability(
         return desirability
 
     dynamics = FirstExitDynamics(
-        interior_passive=passive[np.ix_(interior_states, interior_states)],
-        boundary_passive=passive[goal_state, interior_states][np.newaxis, :],
+        interior_passive=passive_values[
+            np.ix_(interior_states, interior_states)
+        ],
+        boundary_passive=passive_values[
+            goal_state, interior_states
+        ][np.newaxis, :],
     )
     q_interior = np.exp(
         parameters.interior_reward / parameters.lower_control_cost
@@ -358,37 +446,6 @@ def solve_desirability(
         q_interior,
     )
     return desirability
-
-
-def controlled_dynamics(
-    maze: Maze,
-    desirability: np.ndarray,
-) -> np.ndarray:
-    """Return the optimal controlled next-state distribution.
-
-    The result follows ``matrix[next_state, current_state]``. A first-exit
-    caller ignores the terminal state's outgoing column because execution ends
-    as soon as that state is reached.
-    """
-
-    values = np.asarray(desirability, dtype=np.float64)
-    expected_shape = (len(maze.free_cells),)
-    if values.shape != expected_shape:
-        raise ValueError(
-            f"Desirability must have shape {expected_shape}, got {values.shape}"
-        )
-    try:
-        return controlled_from_desirability(
-            build_passive_dynamics(maze),
-            values,
-        )
-    except ValueError as error:
-        if "zero-mass column" in str(error):
-            raise ValueError(
-                "Controlled dynamics are undefined when a column has zero "
-                "total desirability"
-            ) from error
-        raise
 
 
 def sample_rollout(

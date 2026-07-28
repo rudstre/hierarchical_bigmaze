@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  full-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package and full validation extras
+        run: python -m pip install -e ".[test,notebook]"
+      - name: Check imports and style
+        run: ruff check src tests notebooks/maze_lmdp_workflows.ipynb
+      - name: Check private dead code
+        run: vulture src/andrew_mlmdp --min-confidence 80
+      - name: Run behavioral, widget, and notebook tests
+        env:
+          MPLBACKEND: Agg
+        run: pytest -q

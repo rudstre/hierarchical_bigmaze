@@ -11,7 +11,6 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Literal, TypeAlias
 
-
 Coordinate: TypeAlias = tuple[int, int]
 Command: TypeAlias = Literal["north", "south", "east", "west", "stay"]
 

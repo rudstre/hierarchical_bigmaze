@@ -5,29 +5,22 @@ from html import escape
 from time import monotonic
 from typing import Callable
 
-from matplotlib.animation import FuncAnimation
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.animation import FuncAnimation
+from matplotlib.backend_bases import MouseButton
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
-from matplotlib.backend_bases import MouseButton
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import Slider
 
 from andrew_mlmdp.discovery import NMFRankDiagnostics, SoftSubtaskDiscovery
 from andrew_mlmdp.hierarchy import (
+    HierarchyTask,
+    HierarchyTemplate,
     LayerOnePlan,
-    SoftHierarchicalRollout,
-    SoftSubtaskAccess,
-    SoftTwoLayerModel,
-    TwoLayerModel,
-    _HierarchyEvent,
-    _OnlineHierarchicalRolloutFrame,
-    _trace_hierarchy_events,
-    _trace_online_hierarchical_rollout,
-    build_soft_two_layer_model,
-    build_two_layer_model,
-    compute_layer_one_plan,
+    Rollout,
+    RolloutEvent,
 )
 from andrew_mlmdp.lmdp import desirability_grid
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
@@ -49,6 +42,8 @@ class _HierarchicalRolloutFrame:
     controlled_access_probability: float | None = None
     refractory: bool = False
     status: str | None = None
+    goal_desirability: np.ndarray | None = None
+    z_iterations: int = 0
 
 
 @dataclass(frozen=True)
@@ -83,13 +78,13 @@ class SoftHierarchicalRolloutPlayer:
     _location_state: dict[str, object]
 
     @property
-    def model(self) -> SoftTwoLayerModel:
+    def model(self) -> HierarchyTask:
         """Return the model used by the currently displayed rollout."""
 
         return self._renderer.model
 
     @property
-    def rollout(self) -> SoftHierarchicalRollout:
+    def rollout(self) -> Rollout:
         """Return the currently displayed rollout."""
 
         return self._renderer.rollout
@@ -188,7 +183,7 @@ class _SoftRolloutRenderer:
     figure: Figure
     _run_state: dict[str, object]
     update: Callable[[int], tuple[object, ...]]
-    replace_run: Callable[[SoftTwoLayerModel, Coordinate, int | None], None]
+    replace_run: Callable[[HierarchyTask, Coordinate, int | None], None]
     set_goal_component: Callable[[bool], None]
     set_framewise_normalization: Callable[[bool], None]
     maze_ax: object
@@ -197,7 +192,7 @@ class _SoftRolloutRenderer:
     desirability_goal_marker: object
 
     @property
-    def model(self) -> SoftTwoLayerModel:
+    def model(self) -> HierarchyTask:
         return self._run_state["model"]
 
     @property
@@ -205,7 +200,7 @@ class _SoftRolloutRenderer:
         return self._run_state["start"]
 
     @property
-    def rollout(self) -> SoftHierarchicalRollout:
+    def rollout(self) -> Rollout:
         return self._run_state["rollout"]
 
     @property
@@ -213,7 +208,7 @@ class _SoftRolloutRenderer:
         return self._run_state["frames"]
 
 
-_RolloutFrame = _HierarchicalRolloutFrame | _OnlineHierarchicalRolloutFrame
+_RolloutFrame = _HierarchicalRolloutFrame
 
 
 def _draw_walls(
@@ -535,7 +530,7 @@ def plot_trajectory(
 
 
 def plot_interactive_subgoal_desirability(
-    model: TwoLayerModel,
+    model: HierarchyTask,
     start: Coordinate,
     *,
     beta: float | None = None,
@@ -549,6 +544,10 @@ def plot_interactive_subgoal_desirability(
     boundary desirability.
     """
 
+    if not model.basis.is_point_basis:
+        raise ValueError(
+            "Interactive point composition requires a point subgoal basis"
+        )
     model.maze.state_index(start)
     if start == model.goal:
         raise ValueError("Start must be a non-goal free cell")
@@ -572,17 +571,12 @@ def plot_interactive_subgoal_desirability(
         goal_model = (
             model
             if goal == model.goal
-            else build_two_layer_model(
-                model.maze,
-                model.subgoals,
-                goal,
-                parameters=model.parameters,
-            )
+            else model.template.for_goal(goal)
         )
         subtask_basis = goal_model.task_basis.interior_desirability[:, :-1]
         goal_state = model.maze.state_index(goal)
         for current in goal_model.interior_state_by_coordinate:
-            plan = compute_layer_one_plan(goal_model, current, beta=beta)
+            plan = goal_model.plan(current, beta=beta)
             values = np.full(
                 len(model.maze.free_cells),
                 np.nan,
@@ -861,7 +855,7 @@ def plot_interactive_subgoal_desirability(
 
 
 def animate_hierarchical_rollout(
-    model: TwoLayerModel,
+    model: HierarchyTask,
     start: Coordinate,
     *,
     beta: float | None = None,
@@ -886,32 +880,25 @@ def animate_hierarchical_rollout(
     object is a Matplotlib ``FuncAnimation``.
     """
 
-    if goal_learning == "exact":
-        if initial_goal_desirability is not None:
-            raise ValueError(
-                "Initial goal desirability is only used in online mode"
-            )
-        frames = _trace_hierarchical_rollout(
-            model,
-            start,
-            beta=beta,
-            max_steps=max_steps,
-            max_abstract_accesses=max_abstract_accesses,
-            seed=seed,
+    if not model.basis.is_point_basis:
+        raise ValueError(
+            "The fixed-subgoal animation requires a point subgoal basis"
         )
-    elif goal_learning == "online":
-        frames = _trace_online_hierarchical_rollout(
-            model,
-            start,
-            initial_goal_desirability=initial_goal_desirability,
-            z_sweeps_per_step=z_sweeps_per_step,
-            beta=beta,
-            max_steps=max_steps,
-            max_abstract_accesses=max_abstract_accesses,
-            seed=seed,
+    if goal_learning == "exact" and initial_goal_desirability is not None:
+        raise ValueError(
+            "Initial goal desirability is only used in online mode"
         )
-    else:
-        raise ValueError("Goal learning must be 'exact' or 'online'")
+    frames = _trace_hierarchical_rollout(
+        model,
+        start,
+        goal_learning=goal_learning,
+        initial_goal_desirability=initial_goal_desirability,
+        z_sweeps_per_step=z_sweeps_per_step,
+        beta=beta,
+        max_steps=max_steps,
+        max_abstract_accesses=max_abstract_accesses,
+        seed=seed,
+    )
     labels = _target_labels(model, subgoal_labels)
     desirability_norm = _desirability_norm(
         frames,
@@ -1155,9 +1142,12 @@ def animate_hierarchical_rollout(
 
 
 def _trace_hierarchical_rollout(
-    model: TwoLayerModel,
+    model: HierarchyTask,
     start: Coordinate,
     *,
+    goal_learning: str = "exact",
+    initial_goal_desirability: np.ndarray | None = None,
+    z_sweeps_per_step: int = 1,
     beta: float | None,
     max_steps: int,
     max_abstract_accesses: int,
@@ -1165,9 +1155,11 @@ def _trace_hierarchical_rollout(
 ) -> list[_HierarchicalRolloutFrame]:
     """Return fixed-subgoal frames emitted by the shared rollout engine."""
 
-    _, events = _trace_hierarchy_events(
-        model,
+    rollout = model.rollout(
         start,
+        goal_learning=goal_learning,
+        initial_goal_desirability=initial_goal_desirability,
+        z_sweeps_per_step=z_sweeps_per_step,
         beta=beta,
         max_steps=max_steps,
         max_abstract_accesses=max_abstract_accesses,
@@ -1199,12 +1191,18 @@ def _trace_hierarchical_rollout(
             controlled_access_probability=event.controlled_access_probability,
             refractory=event.refractory,
             status=event.status,
+            goal_desirability=(
+                None
+                if event.goal_desirability is None
+                else event.goal_desirability.copy()
+            ),
+            z_iterations=event.z_iterations,
         )
-        for event in events
+        for event in rollout.events
     ]
 
 def _target_labels(
-    model: TwoLayerModel,
+    model: HierarchyTask,
     subgoal_labels: list[str] | tuple[str, ...] | None,
 ) -> tuple[str, ...]:
     if subgoal_labels is None:
@@ -1292,7 +1290,7 @@ def _normalized_frame_task_weights(
 
 
 def _composed_log_desirability_grid(
-    model: SoftTwoLayerModel,
+    model: HierarchyTask,
     frame: _SoftRolloutFrame,
     *,
     include_goal_component: bool = True,
@@ -1371,7 +1369,7 @@ def _is_goal_only_plan(frame: _SoftRolloutFrame) -> bool:
 
 
 def _framewise_normalized_composed_desirability_grid(
-    model: SoftTwoLayerModel,
+    model: HierarchyTask,
     frame: _SoftRolloutFrame,
     *,
     include_goal_component: bool = True,
@@ -1401,7 +1399,7 @@ def _framewise_normalized_composed_desirability_grid(
 
 
 def _goal_anchored_composed_desirability_norm(
-    model: SoftTwoLayerModel,
+    model: HierarchyTask,
     frame: _SoftRolloutFrame,
     *,
     include_goal_component: bool = True,
@@ -1460,7 +1458,7 @@ def _communication_status(frame: _RolloutFrame) -> str:
 def _communication_details(
     frame: _RolloutFrame,
     labels: tuple[str, ...],
-    model: TwoLayerModel,
+    model: HierarchyTask,
 ) -> str:
     request_label = "none"
     if frame.requested_subgoal is not None:
@@ -1522,7 +1520,7 @@ def plot_soft_subtasks(
         zip(axes.flat, subtask_labels)
     ):
         image = ax.imshow(
-            desirability_grid(maze, discovery.display_profiles[:, subtask]),
+            desirability_grid(maze, discovery.profiles[:, subtask]),
             cmap=color_map,
             norm=Normalize(vmin=0.0, vmax=1.0),
             origin="upper",
@@ -1568,46 +1566,28 @@ def plot_soft_subtask_rank_diagnostics(
 
 
 def _trace_soft_hierarchical_rollout(
-    model: SoftTwoLayerModel,
+    model: HierarchyTask,
     start: Coordinate,
     *,
     beta: float | None,
     max_steps: int,
     max_abstract_accesses: int,
     seed: int | None,
-) -> tuple[SoftHierarchicalRollout, list[_SoftRolloutFrame]]:
+) -> tuple[Rollout, list[_SoftRolloutFrame]]:
     """Trace one soft rollout and translate its recorded engine events."""
 
-    engine_result, engine_events = _trace_hierarchy_events(
-        model,
+    rollout = model.rollout(
         start,
         beta=beta,
         max_steps=max_steps,
         max_abstract_accesses=max_abstract_accesses,
         seed=seed,
     )
-    rollout = SoftHierarchicalRollout(
-        trajectory=engine_result.trajectory,
-        subtask_accesses=[
-            SoftSubtaskAccess(
-                subtask=transition.entered_state,
-                coordinate=transition.coordinate,
-                physical_steps=transition.physical_steps,
-            )
-            for transition in engine_result.upper_transitions
-        ],
-        upper_transitions=engine_result.upper_transitions,
-        weight_history=engine_result.weight_history,
-        physical_steps=engine_result.physical_steps,
-        abstract_accesses=len(engine_result.upper_transitions),
-        reached_goal=engine_result.reached_goal,
-        status=engine_result.status,
-    )
-    return rollout, _soft_rollout_frames(engine_events)
+    return rollout, _soft_rollout_frames(list(rollout.events))
 
 
 def _build_soft_hierarchical_rollout_renderer(
-    model: SoftTwoLayerModel,
+    model: HierarchyTask,
     start: Coordinate,
     *,
     beta: float | None = None,
@@ -2040,7 +2020,7 @@ def _build_soft_hierarchical_rollout_renderer(
         frame_normalization_state["enabled"] = bool(enabled)
 
     def replace_run(
-        new_model: SoftTwoLayerModel,
+        new_model: HierarchyTask,
         new_start: Coordinate,
         new_seed: int | None,
     ) -> None:
@@ -2080,47 +2060,10 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
 
-def animate_soft_hierarchical_rollout(
-    model: SoftTwoLayerModel,
-    start: Coordinate,
-    *,
-    beta: float | None = None,
-    max_steps: int = 500,
-    max_abstract_accesses: int = 500,
-    seed: int | None = None,
-    subtask_labels: list[str] | tuple[str, ...] | None = None,
-    interval: int = 500,
-    repeat: bool = False,
-    figsize: tuple[float, float] = (14, 8),
-) -> FuncAnimation:
-    """Animate physical motion and distributed subtask accesses."""
-
-    renderer = _build_soft_hierarchical_rollout_renderer(
-        model,
-        start,
-        beta=beta,
-        max_steps=max_steps,
-        max_abstract_accesses=max_abstract_accesses,
-        seed=seed,
-        subtask_labels=subtask_labels,
-        figsize=figsize,
-    )
-    animation = FuncAnimation(
-        renderer.figure,
-        renderer.update,
-        frames=len(renderer.frames),
-        interval=interval,
-        repeat=repeat,
-        blit=False,
-    )
-    animation._soft_rollout = renderer.rollout
-    animation._soft_frames = renderer.frames
-    return animation
-
-
 def plot_interactive_soft_hierarchical_rollout(
-    model: SoftTwoLayerModel,
+    template: HierarchyTemplate,
     start: Coordinate,
+    goal: Coordinate,
     *,
     beta: float | None = None,
     max_steps: int = 500,
@@ -2147,6 +2090,11 @@ def plot_interactive_soft_hierarchical_rollout(
             "pip install 'andrew-mlmdp[notebook]'"
         ) from error
 
+    if template.basis.is_point_basis:
+        raise ValueError(
+            "The soft rollout player requires a distributed subgoal basis"
+        )
+    model = template.for_goal(goal)
     renderer = _build_soft_hierarchical_rollout_renderer(
         model,
         start,
@@ -2205,8 +2153,6 @@ def plot_interactive_soft_hierarchical_rollout(
         ),
     )
     location_status = widgets.HTML()
-    base_profiles = model.subtask_profiles.copy()
-    model_by_goal = {model.goal: model}
     seed_generator = np.random.default_rng(seed)
     used_recompute_seeds: set[int] = set()
     if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
@@ -2379,19 +2325,7 @@ def plot_interactive_soft_hierarchical_rollout(
             pending_start = location_state["pending_start"]
             pending_goal = location_state["pending_goal"]
             new_seed = next_rollout_seed()
-            new_model = model_by_goal.get(pending_goal)
-            if new_model is None:
-                new_model = build_soft_two_layer_model(
-                    model.maze,
-                    base_profiles,
-                    pending_goal,
-                    parameters=model.parameters,
-                    core_threshold=None,
-                    include_goal_component_while_active=(
-                        model.include_goal_component_while_active
-                    ),
-                )
-                model_by_goal[pending_goal] = new_model
+            new_model = template.for_goal(pending_goal)
             renderer.replace_run(new_model, pending_start, new_seed)
             location_state["rollout_seed"] = new_seed
             frame_slider.max = len(renderer.frames) - 1
@@ -2461,7 +2395,7 @@ def plot_interactive_soft_hierarchical_rollout(
 
 
 def _soft_rollout_frames(
-    events: list[_HierarchyEvent],
+    events: list[RolloutEvent],
 ) -> list[_SoftRolloutFrame]:
     """Translate engine events without reconstructing or resampling plans."""
 

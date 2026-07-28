@@ -4,7 +4,6 @@ import pytest
 
 from andrew_mlmdp import Maze
 
-
 FOUR_ROOMS_FILE = Path(__file__).parents[1] / "mazes" / "four_rooms.txt"
 
 
