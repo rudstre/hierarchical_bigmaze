@@ -1,5 +1,6 @@
 """Direct plotting functions for inspecting maze LMDPs."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from html import escape
 from time import monotonic
@@ -253,6 +254,42 @@ def _format_maze_axes(maze: Maze, ax, *, show_grid: bool) -> None:
     ax.set_ylabel("row")
 
 
+def plot_maze(
+    maze: Maze,
+    *,
+    labels: Mapping[Coordinate, str] | None = None,
+    show_grid: bool = True,
+    wall_color: str = "0.18",
+    title: str | None = "Discrete maze",
+    ax=None,
+):
+    """Plot discrete free states and walls, optionally labeling free states."""
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 7))
+
+    _draw_walls(maze, ax, color=wall_color)
+    if labels is not None:
+        for coordinate, label in labels.items():
+            maze.state_index(coordinate)
+            row, column = coordinate
+            ax.text(
+                column,
+                row,
+                str(label),
+                color="0.15",
+                fontsize=7,
+                horizontalalignment="center",
+                verticalalignment="center",
+                zorder=2,
+            )
+
+    _format_maze_axes(maze, ax, show_grid=show_grid)
+    if title is not None:
+        ax.set_title(title)
+    return ax
+
+
 def plot_subgoal_passive_dynamics(
     maze: Maze,
     subgoals: list[Coordinate] | tuple[Coordinate, ...],
@@ -286,7 +323,13 @@ def plot_subgoal_passive_dynamics(
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
-    _draw_walls(maze, ax, color="black", zorder=1)
+    plot_maze(
+        maze,
+        show_grid=False,
+        wall_color="black",
+        title=None,
+        ax=ax,
+    )
 
     edges = []
     for first in range(number_of_subgoals):
@@ -349,7 +392,6 @@ def plot_subgoal_passive_dynamics(
                 zorder=4,
             )
 
-    _format_maze_axes(maze, ax, show_grid=False)
     ax.set_title("Task-independent layer-2 passive dynamics")
 
     return ax
@@ -416,9 +458,9 @@ def plot_controlled_dynamics(
     if largest_probability > 0.0:
         arrow_scale = 0.42 / largest_probability
 
-    # Draw walls as cells. Free space stays white so the dense arrows remain
-    # the most prominent information in the figure.
-    _draw_walls(maze, ax, color="0.18")
+    # Free space stays white so the dense arrows remain the most prominent
+    # information in the figure.
+    plot_maze(maze, title=None, ax=ax)
 
     for coordinate, row_change, column_change, probability in arrows:
         row, column = coordinate
@@ -454,7 +496,6 @@ def plot_controlled_dynamics(
         zorder=4,
     )
 
-    _format_maze_axes(maze, ax, show_grid=True)
     ax.set_title("Controlled next-state probabilities")
 
     return ax
@@ -479,7 +520,7 @@ def plot_trajectory(
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
-    _draw_walls(maze, ax, color="0.18")
+    plot_maze(maze, title=None, ax=ax)
 
     rows = []
     columns = []
@@ -523,7 +564,6 @@ def plot_trajectory(
         zorder=4,
     )
 
-    _format_maze_axes(maze, ax, show_grid=True)
     ax.set_title(f"Sample controlled rollout ({len(trajectory) - 1} steps)")
 
     return ax
@@ -627,8 +667,7 @@ def plot_interactive_subgoal_desirability(
         wspace=0.34,
     )
 
-    _draw_walls(model.maze, maze_ax, color="0.18")
-    _format_maze_axes(model.maze, maze_ax, show_grid=True)
+    plot_maze(model.maze, title=None, ax=maze_ax)
     subgoal_rows = [coordinate[0] for coordinate in model.subgoals]
     subgoal_columns = [coordinate[1] for coordinate in model.subgoals]
     maze_ax.scatter(
@@ -917,8 +956,7 @@ def animate_hierarchical_rollout(
     weights_ax = axes["weights"]
     communication_ax = axes["communication"]
 
-    _draw_walls(model.maze, maze_ax, color="0.18")
-    _format_maze_axes(model.maze, maze_ax, show_grid=True)
+    plot_maze(model.maze, title=None, ax=maze_ax)
     maze_ax.set_title("Layer-1 physical state")
 
     subgoal_rows = [coordinate[0] for coordinate in model.subgoals]
@@ -1630,8 +1668,7 @@ def _build_soft_hierarchical_rollout_renderer(
     weights_ax = axes["weights"]
     communication_ax = axes["communication"]
 
-    _draw_walls(model.maze, maze_ax, color="0.18")
-    _format_maze_axes(model.maze, maze_ax, show_grid=True)
+    plot_maze(model.maze, title=None, ax=maze_ax)
     start_row, start_column = start
     goal_row, goal_column = model.goal
     (start_marker,) = maze_ax.plot(

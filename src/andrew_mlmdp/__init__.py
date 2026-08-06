@@ -19,6 +19,11 @@ from andrew_mlmdp.hierarchy import (
     SubgoalBasis,
     TaskBasis,
 )
+from andrew_mlmdp.labeled_maze import (
+    LabeledMaze,
+    load_doohan_maze,
+    maze_from_labeled_edges,
+)
 from andrew_mlmdp.lmdp import (
     FirstExitDynamics,
     FlatSolution,
@@ -42,6 +47,7 @@ __all__ = [
     "HierarchyTemplate",
     "LMDPEnvironment",
     "LayerOnePlan",
+    "LabeledMaze",
     "Maze",
     "ModelParameters",
     "NMFDiscoveryParameters",
@@ -57,6 +63,8 @@ __all__ = [
     "desirability_grid",
     "discover_soft_subgoals",
     "hard_hierarchy_parameters",
+    "load_doohan_maze",
+    "maze_from_labeled_edges",
     "plotting",
     "soft_hierarchy_parameters",
     "solve_first_exit",

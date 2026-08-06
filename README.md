@@ -78,6 +78,42 @@ basis, upper dynamics, upper policy, plans, and recorded rollout events.
 Point bases automatically use the validated `hard_hierarchy_parameters()`
 defaults when no explicit parameters are supplied.
 
+## Doohan edge-list mazes
+
+The GridMaze data submodule defines its mazes as labeled edges between towers.
+`load_doohan_maze` expands each walkway into a bridge state so the resulting
+maze works with the same raster LMDP implementation:
+
+```python
+from andrew_mlmdp import LMDPEnvironment, load_doohan_maze
+
+definition = load_doohan_maze("maze_1")
+environment = LMDPEnvironment(definition.maze)
+
+start = definition.coordinate_for("A2")
+goal = definition.coordinate_for("G7")
+solution = environment.solve_flat(goal)
+trajectory = solution.rollout(start, seed=0)
+labels = [definition.label_for(coordinate) for coordinate in trajectory]
+```
+
+Plot the discrete maze, optionally labeling only the states of interest:
+
+```python
+from andrew_mlmdp import plotting
+
+tower_labels = {
+    coordinate: label
+    for coordinate, label in definition.label_by_coordinate.items()
+    if "-" not in label
+}
+plotting.plot_maze(definition.maze, labels=tower_labels)
+```
+
+By default the loader reads
+`external/GridMaze-mFC-ephys-DATA/data/experiment_info/maze_configs.json`.
+Pass `config_path` explicitly when the downloaded data lives elsewhere.
+
 ## NMF soft subgoals
 
 ```python

@@ -4,6 +4,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 from matplotlib.animation import FuncAnimation
 from matplotlib.backend_bases import MouseButton, MouseEvent
 
@@ -49,6 +50,10 @@ def test_static_plots_render_for_non_four_room_maze(tmp_path):
     )
     trajectory = flat.rollout((0, 0), seed=3)
     objects = [
+        plotting.plot_maze(
+            maze,
+            labels={(0, 0): "start", (2, 2): "goal"},
+        ).figure,
         plotting.plot_controlled_dynamics(
             maze,
             flat.controlled,
@@ -74,6 +79,26 @@ def test_static_plots_render_for_non_four_room_maze(tmp_path):
         rendered.savefig(path)
         assert path.stat().st_size > 0
         plt.close(rendered)
+
+
+def test_plot_maze_rejects_labels_on_walls():
+    maze = Maze.from_ascii(".#.")
+
+    with pytest.raises(ValueError, match="not a free cell"):
+        plotting.plot_maze(maze, labels={(0, 1): "wall"})
+
+
+def test_plot_maze_draws_walls_and_free_state_labels():
+    maze = Maze.from_ascii(".#.")
+    ax = plotting.plot_maze(
+        maze,
+        labels={(0, 0): "A", (0, 2): "B"},
+    )
+
+    assert len(ax.patches) == 1
+    assert {text.get_text() for text in ax.texts} == {"A", "B"}
+    assert ax.get_title() == "Discrete maze"
+    plt.close(ax.figure)
 
 
 def test_fixed_animation_uses_unified_rollout_for_exact_and_online():
