@@ -1,0 +1,3 @@
+[submodule "external/GridMaze-mFC-ephys-DATA"]
+	path = external/GridMaze-mFC-ephys-DATA
+	url = https://github.com/peterdoohan/GridMaze-mFC-ephys-DATA.git
