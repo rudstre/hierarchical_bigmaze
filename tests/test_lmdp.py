@@ -6,6 +6,7 @@ from andrew_mlmdp import (
     LMDPEnvironment,
     Maze,
     ModelParameters,
+    SubgoalBasis,
     controlled_from_desirability,
     solve_first_exit,
     z_iteration_step,
@@ -18,10 +19,10 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
     calls = 0
     original = lmdp.build_passive_dynamics
 
-    def counted(maze):
+    def counted(maze, *, mode="five_commands"):
         nonlocal calls
         calls += 1
-        return original(maze)
+        return original(maze, mode=mode)
 
     monkeypatch.setattr(lmdp, "build_passive_dynamics", counted)
     environment = LMDPEnvironment(Maze.from_ascii("....."))
@@ -32,6 +33,109 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
     assert first.environment is second.environment is environment
     assert environment.passive.shape == (5, 5)
     assert np.allclose(environment.passive.sum(axis=0), 1.0)
+
+
+def test_default_passive_mode_preserves_five_command_dynamics():
+    environment = LMDPEnvironment(Maze.from_ascii("..."))
+
+    assert environment.passive_mode == "five_commands"
+    assert environment.passive == pytest.approx(
+        np.asarray(
+            [
+                [0.8, 0.2, 0.0],
+                [0.2, 0.6, 0.2],
+                [0.0, 0.2, 0.8],
+            ]
+        )
+    )
+
+
+def test_valid_neighbors_is_uniform_over_traversable_moves():
+    maze = Maze.from_ascii("...\n...")
+    environment = LMDPEnvironment(maze, passive_mode="valid_neighbors")
+    corner = maze.state_index((0, 0))
+    junction = maze.state_index((0, 1))
+
+    assert environment.passive[:, corner] == pytest.approx(
+        [0.0, 0.5, 0.0, 0.5, 0.0, 0.0]
+    )
+    assert environment.passive[:, junction] == pytest.approx(
+        [1 / 3, 0.0, 1 / 3, 0.0, 1 / 3, 0.0]
+    )
+    assert np.all(environment.passive >= 0.0)
+    assert np.all(np.isfinite(environment.passive))
+    assert np.allclose(environment.passive.sum(axis=0), 1.0)
+    assert np.allclose(np.diag(environment.passive), 0.0)
+    solution = environment.solve_flat((1, 2))
+    assert np.allclose(np.diag(solution.controlled), 0.0)
+
+
+def test_valid_neighbors_respects_explicit_connections():
+    maze = Maze.from_ascii("..\n..").with_connections(
+        (
+            ((0, 0), (1, 0)),
+            ((1, 0), (1, 1)),
+            ((1, 1), (0, 1)),
+        )
+    )
+    environment = LMDPEnvironment(maze, passive_mode="valid_neighbors")
+    top_left = maze.state_index((0, 0))
+    bottom_left = maze.state_index((1, 0))
+
+    assert environment.passive[:, top_left] == pytest.approx(
+        [0.0, 0.0, 1.0, 0.0]
+    )
+    assert environment.passive[:, bottom_left] == pytest.approx(
+        [0.5, 0.0, 0.0, 0.5]
+    )
+
+
+def test_valid_neighbors_excludes_walls():
+    maze = Maze.from_ascii(".#.\n...")
+    environment = LMDPEnvironment(maze, passive_mode="valid_neighbors")
+    top_left = maze.state_index((0, 0))
+    bottom_left = maze.state_index((1, 0))
+
+    assert environment.passive[:, top_left] == pytest.approx(
+        [0.0, 0.0, 1.0, 0.0, 0.0]
+    )
+    assert environment.passive[:, bottom_left] == pytest.approx(
+        [0.5, 0.0, 0.0, 0.5, 0.0]
+    )
+
+
+def test_valid_neighbors_rejects_isolated_free_state():
+    with pytest.raises(
+        ValueError,
+        match=r"State \(0, 0\) has no valid neighbors",
+    ):
+        LMDPEnvironment(Maze.from_ascii("."), passive_mode="valid_neighbors")
+
+
+def test_unknown_passive_mode_is_rejected():
+    with pytest.raises(ValueError, match="Unknown passive dynamics mode"):
+        LMDPEnvironment(Maze.from_ascii(".."), passive_mode="unknown")
+
+
+@pytest.mark.parametrize("passive_mode", ["five_commands", "valid_neighbors"])
+def test_flat_and_hierarchical_tasks_use_selected_passive_mode(passive_mode):
+    maze = Maze.from_ascii("....")
+    environment = LMDPEnvironment(maze, passive_mode=passive_mode)
+    flat = environment.solve_flat((0, 3))
+    hierarchy = environment.hierarchy(
+        SubgoalBasis.from_locations(maze, ((0, 1),)),
+    )
+    task = hierarchy.for_goal((0, 3))
+
+    assert flat.environment is environment
+    assert task.template.environment is environment
+    lower_diagonal = np.diag(task.lower_dynamics.interior_passive)
+    if passive_mode == "five_commands":
+        assert np.all(lower_diagonal > 0.0)
+    else:
+        assert np.allclose(lower_diagonal, 0.0)
+    assert flat.rollout((0, 0), seed=4)[-1] == (0, 3)
+    assert task.rollout((0, 0), seed=4).reached_goal
 
 
 @pytest.mark.parametrize(

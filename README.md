@@ -71,7 +71,18 @@ online = task.rollout(
 )
 ```
 
-`LMDPEnvironment` constructs the physical passive matrix once.
+`LMDPEnvironment` constructs the physical passive matrix once. By default it
+samples uniformly from north, south, east, west, and stay commands. To instead
+sample only from traversable cardinal neighbors, construct the environment as
+follows:
+
+```python
+movement_only = LMDPEnvironment(
+    maze,
+    passive_mode="valid_neighbors",
+)
+```
+
 `HierarchyTemplate.for_goal` caches goal-conditioned tasks, while each
 `HierarchyTask` exposes its lower dynamics, first-hit probabilities, task
 basis, upper dynamics, upper policy, plans, and recorded rollout events.

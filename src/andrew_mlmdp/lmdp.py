@@ -6,10 +6,13 @@ distributions over the next state.
 """
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
+
+PassiveDynamicsMode = Literal["five_commands", "valid_neighbors"]
 
 
 @dataclass(frozen=True)
@@ -220,16 +223,21 @@ class FlatSolution:
 class LMDPEnvironment:
     """Maze dynamics shared by flat, discovery, and hierarchical tasks.
 
-    The physical passive matrix depends only on maze geometry, so it is built
-    once when the environment is created and reused for every goal and
-    subgoal basis. No assumption is made about maze dimensions or topology.
+    The physical passive matrix depends only on maze geometry and the selected
+    passive mode, so it is built once when the environment is created and
+    reused for every goal and subgoal basis. No assumption is made about maze
+    dimensions or topology.
     """
 
     maze: Maze
+    passive_mode: PassiveDynamicsMode = "five_commands"
     passive: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        passive = build_passive_dynamics(self.maze)
+        passive = build_passive_dynamics(
+            self.maze,
+            mode=self.passive_mode,
+        )
         passive.flags.writeable = False
         object.__setattr__(self, "passive", passive)
 
@@ -419,21 +427,52 @@ def controlled_from_desirability(
     return unnormalized / column_normalizers[np.newaxis, :]
 
 
-def build_passive_dynamics(maze: Maze) -> np.ndarray:
-    """Return a uniform random walk in ``maze.free_cells`` order."""
+def build_passive_dynamics(
+    maze: Maze,
+    *,
+    mode: PassiveDynamicsMode = "five_commands",
+) -> np.ndarray:
+    """Return the selected random walk in ``maze.free_cells`` order.
+
+    ``five_commands`` samples uniformly from the four cardinal commands and
+    ``stay``; blocked commands therefore add self-transition mass.
+    ``valid_neighbors`` instead samples uniformly from traversable cardinal
+    neighbors and never creates a self-transition.
+    """
+
+    if mode not in {"five_commands", "valid_neighbors"}:
+        raise ValueError(f"Unknown passive dynamics mode: {mode!r}")
 
     number_of_states = len(maze.free_cells)
     passive_dynamics = np.zeros(
         (number_of_states, number_of_states),
         dtype=np.float64,
     )
-    command_probability = 1.0 / len(COMMAND_DELTAS)
+    if mode == "five_commands":
+        command_probability = 1.0 / len(COMMAND_DELTAS)
+        for current_state, coordinate in enumerate(maze.free_cells):
+            for command in COMMAND_DELTAS:
+                next_coordinate = maze.command_outcome(coordinate, command)
+                next_state = maze.state_index(next_coordinate)
+                passive_dynamics[next_state, current_state] += command_probability
+        return passive_dynamics
 
     for current_state, coordinate in enumerate(maze.free_cells):
-        for command in COMMAND_DELTAS:
-            next_coordinate = maze.command_outcome(coordinate, command)
+        valid_neighbors = {
+            maze.command_outcome(coordinate, command)
+            for command in COMMAND_DELTAS
+            if command != "stay"
+        }
+        valid_neighbors.discard(coordinate)
+        if not valid_neighbors:
+            raise ValueError(
+                f"State {coordinate} has no valid neighbors under "
+                "passive_mode='valid_neighbors'"
+            )
+        transition_probability = 1.0 / len(valid_neighbors)
+        for next_coordinate in valid_neighbors:
             next_state = maze.state_index(next_coordinate)
-            passive_dynamics[next_state, current_state] += command_probability
+            passive_dynamics[next_state, current_state] = transition_probability
 
     return passive_dynamics
 

@@ -1,4 +1,7 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python.defaultInterpreterPath": "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/external/GridMaze-mFC-ephys-DATA/code"
+    ]
 }
