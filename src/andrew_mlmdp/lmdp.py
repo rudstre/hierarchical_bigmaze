@@ -204,11 +204,11 @@ class FlatSolution:
         self,
         trajectory: list[Coordinate] | tuple[Coordinate, ...],
     ) -> float:
-        """Score collapsed state entries, conditional on leaving each state.
+        """Score state entries, conditional on leaving each distinct state.
 
         This likelihood describes discrete movement observations rather than
-        frame-by-frame tracking data. Consecutive repeats must therefore be
-        removed before scoring.
+        frame-by-frame tracking data. Runs of consecutive repeats are collapsed
+        to one state before scoring.
         """
 
         if not trajectory:
@@ -216,17 +216,19 @@ class FlatSolution:
 
         maze = self.environment.maze
         states = [maze.state_index(coordinate) for coordinate in trajectory]
+        observations = list(zip(trajectory, states))
+        collapsed_observations = [observations[0]]
+        for observation in observations[1:]:
+            if observation[0] != collapsed_observations[-1][0]:
+                collapsed_observations.append(observation)
+
         log_likelihood = 0.0
-        for current_coordinate, next_coordinate, current_state, next_state in zip(
-            trajectory,
-            trajectory[1:],
-            states,
-            states[1:],
+        for current_observation, next_observation in zip(
+            collapsed_observations,
+            collapsed_observations[1:],
         ):
-            if current_coordinate == next_coordinate:
-                raise ValueError(
-                    "Movement trajectory cannot contain consecutive repeats"
-                )
+            current_coordinate, current_state = current_observation
+            _, next_state = next_observation
             if current_coordinate == self.goal:
                 return -np.inf
 

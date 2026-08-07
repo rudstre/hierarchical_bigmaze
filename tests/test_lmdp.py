@@ -213,17 +213,27 @@ def test_movement_log_likelihood_conditions_on_leaving_each_state():
     )
 
     assert solution.movement_log_likelihood(trajectory) == pytest.approx(expected)
+    repeated_trajectory = [
+        (0, 0),
+        (0, 0),
+        (0, 0),
+        (0, 1),
+        (0, 1),
+        (0, 2),
+    ]
+    assert solution.movement_log_likelihood(repeated_trajectory) == pytest.approx(
+        expected
+    )
 
 
-def test_movement_log_likelihood_validates_collapsed_trajectory():
+def test_movement_log_likelihood_validates_trajectory():
     maze = Maze.from_ascii(".#.")
     solution = LMDPEnvironment(maze).solve_flat((0, 2))
 
     assert solution.movement_log_likelihood([(0, 0)]) == 0.0
+    assert solution.movement_log_likelihood([(0, 0), (0, 0)]) == 0.0
     with pytest.raises(ValueError, match="at least one coordinate"):
         solution.movement_log_likelihood([])
-    with pytest.raises(ValueError, match="consecutive repeats"):
-        solution.movement_log_likelihood([(0, 0), (0, 0)])
     with pytest.raises(ValueError, match="not a free cell"):
         solution.movement_log_likelihood([(0, 1)])
 
