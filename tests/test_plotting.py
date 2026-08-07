@@ -101,6 +101,24 @@ def test_plot_maze_draws_walls_and_free_state_labels():
     plt.close(ax.figure)
 
 
+def test_maze_axes_use_alphanumeric_tower_coordinates():
+    maze = Maze.from_ascii(".......\n.......\n.......\n.......\n.......\n.......")
+    ax = plotting.plot_maze(maze)
+
+    assert [tick.get_text() for tick in ax.get_xticklabels()] == list("ABCDEFG")
+    assert [tick.get_text() for tick in ax.get_yticklabels()] == [
+        "6",
+        "5",
+        "4",
+        "3",
+        "2",
+        "1",
+    ]
+    assert ax.get_xlabel() == "tower column"
+    assert ax.get_ylabel() == "tower row"
+    plt.close(ax.figure)
+
+
 def test_plot_maze_draws_explicit_state_connections():
     maze = Maze.from_ascii("..\n..").with_connections(
         [((1, 0), (0, 0)), ((0, 0), (0, 1))]

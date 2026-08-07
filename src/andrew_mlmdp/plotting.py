@@ -262,19 +262,36 @@ def _draw_connections(maze: Maze, ax, *, color: str) -> None:
 
 
 def _format_maze_axes(maze: Maze, ax, *, show_grid: bool) -> None:
-    """Apply the shared row/column coordinate system to a maze plot."""
+    """Apply the shared alphanumeric tower coordinate system to a maze plot."""
 
     number_of_rows, number_of_columns = maze.shape
     ax.set_xlim(-0.5, number_of_columns - 0.5)
     ax.set_ylim(number_of_rows - 0.5, -0.5)
     ax.set_aspect("equal")
-    ax.set_xticks(np.arange(number_of_columns))
-    ax.set_yticks(np.arange(number_of_rows))
+    ax.set_xticks(
+        np.arange(number_of_columns),
+        [_tower_column_label(column) for column in range(number_of_columns)],
+    )
+    ax.set_yticks(
+        np.arange(number_of_rows),
+        [str(number) for number in range(number_of_rows, 0, -1)],
+    )
     if show_grid:
         ax.grid(color="0.86", linewidth=0.6)
         ax.set_axisbelow(True)
-    ax.set_xlabel("column")
-    ax.set_ylabel("row")
+    ax.set_xlabel("tower column")
+    ax.set_ylabel("tower row")
+
+
+def _tower_column_label(column: int) -> str:
+    """Return a spreadsheet-style tower column label (A, ..., Z, AA, ...)."""
+
+    label = ""
+    column += 1
+    while column:
+        column, remainder = divmod(column - 1, 26)
+        label = chr(ord("A") + remainder) + label
+    return label
 
 
 def plot_maze(
