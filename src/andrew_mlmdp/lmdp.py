@@ -200,6 +200,49 @@ class FlatSolution:
     desirability: np.ndarray
     controlled: np.ndarray
 
+    def movement_log_likelihood(
+        self,
+        trajectory: list[Coordinate] | tuple[Coordinate, ...],
+    ) -> float:
+        """Score collapsed state entries, conditional on leaving each state.
+
+        This likelihood describes discrete movement observations rather than
+        frame-by-frame tracking data. Consecutive repeats must therefore be
+        removed before scoring.
+        """
+
+        if not trajectory:
+            raise ValueError("Trajectory must contain at least one coordinate")
+
+        maze = self.environment.maze
+        states = [maze.state_index(coordinate) for coordinate in trajectory]
+        log_likelihood = 0.0
+        for current_coordinate, next_coordinate, current_state, next_state in zip(
+            trajectory,
+            trajectory[1:],
+            states,
+            states[1:],
+        ):
+            if current_coordinate == next_coordinate:
+                raise ValueError(
+                    "Movement trajectory cannot contain consecutive repeats"
+                )
+            if current_coordinate == self.goal:
+                return -np.inf
+
+            leaving_probability = 1.0 - self.controlled[
+                current_state,
+                current_state,
+            ]
+            transition_probability = self.controlled[next_state, current_state]
+            if leaving_probability <= 0.0 or transition_probability <= 0.0:
+                return -np.inf
+            log_likelihood += np.log(
+                transition_probability / leaving_probability
+            )
+
+        return float(log_likelihood)
+
     def rollout(
         self,
         start: Coordinate,

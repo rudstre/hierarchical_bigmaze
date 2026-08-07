@@ -199,6 +199,47 @@ def test_rollout_is_seeded_legal_and_handles_terminal_start():
     assert solution.rollout((1, 3), seed=7) == [(1, 3)]
 
 
+def test_movement_log_likelihood_conditions_on_leaving_each_state():
+    maze = Maze.from_ascii("...")
+    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+    trajectory = [(0, 0), (0, 1), (0, 2)]
+
+    expected = sum(
+        np.log(
+            solution.controlled[next_state, current_state]
+            / (1.0 - solution.controlled[current_state, current_state])
+        )
+        for current_state, next_state in ((0, 1), (1, 2))
+    )
+
+    assert solution.movement_log_likelihood(trajectory) == pytest.approx(expected)
+
+
+def test_movement_log_likelihood_validates_collapsed_trajectory():
+    maze = Maze.from_ascii(".#.")
+    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+
+    assert solution.movement_log_likelihood([(0, 0)]) == 0.0
+    with pytest.raises(ValueError, match="at least one coordinate"):
+        solution.movement_log_likelihood([])
+    with pytest.raises(ValueError, match="consecutive repeats"):
+        solution.movement_log_likelihood([(0, 0), (0, 0)])
+    with pytest.raises(ValueError, match="not a free cell"):
+        solution.movement_log_likelihood([(0, 1)])
+
+
+def test_movement_log_likelihood_returns_negative_infinity_when_impossible():
+    maze = Maze.from_ascii(".#.")
+    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+
+    assert np.isneginf(
+        solution.movement_log_likelihood([(0, 0), (0, 2)])
+    )
+    assert np.isneginf(
+        solution.movement_log_likelihood([(0, 2), (0, 0)])
+    )
+
+
 def test_generic_first_exit_solve_and_z_iteration_converge():
     dynamics = FirstExitDynamics(
         interior_passive=np.asarray([[0.4, 0.2], [0.3, 0.5]]),
