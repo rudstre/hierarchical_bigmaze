@@ -6,6 +6,7 @@ from html import escape
 from time import monotonic
 from typing import Callable
 
+import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
@@ -544,6 +545,77 @@ def plot_controlled_dynamics(
     return ax
 
 
+def plot_trajectory_overlay(
+    maze: Maze,
+    trajectory: list[Coordinate],
+    *,
+    goal: Coordinate,
+    ax,
+):
+    """Plot a trajectory over an existing map without changing its styling."""
+
+    if not trajectory:
+        raise ValueError("Trajectory must contain at least one coordinate")
+
+    maze.state_index(goal)
+    for coordinate in trajectory:
+        maze.state_index(coordinate)
+
+    rows = []
+    columns = []
+    for row, column in trajectory:
+        rows.append(row)
+        columns.append(column)
+
+    (path_line,) = ax.plot(
+        columns,
+        rows,
+        color="#f72585",
+        linewidth=3.5,
+        marker="o",
+        markersize=5.5,
+        markerfacecolor="#f72585",
+        markeredgecolor="white",
+        markeredgewidth=0.7,
+        alpha=1.0,
+        label="trajectory",
+        zorder=5,
+    )
+    path_line.set_path_effects(
+        [
+            path_effects.Stroke(linewidth=6.0, foreground="white"),
+            path_effects.Normal(),
+        ]
+    )
+
+    start_row, start_column = trajectory[0]
+    ax.plot(
+        start_column,
+        start_row,
+        marker="o",
+        markersize=11,
+        markerfacecolor="#4c956c",
+        markeredgecolor="white",
+        markeredgewidth=1.2,
+        label="start",
+        zorder=6,
+    )
+
+    goal_row, goal_column = goal
+    ax.plot(
+        goal_column,
+        goal_row,
+        marker="*",
+        markersize=15,
+        markerfacecolor="#d1495b",
+        markeredgecolor="white",
+        markeredgewidth=1.2,
+        label="goal",
+        zorder=6,
+    )
+    return ax
+
+
 def plot_trajectory(
     maze: Maze,
     trajectory: list[Coordinate],
@@ -553,62 +625,17 @@ def plot_trajectory(
 ):
     """Plot a sampled trajectory over the maze geometry."""
 
-    if not trajectory:
-        raise ValueError("Trajectory must contain at least one coordinate")
-
-    maze.state_index(goal)
-    for coordinate in trajectory:
-        maze.state_index(coordinate)
-
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
     plot_maze(maze, title=None, ax=ax)
-
-    rows = []
-    columns = []
-    for row, column in trajectory:
-        rows.append(row)
-        columns.append(column)
-
-    ax.plot(
-        columns,
-        rows,
-        color="#286f9b",
-        linewidth=2.0,
-        marker="o",
-        markersize=3.5,
-        markeredgewidth=0.0,
-        alpha=0.85,
-        zorder=3,
+    plot_trajectory_overlay(
+        maze,
+        trajectory,
+        goal=goal,
+        ax=ax,
     )
-
-    start_row, start_column = trajectory[0]
-    ax.plot(
-        start_column,
-        start_row,
-        marker="o",
-        markersize=9,
-        markerfacecolor="#4c956c",
-        markeredgecolor="white",
-        markeredgewidth=0.8,
-        zorder=4,
-    )
-
-    goal_row, goal_column = goal
-    ax.plot(
-        goal_column,
-        goal_row,
-        marker="*",
-        markersize=13,
-        markerfacecolor="#d1495b",
-        markeredgecolor="white",
-        markeredgewidth=0.8,
-        zorder=4,
-    )
-
     ax.set_title(f"Sample controlled rollout ({len(trajectory) - 1} steps)")
-
     return ax
 
 

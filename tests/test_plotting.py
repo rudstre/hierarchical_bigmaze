@@ -81,6 +81,32 @@ def test_static_plots_render_for_non_four_room_maze(tmp_path):
         plt.close(rendered)
 
 
+def test_trajectory_overlay_preserves_existing_map():
+    maze = Maze.from_ascii("...")
+    figure, ax = plt.subplots()
+    base_map = ax.scatter([0, 1, 2], [0, 0, 0], c=[0.1, 0.5, 1.0])
+    ax.set_title("Existing map")
+
+    returned = plotting.plot_trajectory_overlay(
+        maze,
+        [(0, 0), (0, 1), (0, 2)],
+        goal=(0, 2),
+        ax=ax,
+    )
+
+    assert returned is ax
+    assert list(ax.collections) == [base_map]
+    assert ax.get_title() == "Existing map"
+    assert len(ax.lines) == 3
+    path = ax.lines[0]
+    assert list(path.get_xdata()) == [0, 1, 2]
+    assert list(path.get_ydata()) == [0, 0, 0]
+    assert path.get_color() == "#f72585"
+    assert path.get_zorder() == 5
+    assert len(path.get_path_effects()) == 2
+    plt.close(figure)
+
+
 def test_plot_maze_rejects_labels_on_walls():
     maze = Maze.from_ascii(".#.")
 
