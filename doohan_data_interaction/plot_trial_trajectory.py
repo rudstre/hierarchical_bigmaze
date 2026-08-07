@@ -1,10 +1,8 @@
 """Plot one trial's navigation trajectory through the maze."""
 
 import argparse
-import os
 import sys
 from pathlib import Path
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--session_id", required=True, help="e.g. m2/2022-06-23.maze")
@@ -23,17 +21,13 @@ session_dir = processed_data_root / subject / session_name
 if not session_dir.is_dir():
     parser.error(f"session not found: {session_dir}")
 
-# The existing loaders resolve experiment_info relative to the data directory.
 output_dir = Path.cwd()
 gridmaze_code = gridmaze_root / "code"
-os.chdir(gridmaze_code)
 sys.path.insert(0, str(gridmaze_code))
 
 import matplotlib.pyplot as plt
 import networkx as nx
-
 from GridMaze.core.get_sessions import MazeSession
-
 
 session = MazeSession(
     subject,
@@ -42,8 +36,13 @@ session = MazeSession(
     verbose=False,
 )
 trial_info = session.trial_info_df
-mask = (trial_info["trial"] == args.trial_id) & (trial_info["trial_phase"] == "navigation")
-trajectory = session.trajectories_df.loc[mask]
+trajectories = session.trajectories_df
+if trial_info is None or trajectories is None:
+    parser.error("required trajectory data is missing")
+mask = (trial_info["trial"] == args.trial_id) & (
+    trial_info["trial_phase"] == "navigation"
+)
+trajectory = trajectories.loc[mask]
 if trajectory.empty:
     parser.error(f"trial {args.trial_id} has no navigation trajectory")
 

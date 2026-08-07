@@ -1,10 +1,8 @@
 """Print the maze nodes entered during one trial's navigation phase."""
 
 import argparse
-import os
 import sys
 from pathlib import Path
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--session_id", required=True, help="e.g. m2/2022-06-23.maze")
@@ -24,11 +22,9 @@ if not session_dir.is_dir():
     parser.error(f"session not found: {session_dir}")
 
 gridmaze_code = gridmaze_root / "code"
-os.chdir(gridmaze_code)
 sys.path.insert(0, str(gridmaze_code))
 
 from GridMaze.core.get_sessions import MazeSession
-
 
 session = MazeSession(
     subject,
@@ -37,8 +33,13 @@ session = MazeSession(
     verbose=False,
 )
 trial_info = session.trial_info_df
-mask = (trial_info["trial"] == args.trial_id) & (trial_info["trial_phase"] == "navigation")
-positions = session.trajectories_df.loc[mask, ("maze_position", "simple")].dropna()
+trajectories = session.trajectories_df
+if trial_info is None or trajectories is None:
+    parser.error("required trajectory data is missing")
+mask = (trial_info["trial"] == args.trial_id) & (
+    trial_info["trial_phase"] == "navigation"
+)
+positions = trajectories.loc[mask, ("maze_position", "simple")].dropna()
 if positions.empty:
     parser.error(f"trial {args.trial_id} has no navigation trajectory")
 
