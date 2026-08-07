@@ -238,6 +238,29 @@ def _draw_walls(
         )
 
 
+def _draw_connections(maze: Maze, ax, *, color: str) -> None:
+    """Draw an explicitly connected maze as nodes and links."""
+
+    for start, end in maze.connections or ():
+        ax.plot(
+            [start[1], end[1]],
+            [start[0], end[0]],
+            color=color,
+            linewidth=3.0,
+            solid_capstyle="round",
+            zorder=0,
+        )
+    ax.scatter(
+        [coordinate[1] for coordinate in maze.free_cells],
+        [coordinate[0] for coordinate in maze.free_cells],
+        s=32,
+        facecolor="white",
+        edgecolor=color,
+        linewidth=1.0,
+        zorder=1,
+    )
+
+
 def _format_maze_axes(maze: Maze, ax, *, show_grid: bool) -> None:
     """Apply the shared row/column coordinate system to a maze plot."""
 
@@ -268,7 +291,10 @@ def plot_maze(
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
 
-    _draw_walls(maze, ax, color=wall_color)
+    if maze.connections is None:
+        _draw_walls(maze, ax, color=wall_color)
+    else:
+        _draw_connections(maze, ax, color=wall_color)
     if labels is not None:
         for coordinate, label in labels.items():
             maze.state_index(coordinate)

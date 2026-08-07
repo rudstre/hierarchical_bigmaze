@@ -101,6 +101,18 @@ def test_plot_maze_draws_walls_and_free_state_labels():
     plt.close(ax.figure)
 
 
+def test_plot_maze_draws_explicit_state_connections():
+    maze = Maze.from_ascii("..\n..").with_connections(
+        [((1, 0), (0, 0)), ((0, 0), (0, 1))]
+    )
+    ax = plotting.plot_maze(maze)
+
+    assert len(ax.lines) == 2
+    assert len(ax.collections) == 1
+    assert len(ax.patches) == 0
+    plt.close(ax.figure)
+
+
 def test_fixed_animation_uses_unified_rollout_for_exact_and_online():
     maze = Maze.from_ascii("......")
     task = LMDPEnvironment(maze).hierarchy(

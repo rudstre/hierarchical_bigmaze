@@ -3,6 +3,10 @@
 ## State and matrix conventions
 
 `Maze` assigns row-major state IDs to free cells in any rectangular layout.
+ASCII mazes use implicit cardinal adjacency between free cells. Edge-list
+mazes retain the same grid coordinates while explicitly restricting which
+adjacent tower states are connected; missing edges become failed commands and
+self-transitions.
 All transition matrices use:
 
 ```text

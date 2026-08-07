@@ -20,18 +20,19 @@ DOOHAN_CONFIG = (
 )
 
 
-def test_labeled_edges_expand_to_tower_and_bridge_states() -> None:
+def test_labeled_edges_create_tower_states_with_explicit_connections() -> None:
     definition = maze_from_labeled_edges(
         ["A1-A2", "A2-B2"],
         tower_shape=(2, 2),
     )
 
-    assert definition.maze.shape == (3, 3)
-    assert len(definition.maze.free_cells) == 6
-    assert definition.coordinate_for("A1") == (2, 0)
-    assert definition.coordinate_for("B2") == (0, 2)
-    assert definition.coordinate_for("A1-A2") == (1, 0)
-    assert definition.label_for((0, 1)) == "A2-B2"
+    assert definition.maze.shape == (2, 2)
+    assert len(definition.maze.free_cells) == 4
+    assert definition.coordinate_for("A1") == (1, 0)
+    assert definition.coordinate_for("B2") == (0, 1)
+    assert definition.label_for((0, 0)) == "A2"
+    with pytest.raises(ValueError, match="Unknown maze label"):
+        definition.coordinate_for("A1-A2")
 
 
 def test_labeled_maze_mappings_are_validated_and_immutable() -> None:
@@ -49,10 +50,8 @@ def test_missing_edges_are_blocked_under_existing_command_dynamics() -> None:
     definition = maze_from_labeled_edges(["A1-A2"], tower_shape=(2, 2))
     maze = definition.maze
     a1 = definition.coordinate_for("A1")
-    bridge = definition.coordinate_for("A1-A2")
 
-    assert maze.command_outcome(a1, "north") == bridge
-    assert maze.command_outcome(bridge, "north") == definition.coordinate_for("A2")
+    assert maze.command_outcome(a1, "north") == definition.coordinate_for("A2")
     assert maze.command_outcome(a1, "east") == a1
 
 
@@ -86,7 +85,7 @@ def test_doohan_loader_reads_an_explicit_configuration(tmp_path) -> None:
 
     definition = load_doohan_maze("tiny", config_path)
 
-    assert definition.coordinate_for("A1-A2") == (11, 0)
+    assert definition.coordinate_for("A1") == (6, 0)
     with pytest.raises(ValueError, match="Unknown Doohan maze"):
         load_doohan_maze("missing", config_path)
     with pytest.raises(FileNotFoundError):
@@ -99,16 +98,16 @@ def test_doohan_loader_reads_an_explicit_configuration(tmp_path) -> None:
 )
 @pytest.mark.parametrize(
     ("maze_name", "number_of_states"),
-    [("maze_1", 101), ("maze_2", 101), ("rooms_maze", 122)],
+    [("maze_1", 49), ("maze_2", 49), ("rooms_maze", 49)],
 )
 def test_downloaded_doohan_mazes_are_connected(maze_name, number_of_states) -> None:
     definition = load_doohan_maze(maze_name)
     maze = definition.maze
 
-    assert maze.shape == (13, 13)
+    assert maze.shape == (7, 7)
     assert len(maze.free_cells) == number_of_states
-    assert definition.coordinate_for("A1") == (12, 0)
-    assert definition.coordinate_for("G7") == (0, 12)
+    assert definition.coordinate_for("A1") == (6, 0)
+    assert definition.coordinate_for("G7") == (0, 6)
     assert maze.reachable_cells(definition.coordinate_for("A1")) == set(
         maze.free_cells
     )

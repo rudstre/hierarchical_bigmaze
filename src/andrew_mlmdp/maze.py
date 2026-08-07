@@ -6,6 +6,7 @@ kept explicit because later transition matrices depend on the state ordering.
 """
 
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from textwrap import dedent
@@ -31,6 +32,7 @@ class Maze:
     free_cells: tuple[Coordinate, ...]
     walls: frozenset[Coordinate]
     state_by_coordinate: dict[Coordinate, int]
+    connections: frozenset[tuple[Coordinate, Coordinate]] | None = None
 
     @classmethod
     def from_ascii(cls, layout: str) -> "Maze":
@@ -100,6 +102,36 @@ class Maze:
 
         return coordinate in self.state_by_coordinate
 
+    def with_connections(
+        self,
+        connections: Iterable[tuple[Coordinate, Coordinate]],
+    ) -> "Maze":
+        """Return this grid restricted to explicit cardinal connections."""
+
+        validated: set[tuple[Coordinate, Coordinate]] = set()
+        for connection in connections:
+            try:
+                start, end = connection
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Maze connections must contain two coordinates"
+                ) from error
+            self.state_index(start)
+            self.state_index(end)
+            if abs(start[0] - end[0]) + abs(start[1] - end[1]) != 1:
+                raise ValueError(
+                    "Maze connections must join cardinally adjacent states"
+                )
+            validated.add(_canonical_connection(start, end))
+
+        return Maze(
+            ascii_rows=self.ascii_rows,
+            free_cells=self.free_cells,
+            walls=self.walls,
+            state_by_coordinate=self.state_by_coordinate,
+            connections=frozenset(validated),
+        )
+
     def command_outcome(self, coordinate: Coordinate, command: Command) -> Coordinate:
         """Apply one grid command, returning the current cell if movement fails."""
 
@@ -116,6 +148,12 @@ class Maze:
 
         # Invalid commands become self-transitions in the passive dynamics.
         if not self.is_free(next_coordinate):
+            return coordinate
+        if (
+            self.connections is not None
+            and _canonical_connection(coordinate, next_coordinate)
+            not in self.connections
+        ):
             return coordinate
         return next_coordinate
 
@@ -155,3 +193,9 @@ def _normalise_layout(layout: str) -> tuple[str, ...]:
         raise ValueError("Maze layout must be rectangular")
     return rows
 
+
+def _canonical_connection(
+    first: Coordinate,
+    second: Coordinate,
+) -> tuple[Coordinate, Coordinate]:
+    return (first, second) if first < second else (second, first)

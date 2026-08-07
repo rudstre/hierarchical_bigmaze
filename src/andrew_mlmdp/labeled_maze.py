@@ -56,7 +56,7 @@ class LabeledMaze:
         )
 
     def coordinate_for(self, label: str) -> Coordinate:
-        """Return the raster coordinate for a tower or bridge label."""
+        """Return the grid coordinate for a tower label."""
 
         try:
             return self.coordinate_by_label[label]
@@ -64,7 +64,7 @@ class LabeledMaze:
             raise ValueError(f"Unknown maze label {label!r}") from error
 
     def label_for(self, coordinate: Coordinate) -> str:
-        """Return the tower or bridge label for a raster coordinate."""
+        """Return the tower label for a grid coordinate."""
 
         try:
             return self.label_by_coordinate[coordinate]
@@ -79,7 +79,7 @@ def maze_from_labeled_edges(
     *,
     tower_shape: tuple[int, int] = (7, 7),
 ) -> LabeledMaze:
-    """Expand a labeled tower graph into a raster of tower and bridge states."""
+    """Create a tower-state maze restricted to the supplied labeled edges."""
 
     number_of_rows, number_of_columns = _validated_tower_shape(tower_shape)
     if isinstance(edges, (str, bytes)):
@@ -87,13 +87,14 @@ def maze_from_labeled_edges(
 
     coordinate_by_label = {
         f"{chr(ord('A') + column)}{number}": (
-            2 * (number_of_rows - number),
-            2 * column,
+            number_of_rows - number,
+            column,
         )
         for column in range(number_of_columns)
         for number in range(1, number_of_rows + 1)
     }
     seen_edges: set[frozenset[str]] = set()
+    connections: list[tuple[Coordinate, Coordinate]] = []
 
     for edge in edges:
         start_label, end_label = _parse_edge_label(edge)
@@ -110,28 +111,18 @@ def maze_from_labeled_edges(
             raise ValueError(f"Edge {edge!r} cannot connect a tower to itself")
         if edge_key in seen_edges:
             raise ValueError(f"Duplicate maze edge {edge!r}")
-        if abs(start[0] - end[0]) + abs(start[1] - end[1]) != 2:
+        if abs(start[0] - end[0]) + abs(start[1] - end[1]) != 1:
             raise ValueError(
                 f"Edge {edge!r} must connect cardinally adjacent towers"
             )
 
         seen_edges.add(edge_key)
-        bridge = (
-            (start[0] + end[0]) // 2,
-            (start[1] + end[1]) // 2,
-        )
-        coordinate_by_label[edge] = bridge
+        connections.append((start, end))
 
-    raster_shape = (2 * number_of_rows - 1, 2 * number_of_columns - 1)
-    free_coordinates = set(coordinate_by_label.values())
     layout = "\n".join(
-        "".join(
-            "." if (row, column) in free_coordinates else "#"
-            for column in range(raster_shape[1])
-        )
-        for row in range(raster_shape[0])
+        "." * number_of_columns for _ in range(number_of_rows)
     )
-    maze = Maze.from_ascii(layout)
+    maze = Maze.from_ascii(layout).with_connections(connections)
     label_by_coordinate = {
         coordinate: label for label, coordinate in coordinate_by_label.items()
     }

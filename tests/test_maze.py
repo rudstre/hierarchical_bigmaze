@@ -33,6 +33,28 @@ def test_invalid_moves_return_the_current_cell() -> None:
     assert maze.command_outcome((0, 0), "east") == (0, 1)
 
 
+def test_explicit_connections_restrict_moves_between_free_cells() -> None:
+    maze = Maze.from_ascii("..\n..").with_connections(
+        [((1, 0), (0, 0)), ((0, 0), (0, 1))]
+    )
+
+    assert maze.command_outcome((1, 0), "north") == (0, 0)
+    assert maze.command_outcome((0, 0), "east") == (0, 1)
+    assert maze.command_outcome((1, 0), "east") == (1, 0)
+    assert maze.reachable_cells((1, 0)) == {(1, 0), (0, 0), (0, 1)}
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [((0, 0), (1, 1)), ((0, 0), (2, 0))],
+)
+def test_explicit_connections_must_be_cardinal_and_in_bounds(connection) -> None:
+    maze = Maze.from_ascii("..\n..")
+
+    with pytest.raises(ValueError):
+        maze.with_connections([connection])
+
+
 def test_ascii_round_trip() -> None:
     maze = Maze.from_file(FOUR_ROOMS_FILE)
     expected_layout = FOUR_ROOMS_FILE.read_text(encoding="utf-8").strip("\n")

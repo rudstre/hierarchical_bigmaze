@@ -7,7 +7,7 @@ included four-room example.
 
 The supported workflows are:
 
-1. parse rectangular ASCII mazes containing walls (`#`) and free cells (`.`);
+1. parse ASCII mazes or labeled tower graphs with explicit connections;
 2. solve and sample a flat first-exit LMDP for any free start and goal;
 3. construct a reusable point-subgoal hierarchy and solve new goals with
    exact or online Z-iteration;
@@ -81,8 +81,8 @@ defaults when no explicit parameters are supplied.
 ## Doohan edge-list mazes
 
 The GridMaze data submodule defines its mazes as labeled edges between towers.
-`load_doohan_maze` expands each walkway into a bridge state so the resulting
-maze works with the same raster LMDP implementation:
+`load_doohan_maze` keeps the 49 towers as physical states and uses the edge
+list to restrict which cardinal movements are allowed:
 
 ```python
 from andrew_mlmdp import LMDPEnvironment, load_doohan_maze
