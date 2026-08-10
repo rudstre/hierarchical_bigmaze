@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 from andrew_mlmdp import (
     LMDPEnvironment,
@@ -7,7 +8,76 @@ from andrew_mlmdp import (
     ModelParameters,
     SubgoalBasis,
     hard_hierarchy_parameters,
+    soft_hierarchy_parameters,
 )
+
+
+def _parameter_values(parameters: ModelParameters) -> dict[str, float]:
+    return {
+        name: parameter.item()
+        for name, parameter in parameters.named_parameters()
+    }
+
+
+def test_model_parameters_are_trainable_float64_scalars():
+    parameters = ModelParameters()
+    expected = {
+        "interior_reward": -0.1,
+        "goal_reward": 1.1,
+        "lower_control_cost": 0.1,
+        "upper_control_cost": 0.25,
+        "alpha": 0.2,
+        "off_target_reward": -0.7,
+        "beta": 16.0,
+        "core_exponent": 1.0,
+    }
+
+    assert isinstance(parameters, torch.nn.Module)
+    assert parameters.core_threshold is None
+    assert _parameter_values(parameters) == pytest.approx(expected)
+    assert set(parameters.state_dict()) == set(expected)
+    assert "interior_reward=-0.1" in repr(parameters)
+    assert "core_threshold=None" in repr(parameters)
+    assert all(
+        isinstance(parameter, torch.nn.Parameter)
+        and parameter.shape == torch.Size([])
+        and parameter.dtype == torch.float64
+        and parameter.requires_grad
+        for parameter in parameters.parameters()
+    )
+    trainable_names = set(dict(parameters.named_parameters()))
+    assert not {
+        "k",
+        "passive_mode",
+        "include_goal_component_while_active",
+        "max_iter",
+        "tolerance",
+    } & trainable_names
+
+
+def test_hierarchy_factories_preserve_core_defaults():
+    hard = hard_hierarchy_parameters()
+    soft = soft_hierarchy_parameters()
+    ungated_soft = soft_hierarchy_parameters(core_threshold=None)
+
+    assert hard.core_threshold is None
+    assert ungated_soft.core_threshold is None
+    assert "core_threshold" not in dict(hard.named_parameters())
+    assert "core_threshold" not in dict(ungated_soft.named_parameters())
+    assert isinstance(soft.core_threshold, torch.nn.Parameter)
+    assert _parameter_values(soft) == pytest.approx(
+        {
+            "interior_reward": -0.1,
+            "goal_reward": 1.1,
+            "lower_control_cost": 0.1,
+            "upper_control_cost": 0.25,
+            "alpha": 0.2,
+            "off_target_reward": -0.7,
+            "beta": 16.0,
+            "core_threshold": 0.8,
+            "core_exponent": 1.0,
+        }
+    )
 
 
 def test_point_basis_is_one_hot_and_validates_arbitrary_count():
@@ -36,8 +106,12 @@ def test_point_hierarchy_uses_swept_hard_defaults():
         off_target_reward=-1.0,
         beta=16.0,
     )
-    assert hard_hierarchy_parameters() == expected
-    assert template.parameters == expected
+    assert _parameter_values(hard_hierarchy_parameters()) == pytest.approx(
+        _parameter_values(expected)
+    )
+    assert _parameter_values(template.parameters) == pytest.approx(
+        _parameter_values(expected)
+    )
 
 
 def test_profile_hierarchy_uses_same_default_as_point_hierarchy():
@@ -55,7 +129,9 @@ def test_profile_hierarchy_uses_same_default_as_point_hierarchy():
 
     template = LMDPEnvironment(maze).hierarchy(basis)
 
-    assert template.parameters == hard_hierarchy_parameters()
+    assert _parameter_values(template.parameters) == pytest.approx(
+        _parameter_values(hard_hierarchy_parameters())
+    )
 
 
 def test_explicit_point_hierarchy_parameters_override_hard_defaults():
@@ -246,14 +322,20 @@ def test_online_learning_can_continue_across_episodes():
 def test_core_gate_is_peak_relative_and_applied_once():
     maze = Maze.from_ascii("....")
     raw = np.asarray([[2.0], [1.6], [1.0], [0.0]])
+    parameters = ModelParameters(core_threshold=0.5, core_exponent=2.0)
     basis = SubgoalBasis.from_profiles(
         maze,
         raw,
-        core_threshold=0.5,
-        core_exponent=2.0,
+        core_threshold=parameters.core_threshold,
+        core_exponent=parameters.core_exponent,
     )
     assert basis.profiles[:, 0] == pytest.approx([1.0, 0.8, 0.5, 0.0])
     assert basis.access_profiles[:, 0] == pytest.approx([1.0, 0.36, 0.0, 0.0])
+    assert isinstance(basis.profiles, np.ndarray)
+    assert isinstance(basis.access_profiles, np.ndarray)
+    assert not basis.profiles.flags.writeable
+    assert not basis.access_profiles.flags.writeable
+    assert "profiles" not in dict(parameters.named_parameters())
     template = LMDPEnvironment(maze).hierarchy(basis)
     first = template.for_goal((0, 3))
     second = template.for_goal((0, 2))

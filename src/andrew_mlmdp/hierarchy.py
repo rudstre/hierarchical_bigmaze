@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
+from torch import Tensor
 
 from andrew_mlmdp.lmdp import (
     FirstExitDynamics,
@@ -103,27 +104,33 @@ class SubgoalBasis:
         maze: Maze,
         profiles: np.ndarray,
         *,
-        core_threshold: float | None = 0.8,
-        core_exponent: float = 1.0,
+        core_threshold: float | Tensor | None = 0.8,
+        core_exponent: float | Tensor = 1.0,
         labels: list[str] | tuple[str, ...] | None = None,
     ) -> "SubgoalBasis":
         """Create a distributed basis and apply its execution gate once."""
 
+        threshold = (
+            None
+            if core_threshold is None
+            else _detached_scalar(core_threshold)
+        )
+        exponent = _detached_scalar(core_exponent)
         supplied = _validated_subtask_profiles(maze, profiles)
         peaks = supplied.max(axis=0, keepdims=True)
         normalized = supplied / peaks
         access = _soft_core_profiles(
             normalized,
-            threshold=core_threshold,
-            exponent=core_exponent,
+            threshold=threshold,
+            exponent=exponent,
         )
         return cls(
             maze=maze,
             profiles=normalized,
             access_profiles=access,
             labels=None if labels is None else tuple(labels),
-            core_threshold=core_threshold,
-            core_exponent=core_exponent,
+            core_threshold=threshold,
+            core_exponent=exponent,
         )
 
     @property
@@ -177,7 +184,7 @@ class HierarchyTemplate:
         """Return task-independent passive dynamics between basis states."""
 
         if self._passive_dynamics is None:
-            access = self.parameters.alpha * self.basis.access_profiles.T
+            access = self.parameters.alpha.item() * self.basis.access_profiles.T
             interior = self.environment.passive.copy()
             interior, access = _normalize_augmented_columns(interior, access)
             fundamental = _fundamental_matrix(interior)
@@ -432,7 +439,7 @@ def _build_hierarchy_task(
         goal,
     )
     raw_access = (
-        template.parameters.alpha
+        template.parameters.alpha.item()
         * template.basis.access_profiles[interior_states, :].T
     )
     if np.any(raw_access.max(axis=1) <= 0.0):
@@ -549,7 +556,7 @@ def _plan_from_abstract_dynamics(
 ) -> LayerOnePlan:
     """Apply reward inpainting and lower task composition."""
 
-    inpainting_scale = model.parameters.beta if beta is None else beta
+    inpainting_scale = model.parameters.beta.item() if beta is None else beta
     if not np.isfinite(inpainting_scale) or inpainting_scale <= 0.0:
         raise ValueError("Beta must be finite and positive")
 
@@ -562,9 +569,9 @@ def _plan_from_abstract_dynamics(
     inpainted_rewards[:-1] = inpainting_scale * (
         controlled_abstract[:-1] - passive_abstract[:-1]
     )
-    inpainted_rewards[-1] = model.parameters.goal_reward
+    inpainted_rewards[-1] = model.parameters.goal_reward.item()
     target_boundary_desirability = np.exp(
-        inpainted_rewards / model.parameters.lower_control_cost
+        inpainted_rewards / model.parameters.lower_control_cost.item()
     )
 
     # Paper Equation 7, using its stated pseudoinverse-and-clipping
@@ -651,10 +658,10 @@ def _goal_only_plan(
         goal_interior_desirability=goal_interior_desirability,
     )
     inpainted = np.full(number_of_boundaries, -np.inf, dtype=np.float64)
-    inpainted[-1] = model.parameters.goal_reward
+    inpainted[-1] = model.parameters.goal_reward.item()
     target = np.zeros(number_of_boundaries, dtype=np.float64)
     target[-1] = np.exp(
-        model.parameters.goal_reward / model.parameters.lower_control_cost
+        model.parameters.goal_reward.item() / model.parameters.lower_control_cost.item()
     )
     return LayerOnePlan(
         current=current,
@@ -860,16 +867,16 @@ def _run_hierarchical_rollout(
             goal_desirability.copy()
         ]
         q_interior = np.exp(
-            model.parameters.interior_reward
-            / model.parameters.lower_control_cost
+            model.parameters.interior_reward.item()
+            / model.parameters.lower_control_cost.item()
         )
         goal_boundary = np.zeros(
             model.lower_dynamics.number_of_boundary_states,
             dtype=np.float64,
         )
         goal_boundary[-1] = np.exp(
-            model.parameters.goal_reward
-            / model.parameters.lower_control_cost
+            model.parameters.goal_reward.item()
+            / model.parameters.lower_control_cost.item()
         )
     else:
         if initial_goal_desirability is not None:
@@ -1238,6 +1245,12 @@ def _validated_subtask_profiles(
     return values
 
 
+def _detached_scalar(value: float | Tensor) -> float:
+    """Snapshot a scalar tensor for the current NumPy implementation."""
+
+    return value.item() if isinstance(value, Tensor) else float(value)
+
+
 def _soft_core_profiles(
     profiles: np.ndarray,
     *,
@@ -1374,10 +1387,10 @@ def _solve_upper_layer(
     parameters: ModelParameters,
 ) -> tuple[np.ndarray, np.ndarray]:
     q_interior = np.exp(
-        parameters.interior_reward / parameters.upper_control_cost
+        parameters.interior_reward.item() / parameters.upper_control_cost.item()
     )
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.upper_control_cost
+        parameters.goal_reward.item() / parameters.upper_control_cost.item()
     )
     interior_desirability = solve_first_exit(
         dynamics,
@@ -1401,10 +1414,10 @@ def _build_task_basis(
     number_of_subgoals = lower.number_of_boundary_states - 1
     number_of_targets = lower.number_of_boundary_states
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.lower_control_cost
+        parameters.goal_reward.item() / parameters.lower_control_cost.item()
     )
     off_target_desirability = np.exp(
-        parameters.off_target_reward / parameters.lower_control_cost
+        parameters.off_target_reward.item() / parameters.lower_control_cost.item()
     )
 
     # The paper's augmented basis is block diagonal: reusable subgoal tasks
@@ -1423,7 +1436,7 @@ def _build_task_basis(
     boundary_basis[-1, -1] = goal_desirability
 
     q_interior = np.exp(
-        parameters.interior_reward / parameters.lower_control_cost
+        parameters.interior_reward.item() / parameters.lower_control_cost.item()
     )
     interior_basis = np.column_stack(
         [

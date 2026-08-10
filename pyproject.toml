@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.8",
     "numpy>=1.26",
     "scikit-learn>=1.5",
+    "torch>=2.2",
 ]
 
 [project.optional-dependencies]

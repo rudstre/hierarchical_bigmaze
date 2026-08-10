@@ -178,14 +178,14 @@ def test_flat_solution_satisfies_bellman_and_control_equations():
     solution = environment.solve_flat(goal, parameters=parameters)
     goal_state = environment.maze.state_index(goal)
     interior = np.asarray([0, 1, 2, 3])
-    q = np.exp(parameters.interior_reward / parameters.lower_control_cost)
+    q = np.exp(parameters.interior_reward.item() / parameters.lower_control_cost.item())
 
     expected = q * (
         environment.passive[:, interior].T @ solution.desirability
     )
     assert solution.desirability[interior] == pytest.approx(expected)
     assert solution.desirability[goal_state] == pytest.approx(
-        np.exp(parameters.goal_reward / parameters.lower_control_cost)
+        np.exp(parameters.goal_reward.item() / parameters.lower_control_cost.item())
     )
     assert solution.controlled == pytest.approx(
         controlled_from_desirability(

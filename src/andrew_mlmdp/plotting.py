@@ -1108,8 +1108,8 @@ def plot_interactive_subgoal_desirability(
 
     labels = _target_labels(model, subgoal_labels)[:-1]
     goal_desirability = np.exp(
-        model.parameters.goal_reward
-        / model.parameters.lower_control_cost
+        model.parameters.goal_reward.item()
+        / model.parameters.lower_control_cost.item()
     )
     goal_locations = tuple(
         coordinate
@@ -1903,7 +1903,7 @@ def _composed_log_desirability_grid(
     if np.isfinite(goal_desirability) and goal_desirability > 0.0:
         positive = desirability > 0.0
         relative_value[positive] = (
-            model.parameters.lower_control_cost
+            model.parameters.lower_control_cost.item()
             * np.log(desirability[positive] / goal_desirability)
         )
     return desirability_grid(model.maze, relative_value)
@@ -2038,7 +2038,7 @@ def _communication_details(
         f"controlled access:{_format_probability(controlled_access)}\n"
         f"refractory:      {'yes' if refractory else 'no'}\n"
         f"current cell:    {frame.coordinate}\n"
-        f"goal reward:     {model.parameters.goal_reward:g} (fixed)"
+        f"goal reward:     {model.parameters.goal_reward.item():g} (fixed)"
         f"{learning_detail}"
     )
 
@@ -2348,7 +2348,7 @@ def _build_soft_hierarchical_rollout_renderer(
     weights_ax.set_ylabel("inpainted reward")
     weights_ax.set_title(
         "Layer-2 subtask reward command "
-        f"(physical goal fixed at +{model.parameters.goal_reward:g})"
+        f"(physical goal fixed at +{model.parameters.goal_reward.item():g})"
     )
     weights_ax.grid(axis="y", color="0.88", linewidth=0.6)
     weights_ax.set_axisbelow(True)

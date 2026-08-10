@@ -9,54 +9,112 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
+import torch
+from torch import nn
 
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
 
 PassiveDynamicsMode = Literal["five_commands", "valid_neighbors"]
 
 
-@dataclass(frozen=True)
-class ModelParameters:
-    """Numerical parameters for flat and hierarchical execution.
+class ModelParameters(nn.Module):
+    """Trainable scalar parameters for flat and hierarchical execution.
 
     The lower cost governs flat and physical-layer calculations, including the
     task basis and reward inpainting. The upper cost governs the abstract LMDP.
     NMF task discovery has separate frozen parameters in
-    ``NMFDiscoveryParameters``. The dataclass defaults are canonical project
-    choices for flat and generic calculations; hierarchy factories use
-    ``hard_hierarchy_parameters`` when no parameters are supplied.
+    ``NMFDiscoveryParameters``. Defaults are canonical project choices for
+    flat and generic calculations; hierarchy factories provide their own
+    context-specific defaults.
     """
 
-    interior_reward: float = -0.1
-    goal_reward: float = 1.1
-    lower_control_cost: float = 0.1
-    upper_control_cost: float = 0.25
-    alpha: float = 0.2
-    off_target_reward: float = -0.7
-    beta: float = 16.0
-
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        interior_reward: float = -0.1,
+        goal_reward: float = 1.1,
+        lower_control_cost: float = 0.1,
+        upper_control_cost: float = 0.25,
+        alpha: float = 0.2,
+        off_target_reward: float = -0.7,
+        beta: float = 16.0,
+        core_threshold: float | None = None,
+        core_exponent: float = 1.0,
+    ) -> None:
+        super().__init__()
         values = (
-            self.interior_reward,
-            self.goal_reward,
-            self.lower_control_cost,
-            self.upper_control_cost,
-            self.alpha,
-            self.off_target_reward,
-            self.beta,
+            interior_reward,
+            goal_reward,
+            lower_control_cost,
+            upper_control_cost,
+            alpha,
+            off_target_reward,
+            beta,
         )
         if not np.all(np.isfinite(values)):
             raise ValueError("Model parameters must be finite")
-        if self.interior_reward >= 0.0:
+        if interior_reward >= 0.0:
             raise ValueError("Interior reward must be negative")
-        if self.lower_control_cost <= 0.0:
+        if lower_control_cost <= 0.0:
             raise ValueError("Lower control cost must be positive")
-        if self.upper_control_cost <= 0.0:
+        if upper_control_cost <= 0.0:
             raise ValueError("Upper control cost must be positive")
-        if self.alpha <= 0.0:
+        if alpha <= 0.0:
             raise ValueError("Alpha must be positive")
-        if self.beta <= 0.0:
+        if beta <= 0.0:
             raise ValueError("Beta must be positive")
+        if (
+            not np.isfinite(core_exponent)
+            or isinstance(core_exponent, (bool, np.bool_))
+            or core_exponent <= 0.0
+        ):
+            raise ValueError("Core exponent must be finite and positive")
+        if core_threshold is not None and (
+            isinstance(core_threshold, (bool, np.bool_))
+            or not np.isfinite(core_threshold)
+            or not 0.0 <= core_threshold < 1.0
+        ):
+            raise ValueError(
+                "Core threshold must be finite and in [0, 1), or None"
+            )
+
+        self.interior_reward = _scalar_parameter(interior_reward)
+        self.goal_reward = _scalar_parameter(goal_reward)
+        self.lower_control_cost = _scalar_parameter(lower_control_cost)
+        self.upper_control_cost = _scalar_parameter(upper_control_cost)
+        self.alpha = _scalar_parameter(alpha)
+        self.off_target_reward = _scalar_parameter(off_target_reward)
+        self.beta = _scalar_parameter(beta)
+        if core_threshold is None:
+            self.register_parameter("core_threshold", None)
+        else:
+            self.core_threshold = _scalar_parameter(core_threshold)
+        self.core_exponent = _scalar_parameter(core_exponent)
+
+    def extra_repr(self) -> str:
+        """Retain the former dataclass's concise value-oriented display."""
+
+        threshold = (
+            "None"
+            if self.core_threshold is None
+            else f"{self.core_threshold.item():g}"
+        )
+        return (
+            f"interior_reward={self.interior_reward.item():g}, "
+            f"goal_reward={self.goal_reward.item():g}, "
+            f"lower_control_cost={self.lower_control_cost.item():g}, "
+            f"upper_control_cost={self.upper_control_cost.item():g}, "
+            f"alpha={self.alpha.item():g}, "
+            f"off_target_reward={self.off_target_reward.item():g}, "
+            f"beta={self.beta.item():g}, "
+            f"core_threshold={threshold}, "
+            f"core_exponent={self.core_exponent.item():g}"
+        )
+
+
+def _scalar_parameter(value: float) -> nn.Parameter:
+    """Return one unconstrained, double-precision trainable scalar."""
+
+    return nn.Parameter(torch.tensor(float(value), dtype=torch.float64))
 
 
 def hard_hierarchy_parameters(
@@ -68,6 +126,8 @@ def hard_hierarchy_parameters(
     alpha: float = 0.4,
     off_target_reward: float = -1.0,
     beta: float = 16.0,
+    core_threshold: float | None = None,
+    core_exponent: float = 1.0,
 ) -> ModelParameters:
     """Return the validated defaults for one-hot subgoal hierarchies.
 
@@ -84,6 +144,8 @@ def hard_hierarchy_parameters(
         alpha=alpha,
         off_target_reward=off_target_reward,
         beta=beta,
+        core_threshold=core_threshold,
+        core_exponent=core_exponent,
     )
 
 
@@ -97,6 +159,8 @@ def soft_hierarchy_parameters(
     alpha: float | None = None,
     off_target_reward: float | None = None,
     beta: float | None = None,
+    core_threshold: float | None = 0.8,
+    core_exponent: float = 1.0,
 ) -> ModelParameters:
     """Return soft-hierarchy execution parameters for rank ``k``.
 
@@ -120,13 +184,17 @@ def soft_hierarchy_parameters(
     reference = ModelParameters()
     rank_scale = float(np.sqrt(float(k) / 8.0))
     derived = {
-        "interior_reward": reference.interior_reward,
-        "goal_reward": reference.goal_reward,
-        "lower_control_cost": reference.lower_control_cost,
-        "upper_control_cost": reference.upper_control_cost * rank_scale,
-        "alpha": reference.alpha / rank_scale,
-        "off_target_reward": reference.off_target_reward,
-        "beta": reference.beta,
+        "interior_reward": reference.interior_reward.item(),
+        "goal_reward": reference.goal_reward.item(),
+        "lower_control_cost": reference.lower_control_cost.item(),
+        "upper_control_cost": (
+            reference.upper_control_cost.item() * rank_scale
+        ),
+        "alpha": reference.alpha.item() / rank_scale,
+        "off_target_reward": reference.off_target_reward.item(),
+        "beta": reference.beta.item(),
+        "core_threshold": core_threshold,
+        "core_exponent": core_exponent,
     }
     overrides = {
         "interior_reward": interior_reward,
@@ -290,10 +358,12 @@ class LMDPEnvironment:
         self,
         goal: Coordinate,
         *,
-        parameters: ModelParameters = ModelParameters(),
+        parameters: ModelParameters | None = None,
     ) -> FlatSolution:
         """Solve a flat first-exit task while reusing physical dynamics."""
 
+        if parameters is None:
+            parameters = ModelParameters()
         desirability = _solve_desirability_from_passive(
             self.maze,
             self.passive,
@@ -545,7 +615,7 @@ def _solve_desirability_from_passive(
 
     desirability = np.empty(len(maze.free_cells), dtype=np.float64)
     goal_desirability = np.exp(
-        parameters.goal_reward / parameters.lower_control_cost
+        parameters.goal_reward.item() / parameters.lower_control_cost.item()
     )
     desirability[goal_state] = goal_desirability
     if len(interior_states) == 0:
@@ -560,7 +630,8 @@ def _solve_desirability_from_passive(
         ][np.newaxis, :],
     )
     q_interior = np.exp(
-        parameters.interior_reward / parameters.lower_control_cost
+        parameters.interior_reward.item()
+        / parameters.lower_control_cost.item()
     )
     desirability[interior_states] = solve_first_exit(
         dynamics,
