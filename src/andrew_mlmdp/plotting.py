@@ -4,16 +4,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from html import escape
 from time import monotonic
-from typing import Callable
+from typing import Callable, Literal, Protocol, TypedDict, cast
 
 import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
+from matplotlib.axes import Axes
 from matplotlib.backend_bases import MouseButton
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+from matplotlib.patches import FancyArrowPatch, PathPatch, Rectangle
+from matplotlib.path import Path
 from matplotlib.widgets import Slider
 
 from andrew_mlmdp.discovery import NMFRankDiagnostics, SoftSubtaskDiscovery
@@ -66,6 +69,75 @@ class _SoftRolloutFrame:
     status: str | None = None
 
 
+class _IntValueWidget(Protocol):
+    """Minimal read/write interface used from an integer widget."""
+
+    @property
+    def value(self) -> int: ...
+
+    @value.setter
+    def value(self, _new_value: int) -> None: ...
+
+
+class _BoolValueWidget(Protocol):
+    """Minimal read/write interface used from a boolean widget."""
+
+    @property
+    def value(self) -> bool: ...
+
+    @value.setter
+    def value(self, _new_value: bool) -> None: ...
+
+
+class _SoftRunState(TypedDict):
+    """Mutable state shared by the soft-rollout renderer callbacks."""
+
+    model: HierarchyTask
+    start: Coordinate
+    rollout: Rollout
+    frames: list[_SoftRolloutFrame]
+
+
+_LocationKind = Literal["start", "goal"]
+
+
+class _LocationState(TypedDict):
+    """Staged locations and interaction state for the notebook player."""
+
+    pending_start: Coordinate
+    pending_goal: Coordinate
+    rollout_seed: int | None
+    dragging: _LocationKind | None
+    last_draw_time: float
+    error: Exception | None
+
+
+_TRAJECTORY_ARROW_COLORS = (
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+)
+
+
+@dataclass(frozen=True)
+class _TrajectoryTraversal:
+    """One offset movement used to render a repeated trajectory edge."""
+
+    start_coordinate: Coordinate
+    start: tuple[float, float]
+    end: tuple[float, float]
+    direction: tuple[float, float]
+    occurrence: int
+    repeated: bool
+
+
 @dataclass(frozen=True)
 class SoftHierarchicalRolloutPlayer:
     """A paused notebook player for inspecting one rollout frame at a time."""
@@ -73,11 +145,11 @@ class SoftHierarchicalRolloutPlayer:
     figure: Figure
     controls: object
     _renderer: "_SoftRolloutRenderer"
-    _frame_slider: object
-    _goal_component_checkbox: object
-    _frame_normalization_checkbox: object
+    _frame_slider: _IntValueWidget
+    _goal_component_checkbox: _BoolValueWidget
+    _frame_normalization_checkbox: _BoolValueWidget
     _recompute_callback: Callable[[], None]
-    _location_state: dict[str, object]
+    _location_state: _LocationState
 
     @property
     def model(self) -> HierarchyTask:
@@ -183,15 +255,15 @@ class _SoftRolloutRenderer:
     """Shared soft-rollout figure state used by players and animations."""
 
     figure: Figure
-    _run_state: dict[str, object]
+    _run_state: _SoftRunState
     update: Callable[[int], tuple[object, ...]]
     replace_run: Callable[[HierarchyTask, Coordinate, int | None], None]
     set_goal_component: Callable[[bool], None]
     set_framewise_normalization: Callable[[bool], None]
-    maze_ax: object
-    start_marker: object
-    goal_marker: object
-    desirability_goal_marker: object
+    maze_ax: Axes
+    start_marker: Line2D
+    goal_marker: Line2D
+    desirability_goal_marker: Line2D
 
     @property
     def model(self) -> HierarchyTask:
@@ -223,20 +295,16 @@ def _draw_walls(
     """Draw one unit square for each wall without changing axis formatting."""
 
     for row, column in maze.walls:
-        wall_options = {
-            "facecolor": color,
-            "edgecolor": color,
-        }
-        if zorder is not None:
-            wall_options["zorder"] = zorder
-        ax.add_patch(
-            Rectangle(
-                (column - 0.5, row - 0.5),
-                1.0,
-                1.0,
-                **wall_options,
-            )
+        wall = Rectangle(
+            (column - 0.5, row - 0.5),
+            1.0,
+            1.0,
+            facecolor=color,
+            edgecolor=color,
         )
+        if zorder is not None:
+            wall.set_zorder(zorder)
+        ax.add_patch(wall)
 
 
 def _draw_connections(maze: Maze, ax, *, color: str) -> None:
@@ -551,15 +619,93 @@ def plot_trajectory_overlay(
     *,
     goal: Coordinate,
     ax,
+    overlap_spacing: float = 0.12,
 ):
-    """Plot a trajectory over an existing map without changing its styling."""
+    """Plot a trajectory over an existing map without changing its styling.
+
+    Repeated corridor traversals use connected parallel lanes when
+    overlap_spacing is positive. Set it to zero for the original rendering.
+    """
 
     if not trajectory:
         raise ValueError("Trajectory must contain at least one coordinate")
+    if not np.isfinite(overlap_spacing) or overlap_spacing < 0.0:
+        raise ValueError("Overlap spacing must be finite and non-negative")
 
     maze.state_index(goal)
     for coordinate in trajectory:
         maze.state_index(coordinate)
+
+    traversals = _offset_trajectory_traversals(
+        trajectory,
+        overlap_spacing=overlap_spacing,
+    )
+    has_repeated_edge = any(traversal.repeated for traversal in traversals)
+
+    enhanced_rendering = overlap_spacing > 0.0 and has_repeated_edge
+    preserved_axes = None
+    if enhanced_rendering and ax.has_data():
+        preserved_axes = (
+            ax.get_xlim(),
+            ax.get_ylim(),
+            ax.get_autoscalex_on(),
+            ax.get_autoscaley_on(),
+        )
+
+    pass_occurrences: tuple[int, ...] = ()
+    existing_legend = ax.get_legend() if enhanced_rendering else None
+    if enhanced_rendering:
+        pass_occurrences = _plot_offset_trajectory(ax, trajectory, traversals)
+        endpoint_zorder = 7
+    else:
+        _plot_legacy_trajectory(ax, trajectory)
+        endpoint_zorder = 6
+
+    start_row, start_column = trajectory[0]
+    ax.plot(
+        start_column,
+        start_row,
+        marker="o",
+        markersize=11,
+        markerfacecolor="#4c956c",
+        markeredgecolor="white",
+        markeredgewidth=1.2,
+        label="start",
+        zorder=endpoint_zorder,
+    )
+
+    goal_row, goal_column = goal
+    ax.plot(
+        goal_column,
+        goal_row,
+        marker="*",
+        markersize=15,
+        markerfacecolor="#d1495b",
+        markeredgecolor="white",
+        markeredgewidth=1.2,
+        label="goal",
+        zorder=endpoint_zorder,
+    )
+
+    if preserved_axes is not None:
+        x_limits, y_limits, autoscale_x, autoscale_y = preserved_axes
+        ax.set_xlim(x_limits)
+        ax.set_ylim(y_limits)
+        ax.set_autoscalex_on(autoscale_x)
+        ax.set_autoscaley_on(autoscale_y)
+
+    if pass_occurrences:
+        _add_trajectory_pass_legend(
+            ax,
+            pass_occurrences,
+            existing_legend=existing_legend,
+        )
+
+    return ax
+
+
+def _plot_legacy_trajectory(ax, trajectory: list[Coordinate]) -> None:
+    """Draw a trajectory using the original line-and-marker styling."""
 
     rows = []
     columns = []
@@ -588,32 +734,301 @@ def plot_trajectory_overlay(
         ]
     )
 
-    start_row, start_column = trajectory[0]
-    ax.plot(
-        start_column,
-        start_row,
-        marker="o",
-        markersize=11,
-        markerfacecolor="#4c956c",
-        markeredgecolor="white",
-        markeredgewidth=1.2,
-        label="start",
-        zorder=6,
-    )
 
-    goal_row, goal_column = goal
-    ax.plot(
-        goal_column,
-        goal_row,
-        marker="*",
-        markersize=15,
-        markerfacecolor="#d1495b",
-        markeredgecolor="white",
-        markeredgewidth=1.2,
-        label="goal",
+def _offset_trajectory_traversals(
+    trajectory: list[Coordinate],
+    *,
+    overlap_spacing: float,
+) -> list[_TrajectoryTraversal]:
+    """Assign stable parallel lanes to all non-stationary movements."""
+
+    movements = [
+        (start, end)
+        for start, end in zip(trajectory, trajectory[1:])
+        if start != end
+    ]
+    edge_counts: dict[tuple[Coordinate, Coordinate], int] = {}
+    for start, end in movements:
+        edge = _canonical_trajectory_edge(start, end)
+        edge_counts[edge] = edge_counts.get(edge, 0) + 1
+
+    edge_spacings = {}
+    for edge, count in edge_counts.items():
+        largest_lane = count // 2
+        if largest_lane == 0:
+            edge_spacings[edge] = overlap_spacing
+        else:
+            edge_spacings[edge] = min(
+                overlap_spacing,
+                0.35 / largest_lane,
+            )
+
+    edge_occurrences: dict[tuple[Coordinate, Coordinate], int] = {}
+    traversals = []
+    for start_coordinate, end_coordinate in movements:
+        edge = _canonical_trajectory_edge(start_coordinate, end_coordinate)
+        occurrence = edge_occurrences.get(edge, 0)
+        edge_occurrences[edge] = occurrence + 1
+        lane = _trajectory_lane(occurrence)
+
+        canonical_start, canonical_end = edge
+        canonical_start_xy = np.asarray(
+            (canonical_start[1], canonical_start[0]),
+            dtype=float,
+        )
+        canonical_end_xy = np.asarray(
+            (canonical_end[1], canonical_end[0]),
+            dtype=float,
+        )
+        canonical_direction = canonical_end_xy - canonical_start_xy
+        canonical_direction /= np.linalg.norm(canonical_direction)
+        normal = np.asarray(
+            (-canonical_direction[1], canonical_direction[0]),
+        )
+        offset = lane * edge_spacings[edge] * normal
+
+        start_xy = np.asarray(
+            (start_coordinate[1], start_coordinate[0]),
+            dtype=float,
+        )
+        end_xy = np.asarray(
+            (end_coordinate[1], end_coordinate[0]),
+            dtype=float,
+        )
+        direction = end_xy - start_xy
+        direction /= np.linalg.norm(direction)
+        traversals.append(
+            _TrajectoryTraversal(
+                start_coordinate=start_coordinate,
+                start=tuple(start_xy + offset),
+                end=tuple(end_xy + offset),
+                direction=tuple(direction),
+                occurrence=occurrence,
+                repeated=edge_counts[edge] > 1,
+            )
+        )
+
+    return traversals
+
+
+def _canonical_trajectory_edge(
+    first: Coordinate,
+    second: Coordinate,
+) -> tuple[Coordinate, Coordinate]:
+    return (first, second) if first < second else (second, first)
+
+
+def _trajectory_lane(occurrence: int) -> int:
+    """Return lanes in first-centered order: 0, +1, -1, +2, -2, ..."""
+
+    if occurrence == 0:
+        return 0
+    magnitude = (occurrence + 1) // 2
+    return magnitude if occurrence % 2 else -magnitude
+
+
+def _plot_offset_trajectory(
+    ax,
+    trajectory: list[Coordinate],
+    traversals: list[_TrajectoryTraversal],
+) -> tuple[int, ...]:
+    """Draw repeated traversals and return the pass numbers shown."""
+
+    vertices: list[tuple[float, float]] = [
+        (float(trajectory[0][1]), float(trajectory[0][0]))
+    ]
+    codes: list[np.uint8] = [Path.MOVETO]
+    previous: _TrajectoryTraversal | None = None
+    for traversal in traversals:
+        if previous is None:
+            _append_straight_connector(vertices, codes, traversal.start)
+        else:
+            _append_trajectory_connector(
+                vertices,
+                codes,
+                previous,
+                traversal,
+            )
+        vertices.append(traversal.end)
+        codes.append(Path.LINETO)
+        previous = traversal
+
+    terminal = (float(trajectory[-1][1]), float(trajectory[-1][0]))
+    _append_straight_connector(vertices, codes, terminal)
+
+    trajectory_patch = PathPatch(
+        Path(vertices, codes),
+        facecolor="none",
+        edgecolor="#f72585",
+        linewidth=3.5,
+        alpha=1.0,
+        label="trajectory",
+        capstyle="round",
+        joinstyle="round",
+        zorder=5,
+    )
+    trajectory_patch.set_path_effects(
+        [
+            path_effects.Stroke(linewidth=6.0, foreground="white"),
+            path_effects.Normal(),
+        ]
+    )
+    ax.add_patch(trajectory_patch)
+
+    used_occurrences: set[int] = set()
+    labelled_occurrences: set[int] = set()
+    previous = None
+    for traversal in traversals:
+        if traversal.repeated:
+            occurrence = traversal.occurrence
+            position = 0.5
+        elif previous is not None and previous.repeated:
+            occurrence = previous.occurrence
+            position = 0.35
+        else:
+            previous = traversal
+            continue
+
+        label = "_nolegend_"
+        if occurrence not in labelled_occurrences:
+            label = f"Pass {occurrence + 1}"
+            labelled_occurrences.add(occurrence)
+        _add_trajectory_arrow(
+            ax,
+            traversal,
+            position=position,
+            color=_trajectory_arrow_color(occurrence),
+            label=label,
+        )
+        used_occurrences.add(occurrence)
+        previous = traversal
+
+    return tuple(sorted(used_occurrences))
+
+
+def _trajectory_arrow_color(occurrence: int) -> str:
+    """Return the fixed categorical color for one temporal pass."""
+
+    return _TRAJECTORY_ARROW_COLORS[
+        occurrence % len(_TRAJECTORY_ARROW_COLORS)
+    ]
+
+
+def _add_trajectory_arrow(
+    ax,
+    traversal: _TrajectoryTraversal,
+    *,
+    position: float,
+    color: str,
+    label: str,
+) -> None:
+    start = np.asarray(traversal.start)
+    end = np.asarray(traversal.end)
+    direction = np.asarray(traversal.direction)
+    center = start + position * (end - start)
+    arrow_start = center - 0.10 * direction
+    arrow_end = center + 0.10 * direction
+    arrow_start_xy = (float(arrow_start[0]), float(arrow_start[1]))
+    arrow_end_xy = (float(arrow_end[0]), float(arrow_end[1]))
+    arrow = FancyArrowPatch(
+        arrow_start_xy,
+        arrow_end_xy,
+        arrowstyle="-|>",
+        mutation_scale=10,
+        linewidth=1.4,
+        color=color,
+        label=label,
+        shrinkA=0.0,
+        shrinkB=0.0,
         zorder=6,
     )
-    return ax
+    arrow.set_path_effects(
+        [
+            path_effects.Stroke(linewidth=3.2, foreground="white"),
+            path_effects.Normal(),
+        ]
+    )
+    ax.add_patch(arrow)
+
+
+def _add_trajectory_pass_legend(
+    ax,
+    occurrences: tuple[int, ...],
+    *,
+    existing_legend,
+) -> None:
+    handles = [
+        Line2D(
+            [],
+            [],
+            color=_trajectory_arrow_color(occurrence),
+            marker=">",
+            linestyle="-",
+            linewidth=1.4,
+            markersize=5,
+        )
+        for occurrence in occurrences
+    ]
+    labels = [f"Pass {occurrence + 1}" for occurrence in occurrences]
+    ax.legend(
+        handles,
+        labels,
+        title="Traversal order",
+        loc="upper right",
+        fontsize=8,
+        title_fontsize=8,
+        framealpha=0.9,
+        borderpad=0.4,
+        labelspacing=0.3,
+        handlelength=1.5,
+    )
+    if existing_legend is not None:
+        ax.add_artist(existing_legend)
+
+
+def _append_straight_connector(
+    vertices: list[tuple[float, float]],
+    codes: list[np.uint8],
+    target: tuple[float, float],
+) -> None:
+    if not np.allclose(vertices[-1], target):
+        vertices.append(target)
+        codes.append(Path.LINETO)
+
+
+def _append_trajectory_connector(
+    vertices: list[tuple[float, float]],
+    codes: list[np.uint8],
+    previous: _TrajectoryTraversal,
+    current: _TrajectoryTraversal,
+) -> None:
+    target = np.asarray(current.start)
+    start = np.asarray(vertices[-1])
+    if np.allclose(start, target):
+        return
+
+    previous_direction = np.asarray(previous.direction)
+    current_direction = np.asarray(current.direction)
+    if np.dot(previous_direction, current_direction) < -0.999:
+        tangent_length = 0.18
+        first_control = start + tangent_length * previous_direction
+        second_control = target - tangent_length * current_direction
+        vertices.extend(
+            [
+                tuple(first_control),
+                tuple(second_control),
+                tuple(target),
+            ]
+        )
+        codes.extend([Path.CURVE4, Path.CURVE4, Path.CURVE4])
+        return
+
+    state_center = (
+        float(current.start_coordinate[1]),
+        float(current.start_coordinate[0]),
+    )
+    vertices.extend([state_center, tuple(target)])
+    codes.extend([Path.CURVE3, Path.CURVE3])
 
 
 def plot_trajectory(
@@ -621,9 +1036,14 @@ def plot_trajectory(
     trajectory: list[Coordinate],
     *,
     goal: Coordinate,
+    overlap_spacing: float = 0.12,
     ax=None,
 ):
-    """Plot a sampled trajectory over the maze geometry."""
+    """Plot a sampled trajectory over the maze geometry.
+
+    overlap_spacing controls the parallel lanes used for repeated edges.
+    Set it to zero for the original rendering.
+    """
 
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 7))
@@ -634,6 +1054,7 @@ def plot_trajectory(
         trajectory,
         goal=goal,
         ax=ax,
+        overlap_spacing=overlap_spacing,
     )
     ax.set_title(f"Sample controlled rollout ({len(trajectory) - 1} steps)")
     return ax
@@ -818,7 +1239,7 @@ def plot_interactive_subgoal_desirability(
     )
 
     bar_positions = np.arange(len(model.subgoals))
-    bar_colors = plt.get_cmap("tab10").colors
+    bar_colors = _TRAJECTORY_ARROW_COLORS
     bars = weights_ax.barh(
         bar_positions,
         displays[(model.goal, start)][1],
@@ -841,7 +1262,7 @@ def plot_interactive_subgoal_desirability(
     weights_ax.grid(axis="x", color="0.86", linewidth=0.6)
     weights_ax.set_axisbelow(True)
 
-    slider_ax = figure.add_axes([0.30, 0.07, 0.40, 0.035])
+    slider_ax = figure.add_axes((0.30, 0.07, 0.40, 0.035))
     slider_ax.set_gid("color-maximum-slider")
     slider_log_minimum = np.log10(minimum * (1.0 + 1e-6))
     slider_log_maximum = np.log10(maximum)
@@ -971,7 +1392,7 @@ def animate_hierarchical_rollout(
     max_steps: int = 500,
     max_abstract_accesses: int = 500,
     seed: int | None = None,
-    goal_learning: str = "exact",
+    goal_learning: Literal["exact", "online"] = "exact",
     initial_goal_desirability: np.ndarray | None = None,
     z_sweeps_per_step: int = 1,
     subgoal_labels: list[str] | tuple[str, ...] | None = None,
@@ -1147,7 +1568,7 @@ def animate_hierarchical_rollout(
 
     number_of_subgoals = len(model.subgoals)
     number_of_tasks = number_of_subgoals + 1
-    weight_colors = plt.get_cmap("tab10").colors
+    weight_colors = _TRAJECTORY_ARROW_COLORS
     weight_lines = []
     for index, label in enumerate(labels):
         (line,) = weights_ax.plot(
@@ -1253,7 +1674,7 @@ def _trace_hierarchical_rollout(
     model: HierarchyTask,
     start: Coordinate,
     *,
-    goal_learning: str = "exact",
+    goal_learning: Literal["exact", "online"] = "exact",
     initial_goal_desirability: np.ndarray | None = None,
     z_sweeps_per_step: int = 1,
     beta: float | None,
@@ -1713,7 +2134,7 @@ def _build_soft_hierarchical_rollout_renderer(
         max_abstract_accesses=max_abstract_accesses,
         seed=seed,
     )
-    run_state = {
+    run_state: _SoftRunState = {
         "model": model,
         "start": start,
         "rollout": rollout,
@@ -2033,16 +2454,15 @@ def _build_soft_hierarchical_rollout_renderer(
                 f"({scale_description}; exact goal basis removed)"
             )
 
-        reward_command_disabled = (
-            frame.plan is None
-            or not np.all(
-                np.isfinite(frame.plan.inpainted_rewards[:-1])
-            )
-        )
-        if reward_command_disabled:
+        plan = frame.plan
+        if plan is None or not np.all(
+            np.isfinite(plan.inpainted_rewards[:-1])
+        ):
+            reward_command_disabled = True
             reward_command = np.zeros(current_model.number_of_subtasks)
         else:
-            reward_command = frame.plan.inpainted_rewards[:-1]
+            reward_command_disabled = False
+            reward_command = plan.inpainted_rewards[:-1]
         reward_limit = 1.25 * max(
             0.1,
             float(np.max(np.abs(reward_command))),
@@ -2262,7 +2682,7 @@ def plot_interactive_soft_hierarchical_rollout(
     used_recompute_seeds: set[int] = set()
     if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
         used_recompute_seeds.add(int(seed))
-    location_state: dict[str, object] = {
+    location_state: _LocationState = {
         "pending_start": start,
         "pending_goal": model.goal,
         "rollout_seed": seed,
@@ -2354,25 +2774,39 @@ def plot_interactive_soft_hierarchical_rollout(
             return None
         return coordinate
 
-    def marker_for(kind: str):
+    def marker_for(kind: _LocationKind) -> Line2D:
         return (
             renderer.start_marker
             if kind == "start"
             else renderer.goal_marker
         )
 
-    def restore_pending_marker(kind: str) -> None:
-        coordinate = location_state[f"pending_{kind}"]
+    def restore_pending_marker(kind: _LocationKind) -> None:
+        coordinate = (
+            location_state["pending_start"]
+            if kind == "start"
+            else location_state["pending_goal"]
+        )
         row, column = coordinate
         marker_for(kind).set_data([column], [row])
         if kind == "goal":
             renderer.desirability_goal_marker.set_data([column], [row])
 
-    def stage_location(kind: str, coordinate: Coordinate) -> bool:
-        other_kind = "goal" if kind == "start" else "start"
-        if coordinate == location_state[f"pending_{other_kind}"]:
+    def stage_location(
+        kind: _LocationKind,
+        coordinate: Coordinate,
+    ) -> bool:
+        other_coordinate = (
+            location_state["pending_goal"]
+            if kind == "start"
+            else location_state["pending_start"]
+        )
+        if coordinate == other_coordinate:
             return False
-        location_state[f"pending_{kind}"] = coordinate
+        if kind == "start":
+            location_state["pending_start"] = coordinate
+        else:
+            location_state["pending_goal"] = coordinate
         location_state["error"] = None
         restore_pending_marker(kind)
         update_location_status()
@@ -2492,8 +2926,12 @@ def plot_interactive_soft_hierarchical_rollout(
         controls=controls,
         _renderer=renderer,
         _frame_slider=frame_slider,
-        _goal_component_checkbox=goal_component_checkbox,
-        _frame_normalization_checkbox=frame_normalization_checkbox,
+        _goal_component_checkbox=cast(
+            _BoolValueWidget, goal_component_checkbox
+        ),
+        _frame_normalization_checkbox=cast(
+            _BoolValueWidget, frame_normalization_checkbox
+        ),
         _recompute_callback=recompute_rollout,
         _location_state=location_state,
     )
