@@ -1,10 +1,11 @@
-# Four-room regression example
+# Four-room example configurations
 
-The repository includes one 11-by-11 demonstration maze with 97 free cells
-and 24 walls in `mazes/four_rooms.txt`. It is a regression fixture and
-walkthrough example, not an architectural constraint.
+The repository includes an 11-by-11 maze with 97 free cells and 24 walls in
+`mazes/four_rooms.txt`. It is a demonstration and regression fixture, not an
+architectural constraint.
 
-Coordinates are `(row, column)`. The notebook uses these point subgoals:
+Coordinates are `(row, column)` from the upper left. The shared point subgoals
+are:
 
 | Label | Coordinate |
 | --- | ---: |
@@ -15,11 +16,23 @@ Coordinates are `(row, column)`. The notebook uses these point subgoals:
 | E | `(9, 7)` |
 | F | `(7, 9)` |
 
-The physical goal is `(10, 9)`. Tests retain the historical matrices, initial
-plan, and seeded flat/hierarchical trajectories in
-`tests/data/four_rooms_regression.json`.
+## Why the numbers differ across examples
 
-The canonical notebook uses these defaults for fixed one-hot subgoals:
+There are three deliberate configurations. They serve different purposes and
+should not be treated as one canonical parameter set.
+
+| Configuration | Goal | Purpose |
+| --- | ---: | --- |
+| Library hard defaults | chosen by caller | General default for one-hot or equivalent profile bases |
+| Canonical notebook | `(1, 9)` | Tuned visual and interactive walkthrough |
+| Frozen regression fixture | `(10, 9)` | Preserve historical matrices and seeded trajectories |
+
+The top-level README matches the canonical notebook. Tests that compare exact
+historical arrays use the frozen regression fixture instead.
+
+## Library hard defaults
+
+Calling `LMDPEnvironment.hierarchy(basis)` without explicit parameters selects:
 
 ```python
 hard_hierarchy_parameters(
@@ -33,18 +46,39 @@ hard_hierarchy_parameters(
 )
 ```
 
-`LMDPEnvironment.hierarchy(point_basis)` selects these defaults
-automatically. The same fallback applies to profile bases so an equivalent
-one-hot profile remains identical to a point basis. Flat tasks retain
-`ModelParameters()` defaults, and calibrated soft hierarchies pass their
-independent `soft_hierarchy_parameters` explicitly.
+This fallback applies to point bases and equivalent one-hot profile bases so
+both representations execute identically. `include_goal_component_while_active`
+is independently `True` by default.
 
-The canonical fixed hierarchy sets
-`include_goal_component_while_active=False`: active plans are composed only
-from the fixed subgoal basis. The exact goal component is enabled only after
-the upper layer terminates.
+Flat tasks use `ModelParameters()` defaults rather than these hard-hierarchy
+defaults.
 
-NMF discovery uses its independent defaults:
+## Canonical executable notebook
+
+[`notebooks/maze_lmdp_workflows.ipynb`](../notebooks/maze_lmdp_workflows.ipynb)
+uses goal `(1, 9)` and the hard defaults above with one explicit override:
+
+```python
+hard_parameters = hard_hierarchy_parameters(upper_control_cost=0.65)
+```
+
+The point-subgoal hierarchy also sets
+`include_goal_component_while_active=False`. While the hierarchy is active,
+plans are composed only from the six fixed subgoal tasks. Upper termination
+then installs the goal-only task permanently.
+
+The notebook's distributed example selects NMF rank eight, applies an
+80%-of-peak execution core, and uses:
+
+```python
+soft_hierarchy_parameters(k=8, upper_control_cost=0.18)
+```
+
+It likewise excludes the exact goal component while the hierarchy is active.
+These upper-cost overrides are example tuning, not package-wide defaults.
+
+NMF discovery itself uses a separate flat-task ensemble and the independent
+defaults:
 
 ```python
 NMFDiscoveryParameters(
@@ -54,10 +88,31 @@ NMFDiscoveryParameters(
 )
 ```
 
-The soft example selects rank eight, applies an 80%-of-peak execution core,
-excludes the exact goal component while the hierarchy is active, and restores
-the goal-only task after upper termination.
+Changing hierarchy execution parameters cannot silently alter the already
+discovered NMF profiles.
+
+## Frozen regression fixture
+
+`tests/test_four_rooms_regression.py` uses goal `(10, 9)` and the parameters
+defined in `tests/conftest.py`:
+
+```python
+ModelParameters(
+    interior_reward=-0.1,
+    goal_reward=1.0,
+    lower_control_cost=0.15,
+    upper_control_cost=0.3,
+    alpha=1.0,
+    off_target_reward=-2.0,
+    beta=10.0,
+)
+```
+
+This fixture retains historical passive and controlled matrices, initial plan
+values, and seeded flat and hierarchical trajectories in
+`tests/data/four_rooms_regression.json`. It intentionally does not track the
+current notebook tuning or the library defaults.
 
 Additional tests construct corridors, tall and wide rectangles, obstacle
-layouts, different subgoal counts, and different NMF ranks to prevent this
-fixture from determining implementation shapes.
+layouts, different subgoal counts, and different NMF ranks so this fixture
+cannot determine implementation shapes.
