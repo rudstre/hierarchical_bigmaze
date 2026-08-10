@@ -111,7 +111,7 @@ zero-mass policy column.
 
 ## 3. One representation for point and distributed subgoals
 
-[`SubgoalBasis`](../src/andrew_mlmdp/hierarchy.py#L26) always stores a
+[`SubgoalBasis`](../src/andrew_mlmdp/hierarchy/core.py#L28) always stores a
 state-by-subgoal profile matrix `D`:
 
 - `SubgoalBasis.from_locations` creates one-hot columns.
@@ -139,11 +139,11 @@ subgoal leaves the current physical coordinate unchanged.
 ## 4. Build the goal-conditioned Layer-1 first-exit process
 
 `environment.hierarchy(basis, ...)` returns a reusable
-[`HierarchyTemplate`](../src/andrew_mlmdp/hierarchy.py#L138).
+[`HierarchyTemplate`](../src/andrew_mlmdp/hierarchy/core.py#L145).
 `template.for_goal(g)` builds and caches one
-[`HierarchyTask`](../src/andrew_mlmdp/hierarchy.py#L213).
+[`HierarchyTask`](../src/andrew_mlmdp/hierarchy/core.py#L221).
 
-For that goal, [`_build_hierarchy_task`](../src/andrew_mlmdp/hierarchy.py#L424)
+For that goal, [`_build_hierarchy_task`](../src/andrew_mlmdp/hierarchy/core.py#L385)
 does the following:
 
 1. Remove `g` from the physical interior, leaving `m` states.
@@ -167,7 +167,7 @@ the original physical states remain in the maze interior. `alpha` controls the
 strength of this passive access relative to ordinary movement.
 
 The implementation is
-[`_build_lower_dynamics_from_access`](../src/andrew_mlmdp/hierarchy.py#L1312).
+[`_build_lower_dynamics_from_access`](../src/andrew_mlmdp/hierarchy/core.py#L874).
 The stacked matrix is column-stochastic after normalization.
 
 ## 5. Convert physical first hits into upper passive dynamics
@@ -202,7 +202,7 @@ P_g^2 = P_g^1 F P_t^{1T}.
 After column normalization, `P_i^2` describes passive transitions among the
 `k` subgoals and `P_g^2` describes passive termination at the one physical
 goal boundary. See
-[`_build_upper_dynamics`](../src/andrew_mlmdp/hierarchy.py#L1357).
+[`_build_upper_dynamics`](../src/andrew_mlmdp/hierarchy/core.py#L919).
 
 This is the bridge between layers: long physical paths through the maze are
 summarized as one small abstract transition matrix.
@@ -215,7 +215,7 @@ The upper layer is another first-exit LMDP:
 - its one boundary state is the physical goal; and
 - it uses `upper_control_cost` rather than `lower_control_cost`.
 
-[`_solve_upper_layer`](../src/andrew_mlmdp/hierarchy.py#L1372) solves for
+[`_solve_upper_layer`](../src/andrew_mlmdp/hierarchy/core.py#L934) solves for
 `task.upper_desirability` and then reweights the passive upper dynamics to
 obtain `task.upper_controlled`.
 
@@ -230,14 +230,14 @@ The corresponding controlled prediction is obtained by multiplying this
 column by upper desirability and normalizing. At an entered subgoal, the code
 uses the matching columns of `upper_dynamics.passive` and
 `upper_controlled` directly. See
-[`compute_hierarchy_plan`](../src/andrew_mlmdp/hierarchy.py#L475).
+[`compute_hierarchy_plan`](../src/andrew_mlmdp/hierarchy/core.py#L436).
 
 ## 7. Pre-solve the reusable lower task basis
 
 Layer 1 needs a way to realize many abstract commands without solving a new
 physical LMDP every time. It therefore pre-solves `k + 1` component tasks.
 
-[`_build_task_basis`](../src/andrew_mlmdp/hierarchy.py#L1397) constructs the
+[`_build_task_basis`](../src/andrew_mlmdp/hierarchy/core.py#L959) constructs the
 boundary matrix `Q_b`:
 
 - subgoal task `j` rewards subgoal boundary `j` and assigns the configured
@@ -258,8 +258,8 @@ combination of these columns is also a valid desirability solution.
 
 ## 8. Turn the current upper policy into one physical policy
 
-[`HierarchyTask.plan`](../src/andrew_mlmdp/hierarchy.py#L260) delegates to
-[`_plan_from_abstract_dynamics`](../src/andrew_mlmdp/hierarchy.py#L540).
+[`HierarchyTask.plan`](../src/andrew_mlmdp/hierarchy/core.py#L267) delegates to
+[`_plan_from_abstract_dynamics`](../src/andrew_mlmdp/hierarchy/core.py#L501).
 Planning performs four transformations.
 
 First, reward inpainting converts the change requested by abstract control
@@ -295,7 +295,7 @@ z_b^1 = Q_b w.
 
 Finally, the standard LMDP reweighting formula converts this desirability into
 `plan.layer_one_controlled`. The complete implementation is in
-[`_compose_lower_policy`](../src/andrew_mlmdp/hierarchy.py#L674).
+[`_compose_lower_policy`](../src/andrew_mlmdp/hierarchy/core.py#L635).
 
 The most useful debugging fields on `LayerOnePlan` are
 `passive_abstract`, `controlled_abstract`, `inpainted_rewards`, `raw_weights`,
@@ -303,7 +303,7 @@ The most useful debugging fields on `LayerOnePlan` are
 
 ## 9. Execute the coupled process
 
-[`_run_hierarchical_rollout`](../src/andrew_mlmdp/hierarchy.py#L822) uses the
+[`_run_hierarchical_rollout`](../src/andrew_mlmdp/hierarchy/rollout.py#L157) uses the
 composed Layer-1 policy as one distribution over:
 
 - another physical interior state;

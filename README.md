@@ -88,11 +88,11 @@ structure is retained while goals and current abstract commands change.
 | --- | --- |
 | How is the passive maze random walk built? | [`build_passive_dynamics`](src/andrew_mlmdp/lmdp.py#L475) |
 | How is a flat first-exit LMDP solved? | [`solve_first_exit`](src/andrew_mlmdp/lmdp.py#L348) and [`LMDPEnvironment.solve_flat`](src/andrew_mlmdp/lmdp.py#L289) |
-| How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy.py#L26) |
-| How is a goal-conditioned hierarchy constructed? | [`_build_hierarchy_task`](src/andrew_mlmdp/hierarchy.py#L424) |
-| How are the lower and upper passive dynamics derived? | [`_build_lower_dynamics_from_access`](src/andrew_mlmdp/hierarchy.py#L1312) and [`_build_upper_dynamics`](src/andrew_mlmdp/hierarchy.py#L1357) |
-| How does an upper policy become a physical policy? | [`compute_hierarchy_plan`](src/andrew_mlmdp/hierarchy.py#L475), [`_plan_from_abstract_dynamics`](src/andrew_mlmdp/hierarchy.py#L540), and [`_compose_lower_policy`](src/andrew_mlmdp/hierarchy.py#L674) |
-| What exactly happens during a rollout? | [`_run_hierarchical_rollout`](src/andrew_mlmdp/hierarchy.py#L822) |
+| How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy/core.py#L28) |
+| How is a goal-conditioned hierarchy constructed? | [`_build_hierarchy_task`](src/andrew_mlmdp/hierarchy/core.py#L385) |
+| How are the lower and upper passive dynamics derived? | [`_build_lower_dynamics_from_access`](src/andrew_mlmdp/hierarchy/core.py#L874) and [`_build_upper_dynamics`](src/andrew_mlmdp/hierarchy/core.py#L919) |
+| How does an upper policy become a physical policy? | [`compute_hierarchy_plan`](src/andrew_mlmdp/hierarchy/core.py#L436), [`_plan_from_abstract_dynamics`](src/andrew_mlmdp/hierarchy/core.py#L501), and [`_compose_lower_policy`](src/andrew_mlmdp/hierarchy/core.py#L635) |
+| What exactly happens during a rollout? | [`_run_hierarchical_rollout`](src/andrew_mlmdp/hierarchy/rollout.py#L157) |
 | How are distributed subgoals discovered? | [`discover_soft_subgoals`](src/andrew_mlmdp/discovery.py#L201) |
 
 ## Minimal end-to-end example
