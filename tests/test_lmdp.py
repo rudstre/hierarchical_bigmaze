@@ -1,3 +1,5 @@
+from typing import cast
+
 import numpy as np
 import pytest
 
@@ -6,6 +8,7 @@ from andrew_mlmdp import (
     LMDPEnvironment,
     Maze,
     ModelParameters,
+    PassiveDynamicsMode,
     SubgoalBasis,
     controlled_from_desirability,
     solve_first_exit,
@@ -19,7 +22,7 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
     calls = 0
     original = lmdp.build_passive_dynamics
 
-    def counted(maze, *, mode="five_commands"):
+    def counted(maze, *, mode: PassiveDynamicsMode = "five_commands"):
         nonlocal calls
         calls += 1
         return original(maze, mode=mode)
@@ -114,11 +117,16 @@ def test_valid_neighbors_rejects_isolated_free_state():
 
 def test_unknown_passive_mode_is_rejected():
     with pytest.raises(ValueError, match="Unknown passive dynamics mode"):
-        LMDPEnvironment(Maze.from_ascii(".."), passive_mode="unknown")
+        LMDPEnvironment(
+            Maze.from_ascii(".."),
+            passive_mode=cast(PassiveDynamicsMode, "unknown"),
+        )
 
 
 @pytest.mark.parametrize("passive_mode", ["five_commands", "valid_neighbors"])
-def test_flat_and_hierarchical_tasks_use_selected_passive_mode(passive_mode):
+def test_flat_and_hierarchical_tasks_use_selected_passive_mode(
+    passive_mode: PassiveDynamicsMode,
+):
     maze = Maze.from_ascii("....")
     environment = LMDPEnvironment(maze, passive_mode=passive_mode)
     flat = environment.solve_flat((0, 3))

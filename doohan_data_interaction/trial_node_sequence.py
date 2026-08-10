@@ -3,6 +3,9 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import cast
+
+import pandas as pd
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--session_id", required=True, help="e.g. m2/2022-06-23.maze")
@@ -24,7 +27,8 @@ if not session_dir.is_dir():
 gridmaze_code = gridmaze_root / "code"
 sys.path.insert(0, str(gridmaze_code))
 
-from GridMaze.core.get_sessions import MazeSession
+# GridMaze is an external checkout rather than an installed package.
+from GridMaze.core.get_sessions import MazeSession  # noqa: E402
 
 session = MazeSession(
     subject,
@@ -39,7 +43,8 @@ if trial_info is None or trajectories is None:
 mask = (trial_info["trial"] == args.trial_id) & (
     trial_info["trial_phase"] == "navigation"
 )
-positions = trajectories.loc[mask, ("maze_position", "simple")].dropna()
+position_values = trajectories.loc[mask, ("maze_position", "simple")]
+positions = cast(pd.Series, position_values).dropna()
 if positions.empty:
     parser.error(f"trial {args.trial_id} has no navigation trajectory")
 

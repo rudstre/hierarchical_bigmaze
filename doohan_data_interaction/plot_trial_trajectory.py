@@ -3,6 +3,11 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import cast
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import pandas as pd
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--session_id", required=True, help="e.g. m2/2022-06-23.maze")
@@ -25,9 +30,8 @@ output_dir = Path.cwd()
 gridmaze_code = gridmaze_root / "code"
 sys.path.insert(0, str(gridmaze_code))
 
-import matplotlib.pyplot as plt
-import networkx as nx
-from GridMaze.core.get_sessions import MazeSession
+# GridMaze is an external checkout rather than an installed package.
+from GridMaze.core.get_sessions import MazeSession  # noqa: E402
 
 session = MazeSession(
     subject,
@@ -48,7 +52,8 @@ if trajectory.empty:
 
 x = trajectory[("centroid_position", "x")]
 y = trajectory[("centroid_position", "y")]
-goal = trial_info.loc[mask, "goal"].iloc[0]
+goal_series = cast(pd.Series, trial_info.loc[mask, "goal"])
+goal = goal_series.iloc[0]
 maze = session.simple_maze()
 
 fig, ax = plt.subplots(figsize=(5, 5))
@@ -69,5 +74,5 @@ ax.axis("off")
 ax.legend()
 
 output = output_dir / f"{subject}_{session_name}_trial_{args.trial_id}.png"
-fig.savefig(output, bbox_inches="tight", dpi=150)
+fig.savefig(str(output), bbox_inches="tight", dpi=150)
 print(output)

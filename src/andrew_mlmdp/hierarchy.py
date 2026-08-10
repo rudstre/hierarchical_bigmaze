@@ -190,7 +190,9 @@ class HierarchyTemplate:
             upper = upper / column_sums[np.newaxis, :]
             upper.flags.writeable = False
             self._passive_dynamics = upper
-        return self._passive_dynamics
+        passive_dynamics = self._passive_dynamics
+        assert passive_dynamics is not None
+        return passive_dynamics
 
     def for_goal(self, goal: Coordinate) -> "HierarchyTask":
         """Return a cached goal-conditioned hierarchy task."""

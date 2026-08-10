@@ -228,7 +228,9 @@ def test_online_learning_can_continue_across_episodes():
         seed=1,
         max_steps=30,
     )
-    initial = first.final_goal_desirability.copy()
+    learned_desirability = first.final_goal_desirability
+    assert learned_desirability is not None
+    initial = learned_desirability.copy()
     second = task.rollout(
         (0, 0),
         goal_learning="online",

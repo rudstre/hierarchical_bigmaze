@@ -1,18 +1,19 @@
 """Direct plotting functions for inspecting maze LMDPs."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html import escape
 from time import monotonic
 from typing import Callable, Literal, Protocol, TypedDict, cast
 
+import matplotlib
 import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.axes import Axes
 from matplotlib.backend_bases import MouseButton
-from matplotlib.colors import LogNorm, Normalize
+from matplotlib.colors import Colormap, LogNorm, Normalize
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, PathPatch, Rectangle
@@ -110,6 +111,17 @@ class _LocationState(TypedDict):
     dragging: _LocationKind | None
     last_draw_time: float
     error: Exception | None
+
+
+def _colormap(name: str, *, bad: str | None = None) -> Colormap:
+    """Return a configured copy from Matplotlib's modern registry API."""
+
+    registry = getattr(matplotlib, "colormaps")
+    color_map = cast(Colormap, registry[name])
+    if bad is None:
+        return color_map
+    with_extremes = cast(Callable[..., Colormap], color_map.with_extremes)
+    return with_extremes(bad=bad)
 
 
 _TRAJECTORY_ARROW_COLORS = (
@@ -456,7 +468,7 @@ def plot_subgoal_passive_dynamics(
         largest_probability = max(largest_probability, probability)
 
     color_scale = Normalize(vmin=0.0, vmax=largest_probability)
-    color_map = plt.get_cmap("YlOrRd")
+    color_map = _colormap("YlOrRd")
     for first, second, probability in edges:
         first_row, first_column = ordered_subgoals[first]
         second_row, second_column = ordered_subgoals[second]
@@ -615,7 +627,7 @@ def plot_controlled_dynamics(
 
 def plot_trajectory_overlay(
     maze: Maze,
-    trajectory: list[Coordinate],
+    trajectory: Sequence[Coordinate],
     *,
     goal: Coordinate,
     ax,
@@ -704,7 +716,7 @@ def plot_trajectory_overlay(
     return ax
 
 
-def _plot_legacy_trajectory(ax, trajectory: list[Coordinate]) -> None:
+def _plot_legacy_trajectory(ax, trajectory: Sequence[Coordinate]) -> None:
     """Draw a trajectory using the original line-and-marker styling."""
 
     rows = []
@@ -736,7 +748,7 @@ def _plot_legacy_trajectory(ax, trajectory: list[Coordinate]) -> None:
 
 
 def _offset_trajectory_traversals(
-    trajectory: list[Coordinate],
+    trajectory: Sequence[Coordinate],
     *,
     overlap_spacing: float,
 ) -> list[_TrajectoryTraversal]:
@@ -829,7 +841,7 @@ def _trajectory_lane(occurrence: int) -> int:
 
 def _plot_offset_trajectory(
     ax,
-    trajectory: list[Coordinate],
+    trajectory: Sequence[Coordinate],
     traversals: list[_TrajectoryTraversal],
 ) -> tuple[int, ...]:
     """Draw repeated traversals and return the pass numbers shown."""
@@ -867,11 +879,12 @@ def _plot_offset_trajectory(
         joinstyle="round",
         zorder=5,
     )
-    trajectory_patch.set_path_effects(
-        [
+    plt.setp(
+        trajectory_patch,
+        path_effects=[
             path_effects.Stroke(linewidth=6.0, foreground="white"),
             path_effects.Normal(),
-        ]
+        ],
     )
     ax.add_patch(trajectory_patch)
 
@@ -942,11 +955,12 @@ def _add_trajectory_arrow(
         shrinkB=0.0,
         zorder=6,
     )
-    arrow.set_path_effects(
-        [
+    plt.setp(
+        arrow,
+        path_effects=[
             path_effects.Stroke(linewidth=3.2, foreground="white"),
             path_effects.Normal(),
-        ]
+        ],
     )
     ax.add_patch(arrow)
 
@@ -1033,7 +1047,7 @@ def _append_trajectory_connector(
 
 def plot_trajectory(
     maze: Maze,
-    trajectory: list[Coordinate],
+    trajectory: Sequence[Coordinate],
     *,
     goal: Coordinate,
     overlap_spacing: float = 0.12,
@@ -1219,7 +1233,7 @@ def plot_interactive_subgoal_desirability(
     maze_ax.set_title(f"Start: {start} | Goal: {model.goal}")
 
     rows, columns = model.maze.shape
-    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    color_map = _colormap("viridis", bad="#252525")
     desirability_image = desirability_ax.imshow(
         displays[(model.goal, start)][0],
         cmap=color_map,
@@ -1442,10 +1456,11 @@ def animate_hierarchical_rollout(
         constrained_layout=True,
         gridspec_kw={"height_ratios": [1.35, 1.0]},
     )
-    maze_ax = axes["maze"]
-    desirability_ax = axes["desirability"]
-    weights_ax = axes["weights"]
-    communication_ax = axes["communication"]
+    named_axes = cast(dict[str, Axes], axes)
+    maze_ax = named_axes["maze"]
+    desirability_ax = named_axes["desirability"]
+    weights_ax = named_axes["weights"]
+    communication_ax = named_axes["communication"]
 
     plot_maze(model.maze, title=None, ax=maze_ax)
     maze_ax.set_title("Layer-1 physical state")
@@ -1532,7 +1547,7 @@ def animate_hierarchical_rollout(
         frames[0],
         goal=model.goal,
     )
-    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    color_map = _colormap("viridis", bad="#252525")
     desirability_image = desirability_ax.imshow(
         first_grid,
         cmap=color_map,
@@ -2042,7 +2057,7 @@ def plot_soft_subtasks(
         constrained_layout=True,
     )
     images = []
-    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    color_map = _colormap("viridis", bad="#252525")
     for subtask, (ax, label) in enumerate(
         zip(axes.flat, subtask_labels)
     ):
@@ -2153,11 +2168,12 @@ def _build_soft_hierarchical_rollout_renderer(
         constrained_layout=True,
         gridspec_kw={"height_ratios": [1.2, 0.9]},
     )
-    maze_ax = axes["maze"]
-    profile_ax = axes["profile"]
-    desirability_ax = axes["desirability"]
-    weights_ax = axes["weights"]
-    communication_ax = axes["communication"]
+    named_axes = cast(dict[str, Axes], axes)
+    maze_ax = named_axes["maze"]
+    profile_ax = named_axes["profile"]
+    desirability_ax = named_axes["desirability"]
+    weights_ax = named_axes["weights"]
+    communication_ax = named_axes["communication"]
 
     plot_maze(model.maze, title=None, ax=maze_ax)
     start_row, start_column = start
@@ -2209,7 +2225,7 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
     rows, columns = model.maze.shape
-    color_map = plt.get_cmap("viridis").with_extremes(bad="#252525")
+    color_map = _colormap("viridis", bad="#252525")
     empty_profile = np.zeros(len(model.maze.free_cells))
     profile_image = profile_ax.imshow(
         desirability_grid(model.maze, empty_profile),

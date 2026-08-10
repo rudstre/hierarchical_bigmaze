@@ -2,6 +2,7 @@
     "python.defaultInterpreterPath": "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python",
     "python.analysis.extraPaths": [
         "${workspaceFolder}/src",
+        "${workspaceFolder}/tests",
         "${workspaceFolder}/external/GridMaze-mFC-ephys-DATA/code"
     ]
 }

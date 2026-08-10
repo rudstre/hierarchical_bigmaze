@@ -2,7 +2,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-from typing import cast
+from typing import Any, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,6 +22,15 @@ from andrew_mlmdp import (
     SubgoalBasis,
     plotting,
 )
+
+
+def _rgba(color: str) -> tuple[float, float, float, float]:
+    """Call Matplotlib despite Pylance's overly narrow bundled stub."""
+
+    return cast(
+        tuple[float, float, float, float],
+        to_rgba(cast(Any, color)),
+    )
 
 
 def _figure_for(ax: Axes) -> Figure:
@@ -165,9 +174,9 @@ def test_trajectory_overlay_separates_and_connects_repeated_edges():
     assert len(trajectory_patches) == 1
     assert len(arrows) == 3
     assert [arrow.get_edgecolor() for arrow in arrows] == [
-        to_rgba("#1f77b4"),
-        to_rgba("#ff7f0e"),
-        to_rgba("#2ca02c"),
+        _rgba("#1f77b4"),
+        _rgba("#ff7f0e"),
+        _rgba("#2ca02c"),
     ]
     assert len(ax.lines) == 2
     assert list(ax.collections) == [base_map]
@@ -220,10 +229,10 @@ def test_trajectory_overlay_marks_post_merge_and_preserves_existing_legend():
     ]
     assert len(arrows) == 4
     assert [arrow.get_edgecolor() for arrow in arrows] == [
-        to_rgba("#1f77b4"),
-        to_rgba("#ff7f0e"),
-        to_rgba("#2ca02c"),
-        to_rgba("#2ca02c"),
+        _rgba("#1f77b4"),
+        _rgba("#ff7f0e"),
+        _rgba("#2ca02c"),
+        _rgba("#2ca02c"),
     ]
     continuation_vertices = np.asarray(
         arrows[-1].get_path().vertices,
@@ -323,7 +332,7 @@ def test_trajectory_overlap_ignores_self_transitions_but_keeps_step_count():
         if isinstance(patch, FancyArrowPatch)
     ]
     assert len(arrows) == 3
-    assert arrows[-1].get_edgecolor() == to_rgba("#ff7f0e")
+    assert arrows[-1].get_edgecolor() == _rgba("#ff7f0e")
     assert ax.get_title() == "Sample controlled rollout (4 steps)"
     plt.close()
 

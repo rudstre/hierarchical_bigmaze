@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -39,7 +40,9 @@ def test_labeled_maze_mappings_are_validated_and_immutable() -> None:
     definition = maze_from_labeled_edges(["A1-A2"], tower_shape=(2, 1))
 
     with pytest.raises(TypeError):
-        definition.coordinate_by_label["new"] = (0, 0)
+        cast(dict[str, tuple[int, int]], definition.coordinate_by_label)[
+            "new"
+        ] = (0, 0)
     with pytest.raises(ValueError, match="Unknown maze label"):
         definition.coordinate_for("G7")
     with pytest.raises(ValueError, match="not a maze state"):
