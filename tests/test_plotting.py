@@ -172,8 +172,9 @@ def test_trajectory_overlay_separates_and_connects_repeated_edges():
         if isinstance(patch, FancyArrowPatch)
     ]
     assert len(trajectory_patches) == 1
-    assert len(arrows) == 3
+    assert len(arrows) == 4
     assert [arrow.get_edgecolor() for arrow in arrows] == [
+        _rgba("#1f77b4"),
         _rgba("#1f77b4"),
         _rgba("#ff7f0e"),
         _rgba("#2ca02c"),
@@ -204,6 +205,9 @@ def test_trajectory_overlay_separates_and_connects_repeated_edges():
         (-1.0, 0.0),
         (1.0, 0.0),
     ]
+    assert [traversal.start[1] for traversal in repeated] == pytest.approx(
+        [0.0, -0.12, 0.12]
+    )
     plt.close(figure)
 
 
@@ -227,13 +231,19 @@ def test_trajectory_overlay_marks_post_merge_and_preserves_existing_legend():
         for patch in ax.patches
         if isinstance(patch, FancyArrowPatch)
     ]
-    assert len(arrows) == 4
+    assert len(arrows) == 5
     assert [arrow.get_edgecolor() for arrow in arrows] == [
+        _rgba("#1f77b4"),
         _rgba("#1f77b4"),
         _rgba("#ff7f0e"),
         _rgba("#2ca02c"),
         _rgba("#2ca02c"),
     ]
+    entry_vertices = np.asarray(
+        arrows[0].get_path().vertices,
+        dtype=float,
+    )
+    assert np.allclose(entry_vertices[0], (0.55, 0.0))
     continuation_vertices = np.asarray(
         arrows[-1].get_path().vertices,
         dtype=float,
@@ -261,7 +271,7 @@ def test_trajectory_arrow_colors_cycle_after_ten_passes():
     assert plotting._trajectory_arrow_color(10) == "#1f77b4"
 
 
-def test_trajectory_overlap_lanes_alternate_and_stay_within_cap():
+def test_trajectory_overlap_lanes_start_right_and_stay_within_cap():
     trajectory = [(0, index % 2) for index in range(11)]
 
     traversals = plotting._offset_trajectory_traversals(
@@ -271,7 +281,7 @@ def test_trajectory_overlap_lanes_alternate_and_stay_within_cap():
 
     offsets = [traversal.start[1] for traversal in traversals]
     assert offsets == pytest.approx(
-        [0.0, 0.07, -0.07, 0.14, -0.14, 0.21, -0.21, 0.28, -0.28, 0.35]
+        [0.0, -0.07, 0.07, -0.14, 0.14, -0.21, 0.21, -0.28, 0.28, -0.35]
     )
     assert max(abs(offset) for offset in offsets) <= 0.35
 

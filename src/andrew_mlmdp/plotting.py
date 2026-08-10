@@ -3,6 +3,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html import escape
+from importlib import import_module
 from time import monotonic
 from typing import Callable, Literal, Protocol, TypedDict, cast
 
@@ -795,7 +796,7 @@ def _offset_trajectory_traversals(
         canonical_direction = canonical_end_xy - canonical_start_xy
         canonical_direction /= np.linalg.norm(canonical_direction)
         normal = np.asarray(
-            (-canonical_direction[1], canonical_direction[0]),
+            (canonical_direction[1], -canonical_direction[0]),
         )
         offset = lane * edge_spacings[edge] * normal
 
@@ -891,13 +892,21 @@ def _plot_offset_trajectory(
     used_occurrences: set[int] = set()
     labelled_occurrences: set[int] = set()
     previous = None
-    for traversal in traversals:
+    for index, traversal in enumerate(traversals):
+        next_traversal = (
+            traversals[index + 1]
+            if index + 1 < len(traversals)
+            else None
+        )
         if traversal.repeated:
             occurrence = traversal.occurrence
             position = 0.5
         elif previous is not None and previous.repeated:
             occurrence = previous.occurrence
             position = 0.35
+        elif next_traversal is not None and next_traversal.repeated:
+            occurrence = next_traversal.occurrence
+            position = 0.65
         else:
             previous = traversal
             continue
@@ -2624,7 +2633,7 @@ def plot_interactive_soft_hierarchical_rollout(
     """
 
     try:
-        import ipywidgets as widgets
+        widgets = import_module("ipywidgets")
     except ImportError as error:  # pragma: no cover - environment dependent
         raise ImportError(
             "Interactive rollout controls require the notebook extra: "
