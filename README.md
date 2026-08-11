@@ -86,14 +86,14 @@ structure is retained while goals and current abstract commands change.
 
 | Question | Start here |
 | --- | --- |
-| How is the passive maze random walk built? | [`build_passive_dynamics`](src/andrew_mlmdp/lmdp.py#L475) |
-| How is a flat first-exit LMDP solved? | [`solve_first_exit`](src/andrew_mlmdp/lmdp.py#L348) and [`LMDPEnvironment.solve_flat`](src/andrew_mlmdp/lmdp.py#L289) |
-| How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy/core.py#L28) |
-| How is a goal-conditioned hierarchy constructed? | [`_build_hierarchy_task`](src/andrew_mlmdp/hierarchy/core.py#L385) |
-| How are the lower and upper passive dynamics derived? | [`_build_lower_dynamics_from_access`](src/andrew_mlmdp/hierarchy/core.py#L874) and [`_build_upper_dynamics`](src/andrew_mlmdp/hierarchy/core.py#L919) |
-| How does an upper policy become a physical policy? | [`compute_hierarchy_plan`](src/andrew_mlmdp/hierarchy/core.py#L436), [`_plan_from_abstract_dynamics`](src/andrew_mlmdp/hierarchy/core.py#L501), and [`_compose_lower_policy`](src/andrew_mlmdp/hierarchy/core.py#L635) |
-| What exactly happens during a rollout? | [`_run_hierarchical_rollout`](src/andrew_mlmdp/hierarchy/rollout.py#L157) |
-| How are distributed subgoals discovered? | [`discover_soft_subgoals`](src/andrew_mlmdp/discovery.py#L201) |
+| How is the passive maze random walk built? | [`build_passive_dynamics`](src/andrew_mlmdp/lmdp.py) |
+| How is a flat first-exit LMDP solved? | [`solve_first_exit` and `LMDPEnvironment.solve_flat`](src/andrew_mlmdp/lmdp.py) |
+| How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy/core.py) |
+| How is a goal-conditioned hierarchy constructed? | [`_build_hierarchy_task`](src/andrew_mlmdp/hierarchy/core.py) |
+| How are the lower and upper passive dynamics derived? | [`_build_lower_dynamics_from_access` and `_build_upper_dynamics`](src/andrew_mlmdp/hierarchy/core.py) |
+| How does an upper policy become a physical policy? | [`compute_hierarchy_plan`, `_plan_from_abstract_dynamics`, and `_compose_lower_policy`](src/andrew_mlmdp/hierarchy/core.py) |
+| What exactly happens during a rollout? | [`_run_hierarchical_rollout`](src/andrew_mlmdp/hierarchy/rollout.py) |
+| How are distributed subgoals discovered? | [`discover_soft_subgoals`](src/andrew_mlmdp/discovery.py) |
 
 ## Minimal end-to-end example
 
@@ -205,11 +205,15 @@ peak-normalized NMF profiles and their gated access profiles are immutable.
 Changing the goal builds or retrieves only a goal-conditioned hierarchy; it
 does not rerun NMF or apply the gate again.
 
-Set `lambda_smooth` to a positive value to penalize neighboring states with
-different profile values over the passive-dynamics connectivity graph.
-Regularized results expose the raw KL-plus-Laplacian objective after every
-iteration through `objective_history`; the default zero value retains the
-original scikit-learn KL-NMF solver and leaves that history unset.
+Set `lambda_smooth` to a positive value in `NMFDiscoveryParameters` to
+penalize neighboring states with different profile values over the
+passive-dynamics connectivity graph. The useful scale is specific to the
+task ensemble because the optimization uses raw generalized KL. For a
+regularized result, `objective_history` contains the initial raw
+KL-plus-Laplacian objective followed by one value per iteration, while
+`reconstruction_error` remains the normalized KL-only diagnostic. The
+default zero strength retains the original scikit-learn solver and leaves
+`objective_history` unset.
 
 ## Doohan edge-list mazes
 
@@ -229,6 +233,11 @@ solution = environment.solve_flat(goal)
 trajectory = solution.rollout(start, seed=0)
 labels = [definition.label_for(coordinate) for coordinate in trajectory]
 ```
+
+The exploratory workflow in
+[`doohan_data_interaction/doohan_trial_lmdp.ipynb`](doohan_data_interaction/doohan_trial_lmdp.ipynb)
+keeps its session, trial, NMF rank, regularization, and execution tuning as
+notebook-local choices so they can be changed without redefining defaults.
 
 By default the loader reads
 `external/GridMaze-mFC-ephys-DATA/data/experiment_info/maze_configs.json`.

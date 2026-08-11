@@ -27,8 +27,9 @@ should not be treated as one canonical parameter set.
 | Canonical notebook | `(1, 9)` | Tuned visual and interactive walkthrough |
 | Frozen regression fixture | `(10, 9)` | Preserve historical matrices and seeded trajectories |
 
-The top-level README matches the canonical notebook. Tests that compare exact
-historical arrays use the frozen regression fixture instead.
+The top-level README uses the canonical hard-hierarchy goal and tuning. Its
+distributed-rank example is illustrative because rank selection remains a
+notebook-local analysis choice. Tests that compare exact historical arrays
 
 ## Library hard defaults
 
@@ -67,11 +68,12 @@ The point-subgoal hierarchy also sets
 plans are composed only from the six fixed subgoal tasks. Upper termination
 then installs the goal-only task permanently.
 
-The notebook's distributed example selects NMF rank eight, applies an
-80%-of-peak execution core, and uses:
+The notebook's distributed example fits several NMF ranks, selects one after
+inspecting the diagnostics, and applies an 80%-of-peak execution core. The
+selected rank is also passed to the execution-parameter helper:
 
 ```python
-soft_hierarchy_parameters(k=8, upper_control_cost=0.18)
+soft_hierarchy_parameters(k=soft_rank, upper_control_cost=0.18)
 ```
 
 It likewise excludes the exact goal component while the hierarchy is active.

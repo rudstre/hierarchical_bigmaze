@@ -50,7 +50,7 @@ cardinal adjacency. Edge-list mazes retain grid coordinates but explicitly
 restrict which adjacent states are connected.
 
 `LMDPEnvironment` calls
-[`build_passive_dynamics`](../src/andrew_mlmdp/lmdp.py#L475) once and stores the
+[`build_passive_dynamics`](../src/andrew_mlmdp/lmdp.py) once and stores the
 result as `environment.passive`.
 
 Two passive models are available:
@@ -88,8 +88,8 @@ boundary desirability `z_b`, the interior solution is
 = \operatorname{diag}(q_i) P_{BI}^{T} z_b.
 ```
 
-[`solve_first_exit`](../src/andrew_mlmdp/lmdp.py#L348) performs this solve.
-[`LMDPEnvironment.solve_flat`](../src/andrew_mlmdp/lmdp.py#L289) removes the
+[`solve_first_exit`](../src/andrew_mlmdp/lmdp.py) performs this solve.
+[`LMDPEnvironment.solve_flat`](../src/andrew_mlmdp/lmdp.py) removes the
 goal from the interior, uses its exponentiated terminal reward as `z_b`, and
 places the solved values back into a length-`n` physical vector.
 
@@ -102,7 +102,7 @@ u^*(s' \mid s)
 ```
 
 This is implemented by
-[`controlled_from_desirability`](../src/andrew_mlmdp/lmdp.py#L446). A state is
+[`controlled_from_desirability`](../src/andrew_mlmdp/lmdp.py). A state is
 preferred when it is both reachable under `P` and desirable under `z`.
 
 For a physical component disconnected from the goal, desirability is zero.
@@ -111,7 +111,7 @@ zero-mass policy column.
 
 ## 3. One representation for point and distributed subgoals
 
-[`SubgoalBasis`](../src/andrew_mlmdp/hierarchy/core.py#L28) always stores a
+[`SubgoalBasis`](../src/andrew_mlmdp/hierarchy/core.py) always stores a
 state-by-subgoal profile matrix `D`:
 
 - `SubgoalBasis.from_locations` creates one-hot columns.
@@ -139,11 +139,11 @@ subgoal leaves the current physical coordinate unchanged.
 ## 4. Build the goal-conditioned Layer-1 first-exit process
 
 `environment.hierarchy(basis, ...)` returns a reusable
-[`HierarchyTemplate`](../src/andrew_mlmdp/hierarchy/core.py#L145).
+[`HierarchyTemplate`](../src/andrew_mlmdp/hierarchy/core.py).
 `template.for_goal(g)` builds and caches one
-[`HierarchyTask`](../src/andrew_mlmdp/hierarchy/core.py#L221).
+[`HierarchyTask`](../src/andrew_mlmdp/hierarchy/core.py).
 
-For that goal, [`_build_hierarchy_task`](../src/andrew_mlmdp/hierarchy/core.py#L385)
+For that goal, [`_build_hierarchy_task`](../src/andrew_mlmdp/hierarchy/core.py)
 does the following:
 
 1. Remove `g` from the physical interior, leaving `m` states.
@@ -167,7 +167,7 @@ the original physical states remain in the maze interior. `alpha` controls the
 strength of this passive access relative to ordinary movement.
 
 The implementation is
-[`_build_lower_dynamics_from_access`](../src/andrew_mlmdp/hierarchy/core.py#L874).
+[`_build_lower_dynamics_from_access`](../src/andrew_mlmdp/hierarchy/core.py).
 The stacked matrix is column-stochastic after normalization.
 
 ## 5. Convert physical first hits into upper passive dynamics
@@ -202,7 +202,7 @@ P_g^2 = P_g^1 F P_t^{1T}.
 After column normalization, `P_i^2` describes passive transitions among the
 `k` subgoals and `P_g^2` describes passive termination at the one physical
 goal boundary. See
-[`_build_upper_dynamics`](../src/andrew_mlmdp/hierarchy/core.py#L919).
+[`_build_upper_dynamics`](../src/andrew_mlmdp/hierarchy/core.py).
 
 This is the bridge between layers: long physical paths through the maze are
 summarized as one small abstract transition matrix.
@@ -215,7 +215,7 @@ The upper layer is another first-exit LMDP:
 - its one boundary state is the physical goal; and
 - it uses `upper_control_cost` rather than `lower_control_cost`.
 
-[`_solve_upper_layer`](../src/andrew_mlmdp/hierarchy/core.py#L934) solves for
+[`_solve_upper_layer`](../src/andrew_mlmdp/hierarchy/core.py) solves for
 `task.upper_desirability` and then reweights the passive upper dynamics to
 obtain `task.upper_controlled`.
 
@@ -230,14 +230,14 @@ The corresponding controlled prediction is obtained by multiplying this
 column by upper desirability and normalizing. At an entered subgoal, the code
 uses the matching columns of `upper_dynamics.passive` and
 `upper_controlled` directly. See
-[`compute_hierarchy_plan`](../src/andrew_mlmdp/hierarchy/core.py#L436).
+[`compute_hierarchy_plan`](../src/andrew_mlmdp/hierarchy/core.py).
 
 ## 7. Pre-solve the reusable lower task basis
 
 Layer 1 needs a way to realize many abstract commands without solving a new
 physical LMDP every time. It therefore pre-solves `k + 1` component tasks.
 
-[`_build_task_basis`](../src/andrew_mlmdp/hierarchy/core.py#L959) constructs the
+[`_build_task_basis`](../src/andrew_mlmdp/hierarchy/core.py) constructs the
 boundary matrix `Q_b`:
 
 - subgoal task `j` rewards subgoal boundary `j` and assigns the configured
@@ -258,8 +258,8 @@ combination of these columns is also a valid desirability solution.
 
 ## 8. Turn the current upper policy into one physical policy
 
-[`HierarchyTask.plan`](../src/andrew_mlmdp/hierarchy/core.py#L267) delegates to
-[`_plan_from_abstract_dynamics`](../src/andrew_mlmdp/hierarchy/core.py#L501).
+[`HierarchyTask.plan`](../src/andrew_mlmdp/hierarchy/core.py) delegates to
+[`_plan_from_abstract_dynamics`](../src/andrew_mlmdp/hierarchy/core.py).
 Planning performs four transformations.
 
 First, reward inpainting converts the change requested by abstract control
@@ -295,7 +295,7 @@ z_b^1 = Q_b w.
 
 Finally, the standard LMDP reweighting formula converts this desirability into
 `plan.layer_one_controlled`. The complete implementation is in
-[`_compose_lower_policy`](../src/andrew_mlmdp/hierarchy/core.py#L635).
+[`_compose_lower_policy`](../src/andrew_mlmdp/hierarchy/core.py).
 
 The most useful debugging fields on `LayerOnePlan` are
 `passive_abstract`, `controlled_abstract`, `inpainted_rewards`, `raw_weights`,
@@ -303,7 +303,7 @@ The most useful debugging fields on `LayerOnePlan` are
 
 ## 9. Execute the coupled process
 
-[`_run_hierarchical_rollout`](../src/andrew_mlmdp/hierarchy/rollout.py#L157) uses the
+[`_run_hierarchical_rollout`](../src/andrew_mlmdp/hierarchy/rollout.py) uses the
 composed Layer-1 policy as one distribution over:
 
 - another physical interior state;
@@ -345,32 +345,71 @@ nonterminal physical move applies the requested number of fixed-point sweeps:
 z_i \leftarrow q_i(P_{II}^{T}z_i + P_{BI}^{T}z_b).
 ```
 
-[`z_iteration_step`](../src/andrew_mlmdp/lmdp.py#L391) performs one sweep. The
+[`z_iteration_step`](../src/andrew_mlmdp/lmdp.py) performs one sweep. The
 fixed subgoal columns remain exact; only the physical-goal component is
 learned. The final vector is available as
 `rollout.final_goal_desirability` and can initialize the next episode.
 
 ## 11. Optional NMF discovery of distributed subgoals
 
-NMF discovery is upstream of hierarchy execution and uses separate parameters:
+NMF discovery is upstream of hierarchy execution and uses separate parameters.
+It first solves a configurable family of flat goals and stacks their
+desirabilities as `Z_tasks = X`, with shape `n x number_of_tasks`. Each
+requested rank `k` produces non-negative factors
 
-1. Solve a family of flat goals with one shared environment.
-2. Stack their desirabilities as `Z_tasks` with shape `n x number_of_tasks`.
-3. Fit non-negative factors
+```math
+X \approx D W,
+\qquad
+D \in \mathbb{R}_{\ge 0}^{n \times k},
+\quad
+W \in \mathbb{R}_{\ge 0}^{k \times number\_of\_tasks}.
+```
 
-   ```math
-   Z_{tasks} \approx D W
-   ```
+With the default `lambda_smooth=0`, discovery uses the original
+scikit-learn multiplicative-update KL-NMF solver and performs no graph work.
 
-   using KL-NMF.
-4. Peak-normalize each column of `D` and absorb its scale into the matching row
-   of `W`, preserving the reconstruction.
-5. Pass `D` to `SubgoalBasis.from_profiles`, optionally applying the execution
-   core gate described above.
+For a positive strength, binary adjacency `A` comes from supported non-self
+transitions in `environment.passive`. Thus it respects maze connections and
+state order without using Euclidean distance. With degree matrix `Delta` and
+`L = Delta - A`, the optimized objective is
 
-[`discover_soft_subgoals`](../src/andrew_mlmdp/discovery.py#L201) fits every
-requested rank exactly once. `study.result(k)` retrieves a cached fit rather
-than rerunning NMF.
+```math
+J(D,W)
+= KL_{raw}(X \mid\mid D W)
++ \lambda_{smooth}\,\operatorname{Tr}(D^T L D).
+```
+
+The Laplacian term applies only to `D` and equals the sum of squared profile
+differences over undirected graph edges. Defining `R = X / (D W)`, one
+regularized multiplicative-update sweep is
+
+```math
+W \leftarrow W \odot
+\frac{D^T R}{D^T \mathbf{1}},
+```
+
+followed by recomputing `R` and applying
+
+```math
+D \leftarrow D \odot
+\frac{R W^T + 2\lambda_{smooth} A D}
+     {\mathbf{1}W^T + 2\lambda_{smooth}\Delta D}.
+```
+
+These updates preserve non-negativity. They are derived for the unconstrained
+objective. After each regularized sweep, the implementation additionally
+fixes the NMF scale gauge by enforcing `max(D[:, j]) = 1` and absorbing the
+scale into row `j` of `W`. Post-normalization objective descent is therefore
+verified empirically rather than assumed from the standard MU guarantee.
+
+[`discover_soft_subgoals`](../src/andrew_mlmdp/discovery.py) fits every
+requested rank once, and `study.result(k)` retrieves that cached fit.
+Regularized results expose the initial full objective and one value per
+iteration through `objective_history`. The existing
+`reconstruction_error` remains normalized generalized KL only, with no
+smoothness penalty. The returned peak-normalized `D` can then be passed to
+`SubgoalBasis.from_profiles`, optionally applying the execution gate
+described above.
 
 ## End-to-end implementation map
 
