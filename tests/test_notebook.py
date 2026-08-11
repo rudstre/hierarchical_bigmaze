@@ -50,6 +50,9 @@ def test_doohan_notebook_is_unexecuted_and_code_cells_compile():
 
     assert notebook.cells
     assert len(code_cells) == 5
+    notebook_source = "\n".join(cell.source for cell in code_cells)
+    assert "hierarchical_task.movement_log_likelihood" in notebook_source
+    assert "viz.plot_soft_subtasks(soft_discovery)" in notebook_source
     for cell in code_cells:
         compile(cell.source, str(DOOHAN_NOTEBOOK), "exec")
         assert cell.execution_count is None
