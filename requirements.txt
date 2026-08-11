@@ -12,6 +12,7 @@ ipywidgets>=8.1
 jupyterlab>=4
 nbclient>=0.10
 nbformat>=5.10
+pandas>=2.2
 
 # Tests and repository checks
 pytest>=8

@@ -164,6 +164,49 @@ A `FlatSolution` contains its desirability, controlled policy, rollout method,
 and `movement_log_likelihood` method for scoring observed discrete movement
 trajectories. Consecutive repeated observations are collapsed before scoring.
 
+For a dataset, keep trials separate so each trajectory starts with a fresh
+controller state and uses its own goal. The dataset helpers retain per-trial
+scores while summing their log-likelihoods:
+
+```python
+from andrew_mlmdp import MovementTrial, score_flat_movement_dataset
+
+trials = [
+    MovementTrial("session-1", 1, (0, 2), ((0, 0), (0, 1), (0, 2))),
+    MovementTrial("session-1", 2, (0, 0), ((0, 2), (0, 1), (0, 0))),
+]
+dataset_score = score_flat_movement_dataset(environment, trials)
+print(dataset_score.total_log_likelihood)
+print(dataset_score.mean_log_likelihood_per_transition)
+```
+
+The processed Doohan data can be assembled into the same trial representation
+by session ID, subject, inclusive date range, or any intersection of those
+selectors:
+
+```python
+from andrew_mlmdp import DoohanMovementDataset
+
+dataset = DoohanMovementDataset.from_data_root(
+    "external/GridMaze-mFC-ephys-DATA/data",
+    subject_ids=["m2"],
+    start_date="2022-06-23",
+    end_date="2022-06-30",
+    maze_name="maze_1",
+)
+flat_report = dataset.report(
+    score_flat_movement_dataset(environment, dataset.trials)
+)
+print(flat_report.summary_record())
+```
+
+The returned dataset retains typed session metadata, valid movement trials,
+and explicit exclusions. Each call to `dataset.report(result)` produces trial,
+session, and dataset summaries for that one model result. A selection must resolve to exactly one maze; provide
+`maze_name` when a subject or date range spans multiple maze configurations.
+Pandas is only required while loading the processed TSV files and is available
+through the `notebook` optional dependency.
+
 ## Distributed subgoals discovered with NMF
 
 Point subgoals are one-hot profiles. Distributed subgoals use the same

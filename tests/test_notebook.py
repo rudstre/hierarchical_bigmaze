@@ -41,7 +41,15 @@ def test_doohan_notebook_is_unexecuted_and_code_cells_compile():
     assert notebook.cells
     assert len(code_cells) == 5
     notebook_source = "\n".join(cell.source for cell in code_cells)
-    assert "hierarchical_task.movement_log_likelihood" in notebook_source
+    assert "DoohanMovementDataset.from_data_root" in notebook_source
+    assert "get_maze_sessions" not in notebook_source
+    assert "score_flat_movement_dataset" in notebook_source
+    assert "score_hierarchical_movement_dataset" in notebook_source
+    assert "flat_report = movement_dataset.report" in notebook_source
+    assert "hierarchical_report = movement_dataset.report" in notebook_source
+    assert "hierarchical_report.summary_dataframe" in notebook_source
+    assert "flat_by_trial" not in notebook_source
+    assert "groupby" not in notebook_source
     assert "viz.plot_soft_subtasks(soft_discovery)" in notebook_source
     for cell in code_cells:
         compile(cell.source, str(DOOHAN_NOTEBOOK), "exec")

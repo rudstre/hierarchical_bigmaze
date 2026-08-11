@@ -1,6 +1,14 @@
 """Notebook-first research tools for maze-based multitask LMDPs."""
 
 from andrew_mlmdp import plotting
+from andrew_mlmdp.dataset import (
+    MovementDatasetLikelihood,
+    MovementTrial,
+    MovementTrialExclusion,
+    MovementTrialLikelihood,
+    score_flat_movement_dataset,
+    score_hierarchical_movement_dataset,
+)
 from andrew_mlmdp.discovery import (
     GoalTaskEnsemble,
     NMFDiscoveryParameters,
@@ -8,6 +16,12 @@ from andrew_mlmdp.discovery import (
     NMFStudy,
     SoftSubtaskDiscovery,
     discover_soft_subgoals,
+)
+from andrew_mlmdp.doohan_dataset import (
+    DoohanDataExclusion,
+    DoohanMovementDataset,
+    DoohanSessionRecord,
+    MovementLikelihoodReport,
 )
 from andrew_mlmdp.hierarchy import (
     HierarchyTask,
@@ -41,6 +55,9 @@ from andrew_mlmdp.maze import Coordinate, Maze
 
 __all__ = [
     "Coordinate",
+    "DoohanDataExclusion",
+    "DoohanMovementDataset",
+    "DoohanSessionRecord",
     "FirstExitDynamics",
     "FlatSolution",
     "GoalTaskEnsemble",
@@ -51,6 +68,11 @@ __all__ = [
     "LabeledMaze",
     "Maze",
     "ModelParameters",
+    "MovementDatasetLikelihood",
+    "MovementLikelihoodReport",
+    "MovementTrial",
+    "MovementTrialExclusion",
+    "MovementTrialLikelihood",
     "PassiveDynamicsMode",
     "NMFDiscoveryParameters",
     "NMFRankDiagnostics",
@@ -68,6 +90,8 @@ __all__ = [
     "load_doohan_maze",
     "maze_from_labeled_edges",
     "plotting",
+    "score_flat_movement_dataset",
+    "score_hierarchical_movement_dataset",
     "soft_hierarchy_parameters",
     "solve_first_exit",
     "z_iteration_step",

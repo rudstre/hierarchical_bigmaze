@@ -26,6 +26,7 @@ notebook = [
     "pandas>=2.2",
 ]
 test = [
+    "pandas>=2.2",
     "pytest>=8",
     "pytest-cov>=5",
     "ruff>=0.12",
