@@ -202,9 +202,12 @@ print(flat_report.summary_record())
 
 The returned dataset retains typed session metadata, valid movement trials,
 and explicit exclusions. Each call to `dataset.report(result)` produces trial,
-session, and dataset summaries for that one model result. A selection must resolve to exactly one maze; provide
-`maze_name` when a subject or date range spans multiple maze configurations.
-Pandas is only required while loading the processed TSV files and is available
+session, and dataset summaries for that one model result. A selection must
+resolve to exactly one maze; provide `maze_name` when a subject or date range
+spans multiple maze configurations. Extracted trajectories stop at their first
+entry into the trial goal, matching the likelihood models' absorbing-goal
+assumption. Pandas is only required while loading the processed TSV files and
+is available
 through the `notebook` optional dependency.
 
 ## Distributed subgoals discovered with NMF

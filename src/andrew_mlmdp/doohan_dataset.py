@@ -612,6 +612,9 @@ def _extract_trial(
             raise ValueError("navigation trial must have exactly one goal")
         goal_label = str(goal_labels[0])
         goal = definition.coordinate_for(goal_label)
+        if goal_label in tower_labels:
+            first_goal_entry = tower_labels.index(goal_label)
+            tower_labels = tower_labels[: first_goal_entry + 1]
         trajectory = tuple(
             definition.coordinate_for(label) for label in tower_labels
         )

@@ -88,6 +88,7 @@ def _write_session(
             "1\tnavigation\tA2\n"
             "1\tnavigation\tA2\n"
             "1\tnavigation\tA2\n"
+            "1\tnavigation\tA2\n"
             "2\tnavigation\tA2\n"
             "3\tnavigation\tA2\n"
             "3\tnavigation\tA3\n"
@@ -101,11 +102,12 @@ def _write_session(
             "2\tA1-A2\n"
             "3\tA2\n"
             "4\tA2\n"
-            "5\tZ9\n"
-            "6\tA1\n"
-            "7\tA2\n"
-            "8\t\n"
-            "9\tA1\n"
+            "5\tA1\n"
+            "6\tZ9\n"
+            "7\tA1\n"
+            "8\tA2\n"
+            "9\t\n"
+            "10\tA1\n"
         )
     (session_root / "frames.trialInfo.htsv").write_text(trial_info)
     (session_root / "frames.trajectories.htsv").write_text(trajectories)
