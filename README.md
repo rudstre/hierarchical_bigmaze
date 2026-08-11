@@ -205,6 +205,12 @@ peak-normalized NMF profiles and their gated access profiles are immutable.
 Changing the goal builds or retrieves only a goal-conditioned hierarchy; it
 does not rerun NMF or apply the gate again.
 
+Set `lambda_smooth` to a positive value to penalize neighboring states with
+different profile values over the passive-dynamics connectivity graph.
+Regularized results expose the raw KL-plus-Laplacian objective after every
+iteration through `objective_history`; the default zero value retains the
+original scikit-learn KL-NMF solver and leaves that history unset.
+
 ## Doohan edge-list mazes
 
 The GridMaze data submodule defines mazes as labeled edges between towers.

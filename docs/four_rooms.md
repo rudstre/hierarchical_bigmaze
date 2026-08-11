@@ -85,6 +85,7 @@ NMFDiscoveryParameters(
     interior_reward=-0.4,
     goal_reward=6.5,
     control_cost=1.2,
+    lambda_smooth=0.0,
 )
 ```
 
