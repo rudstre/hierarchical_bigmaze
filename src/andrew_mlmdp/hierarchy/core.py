@@ -6,6 +6,7 @@ basis, and solve the abstract layer. Intermediate arrays remain public so a
 researcher can inspect every calculation directly.
 """
 
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -23,6 +24,11 @@ from andrew_mlmdp.lmdp import (
 from andrew_mlmdp.maze import Coordinate, Maze
 
 if TYPE_CHECKING:
+    from andrew_mlmdp.dataset import MovementTrial
+    from andrew_mlmdp.hierarchy.fitting import (
+        HierarchicalFitEvaluation,
+        HierarchicalFitResult,
+    )
     from andrew_mlmdp.hierarchy.rollout import Rollout
 
 
@@ -207,6 +213,89 @@ class HierarchyTemplate:
             self._task_cache[goal] = task
         return task
 
+    def torch_parameter_values(
+        self,
+        *,
+        overrides: Mapping[str, "Tensor"] | None = None,
+    ) -> dict[str, "Tensor"]:
+        """Return strict physical tensors for the differentiable hierarchy."""
+
+        from andrew_mlmdp.hierarchy.torch_likelihood import (
+            hierarchical_parameter_values,
+        )
+
+        return hierarchical_parameter_values(self, overrides=overrides)
+
+    def torch_movement_log_likelihood(
+        self,
+        goal: Coordinate,
+        trajectory: list[Coordinate] | tuple[Coordinate, ...],
+        *,
+        parameter_overrides: Mapping[str, "Tensor"] | None = None,
+    ) -> "Tensor":
+        """Score one trajectory through the fresh differentiable hierarchy."""
+
+        from andrew_mlmdp.hierarchy.torch_likelihood import (
+            hierarchical_movement_log_likelihood_torch,
+        )
+
+        values = self.torch_parameter_values(overrides=parameter_overrides)
+        return hierarchical_movement_log_likelihood_torch(
+            self,
+            goal,
+            trajectory,
+            parameter_values=values,
+        )
+
+    def torch_total_movement_log_likelihood(
+        self,
+        trials: Iterable["MovementTrial"],
+        *,
+        parameter_overrides: Mapping[str, "Tensor"] | None = None,
+    ) -> "Tensor":
+        """Sum independent trajectory scores in one differentiable graph."""
+
+        from andrew_mlmdp.hierarchy.torch_likelihood import (
+            total_hierarchical_movement_log_likelihood_torch,
+        )
+
+        values = self.torch_parameter_values(overrides=parameter_overrides)
+        return total_hierarchical_movement_log_likelihood_torch(
+            self,
+            trials,
+            parameter_values=values,
+        )
+
+
+    def fit_parameters(
+        self,
+        trials: Iterable["MovementTrial"],
+        *,
+        parameter_names: Sequence[str],
+        learning_rate: float = 1e-2,
+        max_steps: int = 1000,
+        relative_tolerance: float = 1e-8,
+        patience: int = 20,
+        progress_callback: (
+            Callable[["HierarchicalFitEvaluation"], None] | None
+        ) = None,
+    ) -> "HierarchicalFitResult":
+        """Fit private Torch parameters without mutating this template."""
+
+        from andrew_mlmdp.hierarchy.fitting import (
+            fit_hierarchical_model_parameters,
+        )
+
+        return fit_hierarchical_model_parameters(
+            self,
+            trials,
+            parameter_names=parameter_names,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            relative_tolerance=relative_tolerance,
+            patience=patience,
+            progress_callback=progress_callback,
+        )
 
 @dataclass(frozen=True)
 class HierarchyTask:

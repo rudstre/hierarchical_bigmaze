@@ -431,3 +431,30 @@ described above.
 
 No stage assumes a particular maze size or fixed number of subgoals. Array
 shapes are derived from the supplied maze, goal partition, and profile count.
+
+## Differentiable hierarchical likelihood and fitting
+
+The NumPy hierarchy remains the rollout and regression implementation. The
+Torch likelihood rebuilds every parameter-dependent quantity in float64 for
+each forward graph, while retaining the `P[next_state, current_state]`
+orientation and exact latent controller-mode semantics. Only topology,
+indices, physical passive dynamics, and fixed normalized subgoal profiles are
+safe to retain across optimizer steps. Gated access profiles, lower and upper
+dynamics, task bases, plans, policies, latent kernels, and first-departure
+occupancies must be recomputed.
+
+Gate structure belongs to `SubgoalBasis`: point and ungated soft bases cannot
+acquire gate parameters during fitting. For gated soft bases, threshold and
+exponent defaults come from the basis rather than legacy fields on
+`ModelParameters`. The hard gate is intentionally piecewise differentiable.
+Entries below threshold have no local branch gradient, although gradients from
+active entries may move the global threshold enough to activate them later. If
+only exact profile peaks remain active, threshold and exponent can be weakly
+identified or have zero gradients because gated peaks remain exactly one.
+
+`fit_hierarchical_model_parameters` minimizes the negative summed trajectory
+log-likelihood using a private constrained parameterization. It never mutates
+`ModelParameters`, `SubgoalBasis`, `HierarchyTemplate`, or NumPy caches. Its
+`best_parameter_values` snapshot can be passed explicitly to
+`total_hierarchical_movement_log_likelihood_torch`. NumPy rollout from fitted
+values requires separately constructing a fresh basis and template.
