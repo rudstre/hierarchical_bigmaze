@@ -48,8 +48,8 @@ hard_hierarchy_parameters(
 ```
 
 This fallback applies to point bases and equivalent one-hot profile bases so
-both representations execute identically. `include_goal_component_while_active`
-is independently `True` by default.
+both representations execute identically. Active plans always include the
+physical-goal component with its inpainted mixture weight.
 
 Flat tasks use `ModelParameters()` defaults rather than these hard-hierarchy
 defaults.
@@ -63,10 +63,9 @@ uses goal `(1, 9)` and the hard defaults above with one explicit override:
 hard_parameters = hard_hierarchy_parameters(upper_control_cost=0.65)
 ```
 
-The point-subgoal hierarchy also sets
-`include_goal_component_while_active=False`. While the hierarchy is active,
-plans are composed only from the six fixed subgoal tasks. Upper termination
-then installs the goal-only task permanently.
+While the hierarchy is active, plans combine the six fixed subgoal tasks with
+the exact precomputed goal task. The goal coefficient is determined by reward
+inpainting. Upper termination then installs the goal-only task permanently.
 
 The notebook's distributed example fits several NMF ranks, selects one after
 inspecting the diagnostics, and applies an 80%-of-peak execution core. The
@@ -76,7 +75,6 @@ selected rank is also passed to the execution-parameter helper:
 soft_hierarchy_parameters(k=soft_rank, upper_control_cost=0.18)
 ```
 
-It likewise excludes the exact goal component while the hierarchy is active.
 These upper-cost overrides are example tuning, not package-wide defaults.
 
 NMF discovery itself uses a separate flat-task ensemble and the independent

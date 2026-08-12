@@ -84,5 +84,4 @@ def soft_corridor_template():
     return environment.hierarchy(
         basis,
         parameters=ModelParameters(alpha=0.8, beta=3.0),
-        include_goal_component_while_active=False,
     )

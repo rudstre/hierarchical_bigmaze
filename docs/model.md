@@ -263,14 +263,18 @@ combination of these columns is also a valid desirability solution.
 Planning performs four transformations.
 
 First, reward inpainting converts the change requested by abstract control
-into Layer-1 subgoal-boundary rewards:
+into Layer-1 boundary rewards for every possible abstract outcome, including
+the physical goal:
 
 ```math
 r^1_t = \beta\,(u^2_t - p^2_t).
 ```
 
-The physical-goal boundary keeps `goal_reward`. Exponentiating these rewards
-with `lower_control_cost` produces a target boundary desirability `z_target`.
+The active physical-goal reward is the same probability-difference term, not
+the fixed `goal_reward`. Exponentiating these rewards with
+`lower_control_cost` produces a target boundary desirability `z_target`.
+The fixed goal reward still defines the reusable exact goal-basis column and
+the goal-only plan installed after upper termination.
 
 Second, the target is approximated with the reusable task basis:
 
@@ -280,10 +284,9 @@ w_{raw} = Q_b^+ z_{target},
 w = \max(0, w_{raw}).
 ```
 
-`Q_b^+` is the pseudoinverse. Clipping makes the mixture non-negative. If
-`include_goal_component_while_active=False`, the last weight is forced to zero
-until upper termination; a best-single-subgoal fallback handles the rare case
-where clipping otherwise removes every active component.
+`Q_b^+` is the pseudoinverse. Clipping makes the mixture non-negative. The
+last weight scales the exact precomputed goal-basis column so its boundary
+value matches the inpainted goal target.
 
 Third, the lower desirability is composed linearly:
 

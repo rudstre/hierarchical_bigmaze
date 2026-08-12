@@ -10,6 +10,7 @@ from andrew_mlmdp import (
     hard_hierarchy_parameters,
     soft_hierarchy_parameters,
 )
+from andrew_mlmdp.hierarchy.core import _goal_only_plan
 
 
 def _parameter_values(parameters: ModelParameters) -> dict[str, float]:
@@ -49,7 +50,6 @@ def test_model_parameters_are_trainable_float64_scalars():
     assert not {
         "k",
         "passive_mode",
-        "include_goal_component_while_active",
         "max_iter",
         "tolerance",
     } & trainable_names
@@ -199,49 +199,80 @@ def test_first_hit_and_upper_dynamics_are_stochastic():
     assert np.allclose(task.upper_controlled.sum(axis=0), 1.0)
 
 
-def test_plan_composition_and_goal_exclusion():
+def test_plan_inpaints_goal_and_composes_exact_goal_column():
     maze = Maze.from_ascii(".....")
     environment = LMDPEnvironment(maze)
     basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
-    task = environment.hierarchy(
-        basis,
-        include_goal_component_while_active=False,
-    ).for_goal((0, 4))
+    task = environment.hierarchy(basis).for_goal((0, 4))
     plan = task.plan((0, 0))
 
-    assert plan.weights[-1] == 0.0
+    expected_rewards = task.parameters.beta.item() * (
+        plan.controlled_abstract - plan.passive_abstract
+    )
+    expected_goal_weight = (
+        plan.target_boundary_desirability[-1]
+        / task.task_basis.boundary_desirability[-1, -1]
+    )
+
+    assert plan.inpainted_rewards == pytest.approx(expected_rewards)
+    assert plan.weights[-1] == pytest.approx(expected_goal_weight)
+    assert plan.weights[-1] > 0.0
+    assert plan.reconstructed_boundary_desirability[-1] == pytest.approx(
+        plan.target_boundary_desirability[-1]
+    )
+    assert plan.physical_desirability[task.interior_states] == pytest.approx(
+        task.task_basis.interior_desirability @ plan.weights
+    )
     assert plan.physical_desirability.shape == (5,)
     assert plan.layer_one_controlled.shape == (7, 4)
     assert np.allclose(plan.layer_one_controlled.sum(axis=0), 1.0)
 
 
-def test_goal_exclusion_uses_passive_dynamics_for_isolated_columns(
-    four_room_environment,
-):
-    basis = SubgoalBasis.from_locations(
-        four_room_environment.maze,
-        (
-            (0, 0),
-            (9, 2),
-            (2, 3),
-            (3, 7),
-            (9, 7),
-            (7, 9),
-        ),
+def test_goal_only_plan_keeps_fixed_exact_goal_task():
+    maze = Maze.from_ascii(".....")
+    task = LMDPEnvironment(maze).hierarchy(
+        SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    ).for_goal((0, 4))
+
+    plan = _goal_only_plan(
+        task,
+        (0, 0),
+        goal_interior_desirability=None,
     )
-    task = four_room_environment.hierarchy(
-        basis,
-        parameters=hard_hierarchy_parameters(upper_control_cost=0.65),
-        include_goal_component_while_active=False,
-    ).for_goal((2, 0))
 
-    plan = task.plan((0, 0))
-    isolated_state = task.interior_state_by_coordinate[(3, 0)]
+    expected_goal_desirability = np.exp(
+        task.parameters.goal_reward.item()
+        / task.parameters.lower_control_cost.item()
+    )
 
-    assert plan.weights[-1] == 0.0
+    assert np.all(plan.weights[:-1] == 0.0)
+    assert plan.weights[-1] == 1.0
+    assert np.all(np.isneginf(plan.inpainted_rewards[:-1]))
+    assert plan.inpainted_rewards[-1] == task.parameters.goal_reward.item()
+    assert plan.target_boundary_desirability[-1] == pytest.approx(
+        expected_goal_desirability
+    )
     assert np.allclose(plan.layer_one_controlled.sum(axis=0), 1.0)
-    assert plan.layer_one_controlled[:, isolated_state] == pytest.approx(
-        task.lower_dynamics.passive[:, isolated_state]
+
+
+def test_online_goal_desirability_uses_same_inpainted_goal_weight():
+    maze = Maze.from_ascii(".....")
+    task = LMDPEnvironment(maze).hierarchy(
+        SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    ).for_goal((0, 4))
+    learned_goal = np.linspace(0.2, 0.8, len(task.interior_states))
+
+    exact_plan = task.plan((0, 0))
+    online_plan = task.plan((0, 0), goal_desirability=learned_goal)
+    expected = (
+        task.task_basis.interior_desirability[:, :-1]
+        @ online_plan.weights[:-1]
+        + learned_goal * online_plan.weights[-1]
+    )
+
+    assert online_plan.weights == pytest.approx(exact_plan.weights)
+    assert online_plan.physical_desirability[task.interior_states] == (
+        pytest.approx(expected)
     )
 
 
@@ -288,6 +319,5 @@ def test_point_and_equivalent_profile_basis_match():
     assert point_task.upper_dynamics.passive == pytest.approx(
         soft_task.upper_dynamics.passive
     )
-
 
 

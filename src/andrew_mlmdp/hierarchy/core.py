@@ -153,27 +153,16 @@ class HierarchyTemplate:
         environment: LMDPEnvironment,
         basis: SubgoalBasis,
         parameters: ModelParameters | None = None,
-        include_goal_component_while_active: bool = True,
     ) -> None:
         if basis.maze != environment.maze:
             raise ValueError(
                 "Subgoal basis and environment must use the same maze"
-            )
-        if not isinstance(
-            include_goal_component_while_active,
-            (bool, np.bool_),
-        ):
-            raise ValueError(
-                "include_goal_component_while_active must be a boolean"
             )
         if parameters is None:
             parameters = hard_hierarchy_parameters()
         self.environment = environment
         self.basis = basis
         self.parameters = parameters
-        self.include_goal_component_while_active = bool(
-            include_goal_component_while_active
-        )
         self._task_cache: dict[Coordinate, HierarchyTask] = {}
         self._passive_dynamics: np.ndarray | None = None
 
@@ -245,10 +234,6 @@ class HierarchyTask:
     @property
     def parameters(self) -> ModelParameters:
         return self.template.parameters
-
-    @property
-    def include_goal_component_while_active(self) -> bool:
-        return self.template.include_goal_component_while_active
 
     @property
     def number_of_subtasks(self) -> int:
@@ -516,16 +501,12 @@ def _plan_from_abstract_dynamics(
     if not np.isfinite(inpainting_scale) or inpainting_scale <= 0.0:
         raise ValueError("Beta must be finite and positive")
 
-    # Equation 10 supplies rewards only for abstract subgoal copies. The
-    # physical goal keeps the task's original terminal reward.
-    inpainted_rewards = np.empty(
-        model.lower_dynamics.number_of_boundary_states,
-        dtype=np.float64,
+    # Apply Equation 10 to every abstract outcome, including termination at
+    # the physical goal. The fixed goal reward still defines the exact goal
+    # basis task, while its active mixture coefficient is set by this target.
+    inpainted_rewards = inpainting_scale * (
+        controlled_abstract - passive_abstract
     )
-    inpainted_rewards[:-1] = inpainting_scale * (
-        controlled_abstract[:-1] - passive_abstract[:-1]
-    )
-    inpainted_rewards[-1] = model.parameters.goal_reward.item()
     target_boundary_desirability = np.exp(
         inpainted_rewards / model.parameters.lower_control_cost.item()
     )
@@ -537,13 +518,6 @@ def _plan_from_abstract_dynamics(
         @ target_boundary_desirability
     )
     weights = np.maximum(0.0, raw_weights)
-    if not model.include_goal_component_while_active:
-        weights[-1] = 0.0
-        if not np.any(weights[:-1] > 0.0):
-            weights = _best_single_subgoal_weights(
-                model.task_basis.boundary_desirability,
-                target_boundary_desirability,
-            )
     reconstructed_boundary = (
         model.task_basis.boundary_desirability @ weights
     )
@@ -566,33 +540,6 @@ def _plan_from_abstract_dynamics(
         physical_desirability=physical_desirability,
         layer_one_controlled=layer_one_controlled,
     )
-
-
-def _best_single_subgoal_weights(
-    boundary_basis: np.ndarray,
-    target_boundary: np.ndarray,
-) -> np.ndarray:
-    """Return the best one-column nonnegative fallback composition.
-
-    The paper's pseudoinverse-and-clipping approximation can rarely clip every
-    subgoal coefficient to zero. When the exact goal component is disabled,
-    choose the individual subgoal column with the smallest boundary
-    reconstruction error so the hierarchy still issues a meaningful command.
-    """
-
-    subgoal_columns = boundary_basis[:, :-1]
-    squared_norms = np.sum(subgoal_columns**2, axis=0)
-    scales = (subgoal_columns.T @ target_boundary) / squared_norms
-    scales = np.maximum(0.0, scales)
-    approximations = subgoal_columns * scales[np.newaxis, :]
-    residuals = np.linalg.norm(
-        approximations - target_boundary[:, np.newaxis],
-        axis=0,
-    )
-    selected = int(np.argmin(residuals))
-    weights = np.zeros(boundary_basis.shape[1], dtype=np.float64)
-    weights[selected] = scales[selected]
-    return weights
 
 
 def _goal_only_plan(
@@ -668,26 +615,10 @@ def _compose_lower_policy(
         [interior_desirability, reconstructed_boundary]
     )
     if goal_interior_desirability is None:
-        if model.include_goal_component_while_active:
-            controlled = controlled_from_desirability(
-                model.lower_dynamics.passive,
-                complete_desirability,
-            )
-        else:
-            # A dragged goal can be an articulation point that isolates an
-            # interior cell from every subgoal. Equation 6 is undefined only
-            # for those zero-support columns; retain their physical passive
-            # dynamics without adding goal-directed controllability.
-            unnormalized = (
-                model.lower_dynamics.passive
-                * complete_desirability[:, np.newaxis]
-            )
-            normalizers = unnormalized.sum(axis=0)
-            controlled = model.lower_dynamics.passive.copy()
-            usable = np.isfinite(normalizers) & (normalizers > 0.0)
-            controlled[:, usable] = (
-                unnormalized[:, usable] / normalizers[usable]
-            )
+        controlled = controlled_from_desirability(
+            model.lower_dynamics.passive,
+            complete_desirability,
+        )
     else:
         # Early online iterates may leave states with no usable desirability.
         # Keep those columns at zero so rollout code can report ``zero_policy``.

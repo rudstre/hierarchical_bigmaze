@@ -390,7 +390,6 @@ class LMDPEnvironment:
         basis,
         *,
         parameters: ModelParameters | None = None,
-        include_goal_component_while_active: bool = True,
     ):
         """Create a reusable hierarchy template for a supplied subgoal basis.
 
@@ -409,9 +408,6 @@ class LMDPEnvironment:
             environment=self,
             basis=basis,
             parameters=parameters,
-            include_goal_component_while_active=(
-                include_goal_component_while_active
-            ),
         )
 
 

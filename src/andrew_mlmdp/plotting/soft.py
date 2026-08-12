@@ -232,26 +232,7 @@ def _composed_log_desirability_grid(
     include_goal_component = (
         include_goal_component or _is_goal_only_plan(frame)
     )
-    excluded_execution_goal = (
-        not model.include_goal_component_while_active
-        and frame.plan.weights[-1] == 0.0
-        and frame.plan.raw_weights[-1] > 0.0
-    )
-    if include_goal_component and excluded_execution_goal:
-        display_weights = frame.plan.weights.copy()
-        display_weights[-1] = frame.plan.raw_weights[-1]
-        desirability = np.empty(
-            len(model.maze.free_cells),
-            dtype=np.float64,
-        )
-        desirability[model.interior_states] = (
-            model.task_basis.interior_desirability @ display_weights
-        )
-        goal_state = model.maze.state_index(model.goal)
-        desirability[goal_state] = (
-            model.task_basis.boundary_desirability[-1] @ display_weights
-        )
-    elif include_goal_component:
+    if include_goal_component:
         desirability = frame.plan.physical_desirability
     else:
         desirability = np.zeros(
@@ -263,18 +244,9 @@ def _composed_log_desirability_grid(
             @ frame.plan.weights[:-1]
         )
         goal_state = model.maze.state_index(model.goal)
-        # Non-goal basis tasks have zero desirability at the exact goal
-        # boundary. Retain the full plan's goal value only as a shared display
-        # reference so toggling the component changes no other scale factor.
-        if excluded_execution_goal:
-            desirability[goal_state] = (
-                model.task_basis.boundary_desirability[-1, -1]
-                * frame.plan.raw_weights[-1]
-            )
-        else:
-            desirability[goal_state] = (
-                frame.plan.physical_desirability[goal_state]
-            )
+        # Retain the full plan's goal value as a shared display reference so
+        # hiding the contribution changes no other scale factor.
+        desirability[goal_state] = frame.plan.physical_desirability[goal_state]
     goal_state = model.maze.state_index(model.goal)
     goal_desirability = desirability[goal_state]
     relative_value = np.full_like(desirability, np.nan)
@@ -983,13 +955,12 @@ def plot_interactive_soft_hierarchical_rollout(
         tooltip="Show the next rollout event",
     )
     goal_component_checkbox = widgets.Checkbox(
-        value=model.include_goal_component_while_active,
-        description="Include goal component while hierarchy is active",
+        value=True,
+        description="Show goal contribution",
         indent=False,
         tooltip=(
-            "Toggle the counterfactual final goal-basis column during the "
-            "active hierarchy phase; after termination the actual goal-only "
-            "policy is always shown"
+            "Show or hide the goal-basis contribution in the visualization; "
+            "this does not change rollout execution"
         ),
     )
     frame_normalization_checkbox = widgets.Checkbox(
@@ -1335,4 +1306,3 @@ def _soft_communication_status(frame: _SoftRolloutFrame) -> str:
             "goal-only policy."
         )
     return "Layer 1 follows the currently programmed lower policy."
-

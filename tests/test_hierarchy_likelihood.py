@@ -218,6 +218,14 @@ def test_hierarchy_likelihood_validation_repeats_and_impossible_trajectories():
         task.movement_log_likelihood([(1, 1)])
 
 
+def test_hierarchy_likelihood_supports_direct_entry_into_goal():
+    task = _likelihood_task()
+
+    log_likelihood = task.movement_log_likelihood([(0, 2), task.goal])
+
+    assert np.isfinite(log_likelihood)
+
+
 def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
     task = _likelihood_task()
     flat = task.template.environment.solve_flat(
@@ -281,4 +289,3 @@ def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
             hierarchical_probabilities.append(hierarchical_probability)
 
         assert sum(hierarchical_probabilities) == pytest.approx(1.0)
-

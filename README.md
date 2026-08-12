@@ -121,7 +121,6 @@ basis = SubgoalBasis.from_locations(maze, subgoals)
 hierarchy = environment.hierarchy(
     basis,
     parameters=hard_hierarchy_parameters(upper_control_cost=0.65),
-    include_goal_component_while_active=False,
 )
 task = hierarchy.for_goal(goal)
 
@@ -240,7 +239,6 @@ soft_basis = SubgoalBasis.from_profiles(
 soft_hierarchy = environment.hierarchy(
     soft_basis,
     parameters=soft_hierarchy_parameters(8, upper_control_cost=0.18),
-    include_goal_component_while_active=False,
 )
 soft_task = soft_hierarchy.for_goal(goal)
 soft_rollout = soft_task.rollout((3, 2), seed=0)
