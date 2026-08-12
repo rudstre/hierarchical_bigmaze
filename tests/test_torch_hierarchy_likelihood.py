@@ -184,6 +184,12 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
         task.movement_log_likelihood(trajectory), abs=1e-11
     )
     assert torch_ll <= 0.0
+    batch_ll = total_hierarchical_movement_log_likelihood_torch(
+        template,
+        (MovementTrial("s", 1, goal, trajectory),),
+        parameter_values=values,
+    )
+    assert batch_ll.detach() == pytest.approx(torch_ll.detach(), abs=1e-11)
 
 
 def test_probability_orientation_and_likelihood_invariants():
@@ -355,6 +361,33 @@ def test_total_likelihood_materializes_sum_and_preserves_impossible_semantics():
     assert torch.isneginf(result)
 
 
+def test_prepared_batch_preserves_empty_singleton_and_early_goal_semantics():
+    template = _gated_template()
+    values = _tensor_values(template, requires_grad=True)
+
+    empty = total_hierarchical_movement_log_likelihood_torch(
+        template,
+        (),
+        parameter_values=values,
+    )
+    singleton = total_hierarchical_movement_log_likelihood_torch(
+        template,
+        (MovementTrial("s", 1, (0, 5), ((0, 1),)),),
+        parameter_values=values,
+    )
+    early_goal = total_hierarchical_movement_log_likelihood_torch(
+        template,
+        (MovementTrial("s", 2, (0, 5), ((0, 5), (0, 4))),),
+        parameter_values=values,
+    )
+
+    assert empty == 0.0
+    assert singleton == 0.0
+    assert torch.isneginf(early_goal)
+    empty.backward()
+    assert all(value.grad == 0.0 for value in values.values())
+
+
 def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
     template = _gated_template()
     values = hierarchical_parameter_values(template)
@@ -394,3 +427,160 @@ def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
             ungated,
             overrides={"core_exponent": torch.tensor(0.7, dtype=torch.float64)},
         )
+
+
+def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypatch):
+    from andrew_mlmdp.hierarchy import torch_batch_likelihood as batch_module
+
+    template = _gated_template()
+    trials = (
+        MovementTrial("s", 1, (0, 5), ((0, 0), (0, 1), (0, 2))),
+        MovementTrial("s", 2, (0, 5), ((0, 0), (0, 1), (0, 2))),
+        MovementTrial("s", 3, (0, 5), ((0, 1), (0, 2), (0, 3))),
+    )
+    prepared = batch_module.prepare_hierarchical_likelihood_batch(
+        template, trials
+    )
+    assert prepared.number_of_shared_keys < prepared.number_of_closures
+
+    calls = {"pinv": 0, "closure": 0}
+    original_pinv = torch.linalg.pinv
+    original_closure = batch_module._batched_departure_closures
+
+    def counted_pinv(*args, **kwargs):
+        calls["pinv"] += 1
+        return original_pinv(*args, **kwargs)
+
+    def counted_closure(self_kernels):
+        calls["closure"] += 1
+        assert self_kernels.shape[0] == prepared.number_of_closures
+        return original_closure(self_kernels)
+
+    monkeypatch.setattr(torch.linalg, "pinv", counted_pinv)
+    monkeypatch.setattr(
+        batch_module, "_batched_departure_closures", counted_closure
+    )
+    cached_values = _tensor_values(template, requires_grad=True)
+    cached = batch_module.total_prepared_hierarchical_log_likelihood_torch(
+        template,
+        prepared,
+        parameter_values=cached_values,
+    )
+    cached.backward()
+    assert calls == {"pinv": 1, "closure": 1}
+
+    reference_values = _tensor_values(template, requires_grad=True)
+    reference = sum(
+        hierarchical_movement_log_likelihood_torch(
+            template,
+            trial.goal,
+            trial.trajectory,
+            parameter_values=reference_values,
+        )
+        for trial in trials
+    )
+    reference.backward()
+    assert cached.detach() == pytest.approx(reference.detach(), abs=1e-11)
+    for name in cached_values:
+        assert cached_values[name].grad == pytest.approx(
+            reference_values[name].grad, rel=2e-9, abs=2e-10
+        )
+
+
+def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
+    from andrew_mlmdp.hierarchy import torch_batch_likelihood as batch_module
+
+    template = _gated_template()
+    trials = (
+        MovementTrial("s", 1, (0, 5), ((0, 0), (0, 1), (0, 2))),
+    )
+    prepared = batch_module.prepare_hierarchical_likelihood_batch(
+        template, trials
+    )
+    first_values = _tensor_values(template, requires_grad=True)
+    second_values = _tensor_values(template, requires_grad=True)
+    second_values["alpha"] = (
+        second_values["alpha"].detach() * 0.8
+    ).requires_grad_(True)
+
+    first = batch_module.total_prepared_hierarchical_log_likelihood_torch(
+        template, prepared, parameter_values=first_values
+    )
+    second = batch_module.total_prepared_hierarchical_log_likelihood_torch(
+        template, prepared, parameter_values=second_values
+    )
+    first.backward()
+    second.backward()
+    assert first.detach() != pytest.approx(second.detach())
+    assert first_values["alpha"].grad is not None
+    assert second_values["alpha"].grad is not None
+
+
+def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts():
+    from andrew_mlmdp.hierarchy import torch_batch_likelihood as batch_module
+
+    template = _gated_template()
+    goal = (0, 5)
+    trials = (
+        MovementTrial("s", 1, goal, ((0, 0), (0, 1), (0, 2))),
+        MovementTrial("s", 2, goal, ((0, 1), (0, 2), (0, 3))),
+    )
+    prepared = batch_module.prepare_hierarchical_likelihood_batch(
+        template, trials
+    )
+    metadata = prepared.goals[0]
+    values = hierarchical_parameter_values(template)
+    boundary = batch_module._build_task_boundary(
+        template.basis.number_of_subgoals,
+        values,
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+    )
+    boundary_pinv = torch.linalg.pinv(boundary, rtol=PINV_RCOND)
+    model = _build_torch_hierarchy(
+        template, goal, values, task_boundary=boundary
+    )
+    continuation = batch_module._continuation_policy_bank(
+        model, boundary_pinv
+    )
+    goal_policy = batch_module._goal_only_policy(model)
+    initial = batch_module._initial_policy_bank(
+        model, metadata, boundary_pinv
+    )
+    projection = batch_module._physical_projection(model)
+    shared, continuation_after_access, goal_after_access = (
+        batch_module._shared_column_bank(
+            model,
+            metadata,
+            continuation,
+            goal_policy,
+            projection,
+        )
+    )
+    initial_columns = batch_module._initial_column_bank(
+        model,
+        metadata,
+        initial,
+        continuation_after_access,
+        goal_after_access,
+        projection,
+    )
+
+    for closure_index in range(prepared.number_of_closures):
+        start_slot = int(metadata.closure_start_indices[closure_index])
+        start_interior = int(metadata.start_interior[start_slot])
+        start = template.maze.coordinate(model.interior_states[start_interior])
+        shared_slot = int(metadata.closure_shared_indices[closure_index])
+        current_state = int(metadata.shared_x_states[shared_slot])
+        current = template.maze.coordinate(current_state)
+        assembled = torch.cat(
+            (
+                initial_columns[closure_index].unsqueeze(-1),
+                shared[shared_slot],
+            ),
+            dim=-1,
+        )
+        reference = _physical_step_kernel(
+            model, current, _torch_plans(model, start)
+        )
+        assert torch.allclose(assembled, reference, atol=1e-12, rtol=0.0)

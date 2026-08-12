@@ -13,11 +13,14 @@ from torch import Tensor, nn
 from torch.nn import functional as functional
 
 from andrew_mlmdp.dataset import MovementTrial
+from andrew_mlmdp.hierarchy.torch_batch_likelihood import (
+    prepare_hierarchical_likelihood_batch,
+    total_prepared_hierarchical_log_likelihood_torch,
+)
 from andrew_mlmdp.hierarchy.torch_likelihood import (
     TorchHierarchyNumericalError,
     hierarchical_parameter_values,
     required_hierarchical_parameter_names,
-    total_hierarchical_movement_log_likelihood_torch,
 )
 
 if TYPE_CHECKING:
@@ -187,6 +190,9 @@ def fit_hierarchical_model_parameters(
     if not np.isfinite(relative_tolerance) or relative_tolerance < 0.0:
         raise ValueError("relative_tolerance must be finite and non-negative")
 
+    prepared_trials = prepare_hierarchical_likelihood_batch(
+        template, materialized_trials
+    )
     initial_values = hierarchical_parameter_values(template)
     raw_parameters = _RawFittingParameters(initial_values, selected)
     optimizer = torch.optim.Adam(raw_parameters.parameters(), lr=learning_rate)
@@ -206,9 +212,9 @@ def fit_hierarchical_model_parameters(
         current_values = raw_parameters.physical_values(initial_values)
         last_values = current_values
         try:
-            total_log_likelihood = total_hierarchical_movement_log_likelihood_torch(
+            total_log_likelihood = total_prepared_hierarchical_log_likelihood_torch(
                 template,
-                materialized_trials,
+                prepared_trials,
                 parameter_values=current_values,
             )
         except TorchHierarchyNumericalError:

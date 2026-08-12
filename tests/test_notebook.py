@@ -34,12 +34,12 @@ def test_canonical_notebook_executes_top_to_bottom():
     )
 
 
-def test_doohan_notebook_is_unexecuted_and_code_cells_compile():
+def test_doohan_notebook_compiles_and_fit_cells_are_unexecuted():
     notebook = nbformat.read(DOOHAN_NOTEBOOK, as_version=4)
     code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
 
     assert notebook.cells
-    assert len(code_cells) == 5
+    assert len(code_cells) == 9
     notebook_source = "\n".join(cell.source for cell in code_cells)
     assert "DoohanMovementDataset.from_data_root" in notebook_source
     assert "get_maze_sessions" not in notebook_source
@@ -53,5 +53,10 @@ def test_doohan_notebook_is_unexecuted_and_code_cells_compile():
     assert "viz.plot_soft_subtasks(soft_discovery)" in notebook_source
     for cell in code_cells:
         compile(cell.source, str(DOOHAN_NOTEBOOK), "exec")
+    fit_cells = {
+        cell.id: cell for cell in code_cells if cell.id in {"4f5281d3", "b81e0fd4"}
+    }
+    assert set(fit_cells) == {"4f5281d3", "b81e0fd4"}
+    for cell in fit_cells.values():
         assert cell.execution_count is None
         assert cell.outputs == []

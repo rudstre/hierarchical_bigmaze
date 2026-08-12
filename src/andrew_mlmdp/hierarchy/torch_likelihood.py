@@ -184,28 +184,23 @@ def total_hierarchical_movement_log_likelihood_torch(
     *,
     parameter_values: Mapping[str, Tensor],
 ) -> Tensor:
-    """Return the sum of independent trajectory log-likelihoods.
+    """Return an exact sum using prepared metadata and graph-local tensor banks."""
 
-    Goal-conditioned parameter-dependent tensors are shared for trials with
-    the same goal only within this forward graph.  The template's NumPy caches
-    are neither read nor modified.
-    """
+    from andrew_mlmdp.hierarchy.torch_batch_likelihood import (
+        prepare_hierarchical_likelihood_batch,
+        total_prepared_hierarchical_log_likelihood_torch,
+    )
 
     values = _validated_parameter_values(template, parameter_values)
-    materialized = tuple(trials)
     device = next(iter(values.values())).device
-    total = torch.zeros((), dtype=torch.float64, device=device)
-    models: dict[Coordinate, _TorchHierarchy] = {}
-    for trial in materialized:
-        model = models.get(trial.goal)
-        if model is None:
-            model = _build_torch_hierarchy(template, trial.goal, values)
-            models[trial.goal] = model
-        total = total + _movement_log_likelihood_from_hierarchy(
-            model,
-            trial.trajectory,
-        )
-    return total
+    prepared = prepare_hierarchical_likelihood_batch(
+        template, trials, device=device
+    )
+    return total_prepared_hierarchical_log_likelihood_torch(
+        template,
+        prepared,
+        parameter_values=values,
+    )
 
 
 def _basis_is_gated(template: "HierarchyTemplate") -> bool:
@@ -289,6 +284,8 @@ def _build_torch_hierarchy(
     template: "HierarchyTemplate",
     goal: Coordinate,
     values: Mapping[str, Tensor],
+    *,
+    task_boundary: Tensor | None = None,
 ) -> _TorchHierarchy:
     maze = template.maze
     goal_state = maze.state_index(goal)
@@ -343,7 +340,7 @@ def _build_torch_hierarchy(
     )
     upper = _TorchFirstExitDynamics(upper_interior, upper_boundary)
     upper_desirability, upper_controlled = _solve_upper_layer(upper, values)
-    task_basis = _build_task_basis(lower, values)
+    task_basis = _build_task_basis(lower, values, boundary=task_boundary)
     _require_finite(
         access_profiles,
         lower.passive,
@@ -424,28 +421,41 @@ def _solve_upper_layer(
 def _build_task_basis(
     lower: _TorchFirstExitDynamics,
     values: Mapping[str, Tensor],
+    *,
+    boundary: Tensor | None = None,
 ) -> _TorchTaskBasis:
     number_of_subgoals = lower.boundary_passive.shape[0] - 1
+    if boundary is None:
+        boundary = _build_task_boundary(
+            number_of_subgoals,
+            values,
+            dtype=lower.interior_passive.dtype,
+            device=lower.interior_passive.device,
+        )
     cost = values["lower_control_cost"]
-    goal = torch.exp(values["goal_reward"] / cost)
-    off_target = torch.exp(values["off_target_reward"] / cost)
-    identity = torch.eye(
-        number_of_subgoals,
-        dtype=lower.interior_passive.dtype,
-        device=lower.interior_passive.device,
-    )
-    subgoal_basis = off_target + (goal - off_target) * identity
-    zeros_column = torch.zeros(
-        (number_of_subgoals, 1),
-        dtype=lower.interior_passive.dtype,
-        device=lower.interior_passive.device,
-    )
-    top = torch.cat((subgoal_basis, zeros_column), dim=1)
-    bottom = torch.cat((zeros_column.T, goal.reshape(1, 1)), dim=1)
-    boundary = torch.cat((top, bottom), dim=0)
     q_interior = torch.exp(values["interior_reward"] / cost)
     interior = _solve_first_exit(lower, boundary, q_interior)
     return _TorchTaskBasis(boundary, interior)
+
+
+def _build_task_boundary(
+    number_of_subgoals: int,
+    values: Mapping[str, Tensor],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    cost = values["lower_control_cost"]
+    goal = torch.exp(values["goal_reward"] / cost)
+    off_target = torch.exp(values["off_target_reward"] / cost)
+    identity = torch.eye(number_of_subgoals, dtype=dtype, device=device)
+    subgoal_basis = off_target + (goal - off_target) * identity
+    zeros_column = torch.zeros(
+        (number_of_subgoals, 1), dtype=dtype, device=device
+    )
+    top = torch.cat((subgoal_basis, zeros_column), dim=1)
+    bottom = torch.cat((zeros_column.T, goal.reshape(1, 1)), dim=1)
+    return torch.cat((top, bottom), dim=0)
 
 
 def _plan(

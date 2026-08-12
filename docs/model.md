@@ -443,6 +443,14 @@ safe to retain across optimizer steps. Gated access profiles, lower and upper
 dynamics, task bases, plans, policies, latent kernels, and first-departure
 occupancies must be recomputed.
 
+For full datasets, parameter-independent collapsed trajectories and integer context
+indices are prepared once. Each forward graph then constructs a shared boundary
+task pseudoinverse, goal-specific plan banks, dense shared controller columns,
+start-specific initial columns, and all complete-mode closure systems. The closure
+systems and observed departure operators are assembled by indexed tensor operations
+and solved in one batched float64 call; only the final trajectory recursion remains
+sequential. All differentiable banks are discarded after that graph.
+
 Gate structure belongs to `SubgoalBasis`: point and ungated soft bases cannot
 acquire gate parameters during fitting. For gated soft bases, threshold and
 exponent defaults come from the basis rather than legacy fields on
