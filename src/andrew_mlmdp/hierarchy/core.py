@@ -272,10 +272,13 @@ class HierarchyTemplate:
         trials: Iterable["MovementTrial"],
         *,
         parameter_names: Sequence[str],
-        learning_rate: float = 1e-2,
+        learning_rate: float = 5e-2,
         max_steps: int = 1000,
         relative_tolerance: float = 1e-8,
         patience: int = 20,
+        learning_rate_decay_factor: float = 0.3,
+        learning_rate_decay_patience: int = 7,
+        minimum_learning_rate: float = 1e-5,
         progress_callback: (
             Callable[["HierarchicalFitEvaluation"], None] | None
         ) = None,
@@ -294,6 +297,9 @@ class HierarchyTemplate:
             max_steps=max_steps,
             relative_tolerance=relative_tolerance,
             patience=patience,
+            learning_rate_decay_factor=learning_rate_decay_factor,
+            learning_rate_decay_patience=learning_rate_decay_patience,
+            minimum_learning_rate=minimum_learning_rate,
             progress_callback=progress_callback,
         )
 

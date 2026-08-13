@@ -466,3 +466,15 @@ log-likelihood using a private constrained parameterization. It never mutates
 `best_parameter_values` snapshot can be passed explicitly to
 `total_hierarchical_movement_log_likelihood_torch`. NumPy rollout from fitted
 values requires separately constructing a fresh basis and template.
+
+Adam uses PyTorch's `ReduceLROnPlateau` with the evaluated pre-update loss passed to
+the scheduler only after its aligned optimizer update. When the scheduler lowers
+the learning rate, fitting restores the globally best raw parameter state and starts
+a fresh Adam optimizer and scheduler at that lower rate. This discards momentum
+from the coarser stage and gives every finer stage its own plateau bookkeeping while
+preserving the global best state. Each evaluation records the learning rate active
+for that state; a reduction and best-state restart therefore first appear on the
+following evaluation. Plateau convergence patience is inactive while another
+learning-rate stage remains and starts fresh only after the minimum learning rate is
+active. The default schedule starts at `0.05`, uses factor `0.3` with plateau
+patience `7`, and has a minimum learning rate of `1e-5`.

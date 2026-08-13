@@ -77,6 +77,7 @@ class HierarchicalFitEvaluation:
 
     evaluation: int
     updates_completed: int
+    learning_rate: float
     loss: float
     total_log_likelihood: float
     best_loss: float | None
@@ -109,6 +110,10 @@ class HierarchicalFitResult:
     @property
     def gradient_norm_history(self) -> tuple[float, ...]:
         return tuple(evaluation.gradient_norm for evaluation in self.history)
+
+    @property
+    def learning_rate_history(self) -> tuple[float, ...]:
+        return tuple(evaluation.learning_rate for evaluation in self.history)
 
 
 class _RawFittingParameters(nn.Module):
@@ -149,10 +154,13 @@ def fit_hierarchical_model_parameters(
     trials: Iterable[MovementTrial],
     *,
     parameter_names: Sequence[str],
-    learning_rate: float = 1e-2,
+    learning_rate: float = 5e-2,
     max_steps: int = 1000,
     relative_tolerance: float = 1e-8,
     patience: int = 20,
+    learning_rate_decay_factor: float = 0.3,
+    learning_rate_decay_patience: int = 7,
+    minimum_learning_rate: float = 1e-5,
     progress_callback: Callable[[HierarchicalFitEvaluation], None] | None = None,
 ) -> HierarchicalFitResult:
     """Fit selected parameters without mutating model objects or caches."""
@@ -189,25 +197,54 @@ def fit_hierarchical_model_parameters(
         raise ValueError("learning_rate must be finite and positive")
     if not np.isfinite(relative_tolerance) or relative_tolerance < 0.0:
         raise ValueError("relative_tolerance must be finite and non-negative")
+    if (
+        not np.isfinite(learning_rate_decay_factor)
+        or not 0.0 < learning_rate_decay_factor < 1.0
+    ):
+        raise ValueError("learning_rate_decay_factor must be finite and in (0, 1)")
+    if (
+        isinstance(learning_rate_decay_patience, (bool, np.bool_))
+        or not isinstance(learning_rate_decay_patience, (int, np.integer))
+        or learning_rate_decay_patience < 0
+    ):
+        raise ValueError("learning_rate_decay_patience must be a non-negative integer")
+    if (
+        not np.isfinite(minimum_learning_rate)
+        or minimum_learning_rate <= 0.0
+        or minimum_learning_rate > learning_rate
+    ):
+        raise ValueError(
+            "minimum_learning_rate must be finite, positive, and no greater "
+            "than learning_rate"
+        )
 
     prepared_trials = prepare_hierarchical_likelihood_batch(
         template, materialized_trials
     )
     initial_values = hierarchical_parameter_values(template)
     raw_parameters = _RawFittingParameters(initial_values, selected)
-    optimizer = torch.optim.Adam(raw_parameters.parameters(), lr=learning_rate)
+    optimizer = _adam_optimizer(raw_parameters, learning_rate)
+    scheduler = _plateau_scheduler(
+        optimizer,
+        factor=learning_rate_decay_factor,
+        patience=learning_rate_decay_patience,
+        relative_tolerance=relative_tolerance,
+        minimum_learning_rate=minimum_learning_rate,
+    )
     initial_snapshot = _snapshot(initial_values)
     history: list[HierarchicalFitEvaluation] = []
     best_loss: float | None = None
     best_raw_state: dict[str, Tensor] | None = None
     checkpoint_best_loss: float | None = None
     without_meaningful_improvement = 0
+    convergence_at_minimum_learning_rate = False
     updates_completed = 0
     converged = False
     termination_reason = "max_steps"
     last_values = initial_values
 
     while True:
+        current_learning_rate = float(optimizer.param_groups[0]["lr"])
         optimizer.zero_grad()
         current_values = raw_parameters.physical_values(initial_values)
         last_values = current_values
@@ -230,6 +267,7 @@ def fit_hierarchical_model_parameters(
                 _evaluation(
                     history,
                     updates_completed,
+                    current_learning_rate,
                     loss_value,
                     total_log_likelihood_value,
                     best_loss,
@@ -271,6 +309,7 @@ def fit_hierarchical_model_parameters(
             _evaluation(
                 history,
                 updates_completed,
+                current_learning_rate,
                 loss_value,
                 total_log_likelihood_value,
                 best_loss,
@@ -285,10 +324,18 @@ def fit_hierarchical_model_parameters(
             termination_reason = "nonfinite_gradient"
             break
 
-        if checkpoint_best_loss is None:
+        at_minimum_learning_rate = current_learning_rate <= minimum_learning_rate
+        if not at_minimum_learning_rate:
             checkpoint_best_loss = best_loss
+            without_meaningful_improvement = 0
+            convergence_at_minimum_learning_rate = False
+        elif not convergence_at_minimum_learning_rate:
+            checkpoint_best_loss = best_loss
+            without_meaningful_improvement = 0
+            convergence_at_minimum_learning_rate = True
         elif updates_completed > 0:
             assert best_loss is not None
+            assert checkpoint_best_loss is not None
             meaningful = relative_tolerance * max(1.0, abs(checkpoint_best_loss))
             if checkpoint_best_loss - best_loss > meaningful:
                 checkpoint_best_loss = best_loss
@@ -306,6 +353,26 @@ def fit_hierarchical_model_parameters(
 
         optimizer.step()
         updates_completed += 1
+        scheduler.step(loss_value)
+        scheduled_learning_rate = float(optimizer.param_groups[0]["lr"])
+        if scheduled_learning_rate < current_learning_rate:
+            # The triggering update belongs to the state evaluated before it, but
+            # the scheduler changes the learning rate on the post-step optimizer.
+            # Refine from the globally best aligned raw state with fresh Adam
+            # moments and fresh stage-local scheduler bookkeeping.
+            assert best_raw_state is not None
+            raw_parameters.restore_raw_state(best_raw_state)
+            optimizer = _adam_optimizer(raw_parameters, scheduled_learning_rate)
+            scheduler = _plateau_scheduler(
+                optimizer,
+                factor=learning_rate_decay_factor,
+                patience=learning_rate_decay_patience,
+                relative_tolerance=relative_tolerance,
+                minimum_learning_rate=minimum_learning_rate,
+            )
+            checkpoint_best_loss = best_loss
+            without_meaningful_improvement = 0
+            convergence_at_minimum_learning_rate = False
 
     last_snapshot = _snapshot(last_values)
     best_snapshot = None
@@ -321,6 +388,32 @@ def fit_hierarchical_model_parameters(
         updates_completed=updates_completed,
         converged=converged,
         termination_reason=termination_reason,
+    )
+
+
+def _adam_optimizer(
+    raw_parameters: _RawFittingParameters,
+    learning_rate: float,
+) -> torch.optim.Adam:
+    return torch.optim.Adam(raw_parameters.parameters(), lr=learning_rate)
+
+
+def _plateau_scheduler(
+    optimizer: torch.optim.Adam,
+    *,
+    factor: float,
+    patience: int,
+    relative_tolerance: float,
+    minimum_learning_rate: float,
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=factor,
+        patience=patience,
+        threshold=relative_tolerance,
+        threshold_mode="rel",
+        min_lr=minimum_learning_rate,
     )
 
 
@@ -381,6 +474,7 @@ def _float_values(values: Mapping[str, Tensor]) -> dict[str, float]:
 def _evaluation(
     history: list[HierarchicalFitEvaluation],
     updates_completed: int,
+    learning_rate: float,
     loss: float,
     total_log_likelihood: float,
     best_loss: float | None,
@@ -391,6 +485,7 @@ def _evaluation(
     return HierarchicalFitEvaluation(
         evaluation=len(history),
         updates_completed=updates_completed,
+        learning_rate=learning_rate,
         loss=loss,
         total_log_likelihood=total_log_likelihood,
         best_loss=best_loss,

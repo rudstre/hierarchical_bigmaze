@@ -11,7 +11,11 @@ from andrew_mlmdp import (
     fit_hierarchical_model_parameters,
     total_hierarchical_movement_log_likelihood_torch,
 )
-from andrew_mlmdp.hierarchy.fitting import DOMAIN_EPS, _physical_transform
+from andrew_mlmdp.hierarchy.fitting import (
+    DOMAIN_EPS,
+    _inverse_transform,
+    _physical_transform,
+)
 
 
 def _template(*, threshold=0.2):
@@ -245,6 +249,115 @@ def test_inactive_and_boundary_gate_parameters_cannot_be_fitted():
             _trials(),
             parameter_names=("core_threshold",),
             max_steps=0,
+        )
+
+
+def test_reduce_on_plateau_lr_is_recorded_after_aligned_update():
+    singleton = MovementTrial("s", 5, (0, 5), ((0, 1),))
+    result = _template().fit_parameters(
+        (singleton,),
+        parameter_names=("alpha",),
+        learning_rate=0.05,
+        max_steps=6,
+        patience=2,
+        learning_rate_decay_factor=0.3,
+        learning_rate_decay_patience=1,
+        minimum_learning_rate=1e-5,
+    )
+
+    assert result.updates_completed == 6
+    assert [evaluation.updates_completed for evaluation in result.history] == list(
+        range(7)
+    )
+    assert result.learning_rate_history == pytest.approx(
+        (0.05, 0.05, 0.05, 0.015, 0.015, 0.015, 0.0045)
+    )
+    assert result.loss_history == pytest.approx((0.0,) * 7)
+
+    minimum = _template().fit_parameters(
+        (singleton,),
+        parameter_names=("alpha",),
+        learning_rate=0.05,
+        max_steps=10,
+        patience=3,
+        learning_rate_decay_factor=0.3,
+        learning_rate_decay_patience=1,
+        minimum_learning_rate=0.015,
+    )
+    assert minimum.termination_reason == "patience"
+    assert minimum.converged
+    assert minimum.updates_completed == 6
+    assert minimum.learning_rate_history == pytest.approx(
+        (0.05, 0.05, 0.05, 0.015, 0.015, 0.015, 0.015)
+    )
+
+
+def test_lr_reduction_restores_best_raw_state_and_resets_adam(monkeypatch):
+    import andrew_mlmdp.hierarchy.fitting as fitting
+
+    evaluations = 0
+
+    def flat_value_with_reversing_gradient(template, prepared, *, parameter_values):
+        nonlocal evaluations
+        del template, prepared
+        alpha = parameter_values["alpha"]
+        direction = 1.0 if evaluations < 3 else -1.0
+        evaluations += 1
+        return direction * (alpha - alpha.detach())
+
+    monkeypatch.setattr(
+        fitting,
+        "total_prepared_hierarchical_log_likelihood_torch",
+        flat_value_with_reversing_gradient,
+    )
+    singleton = MovementTrial("s", 6, (0, 5), ((0, 1),))
+    result = _template().fit_parameters(
+        (singleton,),
+        parameter_names=("alpha",),
+        learning_rate=0.05,
+        max_steps=4,
+        patience=20,
+        learning_rate_decay_factor=0.3,
+        learning_rate_decay_patience=1,
+        minimum_learning_rate=1e-5,
+    )
+
+    assert result.learning_rate_history == pytest.approx(
+        (0.05, 0.05, 0.05, 0.015, 0.015)
+    )
+    initial = result.history[0].parameter_values["alpha"]
+    restarted = result.history[3].parameter_values["alpha"]
+    assert restarted == pytest.approx(initial, abs=1e-15)
+
+    restarted_raw = _inverse_transform(
+        "alpha", torch.tensor(restarted, dtype=torch.float64)
+    )
+    after_fresh_step_raw = _inverse_transform(
+        "alpha",
+        torch.tensor(
+            result.history[4].parameter_values["alpha"], dtype=torch.float64
+        ),
+    )
+    # The gradient reverses on entry to the new stage. Fresh Adam moments make
+    # its first step follow that new gradient immediately.
+    assert after_fresh_step_raw < restarted_raw
+    assert restarted_raw - after_fresh_step_raw == pytest.approx(0.015, abs=1e-8)
+
+
+def test_learning_rate_schedule_arguments_are_validated():
+    common = {
+        "template": _template(),
+        "trials": _trials(),
+        "parameter_names": ("alpha",),
+        "max_steps": 0,
+    }
+    with pytest.raises(ValueError, match="decay_factor"):
+        fit_hierarchical_model_parameters(**common, learning_rate_decay_factor=1.0)
+    with pytest.raises(ValueError, match="decay_patience"):
+        fit_hierarchical_model_parameters(**common, learning_rate_decay_patience=-1)
+    with pytest.raises(ValueError, match="minimum_learning_rate"):
+        fit_hierarchical_model_parameters(
+            **common, learning_rate=0.01, minimum_learning_rate=0.02
         )
 
 
