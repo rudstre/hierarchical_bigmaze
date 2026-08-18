@@ -1,6 +1,13 @@
+import numpy as np
 import pytest
 
-from andrew_mlmdp import LMDPEnvironment, Maze, ModelParameters, SubgoalBasis
+from andrew_mlmdp import (
+    LayerOneTaskLibrary,
+    LMDPEnvironment,
+    Maze,
+    ModelParameters,
+    SubgoalBasis,
+)
 
 
 def test_exact_rollout_records_one_event_trace_without_teleporting(
@@ -27,6 +34,12 @@ def test_online_z_iteration_updates_only_after_nonterminal_moves():
     task = LMDPEnvironment(maze).hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 1), (0, 4))),
         parameters=ModelParameters(alpha=1.0),
+        task_library=LayerOneTaskLibrary.from_desirabilities(
+            2,
+            basis_target_desirability=np.exp(1.1 / 0.1),
+            basis_off_target_desirability=np.exp(-0.7 / 0.1),
+            basis_goal_desirability=np.exp(1.1 / 0.1),
+        ),
     ).for_goal((0, 5))
     rollout = task.rollout(
         (0, 0),
@@ -75,6 +88,4 @@ def test_online_learning_can_continue_across_episodes():
 
     assert second.goal_desirability_history[0] == pytest.approx(initial)
     assert second.goal_desirability_history[0] is not initial
-
-
 

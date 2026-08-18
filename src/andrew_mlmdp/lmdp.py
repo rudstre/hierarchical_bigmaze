@@ -35,7 +35,6 @@ class ModelParameters(nn.Module):
         lower_control_cost: float = 0.1,
         upper_control_cost: float = 0.25,
         alpha: float = 0.2,
-        off_target_reward: float = -0.7,
         beta: float = 16.0,
         core_threshold: float | None = None,
         core_exponent: float = 1.0,
@@ -47,7 +46,6 @@ class ModelParameters(nn.Module):
             lower_control_cost,
             upper_control_cost,
             alpha,
-            off_target_reward,
             beta,
         )
         if not np.all(np.isfinite(values)):
@@ -82,7 +80,6 @@ class ModelParameters(nn.Module):
         self.lower_control_cost = _scalar_parameter(lower_control_cost)
         self.upper_control_cost = _scalar_parameter(upper_control_cost)
         self.alpha = _scalar_parameter(alpha)
-        self.off_target_reward = _scalar_parameter(off_target_reward)
         self.beta = _scalar_parameter(beta)
         if core_threshold is None:
             self.register_parameter("core_threshold", None)
@@ -104,7 +101,6 @@ class ModelParameters(nn.Module):
             f"lower_control_cost={self.lower_control_cost.item():g}, "
             f"upper_control_cost={self.upper_control_cost.item():g}, "
             f"alpha={self.alpha.item():g}, "
-            f"off_target_reward={self.off_target_reward.item():g}, "
             f"beta={self.beta.item():g}, "
             f"core_threshold={threshold}, "
             f"core_exponent={self.core_exponent.item():g}"
@@ -124,7 +120,6 @@ def hard_hierarchy_parameters(
     lower_control_cost: float = 0.06,
     upper_control_cost: float = 0.3,
     alpha: float = 0.4,
-    off_target_reward: float = -1.0,
     beta: float = 16.0,
     core_threshold: float | None = None,
     core_exponent: float = 1.0,
@@ -142,7 +137,6 @@ def hard_hierarchy_parameters(
         lower_control_cost=lower_control_cost,
         upper_control_cost=upper_control_cost,
         alpha=alpha,
-        off_target_reward=off_target_reward,
         beta=beta,
         core_threshold=core_threshold,
         core_exponent=core_exponent,
@@ -157,7 +151,6 @@ def soft_hierarchy_parameters(
     lower_control_cost: float | None = None,
     upper_control_cost: float | None = None,
     alpha: float | None = None,
-    off_target_reward: float | None = None,
     beta: float | None = None,
     core_threshold: float | None = 0.8,
     core_exponent: float = 1.0,
@@ -191,7 +184,6 @@ def soft_hierarchy_parameters(
             reference.upper_control_cost.item() * rank_scale
         ),
         "alpha": reference.alpha.item() / rank_scale,
-        "off_target_reward": reference.off_target_reward.item(),
         "beta": reference.beta.item(),
         "core_threshold": core_threshold,
         "core_exponent": core_exponent,
@@ -202,7 +194,6 @@ def soft_hierarchy_parameters(
         "lower_control_cost": lower_control_cost,
         "upper_control_cost": upper_control_cost,
         "alpha": alpha,
-        "off_target_reward": off_target_reward,
         "beta": beta,
     }
     derived.update(
@@ -390,6 +381,9 @@ class LMDPEnvironment:
         basis,
         *,
         parameters: ModelParameters | None = None,
+        task_library=None,
+        composition_exponent: float = 1.0,
+        composition_mode: Literal["power", "winner_take_all"] = "power",
     ):
         """Create a reusable hierarchy template for a supplied subgoal basis.
 
@@ -408,6 +402,9 @@ class LMDPEnvironment:
             environment=self,
             basis=basis,
             parameters=parameters,
+            task_library=task_library,
+            composition_exponent=composition_exponent,
+            composition_mode=composition_mode,
         )
 
 

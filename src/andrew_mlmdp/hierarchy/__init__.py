@@ -5,9 +5,11 @@ movement likelihoods live in focused modules.
 """
 
 from andrew_mlmdp.hierarchy.core import (
+    CoreThresholdDomain,
     HierarchyTask,
     HierarchyTemplate,
     LayerOnePlan,
+    LayerOneTaskLibrary,
     SubgoalBasis,
     TaskBasis,
     compute_hierarchy_plan,
@@ -32,12 +34,14 @@ from andrew_mlmdp.hierarchy.torch_likelihood import (
 )
 
 __all__ = [
+    "CoreThresholdDomain",
     "FittedParameterValues",
     "HierarchicalFitEvaluation",
     "HierarchicalFitResult",
     "fit_hierarchical_model_parameters",
     "HierarchyTask",
     "HierarchyTemplate",
+    "LayerOneTaskLibrary",
     "LayerOnePlan",
     "Rollout",
     "RolloutEvent",

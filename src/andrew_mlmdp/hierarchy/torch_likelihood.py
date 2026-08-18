@@ -32,7 +32,6 @@ _BASE_PARAMETER_NAMES = (
     "lower_control_cost",
     "upper_control_cost",
     "alpha",
-    "off_target_reward",
     "beta",
 )
 _GATE_PARAMETER_NAMES = ("core_threshold", "core_exponent")
@@ -291,6 +290,11 @@ def _build_torch_hierarchy(
     goal_state = maze.state_index(goal)
     if template.basis.locations is not None and goal in template.basis.locations:
         raise ValueError("The goal and point subgoals must be disjoint")
+    if _basis_is_gated(template):
+        template.validate_core_threshold_for_goals(
+            values["core_threshold"],
+            (goal,),
+        )
 
     device = next(iter(values.values())).device
     number_of_states = len(maze.free_cells)
@@ -340,6 +344,12 @@ def _build_torch_hierarchy(
     )
     upper = _TorchFirstExitDynamics(upper_interior, upper_boundary)
     upper_desirability, upper_controlled = _solve_upper_layer(upper, values)
+    if task_boundary is None:
+        task_boundary = torch.tensor(
+            template.task_library.boundary_desirability,
+            dtype=torch.float64,
+            device=device,
+        )
     task_basis = _build_task_basis(lower, values, boundary=task_boundary)
     _require_finite(
         access_profiles,
@@ -424,38 +434,12 @@ def _build_task_basis(
     *,
     boundary: Tensor | None = None,
 ) -> _TorchTaskBasis:
-    number_of_subgoals = lower.boundary_passive.shape[0] - 1
     if boundary is None:
-        boundary = _build_task_boundary(
-            number_of_subgoals,
-            values,
-            dtype=lower.interior_passive.dtype,
-            device=lower.interior_passive.device,
-        )
+        raise ValueError("A fixed task-library boundary matrix is required")
     cost = values["lower_control_cost"]
     q_interior = torch.exp(values["interior_reward"] / cost)
     interior = _solve_first_exit(lower, boundary, q_interior)
     return _TorchTaskBasis(boundary, interior)
-
-
-def _build_task_boundary(
-    number_of_subgoals: int,
-    values: Mapping[str, Tensor],
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> Tensor:
-    cost = values["lower_control_cost"]
-    goal = torch.exp(values["goal_reward"] / cost)
-    off_target = torch.exp(values["off_target_reward"] / cost)
-    identity = torch.eye(number_of_subgoals, dtype=dtype, device=device)
-    subgoal_basis = off_target + (goal - off_target) * identity
-    zeros_column = torch.zeros(
-        (number_of_subgoals, 1), dtype=dtype, device=device
-    )
-    top = torch.cat((subgoal_basis, zeros_column), dim=1)
-    bottom = torch.cat((zeros_column.T, goal.reshape(1, 1)), dim=1)
-    return torch.cat((top, bottom), dim=0)
 
 
 def _plan(
@@ -496,7 +480,11 @@ def _plan(
         )
         @ target
     )
-    weights = torch.clamp_min(raw_weights, 0.0)
+    weights = _composition_weights(
+        torch.clamp_min(raw_weights, 0.0),
+        exponent=model.template.composition_exponent,
+        mode=model.template.composition_mode,
+    )
     reconstructed = model.task_basis.boundary_desirability @ weights
     physical, lower_controlled = _compose_lower_policy(
         model,
@@ -525,8 +513,6 @@ def _goal_only_plan(model: _TorchHierarchy) -> _TorchLayerOnePlan:
         ),
         num_classes=number_of_boundaries,
     ).to(dtype=model.dtype)
-    reconstructed = model.task_basis.boundary_desirability @ weights
-    physical, controlled = _compose_lower_policy(model, weights, reconstructed)
     goal_desirability = torch.exp(
         model.parameter_values["goal_reward"]
         / model.parameter_values["lower_control_cost"]
@@ -550,6 +536,16 @@ def _goal_only_plan(model: _TorchHierarchy) -> _TorchLayerOnePlan:
             goal_desirability.reshape(1),
         )
     )
+    q_interior = torch.exp(
+        model.parameter_values["interior_reward"]
+        / model.parameter_values["lower_control_cost"]
+    )
+    interior = _solve_first_exit(model.lower_dynamics, target, q_interior)
+    physical, controlled = _policy_from_complete_desirability(
+        model,
+        interior,
+        target,
+    )
     zeros = torch.zeros_like(weights)
     return _TorchLayerOnePlan(
         passive_abstract=zeros,
@@ -558,7 +554,7 @@ def _goal_only_plan(model: _TorchHierarchy) -> _TorchLayerOnePlan:
         target_boundary_desirability=target,
         raw_weights=weights,
         weights=weights,
-        reconstructed_boundary_desirability=reconstructed,
+        reconstructed_boundary_desirability=target,
         physical_desirability=physical,
         layer_one_controlled=controlled,
     )
@@ -594,6 +590,86 @@ def _compose_lower_policy(
         complete,
     )
     return physical, controlled
+
+
+def _policy_from_complete_desirability(
+    model: _TorchHierarchy,
+    interior: Tensor,
+    boundary: Tensor,
+) -> tuple[Tensor, Tensor]:
+    number_of_states = len(model.template.maze.free_cells)
+    physical = torch.zeros(
+        number_of_states,
+        dtype=model.dtype,
+        device=model.device,
+    )
+    interior_index = torch.tensor(
+        model.interior_states,
+        dtype=torch.long,
+        device=model.device,
+    )
+    physical = physical.index_copy(0, interior_index, interior)
+    goal_index = torch.tensor(
+        [model.template.maze.state_index(model.goal)],
+        dtype=torch.long,
+        device=model.device,
+    )
+    physical = physical.index_copy(0, goal_index, boundary[-1:])
+    complete = torch.cat((interior, boundary))
+    return physical, _controlled_from_desirability(
+        model.lower_dynamics.passive,
+        complete,
+    )
+
+
+def _composition_weights(
+    clipped_weights: Tensor,
+    *,
+    exponent: float | Tensor,
+    mode: str,
+) -> Tensor:
+    """Redistribute positive subgoal mass while preserving goal weight."""
+
+    exponent_tensor = torch.as_tensor(
+        exponent,
+        dtype=clipped_weights.dtype,
+        device=clipped_weights.device,
+    )
+    if (
+        mode == "power"
+        and not exponent_tensor.requires_grad
+        and float(exponent_tensor) == 1.0
+    ):
+        return clipped_weights
+    subgoal = clipped_weights[..., :-1]
+    mass = subgoal.sum(dim=-1, keepdim=True)
+    positive_mass = mass > 0.0
+    if mode == "winner_take_all":
+        maxima = subgoal == subgoal.max(dim=-1, keepdim=True).values
+        ties = maxima.sum(dim=-1, keepdim=True)
+        selected = maxima.to(dtype=subgoal.dtype) * mass / ties
+        sharpened = torch.where(positive_mass, selected, subgoal)
+    else:
+        safe_mass = torch.where(positive_mass, mass, torch.ones_like(mass))
+        normalized = subgoal / safe_mass
+        positive = normalized > 0.0
+        powered_positive = normalized[positive].pow(exponent_tensor)
+        powered = torch.zeros_like(normalized).masked_scatter(
+            positive,
+            powered_positive,
+        )
+        powered_mass = powered.sum(dim=-1, keepdim=True)
+        safe_powered_mass = torch.where(
+            positive_mass,
+            powered_mass,
+            torch.ones_like(powered_mass),
+        )
+        sharpened = torch.where(
+            positive_mass,
+            mass * powered / safe_powered_mass,
+            subgoal,
+        )
+    return torch.cat((sharpened, clipped_weights[..., -1:]), dim=-1)
 
 
 def _movement_log_likelihood_from_hierarchy(

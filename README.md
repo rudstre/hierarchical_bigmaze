@@ -101,6 +101,7 @@ This uses the same goal and hierarchy tuning as the canonical notebook:
 
 ```python
 from andrew_mlmdp import (
+    LayerOneTaskLibrary,
     LMDPEnvironment,
     Maze,
     SubgoalBasis,
@@ -118,9 +119,11 @@ flat_rollout = flat.rollout((3, 0), seed=0)
 # The hierarchy reuses six subgoal task solutions.
 subgoals = ((0, 0), (9, 2), (2, 3), (3, 7), (9, 7), (7, 9))
 basis = SubgoalBasis.from_locations(maze, subgoals)
+task_library = LayerOneTaskLibrary.from_desirabilities(len(subgoals))
 hierarchy = environment.hierarchy(
     basis,
     parameters=hard_hierarchy_parameters(upper_control_cost=0.65),
+    task_library=task_library,
 )
 task = hierarchy.for_goal(goal)
 
@@ -143,6 +146,7 @@ Useful objects are deliberately inspectable:
   abstract processes;
 - `task.task_basis`: reusable boundary tasks `Q_b` and their solved physical
   desirabilities `Z_i`;
+- `hierarchy.task_library`: the fixed, full-rank Layer-1 task dictionary;
 - `plan.weights`: the current mixture of lower component tasks; and
 - `exact.events`: the complete physical/abstract rollout trace.
 

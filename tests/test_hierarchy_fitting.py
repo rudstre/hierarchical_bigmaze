@@ -13,6 +13,7 @@ from andrew_mlmdp import (
 )
 from andrew_mlmdp.hierarchy.fitting import (
     DOMAIN_EPS,
+    _core_threshold_interior_upper,
     _inverse_transform,
     _physical_transform,
 )
@@ -41,7 +42,6 @@ def _template(*, threshold=0.2):
         lower_control_cost=0.55,
         upper_control_cost=0.9,
         alpha=0.8,
-        off_target_reward=-0.3,
         beta=0.7,
         core_threshold=0.75,
         core_exponent=2.0,
@@ -136,6 +136,50 @@ def test_progress_callback_receives_every_evaluated_state():
 
     assert tuple(evaluations) == result.history
     assert [evaluation.updates_completed for evaluation in evaluations] == [0, 1, 2]
+
+
+def test_fitting_rejects_diagnostic_winner_take_all_composition():
+    base = _template()
+    template = base.environment.hierarchy(
+        base.basis,
+        parameters=base.parameters,
+        task_library=base.task_library,
+        composition_mode="winner_take_all",
+    )
+    with pytest.raises(ValueError, match="diagnostic-only"):
+        fit_hierarchical_model_parameters(
+            template,
+            _trials(),
+            parameter_names=("alpha",),
+            max_steps=1,
+        )
+
+
+def test_fitting_fixes_composition_exponent_at_one():
+    base = _template()
+    assert base.composition_exponent == 1.0
+
+    manually_sharpened = base.environment.hierarchy(
+        base.basis,
+        parameters=base.parameters,
+        task_library=base.task_library,
+        composition_exponent=1.5,
+    )
+    with pytest.raises(ValueError, match="fixes composition_exponent at 1.0"):
+        fit_hierarchical_model_parameters(
+            manually_sharpened,
+            _trials(),
+            parameter_names=("alpha",),
+            max_steps=1,
+        )
+
+    with pytest.raises(ValueError, match="Unknown parameter names"):
+        fit_hierarchical_model_parameters(
+            base,
+            _trials(),
+            parameter_names=("composition_exponent",),
+            max_steps=1,
+        )
 
 
 def test_selected_gradients_are_finite_and_frozen_values_do_not_change():
@@ -251,6 +295,14 @@ def test_inactive_and_boundary_gate_parameters_cannot_be_fitted():
             max_steps=0,
         )
 
+    with pytest.raises(ValueError, match="threshold <"):
+        fit_hierarchical_model_parameters(
+            _template(threshold=0.85),
+            _trials(),
+            parameter_names=("core_threshold",),
+            max_steps=0,
+        )
+
 
 def test_reduce_on_plateau_lr_is_recorded_after_aligned_update():
     singleton = MovementTrial("s", 5, (0, 5), ((0, 1),))
@@ -359,6 +411,42 @@ def test_learning_rate_schedule_arguments_are_validated():
         fit_hierarchical_model_parameters(
             **common, learning_rate=0.01, minimum_learning_rate=0.02
         )
+    with pytest.raises(ValueError, match="scheduler_relative_threshold"):
+        fit_hierarchical_model_parameters(
+            **common, scheduler_relative_threshold=-1.0
+        )
+    with pytest.raises(ValueError, match="convergence_relative_threshold"):
+        fit_hierarchical_model_parameters(
+            **common, convergence_relative_threshold=np.inf
+        )
+
+
+def test_scheduler_and_convergence_thresholds_are_independent(monkeypatch):
+    import andrew_mlmdp.hierarchy.fitting as fitting
+
+    scheduler_thresholds = []
+    original_scheduler = fitting._plateau_scheduler
+
+    def recording_scheduler(optimizer, **kwargs):
+        scheduler_thresholds.append(kwargs["relative_threshold"])
+        return original_scheduler(optimizer, **kwargs)
+
+    monkeypatch.setattr(fitting, "_plateau_scheduler", recording_scheduler)
+    singleton = MovementTrial("s", 7, (0, 5), ((0, 1),))
+    result = _template().fit_parameters(
+        (singleton,),
+        parameter_names=("alpha",),
+        learning_rate=0.05,
+        max_steps=4,
+        relative_tolerance=1e-8,
+        scheduler_relative_threshold=1e-5,
+        convergence_relative_threshold=2e-5,
+        learning_rate_decay_patience=1,
+        minimum_learning_rate=1e-5,
+    )
+
+    assert result.termination_reason == "max_steps"
+    assert scheduler_thresholds == pytest.approx((1e-5, 1e-5))
 
 
 def test_strict_domain_transforms_retain_float64_margins():
@@ -371,3 +459,42 @@ def test_strict_domain_transforms_retain_float64_margins():
     assert negative <= -DOMAIN_EPS
     assert negative < 0.0
     assert 0.0 < threshold < 1.0
+
+
+def test_structural_threshold_transform_stays_one_ulp_inside_goal_domain():
+    template = _template()
+    goals = tuple(dict.fromkeys(trial.goal for trial in _trials()))
+    domain = template.core_threshold_domain(goals)
+    reference = torch.tensor(0.0, dtype=torch.float64)
+    interior_upper = _core_threshold_interior_upper(
+        domain.maximum,
+        reference=reference,
+    )
+
+    assert domain.maximum == pytest.approx(0.85)
+    assert interior_upper == torch.nextafter(
+        torch.tensor(domain.maximum, dtype=torch.float64),
+        torch.tensor(-torch.inf, dtype=torch.float64),
+    )
+    assert interior_upper < domain.maximum
+
+    profiles = template.basis.profiles
+    for raw_value in (-1000.0, -10.0, 0.0, 10.0, 1000.0):
+        threshold = _physical_transform(
+            "core_threshold",
+            torch.tensor(raw_value, dtype=torch.float64),
+            core_threshold_maximum=domain.maximum,
+        )
+        assert 0.0 < threshold <= interior_upper < domain.maximum
+        for goal in goals:
+            goal_state = template.maze.state_index(goal)
+            keep = np.arange(len(profiles)) != goal_state
+            assert np.all(np.max(profiles[keep], axis=0) > float(threshold))
+
+    for invalid in (float(interior_upper), domain.maximum, 0.9):
+        with pytest.raises(ValueError, match="strictly inside"):
+            _inverse_transform(
+                "core_threshold",
+                torch.tensor(invalid, dtype=torch.float64),
+                core_threshold_maximum=domain.maximum,
+            )

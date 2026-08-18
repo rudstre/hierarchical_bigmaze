@@ -35,7 +35,6 @@ _ALL_PARAMETER_NAMES = {
     "lower_control_cost",
     "upper_control_cost",
     "alpha",
-    "off_target_reward",
     "beta",
     "core_threshold",
     "core_exponent",
@@ -121,12 +120,21 @@ class _RawFittingParameters(nn.Module):
         self,
         initial_values: Mapping[str, Tensor],
         parameter_names: tuple[str, ...],
+        *,
+        core_threshold_maximum: float | None,
     ) -> None:
         super().__init__()
         self.parameter_names = parameter_names
+        self.core_threshold_maximum = core_threshold_maximum
         self.raw = nn.ParameterDict(
             {
-                name: nn.Parameter(_inverse_transform(name, initial_values[name]))
+                name: nn.Parameter(
+                    _inverse_transform(
+                        name,
+                        initial_values[name],
+                        core_threshold_maximum=core_threshold_maximum,
+                    )
+                )
                 for name in parameter_names
             }
         )
@@ -137,7 +145,11 @@ class _RawFittingParameters(nn.Module):
     ) -> dict[str, Tensor]:
         values = dict(frozen_values)
         for name in self.parameter_names:
-            values[name] = _physical_transform(name, self.raw[name])
+            values[name] = _physical_transform(
+                name,
+                self.raw[name],
+                core_threshold_maximum=self.core_threshold_maximum,
+            )
         return values
 
     def clone_raw_state(self) -> dict[str, Tensor]:
@@ -157,6 +169,8 @@ def fit_hierarchical_model_parameters(
     learning_rate: float = 5e-2,
     max_steps: int = 1000,
     relative_tolerance: float = 1e-8,
+    scheduler_relative_threshold: float | None = None,
+    convergence_relative_threshold: float | None = None,
     patience: int = 20,
     learning_rate_decay_factor: float = 0.3,
     learning_rate_decay_patience: int = 7,
@@ -166,6 +180,16 @@ def fit_hierarchical_model_parameters(
     """Fit selected parameters without mutating model objects or caches."""
 
     materialized_trials = tuple(trials)
+    if template.composition_mode == "winner_take_all":
+        raise ValueError(
+            "Hard winner-take-all composition is diagnostic-only and cannot "
+            "be fitted with Adam"
+        )
+    if template.composition_exponent != 1.0:
+        raise ValueError(
+            "Adam fitting fixes composition_exponent at 1.0; construct the "
+            "hierarchy with composition_exponent=1.0"
+        )
     if not materialized_trials:
         raise ValueError("Fitting requires at least one trial")
     selected = tuple(parameter_names)
@@ -197,6 +221,16 @@ def fit_hierarchical_model_parameters(
         raise ValueError("learning_rate must be finite and positive")
     if not np.isfinite(relative_tolerance) or relative_tolerance < 0.0:
         raise ValueError("relative_tolerance must be finite and non-negative")
+    scheduler_relative_threshold = _resolved_relative_threshold(
+        "scheduler_relative_threshold",
+        scheduler_relative_threshold,
+        fallback=relative_tolerance,
+    )
+    convergence_relative_threshold = _resolved_relative_threshold(
+        "convergence_relative_threshold",
+        convergence_relative_threshold,
+        fallback=relative_tolerance,
+    )
     if (
         not np.isfinite(learning_rate_decay_factor)
         or not 0.0 < learning_rate_decay_factor < 1.0
@@ -218,17 +252,29 @@ def fit_hierarchical_model_parameters(
             "than learning_rate"
         )
 
+    initial_values = hierarchical_parameter_values(template)
+    core_threshold_maximum = None
+    if "core_threshold" in required_hierarchical_parameter_names(template):
+        goals = tuple(dict.fromkeys(trial.goal for trial in materialized_trials))
+        domain = template.validate_core_threshold_for_goals(
+            initial_values["core_threshold"],
+            goals,
+        )
+        core_threshold_maximum = domain.maximum
     prepared_trials = prepare_hierarchical_likelihood_batch(
         template, materialized_trials
     )
-    initial_values = hierarchical_parameter_values(template)
-    raw_parameters = _RawFittingParameters(initial_values, selected)
+    raw_parameters = _RawFittingParameters(
+        initial_values,
+        selected,
+        core_threshold_maximum=core_threshold_maximum,
+    )
     optimizer = _adam_optimizer(raw_parameters, learning_rate)
     scheduler = _plateau_scheduler(
         optimizer,
         factor=learning_rate_decay_factor,
         patience=learning_rate_decay_patience,
-        relative_tolerance=relative_tolerance,
+        relative_threshold=scheduler_relative_threshold,
         minimum_learning_rate=minimum_learning_rate,
     )
     initial_snapshot = _snapshot(initial_values)
@@ -336,7 +382,10 @@ def fit_hierarchical_model_parameters(
         elif updates_completed > 0:
             assert best_loss is not None
             assert checkpoint_best_loss is not None
-            meaningful = relative_tolerance * max(1.0, abs(checkpoint_best_loss))
+            meaningful = convergence_relative_threshold * max(
+                1.0,
+                abs(checkpoint_best_loss),
+            )
             if checkpoint_best_loss - best_loss > meaningful:
                 checkpoint_best_loss = best_loss
                 without_meaningful_improvement = 0
@@ -367,7 +416,7 @@ def fit_hierarchical_model_parameters(
                 optimizer,
                 factor=learning_rate_decay_factor,
                 patience=learning_rate_decay_patience,
-                relative_tolerance=relative_tolerance,
+                relative_threshold=scheduler_relative_threshold,
                 minimum_learning_rate=minimum_learning_rate,
             )
             checkpoint_best_loss = best_loss
@@ -403,7 +452,7 @@ def _plateau_scheduler(
     *,
     factor: float,
     patience: int,
-    relative_tolerance: float,
+    relative_threshold: float,
     minimum_learning_rate: float,
 ) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -411,24 +460,51 @@ def _plateau_scheduler(
         mode="min",
         factor=factor,
         patience=patience,
-        threshold=relative_tolerance,
+        threshold=relative_threshold,
         threshold_mode="rel",
         min_lr=minimum_learning_rate,
     )
 
 
-def _physical_transform(name: str, raw: Tensor) -> Tensor:
+def _resolved_relative_threshold(
+    name: str,
+    value: float | None,
+    *,
+    fallback: float,
+) -> float:
+    resolved = fallback if value is None else value
+    if not np.isfinite(resolved) or resolved < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return float(resolved)
+
+
+def _physical_transform(
+    name: str,
+    raw: Tensor,
+    *,
+    core_threshold_maximum: float | None = None,
+) -> Tensor:
     margin = torch.as_tensor(DOMAIN_EPS, dtype=raw.dtype, device=raw.device)
     if name == "interior_reward":
         return -(margin + functional.softplus(raw))
     if name in _POSITIVE_PARAMETER_NAMES:
         return margin + functional.softplus(raw)
     if name == "core_threshold":
-        return margin + (1.0 - 2.0 * margin) * torch.sigmoid(raw)
+        upper = _core_threshold_interior_upper(
+            core_threshold_maximum,
+            reference=raw,
+        )
+        transformed = margin + (upper - margin) * torch.sigmoid(raw)
+        return torch.minimum(transformed, upper)
     return raw
 
 
-def _inverse_transform(name: str, physical: Tensor) -> Tensor:
+def _inverse_transform(
+    name: str,
+    physical: Tensor,
+    *,
+    core_threshold_maximum: float | None = None,
+) -> Tensor:
     value = physical.detach().clone()
     margin = torch.as_tensor(DOMAIN_EPS, dtype=value.dtype, device=value.device)
     if name == "interior_reward":
@@ -440,14 +516,47 @@ def _inverse_transform(name: str, physical: Tensor) -> Tensor:
         _require_positive_representable(name, shifted)
         return _inverse_softplus(shifted)
     if name == "core_threshold":
-        scaled = (value - margin) / (1.0 - 2.0 * margin)
+        upper = _core_threshold_interior_upper(
+            core_threshold_maximum,
+            reference=value,
+        )
+        scaled = (value - margin) / (upper - margin)
         if not bool(torch.isfinite(scaled) & (scaled > 0.0) & (scaled < 1.0)):
             raise ValueError(
                 "Fitted core_threshold must start strictly inside the "
-                "float64 interval (DOMAIN_EPS, 1 - DOMAIN_EPS)"
+                f"float64 interval (DOMAIN_EPS, {float(upper):.17g})"
             )
         return torch.logit(scaled)
     return value
+
+
+def _core_threshold_interior_upper(
+    maximum: float | None,
+    *,
+    reference: Tensor,
+) -> Tensor:
+    """Return the largest float64 threshold strictly below the true bound."""
+
+    if maximum is None:
+        maximum = 1.0
+    bound = torch.as_tensor(
+        maximum,
+        dtype=reference.dtype,
+        device=reference.device,
+    )
+    negative_infinity = torch.full_like(bound, -torch.inf)
+    upper = torch.nextafter(bound, negative_infinity)
+    margin = torch.as_tensor(
+        DOMAIN_EPS,
+        dtype=reference.dtype,
+        device=reference.device,
+    )
+    if not bool(torch.isfinite(upper) & (upper > margin)):
+        raise ValueError(
+            "The structural core-threshold domain has no representable "
+            "float64 interior above DOMAIN_EPS"
+        )
+    return upper
 
 
 def _inverse_softplus(value: Tensor) -> Tensor:

@@ -13,9 +13,11 @@ from andrew_mlmdp.dataset import MovementTrial
 from andrew_mlmdp.hierarchy.torch_likelihood import (
     PINV_RCOND,
     TorchHierarchyNumericalError,
-    _build_task_boundary,
     _build_torch_hierarchy,
+    _composition_weights,
+    _policy_from_complete_desirability,
     _require_finite,
+    _solve_first_exit,
     _TorchHierarchy,
     _validated_parameter_values,
 )
@@ -240,9 +242,8 @@ def total_prepared_hierarchical_log_likelihood_torch(
 
     started = perf_counter()
     number_of_subtasks = template.basis.number_of_subgoals
-    boundary = _build_task_boundary(
-        number_of_subtasks,
-        values,
+    boundary = torch.tensor(
+        template.task_library.boundary_desirability,
         dtype=torch.float64,
         device=device,
     )
@@ -383,7 +384,11 @@ def _plan_policy_bank(
     values = model.parameter_values
     inpainted = values["beta"] * (controlled - passive)
     target = torch.exp(inpainted / values["lower_control_cost"])
-    weights = torch.clamp_min(target @ boundary_pinv.T, 0.0)
+    weights = _composition_weights(
+        torch.clamp_min(target @ boundary_pinv.T, 0.0),
+        exponent=model.template.composition_exponent,
+        mode=model.template.composition_mode,
+    )
     reconstructed = weights @ model.task_basis.boundary_desirability.T
     interior = weights @ model.task_basis.interior_desirability.T
     complete = torch.cat((interior, reconstructed), dim=1)
@@ -428,15 +433,31 @@ def _initial_policy_bank(
 
 def _goal_only_policy(model: _TorchHierarchy) -> Tensor:
     number_of_boundaries = model.number_of_subtasks + 1
-    weights = torch.nn.functional.one_hot(
-        torch.tensor(number_of_boundaries - 1, device=model.device),
-        num_classes=number_of_boundaries,
-    ).to(dtype=model.dtype)
-    reconstructed = model.task_basis.boundary_desirability @ weights
-    interior = model.task_basis.interior_desirability @ weights
-    complete = torch.cat((interior, reconstructed))
-    unnormalized = model.lower_dynamics.passive * complete.unsqueeze(1)
-    return unnormalized / unnormalized.sum(dim=0, keepdim=True)
+    goal_desirability = torch.exp(
+        model.parameter_values["goal_reward"]
+        / model.parameter_values["lower_control_cost"]
+    )
+    boundary = torch.cat(
+        (
+            torch.zeros(
+                number_of_boundaries - 1,
+                dtype=model.dtype,
+                device=model.device,
+            ),
+            goal_desirability.reshape(1),
+        )
+    )
+    q_interior = torch.exp(
+        model.parameter_values["interior_reward"]
+        / model.parameter_values["lower_control_cost"]
+    )
+    interior = _solve_first_exit(model.lower_dynamics, boundary, q_interior)
+    _, controlled = _policy_from_complete_desirability(
+        model,
+        interior,
+        boundary,
+    )
+    return controlled
 
 
 def _physical_projection(model: _TorchHierarchy) -> Tensor:

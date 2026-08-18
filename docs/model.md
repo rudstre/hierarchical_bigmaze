@@ -238,12 +238,22 @@ Layer 1 needs a way to realize many abstract commands without solving a new
 physical LMDP every time. It therefore pre-solves `k + 1` component tasks.
 
 [`_build_task_basis`](../src/andrew_mlmdp/hierarchy/core.py) constructs the
-boundary matrix `Q_b`:
+interior basis `Z_i` from the fixed boundary matrix `Q_b` stored by
+`LayerOneTaskLibrary`. The matrix is not constructed from behavioral rewards
+or control costs. The standard canonical library has:
 
-- subgoal task `j` rewards subgoal boundary `j` and assigns the configured
-  off-target reward to other subgoal boundaries;
+- target subgoal desirability `1`;
+- off-target subgoal desirability `exp(-18)`;
 - the physical-goal row is zero in every subgoal task; and
-- the final component rewards only the physical goal.
+- a final physical-goal component with desirability `1`.
+
+For eight subgoals this is a full-rank `9 x 9` matrix: one common subgoal
+mode, seven subgoal-contrast modes, and one physical-goal mode. Its condition
+number is approximately `1.00000012184`. `from_desirabilities(...)` records
+the three canonical construction values as metadata;
+`LayerOneTaskLibrary.from_matrix(...)` instead accepts any validated finite,
+non-negative, full-rank matrix and leaves that optional metadata unset. The
+immutable matrix itself is always the source of truth.
 
 Every column of `Q_b` is solved through the same Layer-1 first-exit dynamics,
 producing `Z_i`. Together these are exposed as `task.task_basis`:
@@ -271,10 +281,12 @@ r^1_t = \beta\,(u^2_t - p^2_t).
 ```
 
 The active physical-goal reward is the same probability-difference term, not
-the fixed `goal_reward`. Exponentiating these rewards with
+the behavioral `goal_reward`. Exponentiating these rewards with
 `lower_control_cost` produces a target boundary desirability `z_target`.
-The fixed goal reward still defines the reusable exact goal-basis column and
-the goal-only plan installed after upper termination.
+`goal_reward` instead remains active in upper termination and in the
+behavioral goal-only policy installed after upper termination; that goal-only
+policy is solved directly and does not depend on the fixed goal-library
+column.
 
 Second, the target is approximated with the reusable task basis:
 
@@ -284,9 +296,26 @@ w_{raw} = Q_b^+ z_{target},
 w = \max(0, w_{raw}).
 ```
 
-`Q_b^+` is the pseudoinverse. Clipping makes the mixture non-negative. The
-last weight scales the exact precomputed goal-basis column so its boundary
-value matches the inpainted goal target.
+`Q_b^+` is the pseudoinverse. Clipping makes the mixture non-negative. With
+`composition_exponent = c`, only the first `k` positive subgoal weights are
+then redistributed:
+
+```math
+p_j = \frac{w_j}{\sum_{l<k} w_l},
+\qquad
+\widetilde w_j
+= \frac{p_j^c}{\sum_{l<k}p_l^c}\sum_{l<k}w_l.
+```
+
+The transform preserves total subgoal weight mass and leaves the final
+physical-goal weight exactly unchanged. Consequently it does not directly
+change subgoal-versus-goal allocation in weight space, although the physical
+policy can change because mass moves among distinct `Z_i` columns. `c = 1`
+is the exact unsharpened path, `c < 1` is more diffuse, and `c > 1` is more
+competitive. Fractional powers are evaluated only at strictly positive
+weights, preserving exact zeros and finite inactive-entry gradients. The
+diagnostic hard winner-take-all mode preserves subgoal mass, splits exact ties,
+and cannot be used with Adam.
 
 Third, the lower desirability is composed linearly:
 
@@ -338,7 +367,9 @@ loops. `Rollout.events` records the state machine explicitly using
 
 ## 10. Exact versus online goal desirability
 
-Exact execution uses the pre-solved final goal column in `Z_i`.
+For ordinary pre-termination plans, exact execution uses the fixed final
+goal-library column in `Z_i`. After upper termination, the goal-only plan is
+instead solved directly from behavioral `goal_reward`.
 
 With `goal_learning="online"`, that column is replaced by a learned vector,
 initialized to zero or supplied through `initial_goal_desirability`. Each
@@ -460,12 +491,36 @@ active entries may move the global threshold enough to activate them later. If
 only exact profile peaks remain active, threshold and exponent can be weakly
 identified or have zero gradients because gated peaks remain exactly one.
 
+For a set of physical goals `G`, the complete hierarchy is structurally
+defined only below
+
+```math
+\tau_{max}=\min_{g\in G,j}\max_{s\ne g}D_{sj}.
+```
+
+`HierarchyTemplate.core_threshold_domain(goals)` reports this strict bound and
+all limiting `(goal, subgoal_index)` pairs. Goal-task construction and fitting
+reject public initial thresholds outside the corresponding domain. During
+fitting, the private raw transform maps into
+`(DOMAIN_EPS, nextafter(tau_max, -inf))`; the one-ULP upper margin prevents a
+saturated sigmoid from eliminating the final support state. This changes
+neither the public physical threshold nor the hard-gate equation.
+
 `fit_hierarchical_model_parameters` minimizes the negative summed trajectory
 log-likelihood using a private constrained parameterization. It never mutates
 `ModelParameters`, `SubgoalBasis`, `HierarchyTemplate`, or NumPy caches. Its
 `best_parameter_values` snapshot can be passed explicitly to
 `total_hierarchical_movement_log_likelihood_torch`. NumPy rollout from fitted
 values requires separately constructing a fresh basis and template.
+
+The fixed task library and `composition_exponent` are not Adam variables.
+Adam fitting currently fixes `composition_exponent = c = 1.0` and rejects a
+template configured with another value. The behavioral fit contains
+`interior_reward`, `goal_reward`, `lower_control_cost`, `upper_control_cost`,
+`alpha`, `beta`, and, when the basis gate is active, `core_threshold` and
+`core_exponent`. The former behavioral `off_target_reward` no longer exists;
+canonical task-library metadata calls its replacement
+`basis_off_target_desirability` and never repurposes it as a fitted reward.
 
 Adam uses PyTorch's `ReduceLROnPlateau` with the evaluated pre-update loss passed to
 the scheduler only after its aligned optimizer update. When the scheduler lowers
@@ -478,3 +533,11 @@ following evaluation. Plateau convergence patience is inactive while another
 learning-rate stage remains and starts fresh only after the minimum learning rate is
 active. The default schedule starts at `0.05`, uses factor `0.3` with plateau
 patience `7`, and has a minimum learning rate of `1e-5`.
+
+Optimization plateau scales are independent of `relative_tolerance`.
+`scheduler_relative_threshold` is passed to `ReduceLROnPlateau`, while
+`convergence_relative_threshold` defines meaningful best-loss improvement for
+patience at the minimum learning rate. Omitting either option preserves legacy
+behavior by falling back to `relative_tolerance`; this keeps existing fitting
+calls compatible while allowing plateau decisions to use a scientifically
+interpretable likelihood scale.

@@ -42,7 +42,6 @@ hard_hierarchy_parameters(
     lower_control_cost=0.06,
     upper_control_cost=0.3,
     alpha=0.4,
-    off_target_reward=-1.0,
     beta=16.0,
 )
 ```
@@ -64,8 +63,9 @@ hard_parameters = hard_hierarchy_parameters(upper_control_cost=0.65)
 ```
 
 While the hierarchy is active, plans combine the six fixed subgoal tasks with
-the exact precomputed goal task. The goal coefficient is determined by reward
-inpainting. Upper termination then installs the goal-only task permanently.
+the fixed physical-goal library component. The goal coefficient is determined
+by reward inpainting. Upper termination then installs a behavioral goal-only
+task, constructed directly from `goal_reward`, permanently.
 
 The notebook's distributed example fits several NMF ranks, selects one after
 inspecting the diagnostics, and applies an 80%-of-peak execution core. The
@@ -104,7 +104,6 @@ ModelParameters(
     lower_control_cost=0.15,
     upper_control_cost=0.3,
     alpha=1.0,
-    off_target_reward=-2.0,
     beta=10.0,
 )
 ```
@@ -112,7 +111,9 @@ ModelParameters(
 This fixture retains historical passive and controlled matrices, initial plan
 values, and seeded flat and hierarchical trajectories in
 `tests/data/four_rooms_regression.json`. It intentionally does not track the
-current notebook tuning or the library defaults.
+current notebook tuning or the library defaults. Its hierarchy supplies an
+explicit historical `LayerOneTaskLibrary`, so removal of the former behavioral
+off-target parameter does not rewrite the frozen regression oracle.
 
 Additional tests construct corridors, tall and wide rectangles, obstacle
 layouts, different subgoal counts, and different NMF ranks so this fixture

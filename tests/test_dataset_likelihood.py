@@ -24,7 +24,6 @@ def _hierarchy_template():
         lower_control_cost=0.5,
         upper_control_cost=1.0,
         alpha=1.0,
-        off_target_reward=-0.1,
         beta=0.5,
     )
     environment = LMDPEnvironment(maze)

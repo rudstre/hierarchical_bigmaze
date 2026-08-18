@@ -24,12 +24,14 @@ from andrew_mlmdp.doohan_dataset import (
     MovementLikelihoodReport,
 )
 from andrew_mlmdp.hierarchy import (
+    CoreThresholdDomain,
     FittedParameterValues,
     HierarchicalFitEvaluation,
     HierarchicalFitResult,
     HierarchyTask,
     HierarchyTemplate,
     LayerOnePlan,
+    LayerOneTaskLibrary,
     Rollout,
     RolloutEvent,
     SubgoalAccess,
@@ -64,6 +66,7 @@ from andrew_mlmdp.maze import Coordinate, Maze
 
 __all__ = [
     "Coordinate",
+    "CoreThresholdDomain",
     "DoohanDataExclusion",
     "DoohanMovementDataset",
     "DoohanSessionRecord",
@@ -75,6 +78,7 @@ __all__ = [
     "HierarchicalFitResult",
     "HierarchyTask",
     "HierarchyTemplate",
+    "LayerOneTaskLibrary",
     "LMDPEnvironment",
     "LayerOnePlan",
     "LabeledMaze",

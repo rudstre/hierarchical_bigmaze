@@ -19,6 +19,7 @@ from andrew_mlmdp.hierarchy.likelihood import (
 from andrew_mlmdp.hierarchy.torch_likelihood import (
     PINV_RCOND,
     _build_torch_hierarchy,
+    _composition_weights,
     _first_departure_forward_torch,
     _goal_only_plan,
     _physical_step_kernel,
@@ -33,7 +34,6 @@ def _parameters(**overrides):
         "lower_control_cost": 0.55,
         "upper_control_cost": 0.9,
         "alpha": 0.8,
-        "off_target_reward": -0.3,
         "beta": 0.7,
     }
     values.update(overrides)
@@ -89,6 +89,78 @@ def _torch_plans(model, start):
         *(_plan(model, start, upper_state=j) for j in range(model.number_of_subtasks)),
         _goal_only_plan(model),
     )
+
+
+@pytest.mark.parametrize("exponent_value", [0.5, 1.0, 4.0])
+def test_torch_composition_has_finite_weight_and_exponent_gradients(exponent_value):
+    weights = torch.tensor(
+        [[0.0, 0.2, 0.8, 0.0, 0.4], [0.0, 0.0, 0.0, 0.0, 0.7]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    exponent = torch.tensor(
+        exponent_value,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    composed = _composition_weights(weights, exponent=exponent, mode="power")
+    objective = (composed * torch.arange(5, dtype=torch.float64)).sum()
+    weight_gradient, exponent_gradient = torch.autograd.grad(
+        objective,
+        (weights, exponent),
+    )
+
+    assert torch.isfinite(weight_gradient).all()
+    assert torch.isfinite(exponent_gradient)
+    assert composed[:, -1].detach() == pytest.approx([0.4, 0.7])
+    assert composed[:, :-1].sum(dim=1).detach() == pytest.approx([1.0, 0.0])
+    assert torch.equal(composed[:, [0, 3]], torch.zeros((2, 2), dtype=torch.float64))
+
+
+def test_torch_winner_take_all_splits_ties_and_preserves_goal_weight():
+    weights = torch.tensor(
+        [[4.0, 4.0, 2.0, 7.0], [0.0, 0.0, 0.0, 3.0]],
+        dtype=torch.float64,
+    )
+    composed = _composition_weights(
+        weights,
+        exponent=1.0,
+        mode="winner_take_all",
+    )
+    assert composed == pytest.approx(
+        torch.tensor([[5.0, 5.0, 0.0, 7.0], [0.0, 0.0, 0.0, 3.0]])
+    )
+
+
+@pytest.mark.parametrize("composition_exponent", [0.5, 1.0, 4.0])
+def test_finite_composition_full_likelihood_has_finite_behavioral_gradients(
+    composition_exponent,
+):
+    base = _gated_template()
+    template = base.environment.hierarchy(
+        base.basis,
+        parameters=base.parameters,
+        task_library=base.task_library,
+        composition_exponent=composition_exponent,
+    )
+    values = _tensor_values(template, requires_grad=True)
+    total = total_hierarchical_movement_log_likelihood_torch(
+        template,
+        (
+            MovementTrial(
+                "s",
+                1,
+                (0, 5),
+                ((0, 1), (0, 2), (0, 3), (0, 4), (0, 5)),
+            ),
+        ),
+        parameter_values=values,
+    )
+    total.backward()
+
+    assert torch.isfinite(total)
+    assert all(value.grad is not None for value in values.values())
+    assert all(torch.isfinite(value.grad) for value in values.values())
 
 
 @pytest.mark.parametrize("kind", ["point", "ungated", "gated"])
@@ -530,9 +602,8 @@ def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts(
     )
     metadata = prepared.goals[0]
     values = hierarchical_parameter_values(template)
-    boundary = batch_module._build_task_boundary(
-        template.basis.number_of_subgoals,
-        values,
+    boundary = torch.tensor(
+        template.task_library.boundary_desirability,
         dtype=torch.float64,
         device=torch.device("cpu"),
     )

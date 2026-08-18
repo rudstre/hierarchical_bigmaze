@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
+    LayerOneTaskLibrary,
     LMDPEnvironment,
     Maze,
     ModelParameters,
@@ -36,7 +37,6 @@ def regression_parameters() -> ModelParameters:
         lower_control_cost=0.15,
         upper_control_cost=0.3,
         alpha=1.0,
-        off_target_reward=-2.0,
         beta=10.0,
     )
 
@@ -54,6 +54,12 @@ def four_room_template(
     return four_room_environment.hierarchy(
         basis,
         parameters=regression_parameters,
+        task_library=LayerOneTaskLibrary.from_desirabilities(
+            len(FOUR_ROOM_SUBGOALS),
+            basis_target_desirability=np.exp(1.0 / 0.15),
+            basis_off_target_desirability=np.exp(-2.0 / 0.15),
+            basis_goal_desirability=np.exp(1.0 / 0.15),
+        ),
     )
 
 
