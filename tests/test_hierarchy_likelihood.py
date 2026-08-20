@@ -7,6 +7,7 @@ from andrew_mlmdp import LMDPEnvironment, Maze, ModelParameters, SubgoalBasis
 from andrew_mlmdp.hierarchy.core import _goal_only_plan
 from andrew_mlmdp.hierarchy.likelihood import (
     _first_departure_forward,
+    _first_departure_kernel,
     _hierarchical_physical_step_kernel,
 )
 from andrew_mlmdp.hierarchy.rollout import _rollout_column
@@ -288,3 +289,35 @@ def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
             hierarchical_probabilities.append(hierarchical_probability)
 
         assert sum(hierarchical_probabilities) == pytest.approx(1.0)
+
+
+def test_first_departure_kernel_closes_same_observation_modes_exactly():
+    self_kernel = np.asarray(
+        [
+            [0.2, 0.0],
+            [0.3, 0.4],
+        ]
+    )
+    exit_kernel = np.diag([0.5, 0.6])
+    kernel = np.stack((self_kernel, exit_kernel))
+
+    departure = _first_departure_kernel(kernel, current_state=0)
+    closure = np.linalg.solve(np.eye(2) - self_kernel, np.eye(2))
+    expected = exit_kernel @ closure
+
+    assert departure.shape == kernel.shape
+    np.testing.assert_array_equal(departure[0], np.zeros((2, 2)))
+    np.testing.assert_allclose(departure[1], expected, atol=1e-14)
+    np.testing.assert_allclose(departure.sum(axis=(0, 1)), np.ones(2))
+    assert departure[1, 1, 0] > 0.0
+
+    forward = np.asarray([0.7, 0.3])
+    np.testing.assert_allclose(
+        _first_departure_forward(
+            kernel,
+            current_state=0,
+            next_state=1,
+            forward=forward,
+        ),
+        departure[1] @ forward,
+    )

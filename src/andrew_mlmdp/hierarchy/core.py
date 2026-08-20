@@ -844,6 +844,7 @@ def _goal_only_plan(
     current: Coordinate,
     *,
     goal_interior_desirability: np.ndarray | None,
+    tolerate_unreachable: bool = False,
 ) -> LayerOnePlan:
     """Construct the permanent physical-goal plan after upper termination."""
 
@@ -871,7 +872,10 @@ def _goal_only_plan(
         model,
         interior,
         target,
-        tolerate_zero_columns=goal_interior_desirability is not None,
+        tolerate_zero_columns=(
+            goal_interior_desirability is not None
+            or tolerate_unreachable
+        ),
     )
     return LayerOnePlan(
         current=current,

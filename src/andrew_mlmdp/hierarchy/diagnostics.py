@@ -21,12 +21,20 @@ from andrew_mlmdp.hierarchy.core import (
     HierarchyTemplate,
     LayerOnePlan,
     _build_hierarchy_task,
+    _goal_only_plan,
+)
+from andrew_mlmdp.hierarchy.likelihood import (
+    _first_departure_kernel,
+    _hierarchical_physical_step_kernel,
 )
 from andrew_mlmdp.hierarchy.rollout import Rollout, _rollout_column
 from andrew_mlmdp.maze import Coordinate, Maze
 
 HierarchyModel = HierarchyTask | HierarchyTemplate
 DisplayCoordinate = tuple[float, float]
+StartGoalPair = tuple[Coordinate, Coordinate]
+
+_PROBABILITY_TOLERANCE = 1e-10
 
 
 def _read_only_array(
@@ -262,6 +270,381 @@ class LatentRouteData:
             "transition_probabilities",
             _read_only_array(self.transition_probabilities, dtype=np.float64),
         )
+
+
+@dataclass(frozen=True)
+class ExpectedPolicyEntropyPairData:
+    """Exact departure-occupancy entropy for one ordered navigation task."""
+
+    start: Coordinate
+    goal: Coordinate
+    expected_entropy_sum_normalized: float
+    expected_entropy_sum_raw: float
+    expected_decision_count: float
+    entropy_normalized: float
+    entropy_raw: float
+
+
+@dataclass(frozen=True)
+class ExpectedPolicyEntropyData:
+    """Uniform-pair expected entropy at encountered physical decisions."""
+
+    encounter_entropy_normalized: float
+    pair_mean_entropy_normalized: float
+    encounter_entropy_raw: float
+    pair_mean_entropy_raw: float
+    expected_total_decisions: float
+    per_start_goal: Mapping[StartGoalPair, ExpectedPolicyEntropyPairData]
+    topologically_unreachable_pairs: tuple[StartGoalPair, ...]
+    policy_nonabsorbing_pairs: tuple[StartGoalPair, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "per_start_goal",
+            MappingProxyType(dict(self.per_start_goal)),
+        )
+        object.__setattr__(
+            self,
+            "topologically_unreachable_pairs",
+            tuple(self.topologically_unreachable_pairs),
+        )
+        object.__setattr__(
+            self,
+            "policy_nonabsorbing_pairs",
+            tuple(self.policy_nonabsorbing_pairs),
+        )
+
+
+def _hierarchical_first_departure_dynamics(
+    task: HierarchyTask,
+    start: Coordinate,
+) -> np.ndarray:
+    """Return ``D[next_physical, next_mode, current_physical, current_mode]``."""
+
+    task.maze.state_index(start)
+    if start == task.goal:
+        raise ValueError("start must differ from the physical goal")
+    plans = (
+        task.plan(start),
+        *(
+            task.plan(start, upper_state=upper_state)
+            for upper_state in range(task.number_of_subtasks)
+        ),
+        _goal_only_plan(
+            task,
+            start,
+            goal_interior_desirability=None,
+            tolerate_unreachable=True,
+        ),
+    )
+    number_of_physical = len(task.maze.free_cells)
+    number_of_modes = task.number_of_subtasks + 2
+    result = np.zeros(
+        (
+            number_of_physical,
+            number_of_modes,
+            number_of_physical,
+            number_of_modes,
+        ),
+        dtype=np.float64,
+    )
+    goal_state = task.maze.state_index(task.goal)
+    for current_state, current in enumerate(task.maze.free_cells):
+        if current_state == goal_state:
+            continue
+        step_kernel = _hierarchical_physical_step_kernel(task, current, plans)
+        result[:, :, current_state, :] = _first_departure_kernel(
+            step_kernel,
+            current_state,
+        )
+    return result
+
+
+def _support_reachable(
+    transition: np.ndarray,
+    initial_state: int,
+) -> np.ndarray:
+    """Return indices reachable in a destination-by-source matrix."""
+
+    reached = {initial_state}
+    pending = deque([initial_state])
+    while pending:
+        current = pending.popleft()
+        for following in np.flatnonzero(transition[:, current] > 0.0):
+            index = int(following)
+            if index not in reached:
+                reached.add(index)
+                pending.append(index)
+    return np.asarray(sorted(reached), dtype=np.int64)
+
+
+def _all_states_can_reach_goal(
+    transition: np.ndarray,
+    goal_probability: np.ndarray,
+) -> bool:
+    """Test whether every state has a positive-probability route to goal."""
+
+    can_reach = set(int(index) for index in np.flatnonzero(goal_probability > 0.0))
+    pending = deque(can_reach)
+    while pending:
+        destination = pending.popleft()
+        for predecessor in np.flatnonzero(transition[destination, :] > 0.0):
+            index = int(predecessor)
+            if index not in can_reach:
+                can_reach.add(index)
+                pending.append(index)
+    return len(can_reach) == transition.shape[0]
+
+
+def _expected_policy_entropy_for_pair(
+    task: HierarchyTask,
+    start: Coordinate,
+) -> ExpectedPolicyEntropyPairData | None:
+    """Return one absorbing-pair result, or ``None`` for policy nonabsorption."""
+
+    departure = _hierarchical_first_departure_dynamics(task, start)
+    number_of_physical, number_of_modes = departure.shape[:2]
+    number_of_controller_states = number_of_physical * number_of_modes
+    goal_state = task.maze.state_index(task.goal)
+    initial_full_state = task.maze.state_index(start) * number_of_modes
+    goal_full_states = np.arange(
+        goal_state * number_of_modes,
+        (goal_state + 1) * number_of_modes,
+    )
+    transient_full_states = np.asarray(
+        [
+            physical_state * number_of_modes + mode
+            for physical_state in range(number_of_physical)
+            if physical_state != goal_state
+            for mode in range(number_of_modes)
+        ],
+        dtype=np.int64,
+    )
+
+    full_transition = departure.reshape(
+        number_of_controller_states,
+        number_of_controller_states,
+    )
+    transient_transition = full_transition[
+        np.ix_(transient_full_states, transient_full_states)
+    ]
+    transient_lookup = {
+        int(full_state): index
+        for index, full_state in enumerate(transient_full_states)
+    }
+    initial_transient = transient_lookup[initial_full_state]
+    reachable_local = _support_reachable(
+        transient_transition,
+        initial_transient,
+    )
+    reachable_full = transient_full_states[reachable_local]
+
+    departure_mass = full_transition[:, reachable_full].sum(axis=0)
+    if not np.all(np.isfinite(departure_mass)):
+        raise RuntimeError("First-departure kernel contains nonfinite mass")
+    if np.any(departure_mass > 1.0 + _PROBABILITY_TOLERANCE):
+        raise RuntimeError("First-departure kernel has excess probability mass")
+    if np.any(departure_mass < 1.0 - _PROBABILITY_TOLERANCE):
+        return None
+    full_transition[:, reachable_full] /= departure_mass[np.newaxis, :]
+
+    transient_transition = full_transition[
+        np.ix_(transient_full_states, transient_full_states)
+    ]
+    restricted_transition = transient_transition[
+        np.ix_(reachable_local, reachable_local)
+    ]
+    goal_probability = full_transition[
+        np.ix_(goal_full_states, reachable_full)
+    ].sum(axis=0)
+    stochastic_mass = restricted_transition.sum(axis=0) + goal_probability
+    if not np.allclose(
+        stochastic_mass,
+        1.0,
+        atol=_PROBABILITY_TOLERANCE,
+        rtol=0.0,
+    ):
+        raise RuntimeError("Reachable departure chain is not stochastic")
+    if not _all_states_can_reach_goal(
+        restricted_transition,
+        goal_probability,
+    ):
+        return None
+
+    initial = np.zeros(len(reachable_local), dtype=np.float64)
+    initial_position = int(np.flatnonzero(reachable_local == initial_transient)[0])
+    initial[initial_position] = 1.0
+    try:
+        occupancy = np.linalg.solve(
+            np.eye(len(reachable_local), dtype=np.float64)
+            - restricted_transition,
+            initial,
+        )
+    except np.linalg.LinAlgError as error:
+        raise RuntimeError(
+            "Absorbing departure chain could not be solved"
+        ) from error
+    if not np.all(np.isfinite(occupancy)):
+        raise RuntimeError("Departure occupancy contains nonfinite values")
+    if np.any(occupancy < -_PROBABILITY_TOLERANCE):
+        raise RuntimeError("Departure occupancy contains negative values")
+    np.maximum(occupancy, 0.0, out=occupancy)
+
+    goal_hitting_probability = float(goal_probability @ occupancy)
+    if goal_hitting_probability < 1.0 - _PROBABILITY_TOLERANCE:
+        return None
+    if goal_hitting_probability > 1.0 + _PROBABILITY_TOLERANCE:
+        raise RuntimeError("Goal-hitting probability exceeds one")
+
+    raw_entropy = np.zeros(len(reachable_full), dtype=np.float64)
+    normalized_entropy = np.zeros(len(reachable_full), dtype=np.float64)
+    passive = task.template.environment.passive
+    for entropy_index, full_source in enumerate(reachable_full):
+        current_state, _ = divmod(int(full_source), number_of_modes)
+        q = full_transition[:, full_source].reshape(
+            number_of_physical,
+            number_of_modes,
+        ).sum(axis=1)
+        if abs(float(q[current_state])) > _PROBABILITY_TOLERANCE:
+            raise RuntimeError("First-departure kernel contains a self departure")
+        q[current_state] = 0.0
+        q_mass = float(q.sum())
+        if not np.isfinite(q_mass) or abs(q_mass - 1.0) > _PROBABILITY_TOLERANCE:
+            raise RuntimeError("Physical departure distribution is not stochastic")
+        if q_mass != 1.0:
+            q /= q_mass
+
+        legal = passive[:, current_state] > 0.0
+        legal[current_state] = False
+        if np.any(q[~legal] > _PROBABILITY_TOLERANCE):
+            raise RuntimeError("Controller departed outside physical topology")
+        positive = q > 0.0
+        entropy = float(-np.sum(q[positive] * np.log(q[positive])))
+        raw_entropy[entropy_index] = entropy
+        degree = int(np.count_nonzero(legal))
+        if degree <= 1:
+            normalized = 0.0
+        else:
+            normalized = entropy / float(np.log(degree))
+            if (
+                normalized < -_PROBABILITY_TOLERANCE
+                or normalized > 1.0 + _PROBABILITY_TOLERANCE
+            ):
+                raise RuntimeError("Normalized physical entropy is outside [0, 1]")
+            normalized = float(np.clip(normalized, 0.0, 1.0))
+        normalized_entropy[entropy_index] = normalized
+
+    expected_decisions = float(occupancy.sum())
+    if not np.isfinite(expected_decisions) or expected_decisions <= 0.0:
+        raise RuntimeError("Expected physical decision count is not positive")
+    expected_raw = float(raw_entropy @ occupancy)
+    expected_normalized = float(normalized_entropy @ occupancy)
+    return ExpectedPolicyEntropyPairData(
+        start=start,
+        goal=task.goal,
+        expected_entropy_sum_normalized=expected_normalized,
+        expected_entropy_sum_raw=expected_raw,
+        expected_decision_count=expected_decisions,
+        entropy_normalized=expected_normalized / expected_decisions,
+        entropy_raw=expected_raw / expected_decisions,
+    )
+
+
+def _physical_reachability(passive: np.ndarray) -> tuple[frozenset[int], ...]:
+    """Return directed physical support reachability for every source state."""
+
+    results = []
+    for start_state in range(passive.shape[0]):
+        reached = {start_state}
+        pending = deque([start_state])
+        while pending:
+            current = pending.popleft()
+            for following in np.flatnonzero(passive[:, current] > 0.0):
+                index = int(following)
+                if index not in reached:
+                    reached.add(index)
+                    pending.append(index)
+        results.append(frozenset(reached))
+    return tuple(results)
+
+
+def get_expected_policy_entropy(
+    model: HierarchyModel,
+) -> ExpectedPolicyEntropyData:
+    """Return exact physical first-departure entropy over uniform task pairs."""
+
+    if isinstance(model, HierarchyTask):
+        template = model.template
+        supplied_task = model
+    elif isinstance(model, HierarchyTemplate):
+        template = model
+        supplied_task = None
+    else:
+        raise TypeError("model must be a HierarchyTask or HierarchyTemplate")
+
+    maze = template.maze
+    physical_reachability = _physical_reachability(template.environment.passive)
+    per_pair: dict[StartGoalPair, ExpectedPolicyEntropyPairData] = {}
+    topologically_unreachable: list[StartGoalPair] = []
+    policy_nonabsorbing: list[StartGoalPair] = []
+    for goal_state, goal in enumerate(maze.free_cells):
+        non_goal_states = np.arange(len(maze.free_cells)) != goal_state
+        if (
+            not np.any(non_goal_states)
+            or np.any(
+                template.basis.access_profiles[non_goal_states].max(axis=0) <= 0.0
+            )
+        ):
+            continue
+        reachable_starts = []
+        for start_state, start in enumerate(maze.free_cells):
+            if start_state == goal_state:
+                continue
+            pair = (start, goal)
+            if goal_state not in physical_reachability[start_state]:
+                topologically_unreachable.append(pair)
+            else:
+                reachable_starts.append(start)
+        if not reachable_starts:
+            continue
+        task = (
+            supplied_task
+            if supplied_task is not None and supplied_task.goal == goal
+            else _build_hierarchy_task(template, goal)
+        )
+        for start in reachable_starts:
+            pair = (start, goal)
+            pair_data = _expected_policy_entropy_for_pair(task, start)
+            if pair_data is None:
+                policy_nonabsorbing.append(pair)
+            else:
+                per_pair[pair] = pair_data
+
+    if not per_pair:
+        raise RuntimeError("No absorbing ordered start-goal pairs are available")
+    pair_values = tuple(per_pair.values())
+    total_decisions = float(
+        sum(pair.expected_decision_count for pair in pair_values)
+    )
+    total_normalized = float(
+        sum(pair.expected_entropy_sum_normalized for pair in pair_values)
+    )
+    total_raw = float(sum(pair.expected_entropy_sum_raw for pair in pair_values))
+    return ExpectedPolicyEntropyData(
+        encounter_entropy_normalized=total_normalized / total_decisions,
+        pair_mean_entropy_normalized=float(
+            np.mean([pair.entropy_normalized for pair in pair_values])
+        ),
+        encounter_entropy_raw=total_raw / total_decisions,
+        pair_mean_entropy_raw=float(
+            np.mean([pair.entropy_raw for pair in pair_values])
+        ),
+        expected_total_decisions=total_decisions,
+        per_start_goal=per_pair,
+        topologically_unreachable_pairs=tuple(topologically_unreachable),
+        policy_nonabsorbing_pairs=tuple(policy_nonabsorbing),
+    )
 
 
 def _resolve_task(

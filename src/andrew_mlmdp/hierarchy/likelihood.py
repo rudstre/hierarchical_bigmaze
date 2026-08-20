@@ -249,6 +249,21 @@ def _first_departure_forward(
 ) -> np.ndarray:
     """Propagate to the first physical coordinate distinct from ``current``."""
 
+    departure = _first_departure_kernel(kernel, current_state)
+    return departure[next_state] @ forward
+
+
+def _first_departure_kernel(
+    kernel: np.ndarray,
+    current_state: int,
+) -> np.ndarray:
+    """Return first-distinct-physical-exit probabilities for every mode.
+
+    The result has the same ``[physical_next, mode_next, mode]`` orientation
+    as ``kernel``. Its ``current_state`` physical row is zero because a
+    same-observation transition is part of the closure, not a departure.
+    """
+
     self_kernel = kernel[current_state]
     other_states = np.arange(kernel.shape[0]) != current_state
     exit_mass = kernel[other_states].sum(axis=(0, 1))
@@ -267,22 +282,23 @@ def _first_departure_forward(
         changed = not np.array_equal(expanded, can_exit)
         can_exit = expanded
 
-    result = np.zeros_like(forward)
+    result = np.zeros_like(kernel)
     if not np.any(can_exit):
         return result
 
     transient = np.flatnonzero(can_exit)
     restricted_self = self_kernel[np.ix_(transient, transient)]
     try:
-        occupancy = np.linalg.solve(
+        closure = np.linalg.solve(
             np.eye(len(transient), dtype=np.float64) - restricted_self,
-            forward[transient],
+            np.eye(len(transient), dtype=np.float64),
         )
     except np.linalg.LinAlgError:
         return result
-    result = kernel[next_state][:, transient] @ occupancy
+    result[:, :, transient] = kernel[:, :, transient] @ closure
+    result[current_state] = 0.0
     if not np.all(np.isfinite(result)) or np.any(result < -1e-12):
-        return np.zeros_like(forward)
+        return np.zeros_like(kernel)
     np.maximum(result, 0.0, out=result)
     return result
 
