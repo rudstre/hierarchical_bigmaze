@@ -166,6 +166,13 @@ additional absorbing **copy** reached probabilistically from physical states;
 the original physical states remain in the maze interior. `alpha` controls the
 strength of this passive access relative to ordinary movement.
 
+These three quantities must not be conflated: `basis.profiles` contains the
+original peak-normalized NMF representation, `basis.access_profiles` contains
+the reusable gated profile, and `task.lower_subtask_passive` contains `P_t^1`,
+the goal-conditioned execution-access transition probabilities after the full
+augmented passive matrix has been normalized. The last quantity is not `D`,
+`D_hat`, or an NMF profile.
+
 The implementation is
 [`_build_lower_dynamics_from_access`](../src/andrew_mlmdp/hierarchy/core.py).
 The stacked matrix is column-stochastic after normalization.
@@ -462,6 +469,69 @@ described above.
 
 No stage assumes a particular maze size or fixed number of subgoals. Array
 shapes are derived from the supplied maze, goal partition, and profile count.
+
+## Hierarchy diagnostics and visualization
+
+Numerical diagnostics live in `andrew_mlmdp.hierarchy.diagnostics` and plotting
+wrappers are exported from `andrew_mlmdp.plotting`. The numerical results copy
+their arrays and make them read-only. Passing a template constructs an
+uncached goal task, so diagnostic inspection does not populate the template's
+task cache.
+
+The access graph exposes three explicitly named arrays:
+
+- `original_nmf_profiles`, copied from `basis.profiles`;
+- `gated_profiles`, copied from `basis.access_profiles`; and
+- `execution_access_probabilities`, mapped directly from
+  `task.lower_subtask_passive` through `task.interior_states`.
+
+Peaks and centroids derived for graph layout are called `display_coordinates`.
+They are visual positions only, never inferred physical entry states.
+
+```python
+from andrew_mlmdp import plotting
+from andrew_mlmdp.hierarchy import (
+    get_composition_weight_data,
+    get_continuation_policy_data,
+    get_upper_graph_data,
+    sample_hierarchical_rollouts,
+)
+
+access = get_upper_graph_data(task, start_state=start)
+continuations = get_continuation_policy_data(task)
+weights = get_composition_weight_data(task, start_state=start)
+
+plotting.plot_subgoal_access_and_upper_dynamics(task)
+plotting.plot_upper_controlled_dynamics(task, start_state=start)
+plotting.plot_continuation_policies(task)
+plotting.plot_composition_weights(task, start_state=start)
+
+ensemble = sample_hierarchical_rollouts(task, start, seed=0)
+plotting.plot_rollout_distribution(task, start, ensemble=ensemble)
+plotting.plot_rollout_subgoal_sequences(task, start, ensemble=ensemble)
+```
+
+`ContinuationPolicyData` stores the stationary `LayerOnePlan` and the exact
+refractory-adjusted columns produced by the rollout engine. A plot can show the
+literal first post-access distribution only when the caller supplies an
+explicit physical entry coordinate for that subgoal; display coordinates are
+never substituted.
+
+Composition diagnostics expose the actual implementation trace
+`raw_weights -> composition_input_weights -> weights`. The middle vector is
+recorded by `LayerOnePlan` at the point where it is passed into composition,
+rather than reconstructed by diagnostics.
+
+Trajectory length always means the number of physical steps. For model
+rollouts this is `rollout.physical_steps`, equal to
+`len(rollout.trajectory) - 1`; abstract accesses add no physical steps.
+Repeated physical coordinates still count as sampled physical transitions.
+Successful-route statistics exclude censored or failed outcomes while status
+counts retain every rollout.
+
+The NumPy object supplied to diagnostics must already contain the desired
+fitted parameter values. `HierarchicalFitResult` snapshots are not applied to
+templates implicitly.
 
 ## Differentiable hierarchical likelihood and fitting
 

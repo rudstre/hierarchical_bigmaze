@@ -652,6 +652,7 @@ class LayerOnePlan:
     inpainted_rewards: np.ndarray
     target_boundary_desirability: np.ndarray
     raw_weights: np.ndarray
+    composition_input_weights: np.ndarray
     weights: np.ndarray
     reconstructed_boundary_desirability: np.ndarray
     physical_desirability: np.ndarray
@@ -807,9 +808,9 @@ def _plan_from_abstract_dynamics(
         np.linalg.pinv(model.task_basis.boundary_desirability)
         @ target_boundary_desirability
     )
-    clipped_weights = np.maximum(0.0, raw_weights)
+    composition_input_weights = np.maximum(0.0, raw_weights)
     weights = _composition_weights(
-        clipped_weights,
+        composition_input_weights,
         exponent=model.template.composition_exponent,
         mode=model.template.composition_mode,
     )
@@ -830,6 +831,7 @@ def _plan_from_abstract_dynamics(
         inpainted_rewards=inpainted_rewards,
         target_boundary_desirability=target_boundary_desirability,
         raw_weights=raw_weights,
+        composition_input_weights=composition_input_weights,
         weights=weights,
         reconstructed_boundary_desirability=reconstructed_boundary,
         physical_desirability=physical_desirability,
@@ -879,6 +881,7 @@ def _goal_only_plan(
         inpainted_rewards=inpainted,
         target_boundary_desirability=target,
         raw_weights=weights.copy(),
+        composition_input_weights=weights.copy(),
         weights=weights,
         reconstructed_boundary_desirability=target,
         physical_desirability=physical,
