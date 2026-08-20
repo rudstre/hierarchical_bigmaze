@@ -46,6 +46,133 @@ def _likelihood_plans(task, start):
             goal_interior_desirability=None,
         ),
     )
+
+
+def _scalar_hierarchical_physical_step_kernel(
+    task,
+    current,
+    plans,
+    *,
+    number_of_initial_modes=1,
+):
+    """Reproduce the pre-batching kernel assembly one mode at a time."""
+
+    number_of_subtasks = task.number_of_subtasks
+    number_of_interior = len(task.interior_states)
+    number_of_enabled_modes = number_of_initial_modes + number_of_subtasks
+    number_of_modes = number_of_enabled_modes + 1
+    current_interior = task.interior_state_by_coordinate[current]
+    goal_state = task.maze.state_index(task.goal)
+    kernel = np.zeros(
+        (len(task.maze.free_cells), number_of_modes, number_of_modes),
+        dtype=np.float64,
+    )
+
+    def add(probabilities, old_mode, new_mode, scale=1.0):
+        kernel[task.interior_states, new_mode, old_mode] += (
+            scale * probabilities[:number_of_interior]
+        )
+        kernel[goal_state, new_mode, old_mode] += scale * probabilities[-1]
+
+    for old_mode in range(number_of_enabled_modes):
+        enabled = _rollout_column(
+            plans[old_mode],
+            current_interior,
+            number_of_interior,
+            number_of_subtasks,
+            suppress_access=False,
+        )
+        if enabled is None:
+            continue
+        add(enabled, old_mode, old_mode)
+        for entered_state in range(number_of_subtasks):
+            access_probability = enabled[number_of_interior + entered_state]
+            if access_probability <= 0.0:
+                continue
+            access_coordinate = (
+                current
+                if task.basis.locations is None
+                else task.basis.locations[entered_state]
+            )
+            access_interior = task.interior_state_by_coordinate[
+                access_coordinate
+            ]
+            termination_probability = task.upper_controlled[-1, entered_state]
+            continuation_mode = number_of_initial_modes + entered_state
+            continuation = _rollout_column(
+                plans[continuation_mode],
+                access_interior,
+                number_of_interior,
+                number_of_subtasks,
+                suppress_access=True,
+            )
+            if continuation is not None:
+                add(
+                    continuation,
+                    old_mode,
+                    continuation_mode,
+                    access_probability * (1.0 - termination_probability),
+                )
+            goal_only = _rollout_column(
+                plans[-1],
+                access_interior,
+                number_of_interior,
+                number_of_subtasks,
+                suppress_access=True,
+            )
+            if goal_only is not None:
+                add(
+                    goal_only,
+                    old_mode,
+                    number_of_modes - 1,
+                    access_probability * termination_probability,
+                )
+
+    goal_only = _rollout_column(
+        plans[-1],
+        current_interior,
+        number_of_interior,
+        number_of_subtasks,
+        suppress_access=True,
+    )
+    if goal_only is not None:
+        add(goal_only, number_of_modes - 1, number_of_modes - 1)
+    return kernel
+
+
+def test_batched_step_kernel_matches_scalar_assembly_with_initial_mode_bank():
+    task = _likelihood_task()
+    starts = tuple(cell for cell in task.maze.free_cells if cell != task.goal)
+    anchor = starts[0]
+    plans = (
+        *(task.plan(start) for start in starts),
+        *(
+            task.plan(anchor, upper_state=upper_state)
+            for upper_state in range(task.number_of_subtasks)
+        ),
+        _goal_only_plan(
+            task,
+            anchor,
+            goal_interior_desirability=None,
+        ),
+    )
+
+    for current in starts:
+        actual = _hierarchical_physical_step_kernel(
+            task,
+            current,
+            plans,
+            number_of_initial_modes=len(starts),
+        )
+        expected = _scalar_hierarchical_physical_step_kernel(
+            task,
+            current,
+            plans,
+            number_of_initial_modes=len(starts),
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-15, atol=1e-15)
+
+
 def test_hierarchy_step_kernel_matches_explicit_latent_path_enumeration():
     task = _likelihood_task()
     current = (0, 1)

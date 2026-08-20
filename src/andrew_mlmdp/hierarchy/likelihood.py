@@ -8,7 +8,7 @@ from andrew_mlmdp.hierarchy.core import (
     _goal_only_plan,
     _layer_one_plan,
 )
-from andrew_mlmdp.hierarchy.rollout import _rollout_column
+from andrew_mlmdp.hierarchy.rollout import _rollout_column, _rollout_columns
 from andrew_mlmdp.maze import Coordinate
 
 
@@ -98,111 +98,115 @@ def _hierarchical_physical_step_kernel(
     model: HierarchyTask,
     current: Coordinate,
     plans: tuple[LayerOnePlan, ...],
+    *,
+    number_of_initial_modes: int = 1,
 ) -> np.ndarray:
     """Return ``P(physical_next, mode_next | current, mode)``.
 
-    Mode zero is the persistent initial plan, modes ``1..k`` are plans issued
-    after nonterminal accesses to upper states ``0..k-1``, and the last mode
-    is the permanently installed goal-only plan. The returned array uses
+    The first ``number_of_initial_modes`` modes are persistent initial plans,
+    the following ``k`` modes are plans issued after nonterminal accesses to
+    upper states ``0..k-1``, and the last mode is the permanently installed
+    goal-only plan. The default retains the likelihood's single initial mode.
     ``[physical_next, mode_next, mode]`` ordering.
     """
 
     number_of_subtasks = model.number_of_subtasks
     number_of_interior = len(model.interior_states)
-    number_of_modes = number_of_subtasks + 2
+    if number_of_initial_modes < 1:
+        raise ValueError("At least one initial controller mode is required")
+    number_of_enabled_modes = number_of_initial_modes + number_of_subtasks
+    number_of_modes = number_of_enabled_modes + 1
     if len(plans) != number_of_modes:
         raise ValueError("Likelihood plans do not match the hierarchy")
 
     current_interior = model.interior_state_by_coordinate[current]
     goal_state = model.maze.state_index(model.goal)
+    number_of_physical = len(model.maze.free_cells)
     kernel = np.zeros(
-        (len(model.maze.free_cells), number_of_modes, number_of_modes),
+        (number_of_physical, number_of_modes, number_of_modes),
         dtype=np.float64,
     )
+    enabled_modes = np.arange(number_of_enabled_modes)
+    enabled, _ = _rollout_columns(
+        plans[:number_of_enabled_modes],
+        np.full(number_of_enabled_modes, current_interior, dtype=np.int64),
+        number_of_interior,
+        number_of_subtasks,
+        suppress_access=False,
+    )
+    kernel[
+        model.interior_states[:, np.newaxis],
+        enabled_modes[np.newaxis, :],
+        enabled_modes[np.newaxis, :],
+    ] += enabled[:number_of_interior]
+    kernel[goal_state, enabled_modes, enabled_modes] += enabled[-1]
 
-    # Enabled modes first sample the complete Layer-1 distribution. A lower
-    # access then samples the rollout's upper termination Bernoulli and one
-    # refractory Layer-1 step under the newly installed plan.
-    for old_mode in range(number_of_subtasks + 1):
-        probabilities = _rollout_column(
-            plans[old_mode],
-            current_interior,
-            number_of_interior,
-            number_of_subtasks,
-            suppress_access=False,
-        )
-        if probabilities is None:
-            continue
-
-        _add_physical_outcomes(
-            kernel,
-            probabilities,
-            old_mode,
-            old_mode,
-            model.interior_states,
-            goal_state,
-        )
-        for entered_state in range(number_of_subtasks):
-            access_probability = probabilities[
-                number_of_interior + entered_state
-            ]
-            if access_probability <= 0.0:
-                continue
-
-            access_coordinate = (
-                current
-                if model.basis.locations is None
-                else model.basis.locations[entered_state]
-            )
-            access_interior = model.interior_state_by_coordinate[
-                access_coordinate
-            ]
-            continuation_mode = entered_state + 1
-            continuation = _rollout_column(
-                plans[continuation_mode],
-                access_interior,
-                number_of_interior,
-                number_of_subtasks,
-                suppress_access=True,
-            )
-            goal_mode = number_of_modes - 1
-            goal_only = _rollout_column(
-                plans[goal_mode],
-                access_interior,
-                number_of_interior,
-                number_of_subtasks,
-                suppress_access=True,
-            )
-            termination_probability = float(
-                model.upper_controlled[-1, entered_state]
-            )
-            if continuation is not None:
-                _add_physical_outcomes(
-                    kernel,
-                    continuation,
-                    old_mode,
-                    continuation_mode,
-                    model.interior_states,
-                    goal_state,
-                    scale=(
-                        access_probability
-                        * (1.0 - termination_probability)
-                    ),
-                )
-            if goal_only is not None:
-                _add_physical_outcomes(
-                    kernel,
-                    goal_only,
-                    old_mode,
-                    goal_mode,
-                    model.interior_states,
-                    goal_state,
-                    scale=access_probability * termination_probability,
-                )
-
-    # Once upper termination occurs, rollout permanently suppresses accesses
-    # and renormalizes the remaining goal-only physical/goal outcomes.
+    access_coordinates = tuple(
+        current
+        if model.basis.locations is None
+        else model.basis.locations[entered_state]
+        for entered_state in range(number_of_subtasks)
+    )
+    access_interiors = np.asarray(
+        [
+            model.interior_state_by_coordinate[coordinate]
+            for coordinate in access_coordinates
+        ],
+        dtype=np.int64,
+    )
+    continuation_plans = plans[
+        number_of_initial_modes:number_of_enabled_modes
+    ]
+    continuation, continuation_usable = _rollout_columns(
+        continuation_plans,
+        access_interiors,
+        number_of_interior,
+        number_of_subtasks,
+        suppress_access=True,
+    )
     goal_mode = number_of_modes - 1
+    goal_access, goal_access_usable = _rollout_columns(
+        tuple(plans[goal_mode] for _ in range(number_of_subtasks)),
+        access_interiors,
+        number_of_interior,
+        number_of_subtasks,
+        suppress_access=True,
+    )
+    continuation_physical = np.zeros(
+        (number_of_physical, number_of_subtasks),
+        dtype=np.float64,
+    )
+    continuation_physical[model.interior_states] = continuation[
+        :number_of_interior
+    ]
+    continuation_physical[goal_state] = continuation[-1]
+    goal_access_physical = np.zeros_like(continuation_physical)
+    goal_access_physical[model.interior_states] = goal_access[
+        :number_of_interior
+    ]
+    goal_access_physical[goal_state] = goal_access[-1]
+    access_probability = enabled[
+        number_of_interior : number_of_interior + number_of_subtasks
+    ]
+
+    for entered_state in range(number_of_subtasks):
+        termination_probability = float(
+            model.upper_controlled[-1, entered_state]
+        )
+        if continuation_usable[entered_state]:
+            continuation_mode = number_of_initial_modes + entered_state
+            kernel[:, continuation_mode, :number_of_enabled_modes] += (
+                continuation_physical[:, entered_state, np.newaxis]
+                * access_probability[entered_state, np.newaxis, :]
+                * (1.0 - termination_probability)
+            )
+        if goal_access_usable[entered_state]:
+            kernel[:, goal_mode, :number_of_enabled_modes] += (
+                goal_access_physical[:, entered_state, np.newaxis]
+                * access_probability[entered_state, np.newaxis, :]
+                * termination_probability
+            )
+
     goal_only = _rollout_column(
         plans[goal_mode],
         current_interior,
@@ -220,7 +224,6 @@ def _hierarchical_physical_step_kernel(
             goal_state,
         )
     return kernel
-
 
 def _add_physical_outcomes(
     kernel: np.ndarray,

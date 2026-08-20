@@ -13,6 +13,7 @@ from matplotlib.patches import FancyArrowPatch
 
 from andrew_mlmdp.hierarchy.diagnostics import (
     ContinuationPolicyData,
+    ExpectedPolicyEntropySweepData,
     HierarchyModel,
     LatentRouteData,
     RolloutDistributionData,
@@ -29,6 +30,47 @@ from andrew_mlmdp.hierarchy.diagnostics import (
 from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting.maze import plot_maze
 from andrew_mlmdp.plotting.shared import _colormap
+
+_ENTROPY_SWEEP_METRIC_LABELS = {
+    "encounter_entropy_normalized": (
+        "Expected encountered policy entropy (normalized)"
+    ),
+    "pair_mean_entropy_normalized": (
+        "Mean per-pair policy entropy (normalized)"
+    ),
+    "encounter_entropy_raw": "Expected encountered policy entropy (nats)",
+    "pair_mean_entropy_raw": "Mean per-pair policy entropy (nats)",
+    "expected_total_decisions": "Expected total decisions",
+}
+
+
+def plot_expected_policy_entropy_sweep(
+    sweep_data: ExpectedPolicyEntropySweepData,
+    *,
+    metric: str = "encounter_entropy_normalized",
+    ax=None,
+):
+    """Plot one exact expected-policy-entropy parameter sweep."""
+
+    if not isinstance(sweep_data, ExpectedPolicyEntropySweepData):
+        raise TypeError("sweep_data must be an ExpectedPolicyEntropySweepData")
+    if metric not in _ENTROPY_SWEEP_METRIC_LABELS:
+        available = ", ".join(_ENTROPY_SWEEP_METRIC_LABELS)
+        raise ValueError(
+            f"Unknown entropy sweep metric {metric!r}; choose one of: {available}"
+        )
+    if ax is None:
+        figure, ax = plt.subplots()
+    else:
+        figure = ax.figure
+    ax.plot(
+        sweep_data.parameter_values,
+        getattr(sweep_data, metric),
+        marker="o",
+    )
+    ax.set_xlabel(sweep_data.parameter_name.replace("_", " ").capitalize())
+    ax.set_ylabel(_ENTROPY_SWEEP_METRIC_LABELS[metric])
+    return figure, ax
 
 
 def _subgoal_colors(number_of_subgoals: int) -> tuple[tuple[float, ...], ...]:

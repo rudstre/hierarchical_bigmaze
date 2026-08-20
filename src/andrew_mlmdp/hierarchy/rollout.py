@@ -129,6 +129,41 @@ def _rollout_from_engine(
     )
 
 
+def _rollout_columns(
+    plans: tuple[LayerOnePlan, ...],
+    current_interiors: np.ndarray,
+    number_of_interior: int,
+    number_of_subtasks: int,
+    *,
+    suppress_access: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Batch the rollout engine's exact column normalization semantics."""
+
+    current_indices = np.asarray(current_interiors, dtype=np.int64)
+    if current_indices.shape != (len(plans),):
+        raise ValueError("Each rollout plan requires one current interior state")
+    probabilities = np.column_stack(
+        [
+            plan.layer_one_controlled[:, current_index]
+            for plan, current_index in zip(plans, current_indices)
+        ]
+    )
+    if suppress_access:
+        probabilities[
+            number_of_interior : number_of_interior + number_of_subtasks,
+            :,
+        ] = 0.0
+    probability_mass = probabilities.sum(axis=0)
+    usable = (
+        np.isfinite(probability_mass)
+        & (probability_mass > 0.0)
+        & ~np.any(probabilities < 0.0, axis=0)
+    )
+    probabilities[:, usable] /= probability_mass[usable][np.newaxis, :]
+    probabilities[:, ~usable] = 0.0
+    return probabilities, usable
+
+
 def _rollout_column(
     plan: LayerOnePlan,
     current_interior: int,
@@ -139,19 +174,16 @@ def _rollout_column(
 ) -> np.ndarray | None:
     """Apply the rollout engine's access suppression and normalization."""
 
-    probabilities = plan.layer_one_controlled[:, current_interior].copy()
-    if suppress_access:
-        probabilities[
-            number_of_interior : number_of_interior + number_of_subtasks
-        ] = 0.0
-    probability_mass = probabilities.sum()
-    if (
-        not np.isfinite(probability_mass)
-        or probability_mass <= 0.0
-        or np.any(probabilities < 0.0)
-    ):
+    probabilities, usable = _rollout_columns(
+        (plan,),
+        np.asarray([current_interior]),
+        number_of_interior,
+        number_of_subtasks,
+        suppress_access=suppress_access,
+    )
+    if not usable[0]:
         return None
-    return probabilities / probability_mass
+    return probabilities[:, 0]
 
 
 def _run_hierarchical_rollout(

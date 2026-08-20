@@ -19,6 +19,7 @@ from andrew_mlmdp.hierarchy.diagnostics import (
     ContinuationPolicyData,
     ExpectedPolicyEntropyData,
     ExpectedPolicyEntropyPairData,
+    ExpectedPolicyEntropySweepData,
     LatentRouteData,
     RolloutDistributionData,
     RolloutEnsemble,
@@ -31,6 +32,7 @@ from andrew_mlmdp.hierarchy.diagnostics import (
     shortest_path_length,
     summarize_rollout_subgoal_sequences,
     summarize_rollouts,
+    sweep_expected_policy_entropy,
 )
 from andrew_mlmdp.hierarchy.fitting import (
     FittedParameterValues,
@@ -57,6 +59,7 @@ __all__ = [
     "CoreThresholdDomain",
     "ExpectedPolicyEntropyData",
     "ExpectedPolicyEntropyPairData",
+    "ExpectedPolicyEntropySweepData",
     "FittedParameterValues",
     "HierarchicalFitEvaluation",
     "HierarchicalFitResult",
@@ -87,5 +90,6 @@ __all__ = [
     "shortest_path_length",
     "summarize_rollout_subgoal_sequences",
     "summarize_rollouts",
+    "sweep_expected_policy_entropy",
     "total_hierarchical_movement_log_likelihood_torch",
 ]
