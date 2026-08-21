@@ -146,7 +146,7 @@ class Maze:
             coordinate[1] + column_change,
         )
 
-        # Invalid commands become self-transitions in the passive dynamics.
+        # Invalid commands stay in place; the five-command mode retains this mass.
         if not self.is_free(next_coordinate):
             return coordinate
         if (

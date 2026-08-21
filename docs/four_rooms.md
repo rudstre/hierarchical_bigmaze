@@ -108,8 +108,8 @@ Parameters(
 )
 ```
 
-This fixture retains historical passive and controlled matrices, initial plan
-values, and seeded flat and hierarchical trajectories in
+This fixture freezes the default valid-neighbor passive and controlled matrices,
+initial plan values, and seeded flat and hierarchical trajectories in
 `tests/data/four_rooms_regression.json`. It intentionally does not track the
 current notebook tuning or the library defaults. Its hierarchy supplies an
 explicit historical `TaskLibrary`, so removal of the former behavioral

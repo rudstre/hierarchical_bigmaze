@@ -55,10 +55,10 @@ result as `environment.passive`.
 
 Two passive models are available:
 
-- `five_commands` samples north, south, east, west, or stay uniformly. Invalid
-  commands remain at the current state.
-- `valid_neighbors` samples uniformly from traversable cardinal neighbors and
-  has no self-transition.
+- `valid_neighbors` is the default. It samples uniformly from traversable
+  cardinal neighbors and has no self-transition.
+- `five_commands` is opt-in. It samples north, south, east, west, or stay
+  uniformly; invalid commands remain at the current state.
 
 This matrix represents uncontrolled behavior and encodes which controlled
 transitions are possible. LMDP control reweights its existing probability

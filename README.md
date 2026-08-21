@@ -152,14 +152,15 @@ Useful objects are deliberately inspectable:
 
 ## Flat LMDPs and passive-motion modes
 
-By default, passive motion samples uniformly from north, south, east, west, and
-stay. A blocked command becomes a self-transition. To sample uniformly only
-from traversable cardinal neighbors:
+By default, passive motion samples uniformly from traversable cardinal
+neighbors and has no self-transitions. The five-command model, which includes
+`stay` and turns blocked commands into self-transitions, remains available
+explicitly:
 
 ```python
-movement_only = Environment(
+command_sampling = Environment(
     maze,
-    passive_mode="valid_neighbors",
+    passive_mode="five_commands",
 )
 ```
 

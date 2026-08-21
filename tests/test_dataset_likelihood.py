@@ -121,11 +121,11 @@ def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks():
 
 
 def test_invalid_trials_are_excluded_but_impossible_trials_are_scored():
-    environment = Environment(Maze.from_ascii(".#."))
+    environment = Environment(Maze.from_ascii("..#.."))
     trials = (
-        Trial("session-a", 1, (0, 2), ((0, 0), (0, 2))),
-        Trial("session-a", 2, (0, 2), ()),
-        Trial("session-a", 3, (0, 2), ((0, 1),)),
+        Trial("session-a", 1, (0, 4), ((0, 0), (0, 4))),
+        Trial("session-a", 2, (0, 4), ()),
+        Trial("session-a", 3, (0, 4), ((0, 2),)),
     )
 
     result = score_flat_dataset(environment, trials)

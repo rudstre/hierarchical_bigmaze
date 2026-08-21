@@ -338,7 +338,7 @@ class Environment:
     """
 
     maze: Maze
-    passive_mode: PassiveMode = "five_commands"
+    passive_mode: PassiveMode = "valid_neighbors"
     passive: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -542,7 +542,7 @@ def controlled_dynamics(
 def passive_dynamics(
     maze: Maze,
     *,
-    mode: PassiveMode = "five_commands",
+    mode: PassiveMode = "valid_neighbors",
 ) -> np.ndarray:
     """Return the selected random walk in ``maze.free_cells`` order.
 

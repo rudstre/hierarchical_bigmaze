@@ -22,7 +22,7 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
     calls = 0
     original = lmdp.passive_dynamics
 
-    def counted(maze, *, mode: PassiveMode = "five_commands"):
+    def counted(maze, *, mode: PassiveMode = "valid_neighbors"):
         nonlocal calls
         calls += 1
         return original(maze, mode=mode)
@@ -38,16 +38,16 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
     assert np.allclose(environment.passive.sum(axis=0), 1.0)
 
 
-def test_default_passive_mode_preserves_five_command_dynamics():
+def test_default_passive_mode_uses_valid_neighbors():
     environment = Environment(Maze.from_ascii("..."))
 
-    assert environment.passive_mode == "five_commands"
+    assert environment.passive_mode == "valid_neighbors"
     assert environment.passive == pytest.approx(
         np.asarray(
             [
-                [0.8, 0.2, 0.0],
-                [0.2, 0.6, 0.2],
-                [0.0, 0.2, 0.8],
+                [0.0, 0.5, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 0.5, 0.0],
             ]
         )
     )
@@ -235,26 +235,26 @@ def test_log_likelihood_conditions_on_leaving_each_state():
 
 
 def test_log_likelihood_validates_trajectory():
-    maze = Maze.from_ascii(".#.")
-    solution = Environment(maze).solve((0, 2))
+    maze = Maze.from_ascii("..#..")
+    solution = Environment(maze).solve((0, 4))
 
     assert solution.log_likelihood([(0, 0)]) == 0.0
     assert solution.log_likelihood([(0, 0), (0, 0)]) == 0.0
     with pytest.raises(ValueError, match="at least one coordinate"):
         solution.log_likelihood([])
     with pytest.raises(ValueError, match="not a free cell"):
-        solution.log_likelihood([(0, 1)])
+        solution.log_likelihood([(0, 2)])
 
 
 def test_log_likelihood_returns_negative_infinity_when_impossible():
-    maze = Maze.from_ascii(".#.")
-    solution = Environment(maze).solve((0, 2))
+    maze = Maze.from_ascii("..#..")
+    solution = Environment(maze).solve((0, 4))
 
     assert np.isneginf(
-        solution.log_likelihood([(0, 0), (0, 2)])
+        solution.log_likelihood([(0, 0), (0, 4)])
     )
     assert np.isneginf(
-        solution.log_likelihood([(0, 2), (0, 0)])
+        solution.log_likelihood([(0, 4), (0, 0)])
     )
 
 
@@ -273,6 +273,6 @@ def test_generic_first_exit_solve_and_z_iteration_converge():
 
 
 def test_disconnected_state_has_zero_desirability():
-    maze = Maze.from_ascii(".#.")
-    solution = Environment(maze).solve((0, 2))
+    maze = Maze.from_ascii("..#..")
+    solution = Environment(maze).solve((0, 4))
     assert solution.desirability[maze.state_index((0, 0))] == pytest.approx(0.0)
