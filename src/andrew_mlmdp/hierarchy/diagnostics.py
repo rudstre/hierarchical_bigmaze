@@ -1770,10 +1770,16 @@ def sweep_expected_policy_entropy(
     parameter_name: str,
     values: Sequence[float],
     *,
+    start: Coordinate | None = None,
+    goal: Coordinate | None = None,
     progress: bool = False,
     compute_condition_diagnostics: bool = False,
 ) -> ExpectedPolicyEntropySweepData:
-    """Evaluate exact entropy and runtime diagnostics over one parameter grid."""
+    """Evaluate exact entropy and runtime diagnostics over one parameter grid.
+
+    When start and goal are supplied, only that pair is evaluated.  For a fixed
+    pair, the encounter and pair-mean entropy metrics are identical.
+    """
 
     if not isinstance(template, HierarchyTemplate):
         raise TypeError("template must be a HierarchyTemplate")
@@ -1783,6 +1789,8 @@ def sweep_expected_policy_entropy(
         raise TypeError("progress must be a boolean")
     if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
         raise TypeError("compute_condition_diagnostics must be a boolean")
+    if (start is None) != (goal is None):
+        raise ValueError("start and goal must be provided together")
     supported = _supported_entropy_sweep_parameters(template)
     if parameter_name not in supported:
         # Use the common replacement validator for one consistent public error.
@@ -1826,13 +1834,34 @@ def sweep_expected_policy_entropy(
         token = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.set(instrumentation)
         entropy_started = perf_counter()
         try:
-            if compute_condition_diagnostics:
+            entropy_kwargs = (
+                {"compute_condition_diagnostics": True}
+                if compute_condition_diagnostics
+                else {}
+            )
+            if start is None:
                 result = get_expected_policy_entropy(
                     candidate,
-                    compute_condition_diagnostics=True,
+                    **entropy_kwargs,
                 )
             else:
-                result = get_expected_policy_entropy(candidate)
+                assert goal is not None
+                pair_result = get_expected_policy_entropy_for_pair(
+                    candidate,
+                    start,
+                    goal,
+                    **entropy_kwargs,
+                )
+                result = ExpectedPolicyEntropyData(
+                    encounter_entropy_normalized=pair_result.entropy_normalized,
+                    pair_mean_entropy_normalized=pair_result.entropy_normalized,
+                    encounter_entropy_raw=pair_result.entropy_raw,
+                    pair_mean_entropy_raw=pair_result.entropy_raw,
+                    expected_total_decisions=pair_result.expected_decision_count,
+                    per_start_goal={(start, goal): pair_result},
+                    topologically_unreachable_pairs=(),
+                    policy_nonabsorbing_pairs=(),
+                )
         except Exception as error:
             entropy_seconds = perf_counter() - entropy_started
             if progress:
@@ -1930,6 +1959,48 @@ def _resolve_task(
         raise ValueError("goal is required when model is a HierarchyTemplate")
     # Use the authoritative constructor without populating the template cache.
     return _build_hierarchy_task(model, goal)
+
+
+def get_expected_policy_entropy_for_pair(
+    model: HierarchyModel,
+    start: Coordinate,
+    goal: Coordinate | None = None,
+    *,
+    compute_condition_diagnostics: bool = False,
+) -> ExpectedPolicyEntropyPairData:
+    """Return exact physical first-departure entropy for one task pair.
+
+    A template requires an explicit ``goal``.  A goal-conditioned task accepts
+    no goal or its existing goal.  Topologically unreachable pairs and policies
+    that do not almost surely reach the goal are reported as errors.
+    """
+
+    if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
+        raise TypeError("compute_condition_diagnostics must be a boolean")
+    task = _resolve_task(model, goal)
+    start_state = task.maze.state_index(start)
+    if start == task.goal:
+        raise ValueError("start must differ from the physical goal")
+    goal_state = task.maze.state_index(task.goal)
+    physical_reachability = _physical_reachability(
+        task.template.environment.passive
+    )
+    if goal_state not in physical_reachability[start_state]:
+        raise ValueError("goal is not topologically reachable from start")
+
+    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
+    if instrumentation is not None:
+        instrumentation.start_goal_pair_count += 1
+    pair_data = _expected_policy_entropy_for_pair(
+        task,
+        start,
+        compute_condition_diagnostics=compute_condition_diagnostics,
+    )
+    if pair_data is None:
+        raise RuntimeError(
+            "Policy is nonabsorbing for the requested start-goal pair"
+        )
+    return pair_data
 
 
 def _subgoal_labels(task: HierarchyTask) -> tuple[str, ...]:

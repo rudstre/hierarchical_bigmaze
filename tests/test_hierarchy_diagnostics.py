@@ -11,6 +11,7 @@ from andrew_mlmdp.hierarchy import (
     get_composition_weight_data,
     get_continuation_policy_data,
     get_expected_policy_entropy,
+    get_expected_policy_entropy_for_pair,
     get_upper_graph_data,
     sample_hierarchical_rollouts,
     shortest_path_length,
@@ -276,6 +277,114 @@ def test_expected_policy_entropy_is_zero_in_degree_one_corridor():
         data.per_start_goal[((0, 0), (0, 1))] = data.per_start_goal[
             ((0, 0), (0, 1))
         ]
+
+
+def test_expected_policy_entropy_for_pair_matches_all_pairs_without_caching():
+    maze = Maze.from_ascii("...")
+    template = _uniform_profile_template(maze)
+    start = (0, 0)
+    goal = (0, 2)
+    expected = get_expected_policy_entropy(template).per_start_goal[
+        (start, goal)
+    ]
+
+    actual = get_expected_policy_entropy_for_pair(template, start, goal)
+
+    assert template._task_cache == {}
+    assert actual.start == start
+    assert actual.goal == goal
+    for field in (
+        "expected_entropy_sum_normalized",
+        "expected_entropy_sum_raw",
+        "expected_decision_count",
+        "entropy_normalized",
+        "entropy_raw",
+    ):
+        assert getattr(actual, field) == pytest.approx(
+            getattr(expected, field),
+            rel=1e-11,
+            abs=1e-12,
+        )
+
+    task_actual = get_expected_policy_entropy_for_pair(
+        template.for_goal(goal),
+        start,
+    )
+    assert task_actual == actual
+
+
+def test_expected_policy_entropy_for_pair_constructs_only_requested_pair(
+    monkeypatch,
+):
+    maze = Maze.from_ascii("...")
+    template = _uniform_profile_template(maze)
+    start = (0, 0)
+    goal = (0, 2)
+    original = hierarchy_diagnostics._hierarchical_first_departure_dynamics
+    calls = []
+
+    def counted_pair_departure(task, selected_start):
+        calls.append((task.goal, selected_start))
+        return original(task, selected_start)
+
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "_hierarchical_first_departure_dynamics",
+        counted_pair_departure,
+    )
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "_hierarchical_goal_first_departure_dynamics",
+        lambda *_args, **_kwargs: pytest.fail(
+            "single-pair entropy constructed goal-level departures"
+        ),
+    )
+
+    get_expected_policy_entropy_for_pair(template, start, goal)
+
+    assert calls == [(goal, start)]
+
+
+def test_expected_policy_entropy_for_pair_validates_arguments():
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    task = template.for_goal((0, 2))
+
+    with pytest.raises(ValueError, match="goal is required"):
+        get_expected_policy_entropy_for_pair(template, (0, 0))
+    with pytest.raises(ValueError, match="not a free cell"):
+        get_expected_policy_entropy_for_pair(template, (1, 0), (0, 2))
+    with pytest.raises(ValueError, match="must differ"):
+        get_expected_policy_entropy_for_pair(template, (0, 2), (0, 2))
+    with pytest.raises(ValueError, match="conflicts"):
+        get_expected_policy_entropy_for_pair(task, (0, 0), (0, 1))
+    with pytest.raises(TypeError, match="compute_condition_diagnostics"):
+        get_expected_policy_entropy_for_pair(
+            task,
+            (0, 0),
+            compute_condition_diagnostics="yes",
+        )
+
+
+def test_expected_policy_entropy_for_pair_rejects_unreachable_pair():
+    maze = Maze.from_ascii("..#..")
+    template = _uniform_profile_template(maze)
+
+    with pytest.raises(ValueError, match="topologically reachable"):
+        get_expected_policy_entropy_for_pair(template, (0, 0), (0, 3))
+
+
+def test_expected_policy_entropy_for_pair_rejects_nonabsorbing_policy(
+    monkeypatch,
+):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "_expected_policy_entropy_for_pair",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="nonabsorbing"):
+        get_expected_policy_entropy_for_pair(template, (0, 0), (0, 2))
 
 
 def test_first_departure_dynamics_has_full_orientation_and_direct_goal_mass():
@@ -738,6 +847,252 @@ def _entropy_sweep_stub(value):
         topologically_unreachable_pairs=(),
         policy_nonabsorbing_pairs=(),
     )
+
+
+def test_entropy_sweep_for_pair_matches_direct_exact_diagnostic():
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    parameter_values = (0.2, 0.08, 0.2)
+    start = (0, 0)
+    goal = (0, 2)
+
+    sweep = sweep_expected_policy_entropy(
+        template,
+        "lower_control_cost",
+        parameter_values,
+        start=start,
+        goal=goal,
+    )
+    direct = [
+        get_expected_policy_entropy_for_pair(
+            hierarchy_diagnostics._hierarchy_template_with_parameter(
+                template,
+                "lower_control_cost",
+                value,
+            ),
+            start,
+            goal,
+        )
+        for value in parameter_values
+    ]
+
+    expected_metrics = {
+        "encounter_entropy_normalized": [
+            pair.entropy_normalized for pair in direct
+        ],
+        "pair_mean_entropy_normalized": [
+            pair.entropy_normalized for pair in direct
+        ],
+        "encounter_entropy_raw": [pair.entropy_raw for pair in direct],
+        "pair_mean_entropy_raw": [pair.entropy_raw for pair in direct],
+        "expected_total_decisions": [
+            pair.expected_decision_count for pair in direct
+        ],
+    }
+    for metric, expected in expected_metrics.items():
+        np.testing.assert_allclose(
+            getattr(sweep, metric),
+            expected,
+            atol=1e-12,
+            rtol=1e-11,
+        )
+    np.testing.assert_array_equal(
+        sweep.start_goal_pair_counts,
+        np.ones(len(parameter_values)),
+    )
+    np.testing.assert_array_equal(
+        sweep.occupancy_solve_counts,
+        np.ones(len(parameter_values)),
+    )
+    assert template._task_cache == {}
+    assert template._passive_dynamics is None
+
+
+def test_entropy_sweep_for_pair_dispatches_only_to_pair_diagnostic(monkeypatch):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    parameter_values = (0.2, 0.4)
+    start = (0, 0)
+    goal = (0, 2)
+    calls = []
+
+    def fake_pair(candidate, selected_start, selected_goal, **kwargs):
+        value = float(candidate.parameters.lower_control_cost.item())
+        calls.append((selected_start, selected_goal, kwargs))
+        return hierarchy_diagnostics.ExpectedPolicyEntropyPairData(
+            start=selected_start,
+            goal=selected_goal,
+            expected_entropy_sum_normalized=value,
+            expected_entropy_sum_raw=value + 1.0,
+            expected_decision_count=value + 2.0,
+            entropy_normalized=value,
+            entropy_raw=value + 1.0,
+        )
+
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "get_expected_policy_entropy",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fixed-pair sweep called the all-pairs diagnostic"
+        ),
+    )
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "get_expected_policy_entropy_for_pair",
+        fake_pair,
+    )
+
+    result = sweep_expected_policy_entropy(
+        template,
+        "lower_control_cost",
+        parameter_values,
+        start=start,
+        goal=goal,
+    )
+
+    assert calls == [(start, goal, {}), (start, goal, {})]
+    np.testing.assert_array_equal(
+        result.encounter_entropy_normalized,
+        parameter_values,
+    )
+    np.testing.assert_array_equal(
+        result.pair_mean_entropy_normalized,
+        parameter_values,
+    )
+    np.testing.assert_array_equal(
+        result.encounter_entropy_raw,
+        np.asarray(parameter_values) + 1.0,
+    )
+    np.testing.assert_array_equal(
+        result.pair_mean_entropy_raw,
+        np.asarray(parameter_values) + 1.0,
+    )
+    np.testing.assert_array_equal(
+        result.expected_total_decisions,
+        np.asarray(parameter_values) + 2.0,
+    )
+
+
+def test_entropy_sweep_pair_selectors_are_validated():
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+
+    with pytest.raises(ValueError, match="provided together"):
+        sweep_expected_policy_entropy(
+            template,
+            "lower_control_cost",
+            (0.2,),
+            start=(0, 0),
+        )
+    with pytest.raises(ValueError, match="provided together"):
+        sweep_expected_policy_entropy(
+            template,
+            "lower_control_cost",
+            (0.2,),
+            goal=(0, 2),
+        )
+    with pytest.raises(ValueError, match="not a free cell"):
+        sweep_expected_policy_entropy(
+            template,
+            "lower_control_cost",
+            (0.2,),
+            start=(1, 0),
+            goal=(0, 2),
+        )
+    with pytest.raises(ValueError, match="must differ"):
+        sweep_expected_policy_entropy(
+            template,
+            "lower_control_cost",
+            (0.2,),
+            start=(0, 2),
+            goal=(0, 2),
+        )
+
+    disconnected = _uniform_profile_template(Maze.from_ascii("..#.."))
+    with pytest.raises(ValueError, match="topologically reachable"):
+        sweep_expected_policy_entropy(
+            disconnected,
+            "lower_control_cost",
+            (0.2,),
+            start=(0, 0),
+            goal=(0, 3),
+        )
+
+
+def test_entropy_sweep_for_pair_reports_nonabsorbing_error_progress(
+    monkeypatch,
+    capsys,
+):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+
+    def fail_pair(*_args, **_kwargs):
+        raise RuntimeError("Policy is nonabsorbing for the requested pair")
+
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "get_expected_policy_entropy_for_pair",
+        fail_pair,
+    )
+
+    with pytest.raises(RuntimeError, match="nonabsorbing"):
+        sweep_expected_policy_entropy(
+            template,
+            "lower_control_cost",
+            (0.2,),
+            start=(0, 0),
+            goal=(0, 2),
+            progress=True,
+        )
+
+    assert (
+        "status=entropy_error=RuntimeError: "
+        "Policy is nonabsorbing for the requested pair"
+    ) in capsys.readouterr().out
+
+
+def test_entropy_sweep_for_pair_condition_diagnostics_are_opt_in(monkeypatch):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    start = (0, 0)
+    goal = (0, 2)
+    original_condition_number = np.linalg.cond
+    condition_calls = []
+
+    def counted_condition_number(matrix):
+        condition_calls.append(matrix.shape)
+        return original_condition_number(matrix)
+
+    monkeypatch.setattr(np.linalg, "cond", counted_condition_number)
+    fast = sweep_expected_policy_entropy(
+        template,
+        "lower_control_cost",
+        (0.2,),
+        start=start,
+        goal=goal,
+    )
+    assert condition_calls == []
+
+    instrumented = sweep_expected_policy_entropy(
+        template,
+        "lower_control_cost",
+        (0.2,),
+        start=start,
+        goal=goal,
+        compute_condition_diagnostics=True,
+    )
+
+    assert len(condition_calls) == 1
+    assert np.all(np.isfinite(instrumented.maximum_transient_condition_numbers))
+    assert np.all(instrumented.maximum_transient_condition_numbers >= 1.0)
+    assert np.all(instrumented.condition_number_seconds >= 0.0)
+    np.testing.assert_array_equal(instrumented.start_goal_pair_counts, [1])
+    for metric in (
+        "encounter_entropy_normalized",
+        "pair_mean_entropy_normalized",
+        "encounter_entropy_raw",
+        "pair_mean_entropy_raw",
+        "expected_total_decisions",
+    ):
+        np.testing.assert_array_equal(
+            getattr(fast, metric),
+            getattr(instrumented, metric),
+        )
 
 
 @pytest.mark.parametrize(
