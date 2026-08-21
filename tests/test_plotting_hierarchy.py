@@ -10,7 +10,6 @@ from matplotlib.figure import Figure
 from andrew_mlmdp import plotting
 from andrew_mlmdp.hierarchy import (
     ExpectedPairDiagnosticsSweepData,
-    ExpectedPolicyEntropySweepData,
     sample_hierarchical_rollouts,
 )
 
@@ -128,8 +127,8 @@ def _pair_diagnostics_sweep_plot_data():
 def test_expected_pair_diagnostics_sweep_plot_renders_comparison():
     data = _pair_diagnostics_sweep_plot_data()
 
-    figure, (entropy_ax, length_ax) = (
-        plotting.plot_expected_pair_diagnostics_sweep(data)
+    figure, (entropy_ax, length_ax) = plotting.plot_expected_pair_diagnostics_sweep(
+        data
     )
 
     np.testing.assert_array_equal(
@@ -149,9 +148,7 @@ def test_expected_pair_diagnostics_sweep_plot_renders_comparison():
         np.full(2, data.shortest_physical_steps),
     )
     assert len(length_ax.collections) == 1
-    assert entropy_ax.get_ylabel() == (
-        "Expected policy entropy (normalized)"
-    )
+    assert entropy_ax.get_ylabel() == ("Expected policy entropy (normalized)")
     assert length_ax.get_ylabel() == "Trajectory length (physical steps)"
     assert length_ax.get_xlabel() == "Lower control cost"
     assert entropy_ax.get_shared_x_axes().joined(entropy_ax, length_ax)
@@ -197,68 +194,3 @@ def test_expected_pair_diagnostics_sweep_plot_validates_inputs():
         )
     plt.close(first_figure)
     plt.close(second_figure)
-
-
-def _entropy_sweep_plot_data():
-    return ExpectedPolicyEntropySweepData(
-        parameter_name="lower_control_cost",
-        parameter_values=np.asarray([0.4, 0.1, 0.8]),
-        encounter_entropy_normalized=np.asarray([0.2, 0.3, 0.1]),
-        pair_mean_entropy_normalized=np.asarray([0.25, 0.35, 0.15]),
-        encounter_entropy_raw=np.asarray([0.4, 0.5, 0.3]),
-        pair_mean_entropy_raw=np.asarray([0.45, 0.55, 0.35]),
-        expected_total_decisions=np.asarray([10.0, 12.0, 8.0]),
-    )
-
-
-def test_expected_policy_entropy_sweep_plot_defaults_render_exact_data():
-    data = _entropy_sweep_plot_data()
-
-    figure, ax = plotting.plot_expected_policy_entropy_sweep(data)
-
-    line = ax.lines[0]
-    np.testing.assert_array_equal(line.get_xdata(), data.parameter_values)
-    np.testing.assert_array_equal(
-        line.get_ydata(),
-        data.encounter_entropy_normalized,
-    )
-    assert ax.get_xlabel() == "Lower control cost"
-    assert ax.get_ylabel() == "Expected encountered policy entropy (normalized)"
-    figure.canvas.draw()
-    plt.close(figure)
-
-
-@pytest.mark.parametrize(
-    "metric",
-    [
-        "encounter_entropy_normalized",
-        "pair_mean_entropy_normalized",
-        "encounter_entropy_raw",
-        "pair_mean_entropy_raw",
-        "expected_total_decisions",
-    ],
-)
-def test_expected_policy_entropy_sweep_plot_selects_metric_and_axes(metric):
-    data = _entropy_sweep_plot_data()
-    supplied_figure, supplied_ax = plt.subplots()
-
-    figure, ax = plotting.plot_expected_policy_entropy_sweep(
-        data,
-        metric=metric,
-        ax=supplied_ax,
-    )
-
-    assert figure is supplied_figure
-    assert ax is supplied_ax
-    np.testing.assert_array_equal(ax.lines[0].get_xdata(), data.parameter_values)
-    np.testing.assert_array_equal(ax.lines[0].get_ydata(), getattr(data, metric))
-    figure.canvas.draw()
-    plt.close(figure)
-
-
-def test_expected_policy_entropy_sweep_plot_rejects_unknown_metric():
-    with pytest.raises(ValueError, match="Unknown entropy sweep metric"):
-        plotting.plot_expected_policy_entropy_sweep(
-            _entropy_sweep_plot_data(),
-            metric="not_a_metric",
-        )
