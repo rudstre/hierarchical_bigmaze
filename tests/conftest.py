@@ -4,11 +4,11 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
-    LayerOneTaskLibrary,
-    LMDPEnvironment,
+    Environment,
     Maze,
-    ModelParameters,
+    Parameters,
     SubgoalBasis,
+    TaskLibrary,
 )
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -24,14 +24,14 @@ FOUR_ROOM_GOAL = (10, 9)
 
 
 @pytest.fixture(scope="session")
-def four_room_environment() -> LMDPEnvironment:
+def four_room_environment() -> Environment:
     maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
-    return LMDPEnvironment(maze)
+    return Environment(maze)
 
 
 @pytest.fixture(scope="session")
-def regression_parameters() -> ModelParameters:
-    return ModelParameters(
+def regression_parameters() -> Parameters:
+    return Parameters(
         interior_reward=-0.1,
         goal_reward=1.0,
         lower_control_cost=0.15,
@@ -54,11 +54,11 @@ def four_room_template(
     return four_room_environment.hierarchy(
         basis,
         parameters=regression_parameters,
-        task_library=LayerOneTaskLibrary.from_desirabilities(
+        task_library=TaskLibrary.from_desirabilities(
             len(FOUR_ROOM_SUBGOALS),
-            basis_target_desirability=np.exp(1.0 / 0.15),
-            basis_off_target_desirability=np.exp(-2.0 / 0.15),
-            basis_goal_desirability=np.exp(1.0 / 0.15),
+            target_value=np.exp(1.0 / 0.15),
+            off_target_value=np.exp(-2.0 / 0.15),
+            goal_value=np.exp(1.0 / 0.15),
         ),
     )
 
@@ -68,7 +68,7 @@ def soft_corridor_template():
     """Frozen profiles isolate soft execution from NMF implementation changes."""
 
     maze = Maze.from_ascii("....\n....")
-    environment = LMDPEnvironment(maze)
+    environment = Environment(maze)
     profiles = np.asarray(
         [
             [1.0, 0.05],
@@ -89,5 +89,5 @@ def soft_corridor_template():
     )
     return environment.hierarchy(
         basis,
-        parameters=ModelParameters(alpha=0.8, beta=3.0),
+        parameters=Parameters(alpha=0.8, beta=3.0),
     )

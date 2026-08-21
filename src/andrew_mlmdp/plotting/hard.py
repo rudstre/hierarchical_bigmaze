@@ -12,7 +12,7 @@ from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
 from matplotlib.widgets import Slider
 
-from andrew_mlmdp.hierarchy import HierarchyTask
+from andrew_mlmdp.hierarchy import Task
 from andrew_mlmdp.lmdp import desirability_grid
 from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting.maze import _format_maze_axes, plot_maze
@@ -21,14 +21,13 @@ from andrew_mlmdp.plotting.shared import (
     _colormap,
     _event_title,
     _format_probability,
-    _HierarchicalRolloutFrame,
+    _ProfileFrame,
     _RolloutFrame,
-    _SoftRolloutFrame,
 )
 
 
-def plot_interactive_subgoal_desirability(
-    model: HierarchyTask,
+def explore_subgoal_desirability(
+    model: Task,
     start: Coordinate,
     *,
     beta: float | None = None,
@@ -69,11 +68,11 @@ def plot_interactive_subgoal_desirability(
         goal_model = (
             model
             if goal == model.goal
-            else model.template.for_goal(goal)
+            else model.template.task(goal)
         )
         subtask_basis = goal_model.task_basis.interior_desirability[:, :-1]
         goal_state = model.maze.state_index(goal)
-        for current in goal_model.interior_state_by_coordinate:
+        for current in goal_model.interior_index:
             plan = goal_model.plan(current, beta=beta)
             values = np.full(
                 len(model.maze.free_cells),
@@ -351,8 +350,8 @@ def plot_interactive_subgoal_desirability(
     return figure
 
 
-def animate_hierarchical_rollout(
-    model: HierarchyTask,
+def animate_rollout(
+    model: Task,
     start: Coordinate,
     *,
     beta: float | None = None,
@@ -385,7 +384,7 @@ def animate_hierarchical_rollout(
         raise ValueError(
             "Initial goal desirability is only used in online mode"
         )
-    frames = _trace_hierarchical_rollout(
+    frames = _trace_rollout(
         model,
         start,
         goal_learning=goal_learning,
@@ -534,8 +533,8 @@ def animate_hierarchical_rollout(
         pad=0.04,
     )
 
-    number_of_subgoals = len(model.subgoals)
-    number_of_tasks = number_of_subgoals + 1
+    n_subgoals = len(model.subgoals)
+    n_tasks = n_subgoals + 1
     weight_colors = _TRAJECTORY_ARROW_COLORS
     weight_lines = []
     for index, label in enumerate(labels):
@@ -559,7 +558,7 @@ def animate_hierarchical_rollout(
     weights_ax.set_title("Task blend commanded by layer 2")
     weights_ax.legend(
         loc="upper left",
-        ncols=min(3, number_of_tasks),
+        ncols=min(3, n_tasks),
         frameon=False,
         fontsize=8,
     )
@@ -603,7 +602,7 @@ def animate_hierarchical_rollout(
         history_steps = [item.physical_steps for item in frame_history]
         history_weights = np.vstack(
             [
-                _normalized_frame_task_weights(item, number_of_tasks)
+                _normalized_frame_task_weights(item, n_tasks)
                 for item in frame_history
             ]
         )
@@ -638,8 +637,8 @@ def animate_hierarchical_rollout(
     return animation
 
 
-def _trace_hierarchical_rollout(
-    model: HierarchyTask,
+def _trace_rollout(
+    model: Task,
     start: Coordinate,
     *,
     goal_learning: Literal["exact", "online"] = "exact",
@@ -649,7 +648,7 @@ def _trace_hierarchical_rollout(
     max_steps: int,
     max_abstract_accesses: int,
     seed: int | None,
-) -> list[_HierarchicalRolloutFrame]:
+) -> list[_RolloutFrame]:
     """Return fixed-subgoal frames emitted by the shared rollout engine."""
 
     rollout = model.rollout(
@@ -663,7 +662,7 @@ def _trace_hierarchical_rollout(
         seed=seed,
     )
     return [
-        _HierarchicalRolloutFrame(
+        _RolloutFrame(
             event=(
                 "subgoal_access"
                 if event.event == "lower_access"
@@ -684,8 +683,8 @@ def _trace_hierarchical_rollout(
             ),
             physical_steps=event.physical_steps,
             abstract_accesses=event.abstract_accesses,
-            passive_access_probability=event.passive_access_probability,
-            controlled_access_probability=event.controlled_access_probability,
+            passive_access=event.passive_access,
+            policy_access=event.policy_access,
             refractory=event.refractory,
             status=event.status,
             goal_desirability=(
@@ -699,7 +698,7 @@ def _trace_hierarchical_rollout(
     ]
 
 def _target_labels(
-    model: HierarchyTask,
+    model: Task,
     subgoal_labels: list[str] | tuple[str, ...] | None,
 ) -> tuple[str, ...]:
     if subgoal_labels is None:
@@ -720,7 +719,7 @@ def _target_labels(
 
 
 def _desirability_norm(
-    frames: list[_RolloutFrame] | list[_SoftRolloutFrame],
+    frames: list[_RolloutFrame] | list[_ProfileFrame],
     *,
     maze: Maze | None = None,
     goal: Coordinate | None = None,
@@ -731,7 +730,7 @@ def _desirability_norm(
     for frame in frames:
         if frame.plan is None:
             continue
-        values = frame.plan.physical_desirability.copy()
+        values = frame.plan.desirability.copy()
         if goal is not None:
             assert maze is not None
             goal_state = maze.state_index(goal)
@@ -757,13 +756,13 @@ def _desirability_norm(
 
 def _frame_desirability_grid(
     maze: Maze,
-    frame: _RolloutFrame | _SoftRolloutFrame,
+    frame: _RolloutFrame | _ProfileFrame,
     *,
     goal: Coordinate | None = None,
 ) -> np.ndarray:
     if frame.plan is None:
         return np.full(maze.shape, np.nan, dtype=np.float64)
-    values = frame.plan.physical_desirability.copy()
+    values = frame.plan.desirability.copy()
     if goal is not None:
         goal_state = maze.state_index(goal)
         goal_value = values[goal_state]
@@ -773,12 +772,12 @@ def _frame_desirability_grid(
 
 
 def _normalized_frame_task_weights(
-    frame: _RolloutFrame | _SoftRolloutFrame,
-    number_of_tasks: int,
+    frame: _RolloutFrame | _ProfileFrame,
+    n_tasks: int,
 ) -> np.ndarray:
     if frame.plan is None:
-        return np.zeros(number_of_tasks, dtype=np.float64)
-    weights = frame.plan.weights[:number_of_tasks].copy()
+        return np.zeros(n_tasks, dtype=np.float64)
+    weights = frame.plan.weights[:n_tasks].copy()
     total = weights.sum()
     if total > 0.0:
         weights /= total
@@ -804,7 +803,7 @@ def _communication_status(frame: _RolloutFrame) -> str:
 def _communication_details(
     frame: _RolloutFrame,
     labels: tuple[str, ...],
-    model: HierarchyTask,
+    model: Task,
 ) -> str:
     request_label = "none"
     if frame.requested_subgoal is not None:
@@ -821,8 +820,8 @@ def _communication_details(
     if z_iterations is not None:
         learning_detail = f"\nZ sweeps:        {z_iterations}"
 
-    passive_access = getattr(frame, "passive_access_probability", None)
-    controlled_access = getattr(frame, "controlled_access_probability", None)
+    passive_access = getattr(frame, "passive_access", None)
+    controlled_access = getattr(frame, "policy_access", None)
     refractory = getattr(frame, "refractory", False)
     return (
         f"physical steps:  {frame.physical_steps}\n"

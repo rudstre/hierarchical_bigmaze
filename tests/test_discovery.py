@@ -2,11 +2,11 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
-    LMDPEnvironment,
+    Environment,
     Maze,
-    NMFDiscoveryParameters,
+    NMFConfig,
     SubgoalBasis,
-    discover_soft_subgoals,
+    discover_subgoals,
 )
 
 
@@ -21,8 +21,8 @@ def test_rank_study_fits_each_requested_rank_once(monkeypatch):
         return original(ensemble, rank, **kwargs)
 
     monkeypatch.setattr(discovery, "_factorize_soft_subtasks", counted)
-    environment = LMDPEnvironment(Maze.from_ascii("...."))
-    study = discover_soft_subgoals(environment, ranks=(1, 2, 3), seed=0)
+    environment = Environment(Maze.from_ascii("...."))
+    study = discover_subgoals(environment, ranks=(1, 2, 3), seed=0)
 
     assert calls == [1, 2, 3]
     assert study.result(2) is study.result(2)
@@ -31,13 +31,13 @@ def test_rank_study_fits_each_requested_rank_once(monkeypatch):
 
 
 def test_goal_ensemble_matches_environment_flat_solutions():
-    environment = LMDPEnvironment(Maze.from_ascii("...."))
-    parameters = NMFDiscoveryParameters(
+    environment = Environment(Maze.from_ascii("...."))
+    parameters = NMFConfig(
         interior_reward=-0.3,
         goal_reward=2.0,
         control_cost=0.8,
     )
-    study = discover_soft_subgoals(
+    study = discover_subgoals(
         environment,
         ranks=(2,),
         goals=((0, 0), (0, 3)),
@@ -50,8 +50,8 @@ def test_goal_ensemble_matches_environment_flat_solutions():
 
 
 def test_nmf_profiles_are_nonnegative_peak_normalized_and_reconstruct():
-    environment = LMDPEnvironment(Maze.from_ascii("...\n...\n..."))
-    result = discover_soft_subgoals(
+    environment = Environment(Maze.from_ascii("...\n...\n..."))
+    result = discover_subgoals(
         environment,
         ranks=(3,),
         seed=4,
@@ -68,9 +68,9 @@ def test_nmf_profiles_are_nonnegative_peak_normalized_and_reconstruct():
 
 
 def test_discovery_is_reproducible_for_seed():
-    environment = LMDPEnvironment(Maze.from_ascii("...\n..."))
-    first = discover_soft_subgoals(environment, ranks=(2,), seed=7).result(2)
-    second = discover_soft_subgoals(environment, ranks=(2,), seed=7).result(2)
+    environment = Environment(Maze.from_ascii("...\n..."))
+    first = discover_subgoals(environment, ranks=(2,), seed=7).result(2)
+    second = discover_subgoals(environment, ranks=(2,), seed=7).result(2)
     assert first.profiles == pytest.approx(second.profiles)
     assert first.task_weights == pytest.approx(second.task_weights)
 
@@ -85,9 +85,9 @@ def test_discovery_is_reproducible_for_seed():
     ],
 )
 def test_discovery_validates_ranks(ranks, match):
-    environment = LMDPEnvironment(Maze.from_ascii("...."))
+    environment = Environment(Maze.from_ascii("...."))
     with pytest.raises(ValueError, match=match):
-        discover_soft_subgoals(environment, ranks=ranks)
+        discover_subgoals(environment, ranks=ranks)
 
 def _raw_generalized_kl(target, reconstruction):
     safe_reconstruction = np.maximum(
@@ -125,16 +125,16 @@ def test_zero_smoothness_uses_unchanged_sklearn_path(monkeypatch):
         "_graph_adjacency_from_passive",
         unexpected_graph_construction,
     )
-    environment = LMDPEnvironment(Maze.from_ascii("...\n..."))
-    default = discover_soft_subgoals(
+    environment = Environment(Maze.from_ascii("...\n..."))
+    default = discover_subgoals(
         environment,
         ranks=(2,),
         seed=7,
     ).result(2)
-    explicit_zero = discover_soft_subgoals(
+    explicit_zero = discover_subgoals(
         environment,
         ranks=(2,),
-        parameters=NMFDiscoveryParameters(lambda_smooth=0.0),
+        parameters=NMFConfig(lambda_smooth=0.0),
         seed=7,
     ).result(2)
 
@@ -161,7 +161,7 @@ def test_zero_smoothness_uses_unchanged_sklearn_path(monkeypatch):
 )
 def test_discovery_validates_smoothness_strength(lambda_smooth, match):
     with pytest.raises(ValueError, match=match):
-        NMFDiscoveryParameters(lambda_smooth=lambda_smooth)
+        NMFConfig(lambda_smooth=lambda_smooth)
 
 
 def test_graph_adjacency_uses_passive_connectivity_and_state_order():
@@ -170,7 +170,7 @@ def test_graph_adjacency_uses_passive_connectivity_and_state_order():
     maze = Maze.from_ascii("...").with_connections(
         [((0, 0), (0, 1))]
     )
-    environment = LMDPEnvironment(maze)
+    environment = Environment(maze)
 
     assert discovery._graph_adjacency_from_passive(
         environment.passive
@@ -188,12 +188,12 @@ def test_graph_adjacency_uses_passive_connectivity_and_state_order():
 def test_regularized_objective_decreases_and_matches_returned_factors():
     import andrew_mlmdp.discovery as discovery
 
-    environment = LMDPEnvironment(Maze.from_ascii("....\n...."))
+    environment = Environment(Maze.from_ascii("....\n...."))
     lambda_smooth = 0.1
-    result = discover_soft_subgoals(
+    result = discover_subgoals(
         environment,
         ranks=(2,),
-        parameters=NMFDiscoveryParameters(
+        parameters=NMFConfig(
             lambda_smooth=lambda_smooth
         ),
         seed=0,
@@ -234,17 +234,17 @@ def test_regularized_objective_decreases_and_matches_returned_factors():
 
 
 def test_regularized_convergence_and_iteration_exhaustion():
-    environment = LMDPEnvironment(Maze.from_ascii("......"))
-    parameters = NMFDiscoveryParameters(lambda_smooth=0.1)
+    environment = Environment(Maze.from_ascii("......"))
+    parameters = NMFConfig(lambda_smooth=0.1)
 
-    loose = discover_soft_subgoals(
+    loose = discover_subgoals(
         environment,
         ranks=(2,),
         parameters=parameters,
         max_iter=20,
         tolerance=1.0,
     ).result(2)
-    exhausted = discover_soft_subgoals(
+    exhausted = discover_subgoals(
         environment,
         ranks=(2,),
         parameters=parameters,
@@ -259,19 +259,19 @@ def test_regularized_convergence_and_iteration_exhaustion():
 
 
 def test_selected_stronger_regularization_smooths_toy_profiles():
-    environment = LMDPEnvironment(Maze.from_ascii("....\n...."))
-    weak = discover_soft_subgoals(
+    environment = Environment(Maze.from_ascii("....\n...."))
+    weak = discover_subgoals(
         environment,
         ranks=(2,),
-        parameters=NMFDiscoveryParameters(lambda_smooth=0.01),
+        parameters=NMFConfig(lambda_smooth=0.01),
         seed=0,
         max_iter=500,
         tolerance=1e-7,
     ).result(2)
-    strong = discover_soft_subgoals(
+    strong = discover_subgoals(
         environment,
         ranks=(2,),
-        parameters=NMFDiscoveryParameters(lambda_smooth=10.0),
+        parameters=NMFConfig(lambda_smooth=10.0),
         seed=0,
         max_iter=500,
         tolerance=1e-7,
@@ -299,5 +299,5 @@ def test_selected_stronger_regularization_smooths_toy_profiles():
         strong.profiles,
     )
     hierarchy = environment.hierarchy(basis)
-    task = hierarchy.for_goal((0, 3))
+    task = hierarchy.task((0, 3))
     assert task.task_basis.interior_desirability.shape[1] == 3

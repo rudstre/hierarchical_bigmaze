@@ -3,13 +3,13 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from andrew_mlmdp import LMDPEnvironment, Maze, ModelParameters, SubgoalBasis
-from andrew_mlmdp.hierarchy.core import _goal_only_plan
+from andrew_mlmdp import Environment, Maze, Parameters, SubgoalBasis
 from andrew_mlmdp.hierarchy.likelihood import (
     _first_departure_forward,
     _first_departure_kernel,
-    _hierarchical_physical_step_kernel,
+    _step_kernel,
 )
+from andrew_mlmdp.hierarchy.model import _goal_only_plan
 from andrew_mlmdp.hierarchy.rollout import _rollout_column
 
 
@@ -20,17 +20,17 @@ def _likelihood_task():
         np.asarray([[1.0], [0.8], [0.4], [0.1]]),
         core_threshold=None,
     )
-    parameters = ModelParameters(
+    parameters = Parameters(
         goal_reward=0.2,
         lower_control_cost=0.5,
         upper_control_cost=1.0,
         alpha=1.0,
         beta=0.5,
     )
-    return LMDPEnvironment(maze).hierarchy(
+    return Environment(maze).hierarchy(
         basis,
         parameters=parameters,
-    ).for_goal((0, 3))
+    ).task((0, 3))
 
 
 def _likelihood_plans(task, start):
@@ -38,55 +38,55 @@ def _likelihood_plans(task, start):
         task.plan(start),
         *(
             task.plan(start, upper_state=j)
-            for j in range(task.number_of_subtasks)
+            for j in range(task.n_subtasks)
         ),
         _goal_only_plan(
             task,
             start,
-            goal_interior_desirability=None,
+            goal_desirability=None,
         ),
     )
 
 
-def _scalar_hierarchical_physical_step_kernel(
+def _scalar_step_kernel(
     task,
     current,
     plans,
     *,
-    number_of_initial_modes=1,
+    n_initial_modes=1,
 ):
     """Reproduce the pre-batching kernel assembly one mode at a time."""
 
-    number_of_subtasks = task.number_of_subtasks
-    number_of_interior = len(task.interior_states)
-    number_of_enabled_modes = number_of_initial_modes + number_of_subtasks
-    number_of_modes = number_of_enabled_modes + 1
-    current_interior = task.interior_state_by_coordinate[current]
+    n_subtasks = task.n_subtasks
+    n_interior = len(task.interior_states)
+    n_enabled_modes = n_initial_modes + n_subtasks
+    n_modes = n_enabled_modes + 1
+    current_interior = task.interior_index[current]
     goal_state = task.maze.state_index(task.goal)
     kernel = np.zeros(
-        (len(task.maze.free_cells), number_of_modes, number_of_modes),
+        (len(task.maze.free_cells), n_modes, n_modes),
         dtype=np.float64,
     )
 
     def add(probabilities, old_mode, new_mode, scale=1.0):
         kernel[task.interior_states, new_mode, old_mode] += (
-            scale * probabilities[:number_of_interior]
+            scale * probabilities[:n_interior]
         )
         kernel[goal_state, new_mode, old_mode] += scale * probabilities[-1]
 
-    for old_mode in range(number_of_enabled_modes):
+    for old_mode in range(n_enabled_modes):
         enabled = _rollout_column(
             plans[old_mode],
             current_interior,
-            number_of_interior,
-            number_of_subtasks,
+            n_interior,
+            n_subtasks,
             suppress_access=False,
         )
         if enabled is None:
             continue
         add(enabled, old_mode, old_mode)
-        for entered_state in range(number_of_subtasks):
-            access_probability = enabled[number_of_interior + entered_state]
+        for entered_state in range(n_subtasks):
+            access_probability = enabled[n_interior + entered_state]
             if access_probability <= 0.0:
                 continue
             access_coordinate = (
@@ -94,16 +94,16 @@ def _scalar_hierarchical_physical_step_kernel(
                 if task.basis.locations is None
                 else task.basis.locations[entered_state]
             )
-            access_interior = task.interior_state_by_coordinate[
+            access_interior = task.interior_index[
                 access_coordinate
             ]
             termination_probability = task.upper_controlled[-1, entered_state]
-            continuation_mode = number_of_initial_modes + entered_state
+            continuation_mode = n_initial_modes + entered_state
             continuation = _rollout_column(
                 plans[continuation_mode],
                 access_interior,
-                number_of_interior,
-                number_of_subtasks,
+                n_interior,
+                n_subtasks,
                 suppress_access=True,
             )
             if continuation is not None:
@@ -116,27 +116,27 @@ def _scalar_hierarchical_physical_step_kernel(
             goal_only = _rollout_column(
                 plans[-1],
                 access_interior,
-                number_of_interior,
-                number_of_subtasks,
+                n_interior,
+                n_subtasks,
                 suppress_access=True,
             )
             if goal_only is not None:
                 add(
                     goal_only,
                     old_mode,
-                    number_of_modes - 1,
+                    n_modes - 1,
                     access_probability * termination_probability,
                 )
 
     goal_only = _rollout_column(
         plans[-1],
         current_interior,
-        number_of_interior,
-        number_of_subtasks,
+        n_interior,
+        n_subtasks,
         suppress_access=True,
     )
     if goal_only is not None:
-        add(goal_only, number_of_modes - 1, number_of_modes - 1)
+        add(goal_only, n_modes - 1, n_modes - 1)
     return kernel
 
 
@@ -148,27 +148,27 @@ def test_batched_step_kernel_matches_scalar_assembly_with_initial_mode_bank():
         *(task.plan(start) for start in starts),
         *(
             task.plan(anchor, upper_state=upper_state)
-            for upper_state in range(task.number_of_subtasks)
+            for upper_state in range(task.n_subtasks)
         ),
         _goal_only_plan(
             task,
             anchor,
-            goal_interior_desirability=None,
+            goal_desirability=None,
         ),
     )
 
     for current in starts:
-        actual = _hierarchical_physical_step_kernel(
+        actual = _step_kernel(
             task,
             current,
             plans,
-            number_of_initial_modes=len(starts),
+            n_initial_modes=len(starts),
         )
-        expected = _scalar_hierarchical_physical_step_kernel(
+        expected = _scalar_step_kernel(
             task,
             current,
             plans,
-            number_of_initial_modes=len(starts),
+            n_initial_modes=len(starts),
         )
         np.testing.assert_allclose(actual, expected, rtol=1e-15, atol=1e-15)
 
@@ -178,37 +178,37 @@ def test_hierarchy_step_kernel_matches_explicit_latent_path_enumeration():
     current = (0, 1)
     next_coordinate = (0, 2)
     plans = _likelihood_plans(task, current)
-    kernel = _hierarchical_physical_step_kernel(task, current, plans)
-    number_of_interior = len(task.interior_states)
-    number_of_subtasks = task.number_of_subtasks
-    current_interior = task.interior_state_by_coordinate[current]
-    next_interior = task.interior_state_by_coordinate[next_coordinate]
+    kernel = _step_kernel(task, current, plans)
+    n_interior = len(task.interior_states)
+    n_subtasks = task.n_subtasks
+    current_interior = task.interior_index[current]
+    next_interior = task.interior_index[next_coordinate]
 
     initial = _rollout_column(
         plans[0],
         current_interior,
-        number_of_interior,
-        number_of_subtasks,
+        n_interior,
+        n_subtasks,
         suppress_access=False,
     )
     assert initial is not None
     expected = np.zeros(len(plans))
     direct_probability = initial[next_interior]
     expected[0] = direct_probability
-    access_probability = initial[number_of_interior]
+    access_probability = initial[n_interior]
     termination_probability = task.upper_controlled[-1, 0]
     continuation = _rollout_column(
         plans[1],
         current_interior,
-        number_of_interior,
-        number_of_subtasks,
+        n_interior,
+        n_subtasks,
         suppress_access=True,
     )
     goal_only = _rollout_column(
         plans[-1],
         current_interior,
-        number_of_interior,
-        number_of_subtasks,
+        n_interior,
+        n_subtasks,
         suppress_access=True,
     )
     assert continuation is not None
@@ -237,7 +237,7 @@ def test_hierarchy_step_kernel_is_stochastic_for_every_controller_mode():
     for current in task.maze.free_cells:
         if current == task.goal:
             continue
-        kernel = _hierarchical_physical_step_kernel(task, current, plans)
+        kernel = _step_kernel(task, current, plans)
         assert kernel.sum(axis=(0, 1)) == pytest.approx(np.ones(len(plans)))
 
 
@@ -246,7 +246,7 @@ def test_hierarchy_likelihood_sums_direct_and_access_routes():
     current = (0, 1)
     next_coordinate = (0, 2)
     plans = _likelihood_plans(task, current)
-    kernel = _hierarchical_physical_step_kernel(task, current, plans)
+    kernel = _step_kernel(task, current, plans)
     current_state = task.maze.state_index(current)
     next_state = task.maze.state_index(next_coordinate)
     forward = np.zeros(len(plans))
@@ -259,7 +259,7 @@ def test_hierarchy_likelihood_sums_direct_and_access_routes():
         forward,
     ).sum()
     likelihood = np.exp(
-        task.movement_log_likelihood([current, next_coordinate])
+        task.log_likelihood([current, next_coordinate])
     )
 
     assert likelihood == pytest.approx(enumerated)
@@ -276,7 +276,7 @@ def test_hierarchy_likelihood_propagates_plans_and_goal_only_termination():
     expected_log_likelihood = 0.0
 
     for current, next_coordinate in zip(trajectory, trajectory[1:]):
-        kernel = _hierarchical_physical_step_kernel(task, current, plans)
+        kernel = _step_kernel(task, current, plans)
         next_forward = _first_departure_forward(
             kernel,
             task.maze.state_index(current),
@@ -292,7 +292,7 @@ def test_hierarchy_likelihood_propagates_plans_and_goal_only_termination():
         else:
             assert np.all(kernel[:, :-1, -1] == 0.0)
 
-    assert task.movement_log_likelihood(trajectory) == pytest.approx(
+    assert task.log_likelihood(trajectory) == pytest.approx(
         expected_log_likelihood
     )
 
@@ -302,9 +302,9 @@ def test_hierarchy_likelihood_matches_seeded_rollout_frequencies():
     start = (0, 1)
     outcomes = ((0, 0), (0, 2))
     counts = dict.fromkeys(outcomes, 0)
-    number_of_rollouts = 5000
+    n_rollouts = 5000
 
-    for seed in range(number_of_rollouts):
+    for seed in range(n_rollouts):
         rollout = task.rollout(start, max_steps=100, seed=seed)
         departure = next(
             coordinate
@@ -315,9 +315,9 @@ def test_hierarchy_likelihood_matches_seeded_rollout_frequencies():
 
     for outcome in outcomes:
         exact_probability = np.exp(
-            task.movement_log_likelihood([start, outcome])
+            task.log_likelihood([start, outcome])
         )
-        empirical_probability = counts[outcome] / number_of_rollouts
+        empirical_probability = counts[outcome] / n_rollouts
         assert empirical_probability == pytest.approx(
             exact_probability,
             abs=0.025,
@@ -326,41 +326,41 @@ def test_hierarchy_likelihood_matches_seeded_rollout_frequencies():
 
 def test_hierarchy_likelihood_validation_repeats_and_impossible_trajectories():
     task = _likelihood_task()
-    expected = task.movement_log_likelihood([(0, 1), (0, 2)])
+    expected = task.log_likelihood([(0, 1), (0, 2)])
 
     assert isinstance(expected, float)
-    assert task.movement_log_likelihood([(0, 1)]) == 0.0
-    assert task.movement_log_likelihood(
+    assert task.log_likelihood([(0, 1)]) == 0.0
+    assert task.log_likelihood(
         [(0, 1), (0, 1), (0, 2), (0, 2)]
     ) == pytest.approx(expected)
     assert np.isneginf(
-        task.movement_log_likelihood([(0, 0), (0, 2)])
+        task.log_likelihood([(0, 0), (0, 2)])
     )
     assert np.isneginf(
-        task.movement_log_likelihood([task.goal, (0, 2)])
+        task.log_likelihood([task.goal, (0, 2)])
     )
     with pytest.raises(ValueError, match="at least one coordinate"):
-        task.movement_log_likelihood([])
+        task.log_likelihood([])
     with pytest.raises(ValueError, match="not a free cell"):
-        task.movement_log_likelihood([(1, 1)])
+        task.log_likelihood([(1, 1)])
 
 
 def test_hierarchy_likelihood_supports_direct_entry_into_goal():
     task = _likelihood_task()
 
-    log_likelihood = task.movement_log_likelihood([(0, 2), task.goal])
+    log_likelihood = task.log_likelihood([(0, 2), task.goal])
 
     assert np.isfinite(log_likelihood)
 
 
 def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
     task = _likelihood_task()
-    flat = task.template.environment.solve_flat(
+    flat = task.template.environment.solve(
         task.goal,
         parameters=task.parameters,
     )
-    number_of_interior = len(task.interior_states)
-    number_of_subtasks = task.number_of_subtasks
+    n_interior = len(task.interior_states)
+    n_subtasks = task.n_subtasks
     goal_state = task.maze.state_index(task.goal)
 
     # Embed the flat controlled distribution in the hierarchy's row layout,
@@ -368,12 +368,12 @@ def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
     # special case; upper transition probabilities must then be irrelevant.
     zero_access_controlled = np.zeros(
         (
-            number_of_interior + number_of_subtasks + 1,
-            number_of_interior,
+            n_interior + n_subtasks + 1,
+            n_interior,
         )
     )
     for interior_state, physical_state in enumerate(task.interior_states):
-        zero_access_controlled[:number_of_interior, interior_state] = (
+        zero_access_controlled[:n_interior, interior_state] = (
             flat.controlled[task.interior_states, physical_state]
         )
         zero_access_controlled[-1, interior_state] = flat.controlled[
@@ -387,11 +387,11 @@ def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
         plans = tuple(
             replace(
                 plan,
-                layer_one_controlled=zero_access_controlled,
+                lower_policy=zero_access_controlled,
             )
             for plan in _likelihood_plans(task, current)
         )
-        kernel = _hierarchical_physical_step_kernel(task, current, plans)
+        kernel = _step_kernel(task, current, plans)
         forward = np.zeros(len(plans))
         forward[0] = 1.0
         hierarchical_probabilities = []
@@ -407,7 +407,7 @@ def test_zero_access_hierarchy_reduces_to_flat_first_departure_kernel():
             )
             hierarchical_probability = next_forward.sum()
             flat_probability = np.exp(
-                flat.movement_log_likelihood([current, next_coordinate])
+                flat.log_likelihood([current, next_coordinate])
             )
             assert hierarchical_probability == pytest.approx(
                 flat_probability,

@@ -9,7 +9,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from andrew_mlmdp.dataset import MovementDatasetLikelihood, MovementTrial
+from andrew_mlmdp.dataset import DatasetScore, Trial
 from andrew_mlmdp.labeled_maze import LabeledMaze, load_doohan_maze
 
 _TRIAL_INFO_FILE = "frames.trialInfo.htsv"
@@ -17,7 +17,7 @@ _TRAJECTORIES_FILE = "frames.trajectories.htsv"
 
 
 @dataclass(frozen=True)
-class DoohanSessionRecord:
+class SessionRecord:
     """Stable metadata for one processed Doohan maze session."""
 
     session_id: str
@@ -37,7 +37,7 @@ class DoohanSessionRecord:
 
 
 @dataclass(frozen=True)
-class DoohanDataExclusion:
+class Exclusion:
     """A selected session or trial that could not become a movement trial."""
 
     session_id: str
@@ -47,15 +47,15 @@ class DoohanDataExclusion:
 
 
 @dataclass(frozen=True)
-class DoohanMovementDataset:
+class DoohanDataset:
     """One-maze collection of typed navigation trials and exclusions."""
 
     data_root: Path
     maze_name: str
     definition: LabeledMaze
-    sessions: tuple[DoohanSessionRecord, ...]
-    trials: tuple[MovementTrial, ...]
-    exclusions: tuple[DoohanDataExclusion, ...]
+    sessions: tuple[SessionRecord, ...]
+    trials: tuple[Trial, ...]
+    exclusions: tuple[Exclusion, ...]
 
     @classmethod
     def from_data_root(
@@ -67,7 +67,7 @@ class DoohanMovementDataset:
         start_date: date | str | None = None,
         end_date: date | str | None = None,
         maze_name: str | None = None,
-    ) -> DoohanMovementDataset:
+    ) -> DoohanDataset:
         """Select sessions and extract navigation trials from processed data.
 
         Every supplied selector narrows the result. Date bounds are inclusive,
@@ -97,8 +97,8 @@ class DoohanMovementDataset:
             root / "experiment_info" / "maze_configs.json",
         )
         pandas = _import_pandas()
-        trials: list[MovementTrial] = []
-        exclusions: list[DoohanDataExclusion] = []
+        trials: list[Trial] = []
+        exclusions: list[Exclusion] = []
         for session in selected:
             session_trials, session_exclusions = _extract_session_trials(
                 root,
@@ -120,11 +120,11 @@ class DoohanMovementDataset:
 
     def report(
         self,
-        result: MovementDatasetLikelihood,
-    ) -> MovementLikelihoodReport:
+        result: DatasetScore,
+    ) -> ScoreReport:
         """Attach one model result to this dataset for reporting."""
 
-        return MovementLikelihoodReport(self, result)
+        return ScoreReport(self, result)
 
     def session_records(self) -> tuple[dict[str, object], ...]:
         """Return dependency-free row dictionaries for session metadata."""
@@ -152,7 +152,7 @@ class DoohanMovementDataset:
                         self.definition.label_for(coordinate)
                         for coordinate in trial.trajectory
                     ),
-                    "number_of_transitions": _movement_transition_count(
+                    "n_transitions": _movement_transition_count(
                         trial.trajectory
                     ),
                 }
@@ -178,11 +178,11 @@ class DoohanMovementDataset:
 
 
 @dataclass(frozen=True)
-class MovementLikelihoodReport:
+class ScoreReport:
     """Tables and summaries for one model result on one Doohan dataset."""
 
-    dataset: DoohanMovementDataset
-    result: MovementDatasetLikelihood
+    dataset: DoohanDataset
+    result: DatasetScore
 
     def __post_init__(self) -> None:
         expected = {
@@ -251,8 +251,8 @@ class MovementLikelihoodReport:
                     "goal_label": self.dataset.definition.label_for(
                         trial.goal
                     ),
-                    "number_of_transitions": (
-                        0 if score is None else score.number_of_transitions
+                    "n_transitions": (
+                        0 if score is None else score.n_transitions
                     ),
                     "log_likelihood": (
                         None if score is None else score.log_likelihood
@@ -274,7 +274,7 @@ class MovementLikelihoodReport:
                     "maze_name": session.maze_name,
                     "trial_id": exclusion.trial_id,
                     "goal_label": exclusion.goal_label,
-                    "number_of_transitions": 0,
+                    "n_transitions": 0,
                     "log_likelihood": None,
                     "status": "excluded",
                     "exclusion_reason": exclusion.reason,
@@ -303,7 +303,7 @@ class MovementLikelihoodReport:
         for score in self.result.trial_likelihoods:
             scores_by_session[score.session_id].append(score.log_likelihood)
             transitions_by_session[score.session_id] += (
-                score.number_of_transitions
+                score.n_transitions
             )
         for exclusion in self.result.exclusions:
             exclusions_by_session[exclusion.session_id] += 1
@@ -341,10 +341,10 @@ class MovementLikelihoodReport:
         return {
             "model": self.model,
             "sessions": len(self.dataset.sessions),
-            "scored_trials": self.result.number_of_scored_trials,
+            "scored_trials": self.result.n_scored,
             "excluded_trials": (
                 len(self.dataset.exclusions)
-                + self.result.number_of_excluded_trials
+                + self.result.n_excluded
             ),
             "transitions": self.result.total_transitions,
             "total_log_likelihood": self.result.total_log_likelihood,
@@ -369,7 +369,7 @@ class MovementLikelihoodReport:
         return _import_pandas().DataFrame([self.summary_record()])
 
 
-def _load_session_catalog(data_root: Path) -> tuple[DoohanSessionRecord, ...]:
+def _load_session_catalog(data_root: Path) -> tuple[SessionRecord, ...]:
     processed_root = data_root / "processed_data"
     if not processed_root.is_dir():
         raise FileNotFoundError(
@@ -393,14 +393,14 @@ def _load_session_catalog(data_root: Path) -> tuple[DoohanSessionRecord, ...]:
     )
 
 
-def _load_session_record(path: Path) -> DoohanSessionRecord:
+def _load_session_record(path: Path) -> SessionRecord:
     try:
         metadata = json.loads(path.read_text(encoding="utf-8"))
         subject_id = str(metadata["subject_ID"])
         session_name = path.parent.name
         folder_subject = path.parent.parent.name
         session_date = date.fromisoformat(str(metadata["session_date"]))
-        record = DoohanSessionRecord(
+        record = SessionRecord(
             session_id=f"{subject_id}/{session_name}",
             subject_id=subject_id,
             session_name=session_name,
@@ -433,14 +433,14 @@ def _load_session_record(path: Path) -> DoohanSessionRecord:
 
 
 def _select_sessions(
-    catalog: tuple[DoohanSessionRecord, ...],
+    catalog: tuple[SessionRecord, ...],
     *,
     session_ids: Iterable[str] | None,
     subject_ids: Iterable[str] | None,
     start_date: date | str | None,
     end_date: date | str | None,
     maze_name: str | None,
-) -> tuple[DoohanSessionRecord, ...]:
+) -> tuple[SessionRecord, ...]:
     requested_sessions = _optional_string_set(session_ids, "session_ids")
     requested_subjects = _optional_string_set(subject_ids, "subject_ids")
     first_date = _optional_date(start_date, "start_date")
@@ -500,7 +500,7 @@ def _import_pandas():
         import pandas as pd
     except ImportError as error:
         raise ImportError(
-            "DoohanMovementDataset requires pandas; install "
+            "DoohanDataset requires pandas; install "
             "andrew-mlmdp[notebook]"
         ) from error
     return pd
@@ -508,10 +508,10 @@ def _import_pandas():
 
 def _extract_session_trials(
     data_root: Path,
-    session: DoohanSessionRecord,
+    session: SessionRecord,
     definition: LabeledMaze,
     pandas: Any,
-) -> tuple[list[MovementTrial], list[DoohanDataExclusion]]:
+) -> tuple[list[Trial], list[Exclusion]]:
     session_root = (
         data_root
         / "processed_data"
@@ -527,7 +527,7 @@ def _extract_session_trials(
     ]
     if missing:
         return [], [
-            DoohanDataExclusion(
+            Exclusion(
                 session_id=session.session_id,
                 trial_id=None,
                 goal_label=None,
@@ -544,7 +544,7 @@ def _extract_session_trials(
         trial_values = trial_info.loc[navigation, "trial"].dropna().unique()
     except (KeyError, OSError, ValueError) as error:
         return [], [
-            DoohanDataExclusion(
+            Exclusion(
                 session_id=session.session_id,
                 trial_id=None,
                 goal_label=None,
@@ -559,7 +559,7 @@ def _extract_session_trials(
             trial_id = int(trial_value)
         except (TypeError, ValueError):
             exclusions.append(
-                DoohanDataExclusion(
+                Exclusion(
                     session_id=session.session_id,
                     trial_id=None,
                     goal_label=None,
@@ -584,13 +584,13 @@ def _extract_session_trials(
 
 
 def _extract_trial(
-    session: DoohanSessionRecord,
+    session: SessionRecord,
     trial_id: int,
     trial_mask: Any,
     trial_info: Any,
     trajectories: Any,
     definition: LabeledMaze,
-) -> tuple[MovementTrial | None, DoohanDataExclusion | None]:
+) -> tuple[Trial | None, Exclusion | None]:
     goal_label = None
     try:
         positions = trajectories.loc[
@@ -619,7 +619,7 @@ def _extract_trial(
             definition.coordinate_for(label) for label in tower_labels
         )
         return (
-            MovementTrial(
+            Trial(
                 session_id=session.session_id,
                 trial_id=trial_id,
                 goal=goal,
@@ -628,7 +628,7 @@ def _extract_trial(
             None,
         )
     except ValueError as error:
-        return None, DoohanDataExclusion(
+        return None, Exclusion(
             session_id=session.session_id,
             trial_id=trial_id,
             goal_label=goal_label,

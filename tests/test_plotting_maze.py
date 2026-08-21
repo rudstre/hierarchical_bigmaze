@@ -7,7 +7,7 @@ import pytest
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
-from andrew_mlmdp import LMDPEnvironment, Maze, SubgoalBasis, plotting
+from andrew_mlmdp import Environment, Maze, SubgoalBasis, plotting
 
 
 def _figure_for(ax: Axes) -> Figure:
@@ -18,8 +18,8 @@ def _figure_for(ax: Axes) -> Figure:
 
 def test_static_plots_render_for_non_four_room_maze(tmp_path):
     maze = Maze.from_ascii("...\n.#.\n...")
-    environment = LMDPEnvironment(maze)
-    flat = environment.solve_flat((2, 2))
+    environment = Environment(maze)
+    flat = environment.solve((2, 2))
     template = environment.hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 0), (0, 2), (2, 0)))
     )
@@ -59,7 +59,7 @@ def test_static_plots_render_for_non_four_room_maze(tmp_path):
     plotting.plot_subgoal_passive_dynamics(
         maze,
         basis_locations,
-        template.passive_dynamics,
+        template.upper_passive,
         ax=ax,
     )
     objects.append(figure)

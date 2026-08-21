@@ -12,35 +12,35 @@ from matplotlib.colors import Normalize, TwoSlopeNorm
 from matplotlib.patches import FancyArrowPatch
 
 from andrew_mlmdp.hierarchy.diagnostics import (
-    ContinuationPolicyData,
-    ExpectedPairDiagnosticsSweepData,
+    ContinuationPolicy,
+    DiagnosticSweep,
     HierarchyModel,
-    LatentRouteData,
-    RolloutDistributionData,
     RolloutEnsemble,
-    UpperGraphData,
+    RolloutSummary,
+    RouteSummary,
+    UpperGraph,
     _resolve_task,
-    get_composition_weight_data,
-    get_continuation_policy_data,
-    get_upper_graph_data,
-    sample_hierarchical_rollouts,
-    summarize_rollout_subgoal_sequences,
+    composition_trace,
+    continuation_policies,
+    sample_rollouts,
     summarize_rollouts,
+    summarize_routes,
+    upper_graph,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting.maze import plot_maze
 from andrew_mlmdp.plotting.shared import _colormap
 
 
-def plot_expected_pair_diagnostics_sweep(
-    sweep_data: ExpectedPairDiagnosticsSweepData,
+def plot_diagnostic_sweep(
+    sweep_data: DiagnosticSweep,
     *,
     axes=None,
 ):
     """Plot exact pair entropy and trajectory-length diagnostics."""
 
-    if not isinstance(sweep_data, ExpectedPairDiagnosticsSweepData):
-        raise TypeError("sweep_data must be an ExpectedPairDiagnosticsSweepData")
+    if not isinstance(sweep_data, DiagnosticSweep):
+        raise TypeError("sweep_data must be an DiagnosticSweep")
     if axes is None:
         figure, created_axes = plt.subplots(2, 1, sharex=True)
         entropy_ax, length_ax = created_axes
@@ -56,15 +56,15 @@ def plot_expected_pair_diagnostics_sweep(
     parameter_values = sweep_data.parameter_values
     entropy_ax.plot(
         parameter_values,
-        sweep_data.policy_entropy_normalized,
+        sweep_data.normalized_entropy,
         marker="o",
         label="Policy entropy",
     )
     entropy_ax.set_ylabel("Expected policy entropy (normalized)")
     entropy_ax.legend()
 
-    mean = sweep_data.mean_physical_steps
-    standard_deviation = sweep_data.standard_deviation_physical_steps
+    mean = sweep_data.mean_steps
+    standard_deviation = sweep_data.step_sd
     length_ax.plot(
         parameter_values,
         mean,
@@ -79,10 +79,10 @@ def plot_expected_pair_diagnostics_sweep(
         label="±1 SD",
     )
     length_ax.axhline(
-        sweep_data.shortest_physical_steps,
+        sweep_data.shortest_steps,
         color="black",
         linestyle="--",
-        label=(f"Shortest path = {sweep_data.shortest_physical_steps} steps"),
+        label=(f"Shortest path = {sweep_data.shortest_steps} steps"),
     )
     length_ax.set_xlabel(sweep_data.parameter_name.replace("_", " ").capitalize())
     length_ax.set_ylabel("Trajectory length (physical steps)")
@@ -90,10 +90,10 @@ def plot_expected_pair_diagnostics_sweep(
     return figure, (entropy_ax, length_ax)
 
 
-def _subgoal_colors(number_of_subgoals: int) -> tuple[tuple[float, ...], ...]:
-    color_map = _colormap("tab20" if number_of_subgoals <= 20 else "hsv")
-    denominator = max(1, number_of_subgoals)
-    return tuple(color_map(index / denominator) for index in range(number_of_subgoals))
+def _subgoal_colors(n_subgoals: int) -> tuple[tuple[float, ...], ...]:
+    color_map = _colormap("tab20" if n_subgoals <= 20 else "hsv")
+    denominator = max(1, n_subgoals)
+    return tuple(color_map(index / denominator) for index in range(n_subgoals))
 
 
 def _profile_rgba(
@@ -193,7 +193,7 @@ def _draw_loop(
 
 def _draw_upper_edges(
     ax,
-    data: UpperGraphData,
+    data: UpperGraph,
     dynamics: np.ndarray,
     colors: Sequence[tuple[float, ...]],
     *,
@@ -201,9 +201,9 @@ def _draw_upper_edges(
     common_maximum: float,
     show_goal: bool = True,
 ) -> None:
-    number_of_subgoals = len(data.display_coordinates)
-    for source in range(number_of_subgoals):
-        for destination in range(number_of_subgoals):
+    n_subgoals = len(data.positions)
+    for source in range(n_subgoals):
+        for destination in range(n_subgoals):
             probability = float(dynamics[destination, source])
             if probability <= probability_threshold:
                 continue
@@ -211,7 +211,7 @@ def _draw_upper_edges(
             if source == destination:
                 _draw_loop(
                     ax,
-                    data.display_coordinates[source],
+                    data.positions[source],
                     width=width,
                     color=colors[source],
                 )
@@ -219,8 +219,8 @@ def _draw_upper_edges(
                 rad = 0.13 if source < destination else -0.13
                 _curved_arrow(
                     ax,
-                    data.display_coordinates[source],
-                    data.display_coordinates[destination],
+                    data.positions[source],
+                    data.positions[destination],
                     width=width,
                     color=colors[source],
                     rad=rad,
@@ -229,7 +229,7 @@ def _draw_upper_edges(
         if goal_probability > probability_threshold:
             _curved_arrow(
                 ax,
-                data.display_coordinates[source],
+                data.positions[source],
                 (float(data.goal[0]), float(data.goal[1])),
                 width=_arrow_width(goal_probability, common_maximum),
                 color=colors[source],
@@ -239,14 +239,14 @@ def _draw_upper_edges(
 
 def _draw_upper_nodes(
     ax,
-    data: UpperGraphData,
+    data: UpperGraph,
     colors: Sequence[tuple[float, ...]],
     *,
     show_goal: bool = True,
 ) -> None:
     for label, coordinate, color in zip(
         data.labels,
-        data.display_coordinates,
+        data.positions,
         colors,
     ):
         row, column = coordinate
@@ -285,7 +285,7 @@ def _draw_upper_nodes(
 
 def _draw_initial_edges(
     ax,
-    data: UpperGraphData,
+    data: UpperGraph,
     values: np.ndarray,
     *,
     maximum: float,
@@ -294,7 +294,7 @@ def _draw_initial_edges(
     if data.start_state is None:
         return
     start = (float(data.start_state[0]), float(data.start_state[1]))
-    for destination, coordinate in enumerate(data.display_coordinates):
+    for destination, coordinate in enumerate(data.positions):
         probability = float(values[destination])
         if probability > probability_threshold:
             _curved_arrow(
@@ -337,7 +337,7 @@ def _draw_initial_edges(
     )
 
 
-def plot_subgoal_access_and_upper_dynamics(
+def plot_upper_graph(
     model: HierarchyModel,
     goal: Coordinate | None = None,
     *,
@@ -349,16 +349,16 @@ def plot_subgoal_access_and_upper_dynamics(
 ):
     """Plot task-level execution access and passive upper dynamics."""
 
-    data = get_upper_graph_data(model, goal, representative=representative)
+    data = upper_graph(model, goal, representative=representative)
     panels: list[tuple[str, np.ndarray]] = []
     if show_original_profiles:
-        panels.append(("Original NMF profiles", data.original_nmf_profiles))
+        panels.append(("Original NMF profiles", data.source_profiles))
     if show_gated_profiles:
         panels.append(("Gated basis profiles", data.gated_profiles))
     panels.append(
         (
             "Goal-conditioned execution-access probabilities",
-            data.execution_access_probabilities,
+            data.access_probabilities,
         )
     )
     figure, axes = plt.subplots(
@@ -387,7 +387,7 @@ def plot_subgoal_access_and_upper_dynamics(
     return figure, axes
 
 
-def plot_upper_controlled_dynamics(
+def plot_upper_policy(
     model: HierarchyModel,
     goal: Coordinate | None = None,
     *,
@@ -398,7 +398,7 @@ def plot_upper_controlled_dynamics(
 ):
     """Plot controlled continuation and optional initial/passive dynamics."""
 
-    data = get_upper_graph_data(
+    data = upper_graph(
         model,
         goal,
         start_state=start_state,
@@ -453,7 +453,7 @@ def plot_upper_controlled_dynamics(
 
 
 def _quantity_values(
-    policy: ContinuationPolicyData,
+    policy: ContinuationPolicy,
     quantity: Literal["desirability", "log_desirability", "value"],
 ) -> np.ndarray:
     if quantity == "desirability":
@@ -544,17 +544,17 @@ def plot_continuation_policies(
     """Plot stationary continuation landscapes and optional refractory exits."""
 
     task = _resolve_task(model, goal)
-    policies = get_continuation_policy_data(task)
+    policies = continuation_policies(task)
     if show_refractory and entry_coordinates is None:
         raise ValueError("entry_coordinates are required for refractory rendering")
     entries = dict(entry_coordinates or {})
     for upper_state, coordinate in entries.items():
-        if not 0 <= upper_state < task.number_of_subtasks:
+        if not 0 <= upper_state < task.n_subtasks:
             raise ValueError("entry-coordinate subgoal index is out of range")
-        if coordinate not in task.interior_state_by_coordinate:
+        if coordinate not in task.interior_index:
             raise ValueError("entry coordinate must be a physical interior state")
-        current_interior = task.interior_state_by_coordinate[coordinate]
-        if task.lower_subtask_passive[upper_state, current_interior] <= 0.0:
+        current_interior = task.interior_index[coordinate]
+        if task.subtask_access[upper_state, current_interior] <= 0.0:
             raise ValueError(
                 "entry coordinate has zero execution-access probability "
                 "for the selected subgoal"
@@ -568,9 +568,9 @@ def plot_continuation_policies(
         )
     else:
         color_norm = Normalize(vmin=0.0, vmax=1.0)
-    number_of_panels = len(policies)
-    columns = max(1, ceil(sqrt(number_of_panels)))
-    rows = ceil(number_of_panels / columns)
+    n_panels = len(policies)
+    columns = max(1, ceil(sqrt(n_panels)))
+    rows = ceil(n_panels / columns)
     figure, axes = plt.subplots(
         rows,
         columns,
@@ -579,7 +579,7 @@ def plot_continuation_policies(
     )
     color_map = _colormap("viridis", bad="white")
     matrices = (
-        [policy.physical_control_delta for policy in policies]
+        [policy.policy_delta for policy in policies]
         if show_control_delta
         else [policy.physical_controlled for policy in policies]
     )
@@ -587,7 +587,7 @@ def plot_continuation_policies(
         (float(np.abs(matrix).max(initial=0.0)) for matrix in matrices),
         default=0.0,
     )
-    display = get_upper_graph_data(task)
+    display = upper_graph(task)
     for panel_index, policy in enumerate(policies):
         ax = axes.flat[panel_index]
         image = ax.imshow(
@@ -618,10 +618,10 @@ def plot_continuation_policies(
                 excluded_sources=entry_sources,
             )
         if entry_sources:
-            current_interior = task.interior_state_by_coordinate[
+            current_interior = task.interior_index[
                 entries[policy.upper_state]
             ]
-            if not policy.refractory_valid_sources[current_interior]:
+            if not policy.valid_refractory_sources[current_interior]:
                 raise ValueError("refractory-adjusted outgoing policy is undefined")
             _draw_physical_policy_arrows(
                 ax,
@@ -644,7 +644,7 @@ def plot_continuation_policies(
                 label="explicit entry / refractory",
             )
             ax.legend(loc="upper right", fontsize=7)
-        display_row, display_column = display.display_coordinates[policy.upper_state]
+        display_row, display_column = display.positions[policy.upper_state]
         ax.scatter(
             [display_column],
             [display_row],
@@ -656,10 +656,10 @@ def plot_continuation_policies(
         )
         goal_row, goal_column = task.goal
         ax.plot(goal_column, goal_row, marker="*", markersize=12, color="#ffd92f")
-    for unused in range(number_of_panels, rows * columns):
+    for unused in range(n_panels, rows * columns):
         axes.flat[unused].set_visible(False)
     figure.colorbar(
-        image, ax=list(axes.flat[:number_of_panels]), shrink=0.75, label=quantity
+        image, ax=list(axes.flat[:n_panels]), shrink=0.75, label=quantity
     )
     figure.subplots_adjust(wspace=0.25, hspace=0.28)
     return figure, axes
@@ -674,7 +674,7 @@ def plot_composition_weights(
 ):
     """Plot the exact raw, composition-input, and final weight stages."""
 
-    data = get_composition_weight_data(
+    data = composition_trace(
         model,
         goal,
         start_state=start_state,
@@ -682,8 +682,8 @@ def plot_composition_weights(
     )
     stages = (
         ("Raw weights", data.raw_weights),
-        ("Composition-input weights", data.composition_input_weights),
-        ("Final weights", data.final_weights),
+        ("Composition-input weights", data.clipped_weights),
+        ("Final weights", data.weights),
     )
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.8), squeeze=False, sharey=True)
     colors = [*_subgoal_colors(len(data.labels) - 1), (0.2, 0.2, 0.2, 1.0)]
@@ -701,22 +701,22 @@ def plot_composition_weights(
         "subgoal fraction: "
         + (
             "n/a"
-            if data.subgoal_fraction_of_total is None
-            else f"{data.subgoal_fraction_of_total:.3f}"
+            if data.subgoal_share is None
+            else f"{data.subgoal_share:.3f}"
         ),
         "effective count: "
         + (
             "no subgoal mass"
-            if data.effective_subgoal_count is None
-            else f"{data.effective_subgoal_count:.3f}"
+            if data.effective_subgoals is None
+            else f"{data.effective_subgoals:.3f}"
         ),
         "entropy: "
         + ("n/a" if data.subgoal_entropy is None else f"{data.subgoal_entropy:.3f}"),
         "maximum share: "
         + (
             "n/a"
-            if data.maximum_subgoal_share is None
-            else f"{data.maximum_subgoal_share:.3f}"
+            if data.max_subgoal_share is None
+            else f"{data.max_subgoal_share:.3f}"
         ),
     ]
     axes[0, -1].text(
@@ -767,7 +767,7 @@ def _draw_route_edges(
 
 def _draw_route_map(
     ax,
-    data: RolloutDistributionData,
+    data: RolloutSummary,
     *,
     edge_values: np.ndarray,
     occupancy_values: np.ndarray,
@@ -817,7 +817,7 @@ def _rollout_ensemble_for_plot(
     seed: int | None,
 ) -> RolloutEnsemble:
     if ensemble is None:
-        return sample_hierarchical_rollouts(
+        return sample_rollouts(
             model,
             start,
             goal,
@@ -896,22 +896,22 @@ def plot_rollout_distribution(
             signed=True,
         )
         histogram_ax = axes[1, 1]
-    if data.successful_physical_steps.size:
+    if data.successful_steps.size:
         histogram_ax.hist(
-            data.successful_physical_steps,
+            data.successful_steps,
             bins="auto",
             alpha=0.6,
             label="model successful rollouts",
         )
-    if data.observed_physical_steps is not None:
+    if data.observed_steps is not None:
         histogram_ax.hist(
-            data.observed_physical_steps,
+            data.observed_steps,
             bins="auto",
             alpha=0.5,
             label="observed",
         )
     histogram_ax.axvline(
-        data.shortest_physical_steps,
+        data.shortest_steps,
         color="black",
         linestyle="--",
         label="shortest physical steps",
@@ -920,15 +920,15 @@ def plot_rollout_distribution(
     histogram_ax.set_ylabel("number of trajectories")
     histogram_ax.set_title("Successful trajectory lengths")
     histogram_ax.legend()
-    has_successes = bool(data.successful_physical_steps.size)
+    has_successes = bool(data.successful_steps.size)
     mean_steps = (
-        float(data.successful_physical_steps.mean()) if has_successes else float("nan")
+        float(data.successful_steps.mean()) if has_successes else float("nan")
     )
-    median_steps = data.physical_step_quantiles.get(0.5, float("nan"))
-    lower_quantile = data.physical_step_quantiles.get(0.05, float("nan"))
-    upper_quantile = data.physical_step_quantiles.get(0.95, float("nan"))
+    median_steps = data.step_quantiles.get(0.5, float("nan"))
+    lower_quantile = data.step_quantiles.get(0.05, float("nan"))
+    upper_quantile = data.step_quantiles.get(0.95, float("nan"))
     mean_excess = (
-        float(data.excess_physical_steps.mean()) if has_successes else float("nan")
+        float(data.excess_steps.mean()) if has_successes else float("nan")
     )
     statuses = ", ".join(
         f"{status}={count}" for status, count in sorted(data.status_counts.items())
@@ -972,7 +972,7 @@ def _latent_positions(tokens: Sequence[str]) -> dict[str, tuple[float, float]]:
     return positions
 
 
-def _draw_latent_graph(ax, data: LatentRouteData) -> None:
+def _draw_latent_graph(ax, data: RouteSummary) -> None:
     positions = _latent_positions(data.tokens)
     maximum = float(data.transition_counts.max(initial=0))
     for source_index, source in enumerate(data.tokens):
@@ -1008,7 +1008,7 @@ def _draw_latent_graph(ax, data: LatentRouteData) -> None:
     ax.set_title("Latent transition frequencies")
 
 
-def plot_rollout_subgoal_sequences(
+def plot_routes(
     model: HierarchyModel,
     start: Coordinate,
     goal: Coordinate | None = None,
@@ -1028,7 +1028,7 @@ def plot_rollout_subgoal_sequences(
         n_rollouts=n_rollouts,
         seed=seed,
     )
-    data = summarize_rollout_subgoal_sequences(selected, top_n=top_n)
+    data = summarize_routes(selected, top_n=top_n)
     figure, axes = plt.subplots(1, 3, figsize=(18, 5.5), squeeze=False)
     _draw_latent_graph(axes[0, 0], data)
     matrix_ax = axes[0, 1]

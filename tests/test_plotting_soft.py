@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backend_bases import MouseButton, MouseEvent
 
-from andrew_mlmdp import HierarchyTask, plotting
+from andrew_mlmdp import Task, plotting
 
 
 def _mouse_event(name, figure, ax, coordinate):
@@ -39,7 +39,7 @@ def test_soft_player_stages_both_locations_and_recomputes_once(
     soft_corridor_template,
     monkeypatch,
 ):
-    original_rollout_method = HierarchyTask.rollout
+    original_rollout_method = Task.rollout
     rollout_calls = 0
 
     def counted_rollout(self, *args, **kwargs):
@@ -48,8 +48,8 @@ def test_soft_player_stages_both_locations_and_recomputes_once(
         return original_rollout_method(self, *args, **kwargs)
 
     # Count only the initial construction and explicit recompute.
-    monkeypatch.setattr(HierarchyTask, "rollout", counted_rollout)
-    player = plotting.plot_interactive_soft_hierarchical_rollout(
+    monkeypatch.setattr(Task, "rollout", counted_rollout)
+    player = plotting.explore_rollout(
         soft_corridor_template,
         (0, 0),
         (1, 3),
@@ -81,7 +81,7 @@ def test_soft_player_stages_both_locations_and_recomputes_once(
 
 
 def test_soft_player_controls_and_invalid_drops(soft_corridor_template):
-    player = plotting.plot_interactive_soft_hierarchical_rollout(
+    player = plotting.explore_rollout(
         soft_corridor_template,
         (0, 0),
         (1, 3),
@@ -98,10 +98,10 @@ def test_soft_player_controls_and_invalid_drops(soft_corridor_template):
     _drag_marker(player.figure, maze_ax, (0, 0), (1, 3))
     assert player.pending_start == (0, 0)
     player.show_goal_component(False)
-    player.show_framewise_normalization(False)
+    player.show_normalization(False)
     player.show_frame(player.frame_count - 1)
     assert not player.goal_component_visible
-    assert not player.framewise_normalization
+    assert not player.frame_normalization
     assert player.frame_index == player.frame_count - 1
     desirability_ax = next(
         ax

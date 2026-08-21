@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Literal
 from andrew_mlmdp.maze import Coordinate
 
 if TYPE_CHECKING:
-    from andrew_mlmdp.hierarchy import HierarchyTemplate
-    from andrew_mlmdp.lmdp import LMDPEnvironment, ModelParameters
+    from andrew_mlmdp.hierarchy import Template
+    from andrew_mlmdp.lmdp import Environment, Parameters
 
 
 @dataclass(frozen=True)
-class MovementTrial:
+class Trial:
     """One independently scored movement trajectory and its goal."""
 
     session_id: str
@@ -26,18 +26,18 @@ class MovementTrial:
 
 
 @dataclass(frozen=True)
-class MovementTrialLikelihood:
+class TrialScore:
     """Likelihood and movement count for one included trial."""
 
     session_id: str
     trial_id: int
     goal: Coordinate
-    number_of_transitions: int
+    n_transitions: int
     log_likelihood: float
 
 
 @dataclass(frozen=True)
-class MovementTrialExclusion:
+class ExcludedTrial:
     """One trial that could not be scored by a requested model."""
 
     session_id: str
@@ -47,25 +47,25 @@ class MovementTrialExclusion:
 
 
 @dataclass(frozen=True)
-class MovementDatasetLikelihood:
+class DatasetScore:
     """Auditable per-trial scores and their dataset-level aggregate."""
 
     model: Literal["flat", "hierarchical"]
-    trial_likelihoods: tuple[MovementTrialLikelihood, ...]
-    exclusions: tuple[MovementTrialExclusion, ...]
+    trial_likelihoods: tuple[TrialScore, ...]
+    exclusions: tuple[ExcludedTrial, ...]
 
     @property
-    def number_of_scored_trials(self) -> int:
+    def n_scored(self) -> int:
         return len(self.trial_likelihoods)
 
     @property
-    def number_of_excluded_trials(self) -> int:
+    def n_excluded(self) -> int:
         return len(self.exclusions)
 
     @property
     def total_transitions(self) -> int:
         return sum(
-            trial.number_of_transitions for trial in self.trial_likelihoods
+            trial.n_transitions for trial in self.trial_likelihoods
         )
 
     @property
@@ -81,49 +81,49 @@ class MovementDatasetLikelihood:
         return self.total_log_likelihood / self.total_transitions
 
 
-def score_flat_movement_dataset(
-    environment: "LMDPEnvironment",
-    trials: Iterable[MovementTrial],
+def score_flat_dataset(
+    environment: "Environment",
+    trials: Iterable[Trial],
     *,
-    parameters: "ModelParameters | None" = None,
-) -> MovementDatasetLikelihood:
+    parameters: "Parameters | None" = None,
+) -> DatasetScore:
     """Score independent trials under flat policies cached by trial goal."""
 
     solutions = {}
 
-    def score(trial: MovementTrial) -> float:
+    def score(trial: Trial) -> float:
         solution = solutions.get(trial.goal)
         if solution is None:
-            solution = environment.solve_flat(
+            solution = environment.solve(
                 trial.goal,
                 parameters=parameters,
             )
             solutions[trial.goal] = solution
-        return solution.movement_log_likelihood(trial.trajectory)
+        return solution.log_likelihood(trial.trajectory)
 
     return _score_movement_dataset("flat", trials, score)
 
 
-def score_hierarchical_movement_dataset(
-    template: "HierarchyTemplate",
-    trials: Iterable[MovementTrial],
+def score_hierarchy_dataset(
+    template: "Template",
+    trials: Iterable[Trial],
     *,
     beta: float | None = None,
-) -> MovementDatasetLikelihood:
+) -> DatasetScore:
     """Score independent trials with hierarchy tasks cached by trial goal."""
 
-    def score(trial: MovementTrial) -> float:
-        task = template.for_goal(trial.goal)
-        return task.movement_log_likelihood(trial.trajectory, beta=beta)
+    def score(trial: Trial) -> float:
+        task = template.task(trial.goal)
+        return task.log_likelihood(trial.trajectory, beta=beta)
 
     return _score_movement_dataset("hierarchical", trials, score)
 
 
 def _score_movement_dataset(
     model: Literal["flat", "hierarchical"],
-    trials: Iterable[MovementTrial],
-    score: Callable[[MovementTrial], float],
-) -> MovementDatasetLikelihood:
+    trials: Iterable[Trial],
+    score: Callable[[Trial], float],
+) -> DatasetScore:
     likelihoods = []
     exclusions = []
     for trial in trials:
@@ -131,7 +131,7 @@ def _score_movement_dataset(
             log_likelihood = score(trial)
         except ValueError as error:
             exclusions.append(
-                MovementTrialExclusion(
+                ExcludedTrial(
                     session_id=trial.session_id,
                     trial_id=trial.trial_id,
                     goal=trial.goal,
@@ -141,25 +141,25 @@ def _score_movement_dataset(
             continue
 
         likelihoods.append(
-            MovementTrialLikelihood(
+            TrialScore(
                 session_id=trial.session_id,
                 trial_id=trial.trial_id,
                 goal=trial.goal,
-                number_of_transitions=_number_of_movement_transitions(
+                n_transitions=_movement_count(
                     trial.trajectory
                 ),
                 log_likelihood=float(log_likelihood),
             )
         )
 
-    return MovementDatasetLikelihood(
+    return DatasetScore(
         model=model,
         trial_likelihoods=tuple(likelihoods),
         exclusions=tuple(exclusions),
     )
 
 
-def _number_of_movement_transitions(
+def _movement_count(
     trajectory: tuple[Coordinate, ...],
 ) -> int:
     return sum(

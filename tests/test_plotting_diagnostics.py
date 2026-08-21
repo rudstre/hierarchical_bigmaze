@@ -9,14 +9,14 @@ from matplotlib.figure import Figure
 
 from andrew_mlmdp import plotting
 from andrew_mlmdp.hierarchy import (
-    ExpectedPairDiagnosticsSweepData,
-    sample_hierarchical_rollouts,
+    DiagnosticSweep,
+    sample_rollouts,
 )
 
 
 def test_all_hierarchy_plots_render(soft_corridor_template):
-    task = soft_corridor_template.for_goal((1, 3))
-    ensemble = sample_hierarchical_rollouts(
+    task = soft_corridor_template.task((1, 3))
+    ensemble = sample_rollouts(
         task,
         (0, 0),
         n_rollouts=8,
@@ -24,19 +24,19 @@ def test_all_hierarchy_plots_render(soft_corridor_template):
         max_steps=100,
     )
     entry_coordinates = {}
-    for upper_state in range(task.number_of_subtasks):
-        support = task.lower_subtask_passive[upper_state] > 0.0
+    for upper_state in range(task.n_subtasks):
+        support = task.subtask_access[upper_state] > 0.0
         current_interior = int(support.nonzero()[0][0])
         physical_state = int(task.interior_states[current_interior])
         entry_coordinates[upper_state] = task.maze.coordinate(physical_state)
 
     figures = [
-        plotting.plot_subgoal_access_and_upper_dynamics(
+        plotting.plot_upper_graph(
             task,
             show_original_profiles=True,
             show_gated_profiles=True,
         )[0],
-        plotting.plot_upper_controlled_dynamics(
+        plotting.plot_upper_policy(
             task,
             start_state=(0, 0),
         )[0],
@@ -51,7 +51,7 @@ def test_all_hierarchy_plots_render(soft_corridor_template):
             (0, 0),
             ensemble=ensemble,
         )[0],
-        plotting.plot_rollout_subgoal_sequences(
+        plotting.plot_routes(
             task,
             (0, 0),
             ensemble=ensemble,
@@ -67,18 +67,18 @@ def test_all_hierarchy_plots_render(soft_corridor_template):
 def test_refractory_plot_requires_explicit_entry_coordinates(
     soft_corridor_template,
 ):
-    task = soft_corridor_template.for_goal((1, 3))
+    task = soft_corridor_template.task((1, 3))
 
     with pytest.raises(ValueError, match="entry_coordinates"):
         plotting.plot_continuation_policies(task, show_refractory=True)
 
 
 def test_refractory_plot_rejects_zero_access_entry(soft_corridor_template):
-    task = soft_corridor_template.for_goal((1, 3))
+    task = soft_corridor_template.task((1, 3))
     zero_coordinate = next(
         task.maze.coordinate(int(physical_state))
         for current_interior, physical_state in enumerate(task.interior_states)
-        if task.lower_subtask_passive[0, current_interior] == 0.0
+        if task.subtask_access[0, current_interior] == 0.0
     )
 
     with pytest.raises(ValueError, match="zero execution-access"):
@@ -92,8 +92,8 @@ def test_refractory_plot_rejects_zero_access_entry(soft_corridor_template):
 def test_rollout_plots_reject_sampling_options_with_ensemble(
     soft_corridor_template,
 ):
-    task = soft_corridor_template.for_goal((1, 3))
-    ensemble = sample_hierarchical_rollouts(
+    task = soft_corridor_template.task((1, 3))
+    ensemble = sample_rollouts(
         task,
         (0, 0),
         n_rollouts=2,
@@ -111,23 +111,23 @@ def test_rollout_plots_reject_sampling_options_with_ensemble(
 
 
 def _pair_diagnostics_sweep_plot_data():
-    return ExpectedPairDiagnosticsSweepData(
+    return DiagnosticSweep(
         parameter_name="lower_control_cost",
         parameter_values=np.asarray([0.1, 0.2, 0.3]),
         start=(0, 0),
         goal=(0, 2),
-        shortest_physical_steps=2,
-        policy_entropy_normalized=np.asarray([0.2, 0.3, 0.1]),
-        policy_entropy_raw=np.asarray([0.4, 0.5, 0.3]),
-        mean_physical_steps=np.asarray([5.0, 4.0, 3.0]),
-        standard_deviation_physical_steps=np.asarray([1.0, 0.5, 0.25]),
+        shortest_steps=2,
+        normalized_entropy=np.asarray([0.2, 0.3, 0.1]),
+        entropy=np.asarray([0.4, 0.5, 0.3]),
+        mean_steps=np.asarray([5.0, 4.0, 3.0]),
+        step_sd=np.asarray([1.0, 0.5, 0.25]),
     )
 
 
 def test_expected_pair_diagnostics_sweep_plot_renders_comparison():
     data = _pair_diagnostics_sweep_plot_data()
 
-    figure, (entropy_ax, length_ax) = plotting.plot_expected_pair_diagnostics_sweep(
+    figure, (entropy_ax, length_ax) = plotting.plot_diagnostic_sweep(
         data
     )
 
@@ -137,15 +137,15 @@ def test_expected_pair_diagnostics_sweep_plot_renders_comparison():
     )
     np.testing.assert_array_equal(
         entropy_ax.lines[0].get_ydata(),
-        data.policy_entropy_normalized,
+        data.normalized_entropy,
     )
     np.testing.assert_array_equal(
         length_ax.lines[0].get_ydata(),
-        data.mean_physical_steps,
+        data.mean_steps,
     )
     np.testing.assert_array_equal(
         length_ax.lines[1].get_ydata(),
-        np.full(2, data.shortest_physical_steps),
+        np.full(2, data.shortest_steps),
     )
     assert len(length_ax.collections) == 1
     assert entropy_ax.get_ylabel() == ("Expected policy entropy (normalized)")
@@ -162,7 +162,7 @@ def test_expected_pair_diagnostics_sweep_plot_uses_supplied_axes():
     data = _pair_diagnostics_sweep_plot_data()
     supplied_figure, supplied_axes = plt.subplots(2, 1, sharex=True)
 
-    figure, axes = plotting.plot_expected_pair_diagnostics_sweep(
+    figure, axes = plotting.plot_diagnostic_sweep(
         data,
         axes=supplied_axes,
     )
@@ -174,12 +174,12 @@ def test_expected_pair_diagnostics_sweep_plot_uses_supplied_axes():
 
 
 def test_expected_pair_diagnostics_sweep_plot_validates_inputs():
-    with pytest.raises(TypeError, match="ExpectedPairDiagnosticsSweepData"):
-        plotting.plot_expected_pair_diagnostics_sweep("not sweep data")
+    with pytest.raises(TypeError, match="DiagnosticSweep"):
+        plotting.plot_diagnostic_sweep("not sweep data")
 
     figure, ax = plt.subplots()
     with pytest.raises(ValueError, match="exactly two"):
-        plotting.plot_expected_pair_diagnostics_sweep(
+        plotting.plot_diagnostic_sweep(
             _pair_diagnostics_sweep_plot_data(),
             axes=(ax,),
         )
@@ -188,7 +188,7 @@ def test_expected_pair_diagnostics_sweep_plot_validates_inputs():
     first_figure, first_ax = plt.subplots()
     second_figure, second_ax = plt.subplots()
     with pytest.raises(ValueError, match="same figure"):
-        plotting.plot_expected_pair_diagnostics_sweep(
+        plotting.plot_diagnostic_sweep(
             _pair_diagnostics_sweep_plot_data(),
             axes=(first_ax, second_ax),
         )

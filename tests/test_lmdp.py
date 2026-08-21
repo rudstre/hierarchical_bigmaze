@@ -4,15 +4,15 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
-    FirstExitDynamics,
-    LMDPEnvironment,
+    Dynamics,
+    Environment,
     Maze,
-    ModelParameters,
-    PassiveDynamicsMode,
+    Parameters,
+    PassiveMode,
     SubgoalBasis,
-    controlled_from_desirability,
+    controlled_dynamics,
+    desirability_step,
     solve_first_exit,
-    z_iteration_step,
 )
 
 
@@ -20,17 +20,17 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
     import andrew_mlmdp.lmdp as lmdp
 
     calls = 0
-    original = lmdp.build_passive_dynamics
+    original = lmdp.passive_dynamics
 
-    def counted(maze, *, mode: PassiveDynamicsMode = "five_commands"):
+    def counted(maze, *, mode: PassiveMode = "five_commands"):
         nonlocal calls
         calls += 1
         return original(maze, mode=mode)
 
-    monkeypatch.setattr(lmdp, "build_passive_dynamics", counted)
-    environment = LMDPEnvironment(Maze.from_ascii("....."))
-    first = environment.solve_flat((0, 4))
-    second = environment.solve_flat((0, 3))
+    monkeypatch.setattr(lmdp, "passive_dynamics", counted)
+    environment = Environment(Maze.from_ascii("....."))
+    first = environment.solve((0, 4))
+    second = environment.solve((0, 3))
 
     assert calls == 1
     assert first.environment is second.environment is environment
@@ -39,7 +39,7 @@ def test_environment_builds_geometry_only_passive_dynamics_once(monkeypatch):
 
 
 def test_default_passive_mode_preserves_five_command_dynamics():
-    environment = LMDPEnvironment(Maze.from_ascii("..."))
+    environment = Environment(Maze.from_ascii("..."))
 
     assert environment.passive_mode == "five_commands"
     assert environment.passive == pytest.approx(
@@ -55,7 +55,7 @@ def test_default_passive_mode_preserves_five_command_dynamics():
 
 def test_valid_neighbors_is_uniform_over_traversable_moves():
     maze = Maze.from_ascii("...\n...")
-    environment = LMDPEnvironment(maze, passive_mode="valid_neighbors")
+    environment = Environment(maze, passive_mode="valid_neighbors")
     corner = maze.state_index((0, 0))
     junction = maze.state_index((0, 1))
 
@@ -69,7 +69,7 @@ def test_valid_neighbors_is_uniform_over_traversable_moves():
     assert np.all(np.isfinite(environment.passive))
     assert np.allclose(environment.passive.sum(axis=0), 1.0)
     assert np.allclose(np.diag(environment.passive), 0.0)
-    solution = environment.solve_flat((1, 2))
+    solution = environment.solve((1, 2))
     assert np.allclose(np.diag(solution.controlled), 0.0)
 
 
@@ -81,7 +81,7 @@ def test_valid_neighbors_respects_explicit_connections():
             ((1, 1), (0, 1)),
         )
     )
-    environment = LMDPEnvironment(maze, passive_mode="valid_neighbors")
+    environment = Environment(maze, passive_mode="valid_neighbors")
     top_left = maze.state_index((0, 0))
     bottom_left = maze.state_index((1, 0))
 
@@ -95,7 +95,7 @@ def test_valid_neighbors_respects_explicit_connections():
 
 def test_valid_neighbors_excludes_walls():
     maze = Maze.from_ascii(".#.\n...")
-    environment = LMDPEnvironment(maze, passive_mode="valid_neighbors")
+    environment = Environment(maze, passive_mode="valid_neighbors")
     top_left = maze.state_index((0, 0))
     bottom_left = maze.state_index((1, 0))
 
@@ -112,28 +112,28 @@ def test_valid_neighbors_rejects_isolated_free_state():
         ValueError,
         match=r"State \(0, 0\) has no valid neighbors",
     ):
-        LMDPEnvironment(Maze.from_ascii("."), passive_mode="valid_neighbors")
+        Environment(Maze.from_ascii("."), passive_mode="valid_neighbors")
 
 
 def test_unknown_passive_mode_is_rejected():
     with pytest.raises(ValueError, match="Unknown passive dynamics mode"):
-        LMDPEnvironment(
+        Environment(
             Maze.from_ascii(".."),
-            passive_mode=cast(PassiveDynamicsMode, "unknown"),
+            passive_mode=cast(PassiveMode, "unknown"),
         )
 
 
 @pytest.mark.parametrize("passive_mode", ["five_commands", "valid_neighbors"])
 def test_flat_and_hierarchical_tasks_use_selected_passive_mode(
-    passive_mode: PassiveDynamicsMode,
+    passive_mode: PassiveMode,
 ):
     maze = Maze.from_ascii("....")
-    environment = LMDPEnvironment(maze, passive_mode=passive_mode)
-    flat = environment.solve_flat((0, 3))
+    environment = Environment(maze, passive_mode=passive_mode)
+    flat = environment.solve((0, 3))
     hierarchy = environment.hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 1),)),
     )
-    task = hierarchy.for_goal((0, 3))
+    task = hierarchy.task((0, 3))
 
     assert flat.environment is environment
     assert task.template.environment is environment
@@ -155,8 +155,8 @@ def test_flat_and_hierarchical_tasks_use_selected_passive_mode(
     ],
 )
 def test_flat_solution_is_size_and_shape_independent(layout, goal):
-    environment = LMDPEnvironment(Maze.from_ascii(layout))
-    solution = environment.solve_flat(goal)
+    environment = Environment(Maze.from_ascii(layout))
+    solution = environment.solve(goal)
 
     assert solution.desirability.shape == (len(environment.maze.free_cells),)
     assert solution.controlled.shape == (
@@ -168,14 +168,14 @@ def test_flat_solution_is_size_and_shape_independent(layout, goal):
 
 
 def test_flat_solution_satisfies_bellman_and_control_equations():
-    environment = LMDPEnvironment(Maze.from_ascii("....."))
-    parameters = ModelParameters(
+    environment = Environment(Maze.from_ascii("....."))
+    parameters = Parameters(
         interior_reward=-0.2,
         goal_reward=1.3,
         lower_control_cost=0.7,
     )
     goal = (0, 4)
-    solution = environment.solve_flat(goal, parameters=parameters)
+    solution = environment.solve(goal, parameters=parameters)
     goal_state = environment.maze.state_index(goal)
     interior = np.asarray([0, 1, 2, 3])
     q = np.exp(parameters.interior_reward.item() / parameters.lower_control_cost.item())
@@ -188,7 +188,7 @@ def test_flat_solution_satisfies_bellman_and_control_equations():
         np.exp(parameters.goal_reward.item() / parameters.lower_control_cost.item())
     )
     assert solution.controlled == pytest.approx(
-        controlled_from_desirability(
+        controlled_dynamics(
             environment.passive,
             solution.desirability,
         )
@@ -197,7 +197,7 @@ def test_flat_solution_satisfies_bellman_and_control_equations():
 
 def test_rollout_is_seeded_legal_and_handles_terminal_start():
     maze = Maze.from_ascii("....\n.#..")
-    solution = LMDPEnvironment(maze).solve_flat((1, 3))
+    solution = Environment(maze).solve((1, 3))
 
     first = solution.rollout((0, 0), seed=7)
     second = solution.rollout((0, 0), seed=7)
@@ -207,9 +207,9 @@ def test_rollout_is_seeded_legal_and_handles_terminal_start():
     assert solution.rollout((1, 3), seed=7) == [(1, 3)]
 
 
-def test_movement_log_likelihood_conditions_on_leaving_each_state():
+def test_log_likelihood_conditions_on_leaving_each_state():
     maze = Maze.from_ascii("...")
-    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+    solution = Environment(maze).solve((0, 2))
     trajectory = [(0, 0), (0, 1), (0, 2)]
 
     expected = sum(
@@ -220,7 +220,7 @@ def test_movement_log_likelihood_conditions_on_leaving_each_state():
         for current_state, next_state in ((0, 1), (1, 2))
     )
 
-    assert solution.movement_log_likelihood(trajectory) == pytest.approx(expected)
+    assert solution.log_likelihood(trajectory) == pytest.approx(expected)
     repeated_trajectory = [
         (0, 0),
         (0, 0),
@@ -229,37 +229,37 @@ def test_movement_log_likelihood_conditions_on_leaving_each_state():
         (0, 1),
         (0, 2),
     ]
-    assert solution.movement_log_likelihood(repeated_trajectory) == pytest.approx(
+    assert solution.log_likelihood(repeated_trajectory) == pytest.approx(
         expected
     )
 
 
-def test_movement_log_likelihood_validates_trajectory():
+def test_log_likelihood_validates_trajectory():
     maze = Maze.from_ascii(".#.")
-    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+    solution = Environment(maze).solve((0, 2))
 
-    assert solution.movement_log_likelihood([(0, 0)]) == 0.0
-    assert solution.movement_log_likelihood([(0, 0), (0, 0)]) == 0.0
+    assert solution.log_likelihood([(0, 0)]) == 0.0
+    assert solution.log_likelihood([(0, 0), (0, 0)]) == 0.0
     with pytest.raises(ValueError, match="at least one coordinate"):
-        solution.movement_log_likelihood([])
+        solution.log_likelihood([])
     with pytest.raises(ValueError, match="not a free cell"):
-        solution.movement_log_likelihood([(0, 1)])
+        solution.log_likelihood([(0, 1)])
 
 
-def test_movement_log_likelihood_returns_negative_infinity_when_impossible():
+def test_log_likelihood_returns_negative_infinity_when_impossible():
     maze = Maze.from_ascii(".#.")
-    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+    solution = Environment(maze).solve((0, 2))
 
     assert np.isneginf(
-        solution.movement_log_likelihood([(0, 0), (0, 2)])
+        solution.log_likelihood([(0, 0), (0, 2)])
     )
     assert np.isneginf(
-        solution.movement_log_likelihood([(0, 2), (0, 0)])
+        solution.log_likelihood([(0, 2), (0, 0)])
     )
 
 
 def test_generic_first_exit_solve_and_z_iteration_converge():
-    dynamics = FirstExitDynamics(
+    dynamics = Dynamics(
         interior_passive=np.asarray([[0.4, 0.2], [0.3, 0.5]]),
         boundary_passive=np.asarray([[0.3, 0.3]]),
     )
@@ -268,11 +268,11 @@ def test_generic_first_exit_solve_and_z_iteration_converge():
     exact = solve_first_exit(dynamics, boundary, q)
     learned = np.zeros(2)
     for _ in range(300):
-        learned = z_iteration_step(dynamics, learned, boundary, q)
+        learned = desirability_step(dynamics, learned, boundary, q)
     assert learned == pytest.approx(exact)
 
 
 def test_disconnected_state_has_zero_desirability():
     maze = Maze.from_ascii(".#.")
-    solution = LMDPEnvironment(maze).solve_flat((0, 2))
+    solution = Environment(maze).solve((0, 2))
     assert solution.desirability[maze.state_index((0, 0))] == pytest.approx(0.0)

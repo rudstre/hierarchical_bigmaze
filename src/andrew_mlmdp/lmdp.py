@@ -14,16 +14,16 @@ from torch import nn
 
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
 
-PassiveDynamicsMode = Literal["five_commands", "valid_neighbors"]
+PassiveMode = Literal["five_commands", "valid_neighbors"]
 
 
-class ModelParameters(nn.Module):
+class Parameters(nn.Module):
     """Trainable scalar parameters for flat and hierarchical execution.
 
     The lower cost governs flat and physical-layer calculations, including the
     task basis and reward inpainting. The upper cost governs the abstract LMDP.
     NMF task discovery has separate frozen parameters in
-    ``NMFDiscoveryParameters``. Defaults are canonical project choices for
+    ``NMFConfig``. Defaults are canonical project choices for
     flat and generic calculations; hierarchy factories provide their own
     context-specific defaults.
     """
@@ -113,7 +113,7 @@ def _scalar_parameter(value: float) -> nn.Parameter:
     return nn.Parameter(torch.tensor(float(value), dtype=torch.float64))
 
 
-def hard_hierarchy_parameters(
+def point_parameters(
     *,
     interior_reward: float = -0.1,
     goal_reward: float = 1.1,
@@ -123,7 +123,7 @@ def hard_hierarchy_parameters(
     beta: float = 16.0,
     core_threshold: float | None = None,
     core_exponent: float = 1.0,
-) -> ModelParameters:
+) -> Parameters:
     """Return the validated defaults for one-hot subgoal hierarchies.
 
     These defaults balance fixed-subgoal desirability structure, rollout
@@ -131,7 +131,7 @@ def hard_hierarchy_parameters(
     do not encode a particular maze shape, size, goal, or subgoal count.
     """
 
-    return ModelParameters(
+    return Parameters(
         interior_reward=interior_reward,
         goal_reward=goal_reward,
         lower_control_cost=lower_control_cost,
@@ -143,7 +143,7 @@ def hard_hierarchy_parameters(
     )
 
 
-def soft_hierarchy_parameters(
+def soft_parameters(
     k: int = 8,
     *,
     interior_reward: float | None = None,
@@ -154,7 +154,7 @@ def soft_hierarchy_parameters(
     beta: float | None = None,
     core_threshold: float | None = 0.8,
     core_exponent: float = 1.0,
-) -> ModelParameters:
+) -> Parameters:
     """Return soft-hierarchy execution parameters for rank ``k``.
 
     The rank-eight reference was validated after component-wise NMF peak
@@ -174,7 +174,7 @@ def soft_hierarchy_parameters(
     ):
         raise ValueError("Soft hierarchy rank k must be a positive integer")
 
-    reference = ModelParameters()
+    reference = Parameters()
     rank_scale = float(np.sqrt(float(k) / 8.0))
     derived = {
         "interior_reward": reference.interior_reward.item(),
@@ -203,11 +203,11 @@ def soft_hierarchy_parameters(
             if value is not None
         }
     )
-    return ModelParameters(**derived)
+    return Parameters(**derived)
 
 
 @dataclass(frozen=True)
-class FirstExitDynamics:
+class Dynamics:
     """Passive dynamics split into interior and boundary rows.
 
     ``interior_passive`` has shape ``(n_interior, n_interior)`` and
@@ -241,25 +241,29 @@ class FirstExitDynamics:
         return np.vstack([self.interior_passive, self.boundary_passive])
 
     @property
-    def number_of_interior_states(self) -> int:
+    def n_interior(self) -> int:
+        """Number of non-terminal states."""
+
         return self.interior_passive.shape[0]
 
     @property
-    def number_of_boundary_states(self) -> int:
+    def n_boundary(self) -> int:
+        """Number of terminal boundary states."""
+
         return self.boundary_passive.shape[0]
 
 
 @dataclass(frozen=True)
-class FlatSolution:
+class Solution:
     """A solved flat maze task with its policy and rollout convenience API."""
 
-    environment: "LMDPEnvironment"
+    environment: "Environment"
     goal: Coordinate
-    parameters: ModelParameters
+    parameters: Parameters
     desirability: np.ndarray
     controlled: np.ndarray
 
-    def movement_log_likelihood(
+    def log_likelihood(
         self,
         trajectory: list[Coordinate] | tuple[Coordinate, ...],
     ) -> float:
@@ -324,7 +328,7 @@ class FlatSolution:
 
 
 @dataclass(frozen=True)
-class LMDPEnvironment:
+class Environment:
     """Maze dynamics shared by flat, discovery, and hierarchical tasks.
 
     The physical passive matrix depends only on maze geometry and the selected
@@ -334,27 +338,27 @@ class LMDPEnvironment:
     """
 
     maze: Maze
-    passive_mode: PassiveDynamicsMode = "five_commands"
+    passive_mode: PassiveMode = "five_commands"
     passive: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        passive = build_passive_dynamics(
+        passive = passive_dynamics(
             self.maze,
             mode=self.passive_mode,
         )
         passive.flags.writeable = False
         object.__setattr__(self, "passive", passive)
 
-    def solve_flat(
+    def solve(
         self,
         goal: Coordinate,
         *,
-        parameters: ModelParameters | None = None,
-    ) -> FlatSolution:
+        parameters: Parameters | None = None,
+    ) -> Solution:
         """Solve a flat first-exit task while reusing physical dynamics."""
 
         if parameters is None:
-            parameters = ModelParameters()
+            parameters = Parameters()
         desirability = _solve_desirability_from_passive(
             self.maze,
             self.passive,
@@ -368,7 +372,7 @@ class LMDPEnvironment:
         controlled[:, usable] = (
             unnormalized[:, usable] / normalizers[usable]
         )
-        return FlatSolution(
+        return Solution(
             environment=self,
             goal=goal,
             parameters=parameters,
@@ -380,25 +384,25 @@ class LMDPEnvironment:
         self,
         basis,
         *,
-        parameters: ModelParameters | None = None,
+        parameters: Parameters | None = None,
         task_library=None,
         composition_exponent: float = 1.0,
         composition_mode: Literal["power", "winner_take_all"] = "power",
     ):
         """Create a reusable hierarchy template for a supplied subgoal basis.
 
-        Hierarchies use :func:`hard_hierarchy_parameters` when ``parameters``
+        Hierarchies use :func:`point_parameters` when ``parameters``
         is omitted. This preserves exact equivalence between a point basis and
         the same one-hot profiles supplied through the distributed API.
         Calibrated soft workflows should pass
-        :func:`soft_hierarchy_parameters` explicitly.
+        :func:`soft_parameters` explicitly.
         """
 
-        from andrew_mlmdp.hierarchy import HierarchyTemplate
+        from andrew_mlmdp.hierarchy import Template
 
         if parameters is None:
-            parameters = hard_hierarchy_parameters()
-        return HierarchyTemplate(
+            parameters = point_parameters()
+        return Template(
             environment=self,
             basis=basis,
             parameters=parameters,
@@ -409,39 +413,39 @@ class LMDPEnvironment:
 
 
 def solve_first_exit(
-    dynamics: FirstExitDynamics,
+    dynamics: Dynamics,
     boundary_desirability: np.ndarray,
-    interior_exponentiated_reward: float | np.ndarray,
+    q_interior: float | np.ndarray,
 ) -> np.ndarray:
     """Solve the exponentiated Bellman equation (paper Equation 4).
 
-    ``interior_exponentiated_reward`` is ``q_i = exp(r_i / lambda)`` and may
+    ``q_interior`` is ``q_i = exp(r_i / lambda)`` and may
     be one shared scalar or one value per interior state. The returned vector
     follows the interior-state column order of ``dynamics``.
     """
 
-    number_of_states = dynamics.number_of_interior_states
+    n_states = dynamics.n_interior
     boundary = np.asarray(boundary_desirability, dtype=np.float64)
-    expected_boundary_shape = (dynamics.number_of_boundary_states,)
+    expected_boundary_shape = (dynamics.n_boundary,)
     if boundary.shape != expected_boundary_shape:
         raise ValueError(
             "Boundary desirability must have shape "
             f"{expected_boundary_shape}, got {boundary.shape}"
         )
 
-    q_interior = np.asarray(interior_exponentiated_reward, dtype=np.float64)
+    q_interior = np.asarray(q_interior, dtype=np.float64)
     if q_interior.ndim == 0:
-        q_interior = np.full(number_of_states, float(q_interior))
-    if q_interior.shape != (number_of_states,):
+        q_interior = np.full(n_states, float(q_interior))
+    if q_interior.shape != (n_states,):
         raise ValueError(
             "Interior exponentiated reward must be scalar or have shape "
-            f"{(number_of_states,)}, got {q_interior.shape}"
+            f"{(n_states,)}, got {q_interior.shape}"
         )
     if np.any(q_interior < 0.0) or not np.all(np.isfinite(q_interior)):
         raise ValueError("Exponentiated rewards must be finite and non-negative")
 
     # (I - diag(q_i) P_II^T) z_i = diag(q_i) P_BI^T z_b.
-    coefficient_matrix = np.eye(number_of_states)
+    coefficient_matrix = np.eye(n_states)
     coefficient_matrix -= q_interior[:, np.newaxis] * (
         dynamics.interior_passive.T
     )
@@ -451,11 +455,11 @@ def solve_first_exit(
     return np.linalg.solve(coefficient_matrix, right_hand_side)
 
 
-def z_iteration_step(
-    dynamics: FirstExitDynamics,
+def desirability_step(
+    dynamics: Dynamics,
     interior_desirability: np.ndarray,
     boundary_desirability: np.ndarray,
-    interior_exponentiated_reward: float | np.ndarray,
+    q_interior: float | np.ndarray,
 ) -> np.ndarray:
     """Apply one full desirability update from paper Equation 5.
 
@@ -464,9 +468,9 @@ def z_iteration_step(
     The input desirability is not modified.
     """
 
-    number_of_states = dynamics.number_of_interior_states
+    n_states = dynamics.n_interior
     interior = np.asarray(interior_desirability, dtype=np.float64)
-    expected_interior_shape = (number_of_states,)
+    expected_interior_shape = (n_states,)
     if interior.shape != expected_interior_shape:
         raise ValueError(
             "Interior desirability must have shape "
@@ -474,16 +478,16 @@ def z_iteration_step(
         )
 
     boundary = np.asarray(boundary_desirability, dtype=np.float64)
-    expected_boundary_shape = (dynamics.number_of_boundary_states,)
+    expected_boundary_shape = (dynamics.n_boundary,)
     if boundary.shape != expected_boundary_shape:
         raise ValueError(
             "Boundary desirability must have shape "
             f"{expected_boundary_shape}, got {boundary.shape}"
         )
 
-    q_interior = np.asarray(interior_exponentiated_reward, dtype=np.float64)
+    q_interior = np.asarray(q_interior, dtype=np.float64)
     if q_interior.ndim == 0:
-        q_interior = np.full(number_of_states, float(q_interior))
+        q_interior = np.full(n_states, float(q_interior))
     if q_interior.shape != expected_interior_shape:
         raise ValueError(
             "Interior exponentiated reward must be scalar or have shape "
@@ -506,7 +510,7 @@ def z_iteration_step(
     )
 
 
-def controlled_from_desirability(
+def controlled_dynamics(
     passive: np.ndarray,
     desirability: np.ndarray,
 ) -> np.ndarray:
@@ -535,10 +539,10 @@ def controlled_from_desirability(
     return unnormalized / column_normalizers[np.newaxis, :]
 
 
-def build_passive_dynamics(
+def passive_dynamics(
     maze: Maze,
     *,
-    mode: PassiveDynamicsMode = "five_commands",
+    mode: PassiveMode = "five_commands",
 ) -> np.ndarray:
     """Return the selected random walk in ``maze.free_cells`` order.
 
@@ -551,9 +555,9 @@ def build_passive_dynamics(
     if mode not in {"five_commands", "valid_neighbors"}:
         raise ValueError(f"Unknown passive dynamics mode: {mode!r}")
 
-    number_of_states = len(maze.free_cells)
+    n_states = len(maze.free_cells)
     passive_dynamics = np.zeros(
-        (number_of_states, number_of_states),
+        (n_states, n_states),
         dtype=np.float64,
     )
     if mode == "five_commands":
@@ -589,7 +593,7 @@ def _solve_desirability_from_passive(
     maze: Maze,
     passive: np.ndarray,
     goal: Coordinate,
-    parameters: ModelParameters,
+    parameters: Parameters,
 ) -> np.ndarray:
     """Solve a goal task from a validated, reusable physical matrix."""
 
@@ -614,7 +618,7 @@ def _solve_desirability_from_passive(
     if len(interior_states) == 0:
         return desirability
 
-    dynamics = FirstExitDynamics(
+    dynamics = Dynamics(
         interior_passive=passive_values[
             np.ix_(interior_states, interior_states)
         ],
@@ -649,9 +653,9 @@ def sample_rollout(
     is exhausted first, the final coordinate is the last visited state.
     """
 
-    number_of_states = len(maze.free_cells)
+    n_states = len(maze.free_cells)
     values = np.asarray(controlled, dtype=np.float64)
-    expected_shape = (number_of_states, number_of_states)
+    expected_shape = (n_states, n_states)
     if values.shape != expected_shape:
         raise ValueError(
             f"Controlled dynamics must have shape {expected_shape}, "
@@ -671,7 +675,7 @@ def sample_rollout(
             break
         current_state = maze.state_index(current_coordinate)
         next_state = random_generator.choice(
-            number_of_states,
+            n_states,
             p=values[:, current_state],
         )
         current_coordinate = maze.coordinate(int(next_state))

@@ -45,16 +45,16 @@ maze
 
 More concretely:
 
-1. `LMDPEnvironment` builds the maze's passive physical dynamics once.
+1. `Environment` builds the maze's passive physical dynamics once.
 2. `SubgoalBasis` represents each point or distributed subgoal as one profile
    column over physical states.
-3. `HierarchyTemplate.for_goal` treats subgoal access and the physical goal as
+3. `Template.task` treats subgoal access and the physical goal as
    first-exit boundaries. A fundamental matrix converts the augmented physical
    dynamics into probabilities of hitting each boundary first.
 4. Those first-hit probabilities define a small passive process whose states
    are the subgoals and whose sole boundary is the physical goal. Solving this
    upper LMDP produces the goal-directed abstract policy.
-5. At the start and after every subgoal access, `HierarchyTask.plan` compares
+5. At the start and after every subgoal access, `Task.plan` compares
    the controlled and passive abstract transitions. Reward inpainting turns
    that difference into a desired Layer-1 boundary desirability.
 6. The desired task is projected onto a pre-solved basis of lower-level tasks.
@@ -73,10 +73,10 @@ physical policy until the next abstract access.
 
 | Lifetime | Computation | Main object |
 | --- | --- | --- |
-| Once per maze | Physical passive dynamics | `LMDPEnvironment` |
+| Once per maze | Physical passive dynamics | `Environment` |
 | Once per discovered/fixed basis | Subgoal profiles and optional access gate | `SubgoalBasis` |
-| Once per goal, then cached | Lower first-exit dynamics, first-hit matrix, upper LMDP, and lower task basis | `HierarchyTask` |
-| At rollout start and each abstract access | Reward inpainting, task weights, and composed physical policy | `LayerOnePlan` |
+| Once per goal, then cached | Lower first-exit dynamics, first-hit matrix, upper LMDP, and lower task basis | `Task` |
+| At rollout start and each abstract access | Reward inpainting, task weights, and composed physical policy | `Plan` |
 | After each physical move in online mode | One or more goal-column Z-iteration sweeps | `Rollout` state |
 
 This separation is central to the multitask behavior: expensive reusable
@@ -86,14 +86,14 @@ structure is retained while goals and current abstract commands change.
 
 | Question | Start here |
 | --- | --- |
-| How is the passive maze random walk built? | [`build_passive_dynamics`](src/andrew_mlmdp/lmdp.py) |
-| How is a flat first-exit LMDP solved? | [`solve_first_exit` and `LMDPEnvironment.solve_flat`](src/andrew_mlmdp/lmdp.py) |
-| How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy/core.py) |
-| How is a goal-conditioned hierarchy constructed? | [`_build_hierarchy_task`](src/andrew_mlmdp/hierarchy/core.py) |
-| How are the lower and upper passive dynamics derived? | [`_build_lower_dynamics_from_access` and `_build_upper_dynamics`](src/andrew_mlmdp/hierarchy/core.py) |
-| How does an upper policy become a physical policy? | [`compute_hierarchy_plan`, `_plan_from_abstract_dynamics`, and `_compose_lower_policy`](src/andrew_mlmdp/hierarchy/core.py) |
-| What exactly happens during a rollout? | [`_run_hierarchical_rollout`](src/andrew_mlmdp/hierarchy/rollout.py) |
-| How are distributed subgoals discovered? | [`discover_soft_subgoals`](src/andrew_mlmdp/discovery.py) |
+| How is the passive maze random walk built? | [`passive_dynamics`](src/andrew_mlmdp/lmdp.py) |
+| How is a flat first-exit LMDP solved? | [`solve_first_exit` and `Environment.solve`](src/andrew_mlmdp/lmdp.py) |
+| How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy/model.py) |
+| How is a goal-conditioned hierarchy constructed? | [`_build_task`](src/andrew_mlmdp/hierarchy/model.py) |
+| How are the lower and upper passive dynamics derived? | [`_lower_dynamics` and `_upper_dynamics`](src/andrew_mlmdp/hierarchy/model.py) |
+| How does an upper policy become a physical policy? | [`compute_plan`, `_compose_plan`, and `_compose_policy`](src/andrew_mlmdp/hierarchy/model.py) |
+| What exactly happens during a rollout? | [`_run_rollout`](src/andrew_mlmdp/hierarchy/rollout.py) |
+| How are distributed subgoals discovered? | [`discover_subgoals`](src/andrew_mlmdp/discovery.py) |
 
 ## Minimal end-to-end example
 
@@ -101,31 +101,31 @@ This uses the same goal and hierarchy tuning as the canonical notebook:
 
 ```python
 from andrew_mlmdp import (
-    LayerOneTaskLibrary,
-    LMDPEnvironment,
+    TaskLibrary,
+    Environment,
     Maze,
     SubgoalBasis,
-    hard_hierarchy_parameters,
+    point_parameters,
 )
 
 maze = Maze.from_file("mazes/four_rooms.txt")
-environment = LMDPEnvironment(maze)
+environment = Environment(maze)
 goal = (1, 9)
 
 # A flat LMDP solves directly for this physical goal.
-flat = environment.solve_flat(goal)
+flat = environment.solve(goal)
 flat_rollout = flat.rollout((3, 0), seed=0)
 
 # The hierarchy reuses six subgoal task solutions.
 subgoals = ((0, 0), (9, 2), (2, 3), (3, 7), (9, 7), (7, 9))
 basis = SubgoalBasis.from_locations(maze, subgoals)
-task_library = LayerOneTaskLibrary.from_desirabilities(len(subgoals))
+task_library = TaskLibrary.from_desirabilities(len(subgoals))
 hierarchy = environment.hierarchy(
     basis,
-    parameters=hard_hierarchy_parameters(upper_control_cost=0.65),
+    parameters=point_parameters(upper_control_cost=0.65),
     task_library=task_library,
 )
-task = hierarchy.for_goal(goal)
+task = hierarchy.task(goal)
 
 plan = task.plan((3, 2))
 exact = task.rollout((3, 2), seed=0)
@@ -140,7 +140,7 @@ online = task.rollout(
 Useful objects are deliberately inspectable:
 
 - `task.lower_dynamics`: augmented physical first-exit process;
-- `task.first_hit_probabilities`: boundary-first-hit probabilities from every
+- `task.first_hit`: boundary-first-hit probabilities from every
   physical interior state;
 - `task.upper_dynamics` and `task.upper_controlled`: passive and controlled
   abstract processes;
@@ -157,14 +157,14 @@ stay. A blocked command becomes a self-transition. To sample uniformly only
 from traversable cardinal neighbors:
 
 ```python
-movement_only = LMDPEnvironment(
+movement_only = Environment(
     maze,
     passive_mode="valid_neighbors",
 )
 ```
 
-A `FlatSolution` contains its desirability, controlled policy, rollout method,
-and `movement_log_likelihood` method for scoring observed discrete movement
+A `Solution` contains its desirability, controlled policy, rollout method,
+and `log_likelihood` method for scoring observed discrete movement
 trajectories. Consecutive repeated observations are collapsed before scoring.
 
 For a dataset, keep trials separate so each trajectory starts with a fresh
@@ -172,13 +172,13 @@ controller state and uses its own goal. The dataset helpers retain per-trial
 scores while summing their log-likelihoods:
 
 ```python
-from andrew_mlmdp import MovementTrial, score_flat_movement_dataset
+from andrew_mlmdp import Trial, score_flat_dataset
 
 trials = [
-    MovementTrial("session-1", 1, (0, 2), ((0, 0), (0, 1), (0, 2))),
-    MovementTrial("session-1", 2, (0, 0), ((0, 2), (0, 1), (0, 0))),
+    Trial("session-1", 1, (0, 2), ((0, 0), (0, 1), (0, 2))),
+    Trial("session-1", 2, (0, 0), ((0, 2), (0, 1), (0, 0))),
 ]
-dataset_score = score_flat_movement_dataset(environment, trials)
+dataset_score = score_flat_dataset(environment, trials)
 print(dataset_score.total_log_likelihood)
 print(dataset_score.mean_log_likelihood_per_transition)
 ```
@@ -188,9 +188,9 @@ by session ID, subject, inclusive date range, or any intersection of those
 selectors:
 
 ```python
-from andrew_mlmdp import DoohanMovementDataset
+from andrew_mlmdp import DoohanDataset
 
-dataset = DoohanMovementDataset.from_data_root(
+dataset = DoohanDataset.from_data_root(
     "external/GridMaze-mFC-ephys-DATA/data",
     subject_ids=["m2"],
     start_date="2022-06-23",
@@ -198,7 +198,7 @@ dataset = DoohanMovementDataset.from_data_root(
     maze_name="maze_1",
 )
 flat_report = dataset.report(
-    score_flat_movement_dataset(environment, dataset.trials)
+    score_flat_dataset(environment, dataset.trials)
 )
 print(flat_report.summary_record())
 ```
@@ -221,16 +221,16 @@ desirabilities:
 
 ```python
 from andrew_mlmdp import (
-    NMFDiscoveryParameters,
+    NMFConfig,
     SubgoalBasis,
-    discover_soft_subgoals,
-    soft_hierarchy_parameters,
+    discover_subgoals,
+    soft_parameters,
 )
 
-study = discover_soft_subgoals(
+study = discover_subgoals(
     environment,
     ranks=range(2, 13),
-    parameters=NMFDiscoveryParameters(),
+    parameters=NMFConfig(),
     seed=0,
 )
 rank_eight = study.result(8)  # returns the already-fitted result
@@ -242,9 +242,9 @@ soft_basis = SubgoalBasis.from_profiles(
 )
 soft_hierarchy = environment.hierarchy(
     soft_basis,
-    parameters=soft_hierarchy_parameters(8, upper_control_cost=0.18),
+    parameters=soft_parameters(8, upper_control_cost=0.18),
 )
-soft_task = soft_hierarchy.for_goal(goal)
+soft_task = soft_hierarchy.task(goal)
 soft_rollout = soft_task.rollout((3, 2), seed=0)
 ```
 
@@ -253,7 +253,7 @@ peak-normalized NMF profiles and their gated access profiles are immutable.
 Changing the goal builds or retrieves only a goal-conditioned hierarchy; it
 does not rerun NMF or apply the gate again.
 
-Set `lambda_smooth` to a positive value in `NMFDiscoveryParameters` to
+Set `lambda_smooth` to a positive value in `NMFConfig` to
 penalize neighboring states with different profile values over the
 passive-dynamics connectivity graph. The useful scale is specific to the
 task ensemble because the optimization uses raw generalized KL. For a
@@ -270,14 +270,14 @@ The GridMaze data submodule defines mazes as labeled edges between towers.
 to restrict cardinal movement:
 
 ```python
-from andrew_mlmdp import LMDPEnvironment, load_doohan_maze
+from andrew_mlmdp import Environment, load_doohan_maze
 
 definition = load_doohan_maze("maze_1")
-environment = LMDPEnvironment(definition.maze)
+environment = Environment(definition.maze)
 start = definition.coordinate_for("A2")
 goal = definition.coordinate_for("G7")
 
-solution = environment.solve_flat(goal)
+solution = environment.solve(goal)
 trajectory = solution.rollout(start, seed=0)
 labels = [definition.label_for(coordinate) for coordinate in trajectory]
 ```

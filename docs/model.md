@@ -49,8 +49,8 @@ Superscripts name the layer, not a matrix power.
 cardinal adjacency. Edge-list mazes retain grid coordinates but explicitly
 restrict which adjacent states are connected.
 
-`LMDPEnvironment` calls
-[`build_passive_dynamics`](../src/andrew_mlmdp/lmdp.py) once and stores the
+`Environment` calls
+[`passive_dynamics`](../src/andrew_mlmdp/lmdp.py) once and stores the
 result as `environment.passive`.
 
 Two passive models are available:
@@ -89,7 +89,7 @@ boundary desirability `z_b`, the interior solution is
 ```
 
 [`solve_first_exit`](../src/andrew_mlmdp/lmdp.py) performs this solve.
-[`LMDPEnvironment.solve_flat`](../src/andrew_mlmdp/lmdp.py) removes the
+[`Environment.solve`](../src/andrew_mlmdp/lmdp.py) removes the
 goal from the interior, uses its exponentiated terminal reward as `z_b`, and
 places the solved values back into a length-`n` physical vector.
 
@@ -102,7 +102,7 @@ u^*(s' \mid s)
 ```
 
 This is implemented by
-[`controlled_from_desirability`](../src/andrew_mlmdp/lmdp.py). A state is
+[`controlled_dynamics`](../src/andrew_mlmdp/lmdp.py). A state is
 preferred when it is both reachable under `P` and desirable under `z`.
 
 For a physical component disconnected from the goal, desirability is zero.
@@ -111,7 +111,7 @@ zero-mass policy column.
 
 ## 3. One representation for point and distributed subgoals
 
-[`SubgoalBasis`](../src/andrew_mlmdp/hierarchy/core.py) always stores a
+[`SubgoalBasis`](../src/andrew_mlmdp/hierarchy/model.py) always stores a
 state-by-subgoal profile matrix `D`:
 
 - `SubgoalBasis.from_locations` creates one-hot columns.
@@ -139,11 +139,11 @@ subgoal leaves the current physical coordinate unchanged.
 ## 4. Build the goal-conditioned Layer-1 first-exit process
 
 `environment.hierarchy(basis, ...)` returns a reusable
-[`HierarchyTemplate`](../src/andrew_mlmdp/hierarchy/core.py).
-`template.for_goal(g)` builds and caches one
-[`HierarchyTask`](../src/andrew_mlmdp/hierarchy/core.py).
+[`Template`](../src/andrew_mlmdp/hierarchy/model.py).
+`template.task(g)` builds and caches one
+[`Task`](../src/andrew_mlmdp/hierarchy/model.py).
 
-For that goal, [`_build_hierarchy_task`](../src/andrew_mlmdp/hierarchy/core.py)
+For that goal, [`_build_task`](../src/andrew_mlmdp/hierarchy/model.py)
 does the following:
 
 1. Remove `g` from the physical interior, leaving `m` states.
@@ -168,13 +168,13 @@ strength of this passive access relative to ordinary movement.
 
 These three quantities must not be conflated: `basis.profiles` contains the
 original peak-normalized NMF representation, `basis.access_profiles` contains
-the reusable gated profile, and `task.lower_subtask_passive` contains `P_t^1`,
+the reusable gated profile, and `task.subtask_access` contains `P_t^1`,
 the goal-conditioned execution-access transition probabilities after the full
 augmented passive matrix has been normalized. The last quantity is not `D`,
 `D_hat`, or an NMF profile.
 
 The implementation is
-[`_build_lower_dynamics_from_access`](../src/andrew_mlmdp/hierarchy/core.py).
+[`_lower_dynamics`](../src/andrew_mlmdp/hierarchy/model.py).
 The stacked matrix is column-stochastic after normalization.
 
 ## 5. Convert physical first hits into upper passive dynamics
@@ -194,7 +194,7 @@ H = [P_t^1; P_g^1] F
 
 gives the probability of first reaching each subgoal copy or the physical goal
 from every physical interior state. It is exposed as
-`task.first_hit_probabilities`.
+`task.first_hit`.
 
 To start an abstract transition at subgoal `j`, the construction uses the
 transpose of the corresponding access row as a physical source weighting. This
@@ -209,7 +209,7 @@ P_g^2 = P_g^1 F P_t^{1T}.
 After column normalization, `P_i^2` describes passive transitions among the
 `k` subgoals and `P_g^2` describes passive termination at the one physical
 goal boundary. See
-[`_build_upper_dynamics`](../src/andrew_mlmdp/hierarchy/core.py).
+[`_upper_dynamics`](../src/andrew_mlmdp/hierarchy/model.py).
 
 This is the bridge between layers: long physical paths through the maze are
 summarized as one small abstract transition matrix.
@@ -222,7 +222,7 @@ The upper layer is another first-exit LMDP:
 - its one boundary state is the physical goal; and
 - it uses `upper_control_cost` rather than `lower_control_cost`.
 
-[`_solve_upper_layer`](../src/andrew_mlmdp/hierarchy/core.py) solves for
+[`_solve_upper`](../src/andrew_mlmdp/hierarchy/model.py) solves for
 `task.upper_desirability` and then reweights the passive upper dynamics to
 obtain `task.upper_controlled`.
 
@@ -237,16 +237,16 @@ The corresponding controlled prediction is obtained by multiplying this
 column by upper desirability and normalizing. At an entered subgoal, the code
 uses the matching columns of `upper_dynamics.passive` and
 `upper_controlled` directly. See
-[`compute_hierarchy_plan`](../src/andrew_mlmdp/hierarchy/core.py).
+[`compute_plan`](../src/andrew_mlmdp/hierarchy/model.py).
 
 ## 7. Pre-solve the reusable lower task basis
 
 Layer 1 needs a way to realize many abstract commands without solving a new
 physical LMDP every time. It therefore pre-solves `k + 1` component tasks.
 
-[`_build_task_basis`](../src/andrew_mlmdp/hierarchy/core.py) constructs the
+[`_task_basis`](../src/andrew_mlmdp/hierarchy/model.py) constructs the
 interior basis `Z_i` from the fixed boundary matrix `Q_b` stored by
-`LayerOneTaskLibrary`. The matrix is not constructed from behavioral rewards
+`TaskLibrary`. The matrix is not constructed from behavioral rewards
 or control costs. The standard canonical library has:
 
 - target subgoal desirability `1`;
@@ -258,7 +258,7 @@ For eight subgoals this is a full-rank `9 x 9` matrix: one common subgoal
 mode, seven subgoal-contrast modes, and one physical-goal mode. Its condition
 number is approximately `1.00000012184`. `from_desirabilities(...)` records
 the three canonical construction values as metadata;
-`LayerOneTaskLibrary.from_matrix(...)` instead accepts any validated finite,
+`TaskLibrary.from_matrix(...)` instead accepts any validated finite,
 non-negative, full-rank matrix and leaves that optional metadata unset. The
 immutable matrix itself is always the source of truth.
 
@@ -275,8 +275,8 @@ combination of these columns is also a valid desirability solution.
 
 ## 8. Turn the current upper policy into one physical policy
 
-[`HierarchyTask.plan`](../src/andrew_mlmdp/hierarchy/core.py) delegates to
-[`_plan_from_abstract_dynamics`](../src/andrew_mlmdp/hierarchy/core.py).
+[`Task.plan`](../src/andrew_mlmdp/hierarchy/model.py) delegates to
+[`_compose_plan`](../src/andrew_mlmdp/hierarchy/model.py).
 Planning performs four transformations.
 
 First, reward inpainting converts the change requested by abstract control
@@ -333,16 +333,16 @@ z_b^1 = Q_b w.
 ```
 
 Finally, the standard LMDP reweighting formula converts this desirability into
-`plan.layer_one_controlled`. The complete implementation is in
-[`_compose_lower_policy`](../src/andrew_mlmdp/hierarchy/core.py).
+`plan.lower_policy`. The complete implementation is in
+[`_compose_policy`](../src/andrew_mlmdp/hierarchy/model.py).
 
-The most useful debugging fields on `LayerOnePlan` are
-`passive_abstract`, `controlled_abstract`, `inpainted_rewards`, `raw_weights`,
-`weights`, `physical_desirability`, and `layer_one_controlled`.
+The most useful debugging fields on `Plan` are
+`upper_passive`, `upper_policy`, `rewards`, `raw_weights`,
+`weights`, `desirability`, and `lower_policy`.
 
 ## 9. Execute the coupled process
 
-[`_run_hierarchical_rollout`](../src/andrew_mlmdp/hierarchy/rollout.py) uses the
+[`_run_rollout`](../src/andrew_mlmdp/hierarchy/rollout.py) uses the
 composed Layer-1 policy as one distribution over:
 
 - another physical interior state;
@@ -386,7 +386,7 @@ nonterminal physical move applies the requested number of fixed-point sweeps:
 z_i \leftarrow q_i(P_{II}^{T}z_i + P_{BI}^{T}z_b).
 ```
 
-[`z_iteration_step`](../src/andrew_mlmdp/lmdp.py) performs one sweep. The
+[`desirability_step`](../src/andrew_mlmdp/lmdp.py) performs one sweep. The
 fixed subgoal columns remain exact; only the physical-goal component is
 learned. The final vector is available as
 `rollout.final_goal_desirability` and can initialize the next episode.
@@ -443,7 +443,7 @@ fixes the NMF scale gauge by enforcing `max(D[:, j]) = 1` and absorbing the
 scale into row `j` of `W`. Post-normalization objective descent is therefore
 verified empirically rather than assumed from the standard MU guarantee.
 
-[`discover_soft_subgoals`](../src/andrew_mlmdp/discovery.py) fits every
+[`discover_subgoals`](../src/andrew_mlmdp/discovery.py) fits every
 requested rank once, and `study.result(k)` retrieves that cached fit.
 Regularized results expose the initial full objective and one value per
 iteration through `objective_history`. The existing
@@ -456,16 +456,16 @@ described above.
 
 | Stage | Public result | Implementation |
 | --- | --- | --- |
-| Physical passive dynamics | `environment.passive` | `lmdp.build_passive_dynamics` |
-| Flat goal solution | `FlatSolution` | `LMDPEnvironment.solve_flat` |
+| Physical passive dynamics | `environment.passive` | `lmdp.passive_dynamics` |
+| Flat goal solution | `Solution` | `Environment.solve` |
 | Reusable subgoal representation | `SubgoalBasis` | `SubgoalBasis.from_locations` / `from_profiles` |
-| Goal-conditioned construction | `HierarchyTask` | `HierarchyTemplate.for_goal` -> `_build_hierarchy_task` |
-| First-hit abstraction | `first_hit_probabilities` | `_fundamental_matrix`, `_build_upper_dynamics` |
-| Upper LMDP | `upper_desirability`, `upper_controlled` | `_solve_upper_layer` |
-| Reusable lower solutions | `task_basis` | `_build_task_basis` |
-| Top-down composition | `LayerOnePlan` | `compute_hierarchy_plan` -> `_plan_from_abstract_dynamics` |
-| Coupled execution | `Rollout` | `_run_hierarchical_rollout` |
-| Distributed discovery | `NMFStudy` | `discover_soft_subgoals` |
+| Goal-conditioned construction | `Task` | `Template.task` -> `_build_task` |
+| First-hit abstraction | `first_hit` | `_fundamental_matrix`, `_upper_dynamics` |
+| Upper LMDP | `upper_desirability`, `upper_controlled` | `_solve_upper` |
+| Reusable lower solutions | `task_basis` | `_task_basis` |
+| Top-down composition | `Plan` | `compute_plan` -> `_compose_plan` |
+| Coupled execution | `Rollout` | `_run_rollout` |
+| Distributed discovery | `NMFStudy` | `discover_subgoals` |
 
 No stage assumes a particular maze size or fixed number of subgoals. Array
 shapes are derived from the supplied maze, goal partition, and profile count.
@@ -480,46 +480,46 @@ task cache.
 
 The access graph exposes three explicitly named arrays:
 
-- `original_nmf_profiles`, copied from `basis.profiles`;
+- `source_profiles`, copied from `basis.profiles`;
 - `gated_profiles`, copied from `basis.access_profiles`; and
-- `execution_access_probabilities`, mapped directly from
-  `task.lower_subtask_passive` through `task.interior_states`.
+- `access_probabilities`, mapped directly from
+  `task.subtask_access` through `task.interior_states`.
 
-Peaks and centroids derived for graph layout are called `display_coordinates`.
+Peaks and centroids derived for graph layout are called `positions`.
 They are visual positions only, never inferred physical entry states.
 
 ```python
 from andrew_mlmdp import plotting
 from andrew_mlmdp.hierarchy import (
-    get_composition_weight_data,
-    get_continuation_policy_data,
-    get_upper_graph_data,
-    sample_hierarchical_rollouts,
+    composition_trace,
+    continuation_policies,
+    upper_graph,
+    sample_rollouts,
 )
 
-access = get_upper_graph_data(task, start_state=start)
-continuations = get_continuation_policy_data(task)
-weights = get_composition_weight_data(task, start_state=start)
+access = upper_graph(task, start_state=start)
+continuations = continuation_policies(task)
+weights = composition_trace(task, start_state=start)
 
-plotting.plot_subgoal_access_and_upper_dynamics(task)
-plotting.plot_upper_controlled_dynamics(task, start_state=start)
+plotting.plot_upper_graph(task)
+plotting.plot_upper_policy(task, start_state=start)
 plotting.plot_continuation_policies(task)
 plotting.plot_composition_weights(task, start_state=start)
 
-ensemble = sample_hierarchical_rollouts(task, start, seed=0)
+ensemble = sample_rollouts(task, start, seed=0)
 plotting.plot_rollout_distribution(task, start, ensemble=ensemble)
-plotting.plot_rollout_subgoal_sequences(task, start, ensemble=ensemble)
+plotting.plot_routes(task, start, ensemble=ensemble)
 ```
 
-`ContinuationPolicyData` stores the stationary `LayerOnePlan` and the exact
+`ContinuationPolicy` stores the stationary `Plan` and the exact
 refractory-adjusted columns produced by the rollout engine. A plot can show the
 literal first post-access distribution only when the caller supplies an
 explicit physical entry coordinate for that subgoal; display coordinates are
 never substituted.
 
 Composition diagnostics expose the actual implementation trace
-`raw_weights -> composition_input_weights -> weights`. The middle vector is
-recorded by `LayerOnePlan` at the point where it is passed into composition,
+`raw_weights -> clipped_weights -> weights`. The middle vector is
+recorded by `Plan` at the point where it is passed into composition,
 rather than reconstructed by diagnostics.
 
 Trajectory length always means the number of physical steps. For model
@@ -530,7 +530,7 @@ Successful-route statistics exclude censored or failed outcomes while status
 counts retain every rollout.
 
 The NumPy object supplied to diagnostics must already contain the desired
-fitted parameter values. `HierarchicalFitResult` snapshots are not applied to
+fitted parameter values. `FitResult` snapshots are not applied to
 templates implicitly.
 
 ## Differentiable hierarchical likelihood and fitting
@@ -554,8 +554,8 @@ sequential. All differentiable banks are discarded after that graph.
 
 Gate structure belongs to `SubgoalBasis`: point and ungated soft bases cannot
 acquire gate parameters during fitting. For gated soft bases, threshold and
-exponent defaults come from the basis rather than legacy fields on
-`ModelParameters`. The hard gate is intentionally piecewise differentiable.
+exponent defaults come from the basis rather than unused gate fields on
+`Parameters`. The hard gate is intentionally piecewise differentiable.
 Entries below threshold have no local branch gradient, although gradients from
 active entries may move the global threshold enough to activate them later. If
 only exact profile peaks remain active, threshold and exponent can be weakly
@@ -568,7 +568,7 @@ defined only below
 \tau_{max}=\min_{g\in G,j}\max_{s\ne g}D_{sj}.
 ```
 
-`HierarchyTemplate.core_threshold_domain(goals)` reports this strict bound and
+`Template.threshold_range(goals)` reports this strict bound and
 all limiting `(goal, subgoal_index)` pairs. Goal-task construction and fitting
 reject public initial thresholds outside the corresponding domain. During
 fitting, the private raw transform maps into
@@ -576,11 +576,11 @@ fitting, the private raw transform maps into
 saturated sigmoid from eliminating the final support state. This changes
 neither the public physical threshold nor the hard-gate equation.
 
-`fit_hierarchical_model_parameters` minimizes the negative summed trajectory
+`fit_parameters` minimizes the negative summed trajectory
 log-likelihood using a private constrained parameterization. It never mutates
-`ModelParameters`, `SubgoalBasis`, `HierarchyTemplate`, or NumPy caches. Its
-`best_parameter_values` snapshot can be passed explicitly to
-`total_hierarchical_movement_log_likelihood_torch`. NumPy rollout from fitted
+`Parameters`, `SubgoalBasis`, `Template`, or NumPy caches. Its
+`best_values` snapshot can be passed explicitly to
+`total_log_likelihood`. NumPy rollout from fitted
 values requires separately constructing a fresh basis and template.
 
 The fixed task library and `composition_exponent` are not Adam variables.
@@ -590,7 +590,7 @@ template configured with another value. The behavioral fit contains
 `alpha`, `beta`, and, when the basis gate is active, `core_threshold` and
 `core_exponent`. The former behavioral `off_target_reward` no longer exists;
 canonical task-library metadata calls its replacement
-`basis_off_target_desirability` and never repurposes it as a fitted reward.
+`off_target_value` and never repurposes it as a fitted reward.
 
 Adam uses PyTorch's `ReduceLROnPlateau` with the evaluated pre-update loss passed to
 the scheduler only after its aligned optimizer update. When the scheduler lowers
@@ -604,10 +604,21 @@ learning-rate stage remains and starts fresh only after the minimum learning rat
 active. The default schedule starts at `0.05`, uses factor `0.3` with plateau
 patience `7`, and has a minimum learning rate of `1e-5`.
 
-Optimization plateau scales are independent of `relative_tolerance`.
-`scheduler_relative_threshold` is passed to `ReduceLROnPlateau`, while
-`convergence_relative_threshold` defines meaningful best-loss improvement for
-patience at the minimum learning rate. Omitting either option preserves legacy
-behavior by falling back to `relative_tolerance`; this keeps existing fitting
-calls compatible while allowing plateau decisions to use a scientifically
-interpretable likelihood scale.
+Optimization plateau scales are independent of `tolerance`.
+`scheduler_tolerance` is passed to `ReduceLROnPlateau`, while
+`convergence_tolerance` defines meaningful best-loss improvement for
+patience at the minimum learning rate. Omitting either option falls back to `tolerance`, allowing plateau decisions
+to use a scientifically interpretable likelihood scale.
+
+
+## Naming conventions
+
+Names use the nearest module as context. Inside `andrew_mlmdp.hierarchy`, prefer
+`Template`, `Task`, `Plan`, and `TaskLibrary`; repeating `Hierarchy` or
+`LayerOne` does not add information there. Result records name the concept they
+contain (`PairDiagnostics`, `UpperGraph`, `RolloutSummary`) rather than ending
+in the generic suffix `Data`. Functions use a direct verb or noun phrase:
+`diagnose_pair`, `composition_trace`, `sample_rollouts`, and `fit_parameters`.
+Local sizes use `n_states`, `n_modes`, and similar `n_*` names.
+
+These names are the sole project API; no alternate names are retained.

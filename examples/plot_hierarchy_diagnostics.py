@@ -3,8 +3,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-from andrew_mlmdp import LMDPEnvironment, Maze, ModelParameters, SubgoalBasis, plotting
-from andrew_mlmdp.hierarchy import sample_hierarchical_rollouts
+from andrew_mlmdp import Environment, Maze, Parameters, SubgoalBasis, plotting
+from andrew_mlmdp.hierarchy import sample_rollouts
 
 maze = Maze.from_ascii(
     """
@@ -41,24 +41,24 @@ basis = SubgoalBasis.from_profiles(
 # In fitted workflows, construct this template with the fitted parameter
 # values before calling the diagnostics. Fit-result snapshots are not applied
 # implicitly by the plotting layer.
-template = LMDPEnvironment(maze).hierarchy(
+template = Environment(maze).hierarchy(
     basis,
-    parameters=ModelParameters(alpha=0.8, beta=3.0),
+    parameters=Parameters(alpha=0.8, beta=3.0),
 )
 start = (3, 0)
 goal = (0, 3)
-task = template.for_goal(goal)
+task = template.task(goal)
 
-plotting.plot_subgoal_access_and_upper_dynamics(
+plotting.plot_upper_graph(
     task,
     show_original_profiles=True,
     show_gated_profiles=True,
 )
-plotting.plot_upper_controlled_dynamics(task, start_state=start)
+plotting.plot_upper_policy(task, start_state=start)
 
 entry_coordinates = {}
-for upper_state in range(task.number_of_subtasks):
-    support = np.flatnonzero(task.lower_subtask_passive[upper_state] > 0.0)
+for upper_state in range(task.n_subtasks):
+    support = np.flatnonzero(task.subtask_access[upper_state] > 0.0)
     physical_state = int(task.interior_states[int(support[0])])
     entry_coordinates[upper_state] = task.maze.coordinate(physical_state)
 
@@ -69,7 +69,7 @@ plotting.plot_continuation_policies(
 )
 plotting.plot_composition_weights(task, start_state=start)
 
-ensemble = sample_hierarchical_rollouts(
+ensemble = sample_rollouts(
     task,
     start,
     n_rollouts=250,
@@ -80,7 +80,7 @@ plotting.plot_rollout_distribution(
     start,
     ensemble=ensemble,
 )
-plotting.plot_rollout_subgoal_sequences(
+plotting.plot_routes(
     task,
     start,
     ensemble=ensemble,

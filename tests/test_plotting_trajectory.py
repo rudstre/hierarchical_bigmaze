@@ -195,7 +195,7 @@ def test_trajectory_overlap_lanes_start_right_and_stay_within_cap():
     assert max(abs(offset) for offset in offsets) <= 0.35
 
 
-def test_zero_overlap_spacing_uses_legacy_trajectory_rendering():
+def test_zero_overlap_spacing_uses_standard_trajectory_rendering():
     maze = Maze.from_ascii("...")
     figure, ax = plt.subplots()
     trajectory = [(0, 0), (0, 1), (0, 2), (0, 1)]

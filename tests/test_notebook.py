@@ -46,16 +46,16 @@ def test_doohan_notebook_compiles_and_fit_cells_are_unexecuted():
     assert notebook.cells
     assert len(code_cells) == 9
     notebook_source = "\n".join(cell.source for cell in code_cells)
-    assert "DoohanMovementDataset.from_data_root" in notebook_source
+    assert "DoohanDataset.from_data_root" in notebook_source
     assert "get_maze_sessions" not in notebook_source
-    assert "score_flat_movement_dataset" in notebook_source
-    assert "score_hierarchical_movement_dataset" in notebook_source
+    assert "score_flat_dataset" in notebook_source
+    assert "score_hierarchy_dataset" in notebook_source
     assert "flat_report = movement_dataset.report" in notebook_source
     assert "hierarchical_report = movement_dataset.report" in notebook_source
     assert "hierarchical_report.summary_dataframe" in notebook_source
     assert "flat_by_trial" not in notebook_source
     assert "groupby" not in notebook_source
-    assert "viz.plot_soft_subtasks(soft_discovery)" in notebook_source
+    assert "viz.plot_subtasks(soft_discovery)" in notebook_source
     for cell in code_cells:
         compile(cell.source, str(DOOHAN_NOTEBOOK), "exec")
     fit_cells = {
@@ -75,8 +75,8 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
     notebook_source = "\n".join(cell.source for cell in code_cells)
 
-    assert "sweep_expected_pair_diagnostics" in notebook_source
-    assert "plot_expected_pair_diagnostics_sweep" in notebook_source
+    assert "sweep_diagnostics" in notebook_source
+    assert "plot_diagnostic_sweep" in notebook_source
     assert "start=example_start" in notebook_source
     assert "goal=example_goal" in notebook_source
     assert "sweep_expected_policy_entropy" not in notebook_source

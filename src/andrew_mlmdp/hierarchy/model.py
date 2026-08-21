@@ -14,35 +14,35 @@ import numpy as np
 from torch import Tensor, detach
 
 from andrew_mlmdp.lmdp import (
-    FirstExitDynamics,
-    LMDPEnvironment,
-    ModelParameters,
-    controlled_from_desirability,
-    hard_hierarchy_parameters,
+    Dynamics,
+    Environment,
+    Parameters,
+    controlled_dynamics,
+    point_parameters,
     solve_first_exit,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 
 if TYPE_CHECKING:
-    from andrew_mlmdp.dataset import MovementTrial
+    from andrew_mlmdp.dataset import Trial
     from andrew_mlmdp.hierarchy.fitting import (
-        HierarchicalFitEvaluation,
-        HierarchicalFitResult,
+        FitResult,
+        FitStep,
     )
     from andrew_mlmdp.hierarchy.rollout import Rollout
 
 
-CANONICAL_BASIS_OFF_TARGET_DESIRABILITY = float(np.exp(-18.0))
+DEFAULT_OFF_TARGET = float(np.exp(-18.0))
 
 
 @dataclass(frozen=True)
-class LayerOneTaskLibrary:
+class TaskLibrary:
     """Immutable boundary-desirability dictionary for Layer-1 composition."""
 
     boundary_desirability: np.ndarray
-    basis_target_desirability: float | None = None
-    basis_off_target_desirability: float | None = None
-    basis_goal_desirability: float | None = None
+    target_value: float | None = None
+    off_target_value: float | None = None
+    goal_value: float | None = None
 
     def __post_init__(self) -> None:
         boundary = np.asarray(self.boundary_desirability, dtype=np.float64).copy()
@@ -67,45 +67,45 @@ class LayerOneTaskLibrary:
     @classmethod
     def from_desirabilities(
         cls,
-        number_of_subgoals: int,
+        n_subgoals: int,
         *,
-        basis_target_desirability: float = 1.0,
-        basis_off_target_desirability: float = (
-            CANONICAL_BASIS_OFF_TARGET_DESIRABILITY
+        target_value: float = 1.0,
+        off_target_value: float = (
+            DEFAULT_OFF_TARGET
         ),
-        basis_goal_desirability: float = 1.0,
-    ) -> "LayerOneTaskLibrary":
+        goal_value: float = 1.0,
+    ) -> "TaskLibrary":
         """Build the standard block-diagonal multitask dictionary."""
 
         if (
-            isinstance(number_of_subgoals, (bool, np.bool_))
-            or not isinstance(number_of_subgoals, (int, np.integer))
-            or number_of_subgoals < 1
+            isinstance(n_subgoals, (bool, np.bool_))
+            or not isinstance(n_subgoals, (int, np.integer))
+            or n_subgoals < 1
         ):
-            raise ValueError("number_of_subgoals must be a positive integer")
+            raise ValueError("n_subgoals must be a positive integer")
         metadata = (
-            basis_target_desirability,
-            basis_off_target_desirability,
-            basis_goal_desirability,
+            target_value,
+            off_target_value,
+            goal_value,
         )
         if not np.all(np.isfinite(metadata)) or np.any(np.asarray(metadata) < 0.0):
             raise ValueError(
                 "Task-library desirabilities must be finite and non-negative"
             )
-        number_of_tasks = number_of_subgoals + 1
-        boundary = np.zeros((number_of_tasks, number_of_tasks), dtype=np.float64)
-        boundary[:-1, :-1] = basis_off_target_desirability
-        np.fill_diagonal(boundary[:-1, :-1], basis_target_desirability)
-        boundary[-1, -1] = basis_goal_desirability
+        n_tasks = n_subgoals + 1
+        boundary = np.zeros((n_tasks, n_tasks), dtype=np.float64)
+        boundary[:-1, :-1] = off_target_value
+        np.fill_diagonal(boundary[:-1, :-1], target_value)
+        boundary[-1, -1] = goal_value
         return cls(
             boundary,
-            basis_target_desirability=float(basis_target_desirability),
-            basis_off_target_desirability=float(basis_off_target_desirability),
-            basis_goal_desirability=float(basis_goal_desirability),
+            target_value=float(target_value),
+            off_target_value=float(off_target_value),
+            goal_value=float(goal_value),
         )
 
     @classmethod
-    def from_matrix(cls, boundary_desirability: np.ndarray) -> "LayerOneTaskLibrary":
+    def from_matrix(cls, boundary_desirability: np.ndarray) -> "TaskLibrary":
         """Snapshot an arbitrary fixed full-rank dictionary."""
 
         return cls(boundary_desirability)
@@ -124,7 +124,7 @@ class LayerOneTaskLibrary:
 
 
 @dataclass(frozen=True)
-class CoreThresholdDomain:
+class ThresholdRange:
     """Goal-conditioned structural domain for a distributed-basis gate."""
 
     maximum: float
@@ -150,8 +150,8 @@ class SubgoalBasis:
     core_exponent: float = 1.0
 
     def __post_init__(self) -> None:
-        profiles = _validated_subtask_profiles(self.maze, self.profiles).copy()
-        access = _validated_subtask_profiles(
+        profiles = _validate_profiles(self.maze, self.profiles).copy()
+        access = _validate_profiles(
             self.maze,
             self.access_profiles,
         ).copy()
@@ -223,7 +223,7 @@ class SubgoalBasis:
             else _detached_scalar(core_threshold)
         )
         exponent = _detached_scalar(core_exponent)
-        supplied = _validated_subtask_profiles(maze, profiles)
+        supplied = _validate_profiles(maze, profiles)
         peaks = supplied.max(axis=0, keepdims=True)
         normalized = supplied / peaks
         access = _soft_core_profiles(
@@ -241,7 +241,9 @@ class SubgoalBasis:
         )
 
     @property
-    def number_of_subgoals(self) -> int:
+    def n_subgoals(self) -> int:
+        """Number of columns in the reusable subgoal basis."""
+
         return self.profiles.shape[1]
 
     @property
@@ -249,16 +251,16 @@ class SubgoalBasis:
         return self.locations is not None
 
 
-class HierarchyTemplate:
+class Template:
     """Goal-independent hierarchy configuration with per-goal task caching."""
 
     def __init__(
         self,
         *,
-        environment: LMDPEnvironment,
+        environment: Environment,
         basis: SubgoalBasis,
-        parameters: ModelParameters | None = None,
-        task_library: LayerOneTaskLibrary | None = None,
+        parameters: Parameters | None = None,
+        task_library: TaskLibrary | None = None,
         composition_exponent: float = 1.0,
         composition_mode: Literal["power", "winner_take_all"] = "power",
     ) -> None:
@@ -267,16 +269,16 @@ class HierarchyTemplate:
                 "Subgoal basis and environment must use the same maze"
             )
         if parameters is None:
-            parameters = hard_hierarchy_parameters()
+            parameters = point_parameters()
         if task_library is None:
-            task_library = LayerOneTaskLibrary.from_desirabilities(
-                basis.number_of_subgoals
+            task_library = TaskLibrary.from_desirabilities(
+                basis.n_subgoals
             )
-        if not isinstance(task_library, LayerOneTaskLibrary):
-            raise TypeError("task_library must be a LayerOneTaskLibrary")
+        if not isinstance(task_library, TaskLibrary):
+            raise TypeError("task_library must be a TaskLibrary")
         expected_library_shape = (
-            basis.number_of_subgoals + 1,
-            basis.number_of_subgoals + 1,
+            basis.n_subgoals + 1,
+            basis.n_subgoals + 1,
         )
         if task_library.boundary_desirability.shape != expected_library_shape:
             raise ValueError(
@@ -297,17 +299,17 @@ class HierarchyTemplate:
         self.task_library = task_library
         self.composition_exponent = exponent
         self.composition_mode = composition_mode
-        self._task_cache: dict[Coordinate, HierarchyTask] = {}
+        self._task_cache: dict[Coordinate, Task] = {}
         self._passive_dynamics: np.ndarray | None = None
 
     @property
     def maze(self) -> Maze:
         return self.environment.maze
 
-    def core_threshold_domain(
+    def threshold_range(
         self,
         goals: Iterable[Coordinate] | None = None,
-    ) -> CoreThresholdDomain:
+    ) -> ThresholdRange:
         """Return the strict threshold bound for the supplied physical goals.
 
         For every goal and subgoal component, at least one non-goal physical
@@ -342,17 +344,17 @@ class HierarchyTemplate:
             for value, goal, subgoal_index in candidates
             if value == maximum
         )
-        return CoreThresholdDomain(maximum, limiting_pairs)
+        return ThresholdRange(maximum, limiting_pairs)
 
-    def validate_core_threshold_for_goals(
+    def validate_threshold(
         self,
         threshold: float | Tensor,
         goals: Iterable[Coordinate],
-    ) -> CoreThresholdDomain:
+    ) -> ThresholdRange:
         """Validate a public physical gate threshold for a goal set."""
 
         value = _detached_scalar(threshold)
-        domain = self.core_threshold_domain(goals)
+        domain = self.threshold_range(goals)
         if not 0.0 <= value < domain.maximum:
             raise ValueError(
                 "core_threshold must satisfy 0 <= threshold < "
@@ -362,13 +364,13 @@ class HierarchyTemplate:
         return domain
 
     @property
-    def passive_dynamics(self) -> np.ndarray:
+    def upper_passive(self) -> np.ndarray:
         """Return task-independent passive dynamics between basis states."""
 
         if self._passive_dynamics is None:
             access = self.parameters.alpha.item() * self.basis.access_profiles.T
             interior = self.environment.passive.copy()
-            interior, access = _normalize_augmented_columns(interior, access)
+            interior, access = _normalize_columns(interior, access)
             fundamental = _fundamental_matrix(interior)
             upper = access @ fundamental @ access.T
             column_sums = upper.sum(axis=0)
@@ -379,11 +381,11 @@ class HierarchyTemplate:
             upper = upper / column_sums[np.newaxis, :]
             upper.flags.writeable = False
             self._passive_dynamics = upper
-        passive_dynamics = self._passive_dynamics
-        assert passive_dynamics is not None
-        return passive_dynamics
+        upper_passive = self._passive_dynamics
+        assert upper_passive is not None
+        return upper_passive
 
-    def for_goal(self, goal: Coordinate) -> "HierarchyTask":
+    def task(self, goal: Coordinate) -> "Task":
         """Return a cached goal-conditioned hierarchy task."""
 
         self.maze.state_index(goal)
@@ -393,30 +395,30 @@ class HierarchyTemplate:
         ):
             raise ValueError("The goal and point subgoals must be disjoint")
         if self.basis.core_threshold is not None:
-            self.validate_core_threshold_for_goals(
+            self.validate_threshold(
                 self.basis.core_threshold,
                 (goal,),
             )
         task = self._task_cache.get(goal)
         if task is None:
-            task = _build_hierarchy_task(self, goal)
+            task = _build_task(self, goal)
             self._task_cache[goal] = task
         return task
 
-    def torch_parameter_values(
+    def parameter_values(
         self,
         *,
         overrides: Mapping[str, "Tensor"] | None = None,
     ) -> dict[str, "Tensor"]:
         """Return strict physical tensors for the differentiable hierarchy."""
 
-        from andrew_mlmdp.hierarchy.torch_likelihood import (
-            hierarchical_parameter_values,
+        from andrew_mlmdp.hierarchy.autodiff import (
+            parameter_values,
         )
 
-        return hierarchical_parameter_values(self, overrides=overrides)
+        return parameter_values(self, overrides=overrides)
 
-    def torch_movement_log_likelihood(
+    def log_likelihood(
         self,
         goal: Coordinate,
         trajectory: list[Coordinate] | tuple[Coordinate, ...],
@@ -425,90 +427,90 @@ class HierarchyTemplate:
     ) -> "Tensor":
         """Score one trajectory through the fresh differentiable hierarchy."""
 
-        from andrew_mlmdp.hierarchy.torch_likelihood import (
-            hierarchical_movement_log_likelihood_torch,
+        from andrew_mlmdp.hierarchy.autodiff import (
+            log_likelihood,
         )
 
-        values = self.torch_parameter_values(overrides=parameter_overrides)
-        return hierarchical_movement_log_likelihood_torch(
+        values = self.parameter_values(overrides=parameter_overrides)
+        return log_likelihood(
             self,
             goal,
             trajectory,
             parameter_values=values,
         )
 
-    def torch_total_movement_log_likelihood(
+    def total_log_likelihood(
         self,
-        trials: Iterable["MovementTrial"],
+        trials: Iterable["Trial"],
         *,
         parameter_overrides: Mapping[str, "Tensor"] | None = None,
     ) -> "Tensor":
         """Sum independent trajectory scores in one differentiable graph."""
 
-        from andrew_mlmdp.hierarchy.torch_likelihood import (
-            total_hierarchical_movement_log_likelihood_torch,
+        from andrew_mlmdp.hierarchy.autodiff import (
+            total_log_likelihood,
         )
 
-        values = self.torch_parameter_values(overrides=parameter_overrides)
-        return total_hierarchical_movement_log_likelihood_torch(
+        values = self.parameter_values(overrides=parameter_overrides)
+        return total_log_likelihood(
             self,
             trials,
             parameter_values=values,
         )
 
 
-    def fit_parameters(
+    def fit(
         self,
-        trials: Iterable["MovementTrial"],
+        trials: Iterable["Trial"],
         *,
-        parameter_names: Sequence[str],
-        learning_rate: float = 5e-2,
+        names: Sequence[str],
+        lr: float = 5e-2,
         max_steps: int = 1000,
-        relative_tolerance: float = 1e-8,
-        scheduler_relative_threshold: float | None = None,
-        convergence_relative_threshold: float | None = None,
+        tolerance: float = 1e-8,
+        scheduler_tolerance: float | None = None,
+        convergence_tolerance: float | None = None,
         patience: int = 20,
-        learning_rate_decay_factor: float = 0.3,
-        learning_rate_decay_patience: int = 7,
-        minimum_learning_rate: float = 1e-5,
-        progress_callback: (
-            Callable[["HierarchicalFitEvaluation"], None] | None
+        lr_decay: float = 0.3,
+        lr_patience: int = 7,
+        min_lr: float = 1e-5,
+        callback: (
+            Callable[["FitStep"], None] | None
         ) = None,
-    ) -> "HierarchicalFitResult":
+    ) -> "FitResult":
         """Fit private Torch parameters without mutating this template."""
 
         from andrew_mlmdp.hierarchy.fitting import (
-            fit_hierarchical_model_parameters,
+            fit_parameters,
         )
 
-        return fit_hierarchical_model_parameters(
+        return fit_parameters(
             self,
             trials,
-            parameter_names=parameter_names,
-            learning_rate=learning_rate,
+            names=names,
+            lr=lr,
             max_steps=max_steps,
-            relative_tolerance=relative_tolerance,
-            scheduler_relative_threshold=scheduler_relative_threshold,
-            convergence_relative_threshold=convergence_relative_threshold,
+            tolerance=tolerance,
+            scheduler_tolerance=scheduler_tolerance,
+            convergence_tolerance=convergence_tolerance,
             patience=patience,
-            learning_rate_decay_factor=learning_rate_decay_factor,
-            learning_rate_decay_patience=learning_rate_decay_patience,
-            minimum_learning_rate=minimum_learning_rate,
-            progress_callback=progress_callback,
+            lr_decay=lr_decay,
+            lr_patience=lr_patience,
+            min_lr=min_lr,
+            callback=callback,
         )
 
 @dataclass(frozen=True)
-class HierarchyTask:
+class Task:
     """Inspectable goal-conditioned task built from a reusable hierarchy."""
 
-    template: HierarchyTemplate
+    template: Template
     goal: Coordinate
     interior_states: np.ndarray
-    interior_state_by_coordinate: dict[Coordinate, int]
-    lower_dynamics: FirstExitDynamics
-    first_hit_probabilities: np.ndarray
+    interior_index: dict[Coordinate, int]
+    lower_dynamics: Dynamics
+    first_hit: np.ndarray
     task_basis: "TaskBasis"
-    upper_dynamics: FirstExitDynamics
+    upper_dynamics: Dynamics
     upper_desirability: np.ndarray
     upper_controlled: np.ndarray
 
@@ -521,12 +523,14 @@ class HierarchyTask:
         return self.template.basis
 
     @property
-    def parameters(self) -> ModelParameters:
+    def parameters(self) -> Parameters:
         return self.template.parameters
 
     @property
-    def number_of_subtasks(self) -> int:
-        return self.basis.number_of_subgoals
+    def n_subtasks(self) -> int:
+        """Number of reusable lower-layer subtasks."""
+
+        return self.basis.n_subgoals
 
     @property
     def subtask_profiles(self) -> np.ndarray:
@@ -537,7 +541,7 @@ class HierarchyTask:
         return () if self.basis.locations is None else self.basis.locations
 
     @property
-    def lower_subtask_passive(self) -> np.ndarray:
+    def subtask_access(self) -> np.ndarray:
         return self.lower_dynamics.boundary_passive[:-1]
 
     def plan(
@@ -547,18 +551,18 @@ class HierarchyTask:
         upper_state: int | None = None,
         beta: float | None = None,
         goal_desirability: np.ndarray | None = None,
-    ) -> "LayerOnePlan":
+    ) -> "Plan":
         """Compose the lower policy at a physical or entered upper state."""
 
-        return compute_hierarchy_plan(
+        return compute_plan(
             self,
             current,
             upper_state=upper_state,
             beta=beta,
-            goal_interior_desirability=goal_desirability,
+            goal_desirability=goal_desirability,
         )
 
-    def movement_log_likelihood(
+    def log_likelihood(
         self,
         trajectory: list[Coordinate] | tuple[Coordinate, ...],
         *,
@@ -567,16 +571,16 @@ class HierarchyTask:
         """Score physical movement after marginalizing hierarchy events.
 
         Consecutive repeated coordinates are collapsed, matching
-        :meth:`FlatSolution.movement_log_likelihood`. Lower accesses and upper
+        :meth:`Solution.log_likelihood`. Lower accesses and upper
         termination decisions are latent; their mutually exclusive routes are
         summed exactly rather than sampled.
         """
 
         from andrew_mlmdp.hierarchy.likelihood import (
-            _hierarchical_movement_log_likelihood,
+            _log_likelihood,
         )
 
-        return _hierarchical_movement_log_likelihood(
+        return _log_likelihood(
             self,
             trajectory,
             beta=beta,
@@ -600,10 +604,10 @@ class HierarchyTask:
             raise ValueError("goal_learning must be 'exact' or 'online'")
         from andrew_mlmdp.hierarchy.rollout import (
             _rollout_from_engine,
-            _run_hierarchical_rollout,
+            _run_rollout,
         )
 
-        result = _run_hierarchical_rollout(
+        result = _run_rollout(
             self,
             start,
             beta=beta,
@@ -642,29 +646,30 @@ class TaskBasis:
 
 
 @dataclass(frozen=True)
-class LayerOnePlan:
+class Plan:
     """Top-down task composition and lower policy at one physical location."""
 
     current: Coordinate
     upper_state: int | None
-    passive_abstract: np.ndarray
-    controlled_abstract: np.ndarray
-    inpainted_rewards: np.ndarray
-    target_boundary_desirability: np.ndarray
+    upper_passive: np.ndarray
+    upper_policy: np.ndarray
+    rewards: np.ndarray
+    target_boundary: np.ndarray
     raw_weights: np.ndarray
-    composition_input_weights: np.ndarray
+    clipped_weights: np.ndarray
     weights: np.ndarray
-    reconstructed_boundary_desirability: np.ndarray
-    physical_desirability: np.ndarray
-    layer_one_controlled: np.ndarray
+    boundary_desirability: np.ndarray
+    desirability: np.ndarray
+    lower_policy: np.ndarray
 
 
-def _build_hierarchy_task(
-    template: HierarchyTemplate,
+def _build_task(
+    template: Template,
     goal: Coordinate,
-) -> HierarchyTask:
+) -> Task:
     """Build one goal task from a reusable point or distributed basis."""
 
+    # Remove the absorbing goal, then express every subtask on that interior.
     interior_states, interior_by_coordinate = _interior_partition(
         template.maze,
         goal,
@@ -677,7 +682,8 @@ def _build_hierarchy_task(
         raise ValueError(
             "Every subgoal must have positive access outside the goal"
         )
-    lower_dynamics = _build_lower_dynamics_from_access(
+    # Layer 1 ends on either a subtask boundary copy or the physical goal.
+    lower_dynamics = _lower_dynamics(
         template.maze,
         goal,
         interior_states,
@@ -685,22 +691,24 @@ def _build_hierarchy_task(
         physical_passive=template.environment.passive,
     )
     fundamental = _fundamental_matrix(lower_dynamics.interior_passive)
-    first_hit_probabilities = (
+    first_hit = (
         lower_dynamics.boundary_passive @ fundamental
     )
-    upper_dynamics = _build_upper_dynamics(lower_dynamics, fundamental)
-    upper_desirability, upper_controlled = _solve_upper_layer(
+    # First-hit probabilities become passive transitions for the abstract layer.
+    upper_dynamics = _upper_dynamics(lower_dynamics, fundamental)
+    # Solve the goal-conditioned abstract policy once; plans compose it below.
+    upper_desirability, upper_controlled = _solve_upper(
         upper_dynamics,
         template.parameters,
     )
-    return HierarchyTask(
+    return Task(
         template=template,
         goal=goal,
         interior_states=interior_states,
-        interior_state_by_coordinate=interior_by_coordinate,
+        interior_index=interior_by_coordinate,
         lower_dynamics=lower_dynamics,
-        first_hit_probabilities=first_hit_probabilities,
-        task_basis=_build_task_basis(
+        first_hit=first_hit,
+        task_basis=_task_basis(
             lower_dynamics,
             template.parameters,
             template.task_library.boundary_desirability,
@@ -711,14 +719,14 @@ def _build_hierarchy_task(
     )
 
 
-def compute_hierarchy_plan(
-    model: HierarchyTask,
+def compute_plan(
+    model: Task,
     current: Coordinate,
     *,
     upper_state: int | None = None,
     beta: float | None = None,
-    goal_interior_desirability: np.ndarray | None = None,
-) -> LayerOnePlan:
+    goal_desirability: np.ndarray | None = None,
+) -> Plan:
     """Compose a lower plan for point or distributed subgoal bases."""
 
     model.maze.state_index(current)
@@ -728,12 +736,12 @@ def compute_hierarchy_plan(
     if upper_state is not None:
         abstract_state = _validated_upper_state(
             upper_state,
-            model.number_of_subtasks,
+            model.n_subtasks,
         )
-        passive_abstract = model.upper_dynamics.passive[
+        upper_passive = model.upper_dynamics.passive[
             :, abstract_state
         ].copy()
-        controlled_abstract = model.upper_controlled[
+        upper_policy = model.upper_controlled[
             :, abstract_state
         ].copy()
     elif (
@@ -741,51 +749,51 @@ def compute_hierarchy_plan(
         and current in model.basis.locations
     ):
         abstract_state = model.basis.locations.index(current)
-        passive_abstract = model.upper_dynamics.passive[
+        upper_passive = model.upper_dynamics.passive[
             :, abstract_state
         ].copy()
-        controlled_abstract = model.upper_controlled[
+        upper_policy = model.upper_controlled[
             :, abstract_state
         ].copy()
     else:
-        interior_state = model.interior_state_by_coordinate[current]
-        passive_abstract = model.first_hit_probabilities[
+        interior_state = model.interior_index[current]
+        upper_passive = model.first_hit[
             :, interior_state
         ].copy()
-        controlled_abstract = passive_abstract * model.upper_desirability
-        controlled_abstract /= controlled_abstract.sum()
+        upper_policy = upper_passive * model.upper_desirability
+        upper_policy /= upper_policy.sum()
 
-    return _plan_from_abstract_dynamics(
+    return _compose_plan(
         model,
         current,
-        passive_abstract,
-        controlled_abstract,
+        upper_passive,
+        upper_policy,
         upper_state=upper_state,
         beta=beta,
-        goal_interior_desirability=goal_interior_desirability,
+        goal_desirability=goal_desirability,
     )
 
 
-def _validated_upper_state(value: int, number_of_states: int) -> int:
+def _validated_upper_state(value: int, n_states: int) -> int:
     if (
         isinstance(value, (bool, np.bool_))
         or not isinstance(value, (int, np.integer))
-        or not 0 <= value < number_of_states
+        or not 0 <= value < n_states
     ):
         raise ValueError("Upper state index is out of range")
     return int(value)
 
 
-def _plan_from_abstract_dynamics(
-    model: HierarchyTask,
+def _compose_plan(
+    model: Task,
     current: Coordinate,
-    passive_abstract: np.ndarray,
-    controlled_abstract: np.ndarray,
+    upper_passive: np.ndarray,
+    upper_policy: np.ndarray,
     *,
     upper_state: int | None,
     beta: float | None,
-    goal_interior_desirability: np.ndarray | None,
-) -> LayerOnePlan:
+    goal_desirability: np.ndarray | None,
+) -> Plan:
     """Apply reward inpainting and lower task composition."""
 
     inpainting_scale = model.parameters.beta.item() if beta is None else beta
@@ -795,154 +803,154 @@ def _plan_from_abstract_dynamics(
     # Apply Equation 10 to every abstract outcome, including termination at
     # the physical goal. The fixed goal reward still defines the exact goal
     # basis task, while its active mixture coefficient is set by this target.
-    inpainted_rewards = inpainting_scale * (
-        controlled_abstract - passive_abstract
+    rewards = inpainting_scale * (
+        upper_policy - upper_passive
     )
-    target_boundary_desirability = np.exp(
-        inpainted_rewards / model.parameters.lower_control_cost.item()
+    target_boundary = np.exp(
+        rewards / model.parameters.lower_control_cost.item()
     )
 
     # Paper Equation 7, using its stated pseudoinverse-and-clipping
     # approximation for tasks outside the exact span of Q_b.
     raw_weights = (
         np.linalg.pinv(model.task_basis.boundary_desirability)
-        @ target_boundary_desirability
+        @ target_boundary
     )
-    composition_input_weights = np.maximum(0.0, raw_weights)
-    weights = _composition_weights(
-        composition_input_weights,
+    clipped_weights = np.maximum(0.0, raw_weights)
+    weights = _shape_weights(
+        clipped_weights,
         exponent=model.template.composition_exponent,
         mode=model.template.composition_mode,
     )
     reconstructed_boundary = (
         model.task_basis.boundary_desirability @ weights
     )
-    physical_desirability, layer_one_controlled = _compose_lower_policy(
+    desirability, lower_policy = _compose_policy(
         model,
         weights,
         reconstructed_boundary,
-        goal_interior_desirability=goal_interior_desirability,
+        goal_desirability=goal_desirability,
     )
-    return LayerOnePlan(
+    return Plan(
         current=current,
         upper_state=upper_state,
-        passive_abstract=passive_abstract,
-        controlled_abstract=controlled_abstract,
-        inpainted_rewards=inpainted_rewards,
-        target_boundary_desirability=target_boundary_desirability,
+        upper_passive=upper_passive,
+        upper_policy=upper_policy,
+        rewards=rewards,
+        target_boundary=target_boundary,
         raw_weights=raw_weights,
-        composition_input_weights=composition_input_weights,
+        clipped_weights=clipped_weights,
         weights=weights,
-        reconstructed_boundary_desirability=reconstructed_boundary,
-        physical_desirability=physical_desirability,
-        layer_one_controlled=layer_one_controlled,
+        boundary_desirability=reconstructed_boundary,
+        desirability=desirability,
+        lower_policy=lower_policy,
     )
 
 
 def _goal_only_plan(
-    model: HierarchyTask,
+    model: Task,
     current: Coordinate,
     *,
-    goal_interior_desirability: np.ndarray | None,
+    goal_desirability: np.ndarray | None,
     tolerate_unreachable: bool = False,
-) -> LayerOnePlan:
+) -> Plan:
     """Construct the permanent physical-goal plan after upper termination."""
 
-    number_of_boundaries = model.lower_dynamics.number_of_boundary_states
-    weights = np.zeros(number_of_boundaries, dtype=np.float64)
+    n_boundaries = model.lower_dynamics.n_boundary
+    weights = np.zeros(n_boundaries, dtype=np.float64)
     weights[-1] = 1.0
-    inpainted = np.full(number_of_boundaries, -np.inf, dtype=np.float64)
+    inpainted = np.full(n_boundaries, -np.inf, dtype=np.float64)
     inpainted[-1] = model.parameters.goal_reward.item()
-    target = np.zeros(number_of_boundaries, dtype=np.float64)
+    target = np.zeros(n_boundaries, dtype=np.float64)
     target[-1] = np.exp(
         model.parameters.goal_reward.item() / model.parameters.lower_control_cost.item()
     )
-    if goal_interior_desirability is None:
+    if goal_desirability is None:
         q_interior = np.exp(
             model.parameters.interior_reward.item()
             / model.parameters.lower_control_cost.item()
         )
         interior = solve_first_exit(model.lower_dynamics, target, q_interior)
     else:
-        interior = _validated_goal_desirability(
+        interior = _validate_goal_desirability(
             model,
-            goal_interior_desirability,
+            goal_desirability,
         )
-    physical, controlled = _policy_from_complete_desirability(
+    physical, controlled = _lower_policy(
         model,
         interior,
         target,
         tolerate_zero_columns=(
-            goal_interior_desirability is not None
+            goal_desirability is not None
             or tolerate_unreachable
         ),
     )
-    return LayerOnePlan(
+    return Plan(
         current=current,
         upper_state=None,
-        passive_abstract=np.zeros(number_of_boundaries, dtype=np.float64),
-        controlled_abstract=np.zeros(number_of_boundaries, dtype=np.float64),
-        inpainted_rewards=inpainted,
-        target_boundary_desirability=target,
+        upper_passive=np.zeros(n_boundaries, dtype=np.float64),
+        upper_policy=np.zeros(n_boundaries, dtype=np.float64),
+        rewards=inpainted,
+        target_boundary=target,
         raw_weights=weights.copy(),
-        composition_input_weights=weights.copy(),
+        clipped_weights=weights.copy(),
         weights=weights,
-        reconstructed_boundary_desirability=target,
-        physical_desirability=physical,
-        layer_one_controlled=controlled,
+        boundary_desirability=target,
+        desirability=physical,
+        lower_policy=controlled,
     )
 
 
-def _compose_lower_policy(
-    model: HierarchyTask,
+def _compose_policy(
+    model: Task,
     weights: np.ndarray,
     reconstructed_boundary: np.ndarray,
     *,
-    goal_interior_desirability: np.ndarray | None,
+    goal_desirability: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Combine fixed subtask solutions with an exact or learned goal column."""
 
     basis = model.task_basis.interior_desirability
-    if goal_interior_desirability is None:
+    if goal_desirability is None:
         interior_desirability = basis @ weights
     else:
-        learned_goal = _validated_goal_desirability(
+        learned_goal = _validate_goal_desirability(
             model,
-            goal_interior_desirability,
+            goal_desirability,
         )
         interior_desirability = (
             basis[:, :-1] @ weights[:-1]
             + learned_goal * weights[-1]
         )
 
-    return _policy_from_complete_desirability(
+    return _lower_policy(
         model,
         interior_desirability,
         reconstructed_boundary,
-        tolerate_zero_columns=goal_interior_desirability is not None,
+        tolerate_zero_columns=goal_desirability is not None,
     )
 
 
-def _policy_from_complete_desirability(
-    model: HierarchyTask,
+def _lower_policy(
+    model: Task,
     interior_desirability: np.ndarray,
     boundary_desirability: np.ndarray,
     *,
     tolerate_zero_columns: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    physical_desirability = np.empty(
+    desirability = np.empty(
         len(model.maze.free_cells),
         dtype=np.float64,
     )
-    physical_desirability[model.interior_states] = interior_desirability
+    desirability[model.interior_states] = interior_desirability
     goal_state = model.maze.state_index(model.goal)
-    physical_desirability[goal_state] = boundary_desirability[-1]
+    desirability[goal_state] = boundary_desirability[-1]
 
     complete_desirability = np.concatenate(
         [interior_desirability, boundary_desirability]
     )
     if not tolerate_zero_columns:
-        controlled = controlled_from_desirability(
+        controlled = controlled_dynamics(
             model.lower_dynamics.passive,
             complete_desirability,
         )
@@ -959,10 +967,10 @@ def _policy_from_complete_desirability(
         controlled[:, usable] = (
             unnormalized[:, usable] / normalizers[usable]
         )
-    return physical_desirability, controlled
+    return desirability, controlled
 
 
-def _composition_weights(
+def _shape_weights(
     clipped_weights: np.ndarray,
     *,
     exponent: float,
@@ -991,8 +999,8 @@ def _composition_weights(
     return result
 
 
-def _validated_goal_desirability(
-    model: HierarchyTask,
+def _validate_goal_desirability(
+    model: Task,
     values: np.ndarray,
 ) -> np.ndarray:
     goal_desirability = np.asarray(values, dtype=np.float64)
@@ -1012,47 +1020,47 @@ def _validated_goal_desirability(
     return goal_desirability
 
 
-def _plan_with_goal_desirability(
-    model: HierarchyTask,
-    plan: LayerOnePlan,
+def _goal_plan(
+    model: Task,
+    plan: Plan,
     goal_desirability: np.ndarray,
-) -> LayerOnePlan:
-    if np.all(np.isneginf(plan.inpainted_rewards[:-1])):
-        learned_goal = _validated_goal_desirability(model, goal_desirability)
-        physical, controlled = _policy_from_complete_desirability(
+) -> Plan:
+    if np.all(np.isneginf(plan.rewards[:-1])):
+        learned_goal = _validate_goal_desirability(model, goal_desirability)
+        physical, controlled = _lower_policy(
             model,
             learned_goal,
-            plan.target_boundary_desirability,
+            plan.target_boundary,
             tolerate_zero_columns=True,
         )
     else:
-        physical, controlled = _compose_lower_policy(
+        physical, controlled = _compose_policy(
             model,
             plan.weights,
-            plan.reconstructed_boundary_desirability,
-            goal_interior_desirability=goal_desirability,
+            plan.boundary_desirability,
+            goal_desirability=goal_desirability,
         )
     return replace(
         plan,
-        physical_desirability=physical,
-        layer_one_controlled=controlled,
+        desirability=physical,
+        lower_policy=controlled,
     )
 
 
-def _layer_one_plan(
-    model: HierarchyTask,
+def _plan_from_weights(
+    model: Task,
     current: Coordinate,
     *,
     upper_state: int | None = None,
     beta: float | None,
     goal_desirability: np.ndarray | None,
-) -> LayerOnePlan:
-    return compute_hierarchy_plan(
+) -> Plan:
+    return compute_plan(
         model,
         current,
         upper_state=upper_state,
         beta=beta,
-        goal_interior_desirability=goal_desirability,
+        goal_desirability=goal_desirability,
     )
 
 
@@ -1070,7 +1078,7 @@ def _validate_subgoals(
     return ordered_subgoals
 
 
-def _validated_subtask_profiles(
+def _validate_profiles(
     maze: Maze,
     profiles: np.ndarray,
 ) -> np.ndarray:
@@ -1079,7 +1087,7 @@ def _validated_subtask_profiles(
     if values.ndim != 2 or values.shape[0] != expected_rows:
         raise ValueError(
             "Subtask profiles must have shape "
-            f"({expected_rows}, number_of_subtasks)"
+            f"({expected_rows}, n_subtasks)"
         )
     if not values.shape[1]:
         raise ValueError("At least one soft subtask is required")
@@ -1155,7 +1163,7 @@ def _interior_partition(
     return interior_states, coordinate_to_interior
 
 
-def _normalize_augmented_columns(
+def _normalize_columns(
     interior_passive: np.ndarray,
     boundary_passive: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1169,14 +1177,14 @@ def _normalize_augmented_columns(
     return interior_passive, boundary_passive
 
 
-def _build_lower_dynamics_from_access(
+def _lower_dynamics(
     maze: Maze,
     goal: Coordinate,
     interior_states: np.ndarray,
     subtask_access: np.ndarray,
     *,
     physical_passive: np.ndarray,
-) -> FirstExitDynamics:
+) -> Dynamics:
     """Augment physical dynamics with supplied abstract access rows."""
 
     access = np.asarray(subtask_access, dtype=np.float64).copy()
@@ -1199,11 +1207,11 @@ def _build_lower_dynamics_from_access(
     goal_state = maze.state_index(goal)
     goal_passive = passive[goal_state, interior_states][np.newaxis, :]
     boundary_passive = np.vstack([access, goal_passive])
-    interior_passive, boundary_passive = _normalize_augmented_columns(
+    interior_passive, boundary_passive = _normalize_columns(
         interior_passive,
         boundary_passive,
     )
-    return FirstExitDynamics(
+    return Dynamics(
         interior_passive,
         boundary_passive,
     )
@@ -1214,24 +1222,24 @@ def _fundamental_matrix(interior_passive: np.ndarray) -> np.ndarray:
     return np.linalg.solve(identity - interior_passive, identity)
 
 
-def _build_upper_dynamics(
-    lower: FirstExitDynamics,
+def _upper_dynamics(
+    lower: Dynamics,
     fundamental: np.ndarray,
-) -> FirstExitDynamics:
+) -> Dynamics:
     lower_subgoals = lower.boundary_passive[:-1]
     lower_goal = lower.boundary_passive[-1:]
     upper_interior = lower_subgoals @ fundamental @ lower_subgoals.T
     upper_boundary = lower_goal @ fundamental @ lower_subgoals.T
-    upper_interior, upper_boundary = _normalize_augmented_columns(
+    upper_interior, upper_boundary = _normalize_columns(
         upper_interior,
         upper_boundary,
     )
-    return FirstExitDynamics(upper_interior, upper_boundary)
+    return Dynamics(upper_interior, upper_boundary)
 
 
-def _solve_upper_layer(
-    dynamics: FirstExitDynamics,
-    parameters: ModelParameters,
+def _solve_upper(
+    dynamics: Dynamics,
+    parameters: Parameters,
 ) -> tuple[np.ndarray, np.ndarray]:
     q_interior = np.exp(
         parameters.interior_reward.item() / parameters.upper_control_cost.item()
@@ -1247,21 +1255,21 @@ def _solve_upper_layer(
     desirability = np.concatenate(
         [interior_desirability, np.asarray([goal_desirability])]
     )
-    controlled = controlled_from_desirability(
+    controlled = controlled_dynamics(
         dynamics.passive,
         desirability,
     )
     return desirability, controlled
 
 
-def _build_task_basis(
-    lower: FirstExitDynamics,
-    parameters: ModelParameters,
+def _task_basis(
+    lower: Dynamics,
+    parameters: Parameters,
     boundary_desirability: np.ndarray,
 ) -> TaskBasis:
-    number_of_targets = lower.number_of_boundary_states
+    n_targets = lower.n_boundary
     boundary_basis = np.asarray(boundary_desirability, dtype=np.float64)
-    expected_shape = (number_of_targets, number_of_targets)
+    expected_shape = (n_targets, n_targets)
     if boundary_basis.shape != expected_shape:
         raise ValueError(
             f"Task-library boundary matrix must have shape {expected_shape}"
@@ -1277,7 +1285,7 @@ def _build_task_basis(
                 boundary_basis[:, task],
                 q_interior,
             )
-            for task in range(number_of_targets)
+            for task in range(n_targets)
         ]
     )
     return TaskBasis(boundary_basis, interior_basis)

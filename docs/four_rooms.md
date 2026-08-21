@@ -33,10 +33,10 @@ notebook-local analysis choice. Tests that compare exact historical arrays
 
 ## Library hard defaults
 
-Calling `LMDPEnvironment.hierarchy(basis)` without explicit parameters selects:
+Calling `Environment.hierarchy(basis)` without explicit parameters selects:
 
 ```python
-hard_hierarchy_parameters(
+point_parameters(
     interior_reward=-0.1,
     goal_reward=1.1,
     lower_control_cost=0.06,
@@ -50,7 +50,7 @@ This fallback applies to point bases and equivalent one-hot profile bases so
 both representations execute identically. Active plans always include the
 physical-goal component with its inpainted mixture weight.
 
-Flat tasks use `ModelParameters()` defaults rather than these hard-hierarchy
+Flat tasks use `Parameters()` defaults rather than these hard-hierarchy
 defaults.
 
 ## Canonical executable notebook
@@ -59,7 +59,7 @@ defaults.
 uses goal `(1, 9)` and the hard defaults above with one explicit override:
 
 ```python
-hard_parameters = hard_hierarchy_parameters(upper_control_cost=0.65)
+hard_parameters = point_parameters(upper_control_cost=0.65)
 ```
 
 While the hierarchy is active, plans combine the six fixed subgoal tasks with
@@ -72,7 +72,7 @@ inspecting the diagnostics, and applies an 80%-of-peak execution core. The
 selected rank is also passed to the execution-parameter helper:
 
 ```python
-soft_hierarchy_parameters(k=soft_rank, upper_control_cost=0.18)
+soft_parameters(k=soft_rank, upper_control_cost=0.18)
 ```
 
 These upper-cost overrides are example tuning, not package-wide defaults.
@@ -81,7 +81,7 @@ NMF discovery itself uses a separate flat-task ensemble and the independent
 defaults:
 
 ```python
-NMFDiscoveryParameters(
+NMFConfig(
     interior_reward=-0.4,
     goal_reward=6.5,
     control_cost=1.2,
@@ -98,7 +98,7 @@ discovered NMF profiles.
 defined in `tests/conftest.py`:
 
 ```python
-ModelParameters(
+Parameters(
     interior_reward=-0.1,
     goal_reward=1.0,
     lower_control_cost=0.15,
@@ -112,7 +112,7 @@ This fixture retains historical passive and controlled matrices, initial plan
 values, and seeded flat and hierarchical trajectories in
 `tests/data/four_rooms_regression.json`. It intentionally does not track the
 current notebook tuning or the library defaults. Its hierarchy supplies an
-explicit historical `LayerOneTaskLibrary`, so removal of the former behavioral
+explicit historical `TaskLibrary`, so removal of the former behavioral
 off-target parameter does not rewrite the frozen regression oracle.
 
 Additional tests construct corridors, tall and wide rectangles, obstacle

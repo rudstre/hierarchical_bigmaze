@@ -7,24 +7,24 @@ import matplotlib
 import numpy as np
 from matplotlib.colors import Colormap
 
-from andrew_mlmdp.hierarchy import LayerOnePlan
+from andrew_mlmdp.hierarchy import Plan
 from andrew_mlmdp.maze import Coordinate
 
 
 @dataclass(frozen=True)
-class _HierarchicalRolloutFrame:
+class _RolloutFrame:
     """One drawable moment in a two-layer rollout."""
 
     event: str
     coordinate: Coordinate
     trajectory: tuple[Coordinate, ...]
-    plan: LayerOnePlan | None
+    plan: Plan | None
     active_subgoal: Coordinate | None
     requested_subgoal: Coordinate | None
     physical_steps: int
     abstract_accesses: int
-    passive_access_probability: float | None = None
-    controlled_access_probability: float | None = None
+    passive_access: float | None = None
+    policy_access: float | None = None
     refractory: bool = False
     status: str | None = None
     goal_desirability: np.ndarray | None = None
@@ -32,25 +32,22 @@ class _HierarchicalRolloutFrame:
 
 
 @dataclass(frozen=True)
-class _SoftRolloutFrame:
+class _ProfileFrame:
     """One drawable physical or distributed-access event."""
 
     event: str
     coordinate: Coordinate
     trajectory: tuple[Coordinate, ...]
-    plan: LayerOnePlan | None
+    plan: Plan | None
     profile_subtask: int | None
     entered_subtask: int | None
     physical_steps: int
     abstract_accesses: int
-    passive_access_probability: float | None = None
-    controlled_access_probability: float | None = None
+    passive_access: float | None = None
+    policy_access: float | None = None
     refractory: bool = False
     status: str | None = None
 
-
-
-_RolloutFrame = _HierarchicalRolloutFrame
 
 
 def _colormap(name: str, *, bad: str | None = None) -> Colormap:

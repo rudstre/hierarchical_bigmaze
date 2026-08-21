@@ -15,18 +15,18 @@ PROJECT_ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from andrew_mlmdp import (  # noqa: E402
-    DoohanMovementDataset,
-    LMDPEnvironment,
-    NMFDiscoveryParameters,
+    DoohanDataset,
+    Environment,
+    NMFConfig,
     SubgoalBasis,
-    discover_soft_subgoals,
-    hierarchical_parameter_values,
-    soft_hierarchy_parameters,
+    discover_subgoals,
+    parameter_values,
+    soft_parameters,
 )
-from andrew_mlmdp.hierarchy.torch_batch_likelihood import (  # noqa: E402
-    BatchLikelihoodDiagnostics,
-    prepare_hierarchical_likelihood_batch,
-    total_prepared_hierarchical_log_likelihood_torch,
+from andrew_mlmdp.hierarchy.batch import (  # noqa: E402
+    BatchTimings,
+    prepare_batch,
+    total_prepared_log_likelihood,
 )
 
 
@@ -36,12 +36,12 @@ def main() -> None:
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     template, trials = _load_problem()
-    prepared = prepare_hierarchical_likelihood_batch(template, trials)
+    prepared = prepare_batch(template, trials)
     print(
         f"trials={len(trials)} goals={len(prepared.goals)} "
-        f"shared={prepared.number_of_shared_keys} "
-        f"closures={prepared.number_of_closures} "
-        f"operators={prepared.number_of_operators}"
+        f"shared={prepared.n_shared} "
+        f"closures={prepared.n_closures} "
+        f"operators={prepared.n_operators}"
     )
 
     _evaluate(template, prepared, backward=True)
@@ -94,18 +94,18 @@ def _load_problem():
     data_root = (
         PROJECT_ROOT / "external" / "GridMaze-mFC-ephys-DATA" / "data"
     )
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         data_root,
         subject_ids=["m2"],
         start_date="2022-06-28",
         end_date="2022-07-05",
         maze_name="maze_1",
     )
-    environment = LMDPEnvironment(dataset.definition.maze)
-    discovery = discover_soft_subgoals(
+    environment = Environment(dataset.definition.maze)
+    discovery = discover_subgoals(
         environment,
         ranks=(8,),
-        parameters=NMFDiscoveryParameters(lambda_smooth=1.0),
+        parameters=NMFConfig(lambda_smooth=1.0),
         seed=0,
     ).result(8)
     basis = SubgoalBasis.from_profiles(
@@ -115,7 +115,7 @@ def _load_problem():
     )
     template = environment.hierarchy(
         basis,
-        parameters=soft_hierarchy_parameters(8, upper_control_cost=0.18),
+        parameters=soft_parameters(8, upper_control_cost=0.18),
     )
     return template, tuple(dataset.trials)
 
@@ -123,11 +123,11 @@ def _load_problem():
 def _evaluate(template, prepared, *, backward: bool):
     values = {
         name: value.detach().clone().requires_grad_(True)
-        for name, value in hierarchical_parameter_values(template).items()
+        for name, value in parameter_values(template).items()
     }
-    diagnostics = BatchLikelihoodDiagnostics()
+    diagnostics = BatchTimings()
     started = perf_counter()
-    total = total_prepared_hierarchical_log_likelihood_torch(
+    total = total_prepared_log_likelihood(
         template,
         prepared,
         parameter_values=values,

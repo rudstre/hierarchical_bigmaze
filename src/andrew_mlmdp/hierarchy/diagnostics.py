@@ -1,7 +1,7 @@
 """Immutable numerical diagnostics for hierarchical MLMDP interpretation.
 
 The helpers in this module deliberately consume arrays already produced by a
-``HierarchyTask`` or ``LayerOnePlan``.  In particular, original NMF profiles,
+``Task`` or ``Plan``.  In particular, original NMF profiles,
 gated basis profiles, and goal-conditioned execution-access probabilities are
 kept as three distinct quantities.
 """
@@ -18,23 +18,23 @@ from typing import Literal
 
 import numpy as np
 
-from andrew_mlmdp.hierarchy.core import (
-    HierarchyTask,
-    HierarchyTemplate,
-    LayerOnePlan,
-    SubgoalBasis,
-    _build_hierarchy_task,
-    _goal_only_plan,
-)
 from andrew_mlmdp.hierarchy.likelihood import (
     _first_departure_kernel,
-    _hierarchical_physical_step_kernel,
+    _step_kernel,
+)
+from andrew_mlmdp.hierarchy.model import (
+    Plan,
+    SubgoalBasis,
+    Task,
+    Template,
+    _build_task,
+    _goal_only_plan,
 )
 from andrew_mlmdp.hierarchy.rollout import Rollout, _rollout_column
-from andrew_mlmdp.lmdp import ModelParameters
+from andrew_mlmdp.lmdp import Parameters
 from andrew_mlmdp.maze import Coordinate, Maze
 
-HierarchyModel = HierarchyTask | HierarchyTemplate
+HierarchyModel = Task | Template
 DisplayCoordinate = tuple[float, float]
 
 _PROBABILITY_TOLERANCE = 1e-10
@@ -56,24 +56,26 @@ def _read_only_optional(values: np.ndarray | None) -> np.ndarray | None:
     return _read_only_array(values, dtype=np.float64)
 
 
+# Immutable result snapshots -------------------------------------------------
+
 @dataclass(frozen=True)
-class UpperGraphData:
+class UpperGraph:
     """Goal-conditioned access representations and upper-layer dynamics.
 
-    ``original_nmf_profiles`` are the reusable peak-normalized profiles.
+    ``source_profiles`` are the reusable peak-normalized profiles.
     ``gated_profiles`` are the reusable profiles after core gating.
-    ``execution_access_probabilities`` are the normalized, goal-conditioned
+    ``access_probabilities`` are the normalized, goal-conditioned
     passive transition probabilities into subgoal boundary copies.
-    ``display_coordinates`` are plotting coordinates only, never entry states.
+    ``positions`` are plotting coordinates only, never entry states.
     """
 
     maze: Maze
     goal: Coordinate
     labels: tuple[str, ...]
-    original_nmf_profiles: np.ndarray
+    source_profiles: np.ndarray
     gated_profiles: np.ndarray
-    execution_access_probabilities: np.ndarray
-    display_coordinates: tuple[DisplayCoordinate, ...]
+    access_probabilities: np.ndarray
+    positions: tuple[DisplayCoordinate, ...]
     upper_passive: np.ndarray
     upper_controlled: np.ndarray
     start_state: Coordinate | None = None
@@ -83,9 +85,9 @@ class UpperGraphData:
 
     def __post_init__(self) -> None:
         for name in (
-            "original_nmf_profiles",
+            "source_profiles",
             "gated_profiles",
-            "execution_access_probabilities",
+            "access_probabilities",
             "upper_passive",
             "upper_controlled",
         ):
@@ -107,13 +109,13 @@ class UpperGraphData:
 
 
 @dataclass(frozen=True)
-class ContinuationPolicyData:
+class ContinuationPolicy:
     """One stationary continuation plan and its rollout projections."""
 
     upper_state: int
     label: str
-    passive_abstract: np.ndarray
-    controlled_abstract: np.ndarray
+    upper_passive: np.ndarray
+    upper_policy: np.ndarray
     desirability: np.ndarray
     log_desirability: np.ndarray
     value: np.ndarray
@@ -121,17 +123,17 @@ class ContinuationPolicyData:
     augmented_controlled: np.ndarray
     physical_passive: np.ndarray
     physical_controlled: np.ndarray
-    physical_control_delta: np.ndarray
-    passive_execution_access: np.ndarray
-    controlled_execution_access: np.ndarray
+    policy_delta: np.ndarray
+    passive_access: np.ndarray
+    policy_access: np.ndarray
     refractory_adjusted: np.ndarray
     refractory_physical: np.ndarray
-    refractory_valid_sources: np.ndarray
+    valid_refractory_sources: np.ndarray
 
     def __post_init__(self) -> None:
         for name in (
-            "passive_abstract",
-            "controlled_abstract",
+            "upper_passive",
+            "upper_policy",
             "desirability",
             "log_desirability",
             "value",
@@ -139,9 +141,9 @@ class ContinuationPolicyData:
             "augmented_controlled",
             "physical_passive",
             "physical_controlled",
-            "physical_control_delta",
-            "passive_execution_access",
-            "controlled_execution_access",
+            "policy_delta",
+            "passive_access",
+            "policy_access",
             "refractory_adjusted",
             "refractory_physical",
         ):
@@ -152,13 +154,13 @@ class ContinuationPolicyData:
             )
         object.__setattr__(
             self,
-            "refractory_valid_sources",
-            _read_only_array(self.refractory_valid_sources, dtype=bool),
+            "valid_refractory_sources",
+            _read_only_array(self.valid_refractory_sources, dtype=bool),
         )
 
 
 @dataclass(frozen=True)
-class CompositionWeightData:
+class CompositionTrace:
     """The exact three-stage task-composition weight trace."""
 
     plan_kind: Literal["initial", "continuation"]
@@ -166,19 +168,19 @@ class CompositionWeightData:
     upper_state: int | None
     labels: tuple[str, ...]
     raw_weights: np.ndarray
-    composition_input_weights: np.ndarray
-    final_weights: np.ndarray
+    clipped_weights: np.ndarray
+    weights: np.ndarray
     subgoal_mass: float
-    subgoal_fraction_of_total: float | None
-    effective_subgoal_count: float | None
+    subgoal_share: float | None
+    effective_subgoals: float | None
     subgoal_entropy: float | None
-    maximum_subgoal_share: float | None
+    max_subgoal_share: float | None
 
     def __post_init__(self) -> None:
         for name in (
             "raw_weights",
-            "composition_input_weights",
-            "final_weights",
+            "clipped_weights",
+            "weights",
         ):
             object.__setattr__(
                 self,
@@ -189,9 +191,9 @@ class CompositionWeightData:
 
 @dataclass(frozen=True)
 class RolloutEnsemble:
-    """A reproducible collection sampled by ``HierarchyTask.rollout``."""
+    """A reproducible collection sampled by ``Task.rollout``."""
 
-    task: HierarchyTask
+    task: Task
     start: Coordinate
     rollouts: tuple[Rollout, ...]
     seeds: tuple[int, ...]
@@ -202,7 +204,7 @@ class RolloutEnsemble:
 
 
 @dataclass(frozen=True)
-class RolloutDistributionData:
+class RolloutSummary:
     """Physical-route counts and physical-step summaries."""
 
     maze: Maze
@@ -210,32 +212,32 @@ class RolloutDistributionData:
     goal: Coordinate
     directed_edge_mean: np.ndarray
     occupancy_mean: np.ndarray
-    all_physical_steps: np.ndarray
-    successful_physical_steps: np.ndarray
-    shortest_physical_steps: int
-    excess_physical_steps: np.ndarray
+    steps: np.ndarray
+    successful_steps: np.ndarray
+    shortest_steps: int
+    excess_steps: np.ndarray
     completion_rate: float
     status_counts: Mapping[str, int]
-    physical_step_quantiles: Mapping[float, float]
+    step_quantiles: Mapping[float, float]
     mean_self_transitions: float
     observed_directed_edge_mean: np.ndarray | None = None
     observed_occupancy_mean: np.ndarray | None = None
-    observed_physical_steps: np.ndarray | None = None
+    observed_steps: np.ndarray | None = None
     observed_mean_self_transitions: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "directed_edge_mean",
             "occupancy_mean",
-            "all_physical_steps",
-            "successful_physical_steps",
-            "excess_physical_steps",
+            "steps",
+            "successful_steps",
+            "excess_steps",
         ):
             object.__setattr__(self, name, _read_only_array(getattr(self, name)))
         for name in (
             "observed_directed_edge_mean",
             "observed_occupancy_mean",
-            "observed_physical_steps",
+            "observed_steps",
         ):
             values = getattr(self, name)
             if values is not None:
@@ -247,13 +249,13 @@ class RolloutDistributionData:
         )
         object.__setattr__(
             self,
-            "physical_step_quantiles",
-            MappingProxyType(dict(self.physical_step_quantiles)),
+            "step_quantiles",
+            MappingProxyType(dict(self.step_quantiles)),
         )
 
 
 @dataclass(frozen=True)
-class LatentRouteData:
+class RouteSummary:
     """Latent subgoal sequences and destination-by-source transitions."""
 
     tokens: tuple[str, ...]
@@ -276,26 +278,26 @@ class LatentRouteData:
 
 
 @dataclass(frozen=True)
-class ExpectedPolicyEntropyPairData:
+class PairEntropy:
     """Exact departure-occupancy entropy for one ordered navigation task."""
 
     start: Coordinate
     goal: Coordinate
-    expected_entropy_sum_normalized: float
-    expected_entropy_sum_raw: float
-    expected_decision_count: float
-    entropy_normalized: float
-    entropy_raw: float
+    normalized_entropy_sum: float
+    entropy_sum: float
+    expected_decisions: float
+    normalized_entropy: float
+    entropy: float
 
 
 @dataclass(frozen=True)
-class ExpectedPairDiagnosticsData:
+class PairDiagnostics:
     """Exact entropy and physical-step moments for one navigation pair."""
 
-    policy_entropy: ExpectedPolicyEntropyPairData
-    mean_physical_steps: float
-    standard_deviation_physical_steps: float
-    shortest_physical_steps: int
+    policy_entropy: PairEntropy
+    mean_steps: float
+    step_sd: float
+    shortest_steps: int
 
     @property
     def start(self) -> Coordinate:
@@ -307,64 +309,64 @@ class ExpectedPairDiagnosticsData:
 
 
 @dataclass
-class _ExpectedPolicyEntropyInstrumentation:
+class _EntropyTiming:
     """Mutable counters for one exact all-pairs entropy evaluation."""
 
-    start_goal_pair_count: int = 0
-    occupancy_solve_count: int = 0
-    occupancy_solve_failure_count: int = 0
-    maximum_transient_condition_number: float = float("nan")
-    maximum_transient_state_count: int = 0
-    first_departure_seconds: float = 0.0
-    condition_number_seconds: float = 0.0
-    occupancy_solve_seconds: float = 0.0
+    pairs: int = 0
+    solves: int = 0
+    solve_failures: int = 0
+    max_condition: float = float("nan")
+    max_states: int = 0
+    departure_seconds: float = 0.0
+    condition_seconds: float = 0.0
+    solve_seconds: float = 0.0
 
     def record_condition_number(self, condition_number: float) -> None:
-        current = self.maximum_transient_condition_number
+        current = self.max_condition
         if np.isnan(current) or condition_number > current:
-            self.maximum_transient_condition_number = condition_number
+            self.max_condition = condition_number
 
 
-_EXPECTED_POLICY_ENTROPY_INSTRUMENTATION: ContextVar[
-    _ExpectedPolicyEntropyInstrumentation | None
+_ENTROPY_TIMING: ContextVar[
+    _EntropyTiming | None
 ] = ContextVar(
-    "_EXPECTED_POLICY_ENTROPY_INSTRUMENTATION",
+    "_ENTROPY_TIMING",
     default=None,
 )
 
 
 @dataclass(frozen=True)
-class ExpectedPairDiagnosticsSweepData:
+class DiagnosticSweep:
     """Exact pair diagnostics and runtime data over one parameter grid."""
 
     parameter_name: str
     parameter_values: np.ndarray
     start: Coordinate
     goal: Coordinate
-    shortest_physical_steps: int
-    policy_entropy_normalized: np.ndarray
-    policy_entropy_raw: np.ndarray
-    mean_physical_steps: np.ndarray
-    standard_deviation_physical_steps: np.ndarray
-    candidate_construction_seconds: np.ndarray | None = None
-    expected_pair_diagnostics_seconds: np.ndarray | None = None
+    shortest_steps: int
+    normalized_entropy: np.ndarray
+    entropy: np.ndarray
+    mean_steps: np.ndarray
+    step_sd: np.ndarray
+    build_seconds: np.ndarray | None = None
+    diagnostic_seconds: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.parameter_name, str) or not self.parameter_name:
             raise ValueError("parameter_name must be a nonempty string")
         if (
-            isinstance(self.shortest_physical_steps, (bool, np.bool_))
-            or not isinstance(self.shortest_physical_steps, (int, np.integer))
-            or self.shortest_physical_steps < 1
+            isinstance(self.shortest_steps, (bool, np.bool_))
+            or not isinstance(self.shortest_steps, (int, np.integer))
+            or self.shortest_steps < 1
         ):
-            raise ValueError("shortest_physical_steps must be a positive integer")
+            raise ValueError("shortest_steps must be a positive integer")
 
         metric_names = (
             "parameter_values",
-            "policy_entropy_normalized",
-            "policy_entropy_raw",
-            "mean_physical_steps",
-            "standard_deviation_physical_steps",
+            "normalized_entropy",
+            "entropy",
+            "mean_steps",
+            "step_sd",
         )
         metrics = {
             name: _read_only_array(getattr(self, name), dtype=np.float64)
@@ -381,8 +383,8 @@ class ExpectedPairDiagnosticsSweepData:
             object.__setattr__(self, name, values)
 
         for name in (
-            "candidate_construction_seconds",
-            "expected_pair_diagnostics_seconds",
+            "build_seconds",
+            "diagnostic_seconds",
         ):
             supplied = getattr(self, name)
             raw_values = (
@@ -398,10 +400,13 @@ class ExpectedPairDiagnosticsSweepData:
             object.__setattr__(self, name, values)
 
 
-def _hierarchical_pair_plans(
-    task: HierarchyTask,
+# Exact pair metrics --------------------------------------------------------
+
+
+def _pair_plans(
+    task: Task,
     start: Coordinate,
-) -> tuple[LayerOnePlan, ...]:
+) -> tuple[Plan, ...]:
     """Return the initial, continuation, and goal-only plans for one pair."""
 
     task.maze.state_index(start)
@@ -411,46 +416,46 @@ def _hierarchical_pair_plans(
         task.plan(start),
         *(
             task.plan(start, upper_state=upper_state)
-            for upper_state in range(task.number_of_subtasks)
+            for upper_state in range(task.n_subtasks)
         ),
         _goal_only_plan(
             task,
             start,
-            goal_interior_desirability=None,
+            goal_desirability=None,
             tolerate_unreachable=True,
         ),
     )
 
 
-def _hierarchical_physical_step_dynamics(
-    task: HierarchyTask,
+def _step_dynamics(
+    task: Task,
     start: Coordinate,
 ) -> np.ndarray:
     """Return one-step controller dynamics for a selected navigation pair."""
 
-    plans = _hierarchical_pair_plans(task, start)
-    number_of_physical = len(task.maze.free_cells)
-    number_of_modes = task.number_of_subtasks + 2
+    plans = _pair_plans(task, start)
+    n_physical = len(task.maze.free_cells)
+    n_modes = task.n_subtasks + 2
     result = np.zeros(
         (
-            number_of_physical,
-            number_of_modes,
-            number_of_physical,
-            number_of_modes,
+            n_physical,
+            n_modes,
+            n_physical,
+            n_modes,
         ),
         dtype=np.float64,
     )
     goal_state = task.maze.state_index(task.goal)
     for current_state, current in enumerate(task.maze.free_cells):
         if current_state != goal_state:
-            result[:, :, current_state, :] = _hierarchical_physical_step_kernel(
+            result[:, :, current_state, :] = _step_kernel(
                 task, current, plans
             )
     return result
 
 
-def _first_departure_dynamics_from_physical_steps(
-    task: HierarchyTask,
+def _departure_dynamics(
+    task: Task,
     physical_steps: np.ndarray,
 ) -> np.ndarray:
     """Collapse same-location steps into first physical departures."""
@@ -466,14 +471,14 @@ def _first_departure_dynamics_from_physical_steps(
     return result
 
 
-def _hierarchical_first_departure_dynamics(
-    task: HierarchyTask,
+def _first_departure_dynamics(
+    task: Task,
     start: Coordinate,
 ) -> np.ndarray:
     """Return ``D[next_physical, next_mode, current_physical, current_mode]``."""
 
-    physical_steps = _hierarchical_physical_step_dynamics(task, start)
-    return _first_departure_dynamics_from_physical_steps(task, physical_steps)
+    physical_steps = _step_dynamics(task, start)
+    return _departure_dynamics(task, physical_steps)
 
 
 _COLUMN_VALID = 0
@@ -537,44 +542,45 @@ def _all_states_can_reach_goal(
     return len(can_reach) == transition.shape[0]
 
 
-def _expected_policy_entropy_for_pair(
-    task: HierarchyTask,
+def _pair_entropy(
+    task: Task,
     start: Coordinate,
     *,
     departure: np.ndarray | None = None,
-    compute_condition_diagnostics: bool = False,
-) -> ExpectedPolicyEntropyPairData | None:
+    check_condition: bool = False,
+) -> PairEntropy | None:
     """Return one absorbing-pair result, or ``None`` for policy nonabsorption."""
 
-    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
+    instrumentation = _ENTROPY_TIMING.get()
     if departure is None:
         departure_started = perf_counter() if instrumentation is not None else 0.0
-        departure = _hierarchical_first_departure_dynamics(task, start)
+        departure = _first_departure_dynamics(task, start)
         if instrumentation is not None:
-            instrumentation.first_departure_seconds += (
+            instrumentation.departure_seconds += (
                 perf_counter() - departure_started
             )
-    number_of_physical, number_of_modes = departure.shape[:2]
-    number_of_controller_states = number_of_physical * number_of_modes
+    n_physical, n_modes = departure.shape[:2]
+    n_controller_states = n_physical * n_modes
     goal_state = task.maze.state_index(task.goal)
-    initial_full_state = task.maze.state_index(start) * number_of_modes
+    initial_full_state = task.maze.state_index(start) * n_modes
     goal_full_states = np.arange(
-        goal_state * number_of_modes,
-        (goal_state + 1) * number_of_modes,
+        goal_state * n_modes,
+        (goal_state + 1) * n_modes,
     )
     transient_full_states = np.asarray(
         [
-            physical_state * number_of_modes + mode
-            for physical_state in range(number_of_physical)
+            physical_state * n_modes + mode
+            for physical_state in range(n_physical)
             if physical_state != goal_state
-            for mode in range(number_of_modes)
+            for mode in range(n_modes)
         ],
         dtype=np.int64,
     )
 
+    # Restrict the controller chain to states reachable from this start.
     full_transition = departure.reshape(
-        number_of_controller_states,
-        number_of_controller_states,
+        n_controller_states,
+        n_controller_states,
     )
     transient_transition = full_transition[
         np.ix_(transient_full_states, transient_full_states)
@@ -621,6 +627,7 @@ def _expected_policy_entropy_for_pair(
     ):
         return None
 
+    # Solve the absorbing chain for expected visits to each transient state.
     initial = np.zeros(len(reachable_local), dtype=np.float64)
     initial_position = int(np.flatnonzero(reachable_local == initial_transient)[0])
     initial[initial_position] = 1.0
@@ -628,33 +635,33 @@ def _expected_policy_entropy_for_pair(
         np.eye(len(reachable_local), dtype=np.float64) - restricted_transition
     )
     if instrumentation is not None:
-        instrumentation.maximum_transient_state_count = max(
-            instrumentation.maximum_transient_state_count,
+        instrumentation.max_states = max(
+            instrumentation.max_states,
             len(reachable_local),
         )
-        if compute_condition_diagnostics:
+        if check_condition:
             condition_started = perf_counter()
             try:
                 condition_number = float(np.linalg.cond(transient_system))
             except np.linalg.LinAlgError:
                 condition_number = float("inf")
-            instrumentation.condition_number_seconds += (
+            instrumentation.condition_seconds += (
                 perf_counter() - condition_started
             )
             if not np.isfinite(condition_number):
                 condition_number = float("inf")
             instrumentation.record_condition_number(condition_number)
-        instrumentation.occupancy_solve_count += 1
+        instrumentation.solves += 1
         solve_started = perf_counter()
     try:
         occupancy = np.linalg.solve(transient_system, initial)
     except np.linalg.LinAlgError as error:
         if instrumentation is not None:
-            instrumentation.occupancy_solve_failure_count += 1
+            instrumentation.solve_failures += 1
         raise RuntimeError("Absorbing departure chain could not be solved") from error
     finally:
         if instrumentation is not None:
-            instrumentation.occupancy_solve_seconds += perf_counter() - solve_started
+            instrumentation.solve_seconds += perf_counter() - solve_started
     if not np.all(np.isfinite(occupancy)):
         raise RuntimeError("Departure occupancy contains nonfinite values")
     if np.any(occupancy < -_PROBABILITY_TOLERANCE):
@@ -667,16 +674,17 @@ def _expected_policy_entropy_for_pair(
     if goal_hitting_probability > 1.0 + _PROBABILITY_TOLERANCE:
         raise RuntimeError("Goal-hitting probability exceeds one")
 
+    # Weight each state policy entropy by its expected visit count.
     raw_entropy = np.zeros(len(reachable_full), dtype=np.float64)
     normalized_entropy = np.zeros(len(reachable_full), dtype=np.float64)
     passive = task.template.environment.passive
     for entropy_index, full_source in enumerate(reachable_full):
-        current_state, _ = divmod(int(full_source), number_of_modes)
+        current_state, _ = divmod(int(full_source), n_modes)
         q = (
             full_transition[:, full_source]
             .reshape(
-                number_of_physical,
-                number_of_modes,
+                n_physical,
+                n_modes,
             )
             .sum(axis=1)
         )
@@ -714,48 +722,48 @@ def _expected_policy_entropy_for_pair(
         raise RuntimeError("Expected physical decision count is not positive")
     expected_raw = float(raw_entropy @ occupancy)
     expected_normalized = float(normalized_entropy @ occupancy)
-    return ExpectedPolicyEntropyPairData(
+    return PairEntropy(
         start=start,
         goal=task.goal,
-        expected_entropy_sum_normalized=expected_normalized,
-        expected_entropy_sum_raw=expected_raw,
-        expected_decision_count=expected_decisions,
-        entropy_normalized=expected_normalized / expected_decisions,
-        entropy_raw=expected_raw / expected_decisions,
+        normalized_entropy_sum=expected_normalized,
+        entropy_sum=expected_raw,
+        expected_decisions=expected_decisions,
+        normalized_entropy=expected_normalized / expected_decisions,
+        entropy=expected_raw / expected_decisions,
     )
 
 
-def _expected_physical_step_moments(
-    task: HierarchyTask,
+def _step_moments(
+    task: Task,
     start: Coordinate,
     physical_steps: np.ndarray,
     *,
-    compute_condition_diagnostics: bool,
+    check_condition: bool,
 ) -> tuple[float, float] | None:
     """Return exact physical-step mean and SD, or none for nonabsorption."""
 
-    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
-    number_of_physical, number_of_modes = physical_steps.shape[:2]
-    number_of_controller_states = number_of_physical * number_of_modes
+    instrumentation = _ENTROPY_TIMING.get()
+    n_physical, n_modes = physical_steps.shape[:2]
+    n_controller_states = n_physical * n_modes
     goal_state = task.maze.state_index(task.goal)
-    initial_full_state = task.maze.state_index(start) * number_of_modes
+    initial_full_state = task.maze.state_index(start) * n_modes
     goal_full_states = np.arange(
-        goal_state * number_of_modes,
-        (goal_state + 1) * number_of_modes,
+        goal_state * n_modes,
+        (goal_state + 1) * n_modes,
     )
     transient_full_states = np.asarray(
         [
-            physical_state * number_of_modes + mode
-            for physical_state in range(number_of_physical)
+            physical_state * n_modes + mode
+            for physical_state in range(n_physical)
             if physical_state != goal_state
-            for mode in range(number_of_modes)
+            for mode in range(n_modes)
         ],
         dtype=np.int64,
     )
 
     full_transition = physical_steps.reshape(
-        number_of_controller_states,
-        number_of_controller_states,
+        n_controller_states,
+        n_controller_states,
     ).copy()
     transient_transition = full_transition[
         np.ix_(transient_full_states, transient_full_states)
@@ -810,17 +818,17 @@ def _expected_physical_step_moments(
         np.eye(len(reachable_local), dtype=np.float64) - restricted_transition.T
     )
     if instrumentation is not None:
-        instrumentation.maximum_transient_state_count = max(
-            instrumentation.maximum_transient_state_count,
+        instrumentation.max_states = max(
+            instrumentation.max_states,
             len(reachable_local),
         )
-        if compute_condition_diagnostics:
+        if check_condition:
             condition_started = perf_counter()
             try:
                 condition_number = float(np.linalg.cond(moment_system))
             except np.linalg.LinAlgError:
                 condition_number = float("inf")
-            instrumentation.condition_number_seconds += (
+            instrumentation.condition_seconds += (
                 perf_counter() - condition_started
             )
             if not np.isfinite(condition_number):
@@ -849,24 +857,24 @@ def _expected_physical_step_moments(
     if initial_hitting > 1.0 + _PROBABILITY_TOLERANCE:
         raise RuntimeError("Goal-hitting probability exceeds one")
 
-    mean_physical_steps = float(mean[initial_position])
+    mean_steps = float(mean[initial_position])
     selected_second_moment = float(second_moment[initial_position])
     if (
-        not np.isfinite(mean_physical_steps)
+        not np.isfinite(mean_steps)
         or not np.isfinite(selected_second_moment)
-        or mean_physical_steps <= 0.0
+        or mean_steps <= 0.0
     ):
         raise RuntimeError("Physical-step moments are invalid")
-    variance = selected_second_moment - mean_physical_steps**2
+    variance = selected_second_moment - mean_steps**2
     variance_tolerance = _PROBABILITY_TOLERANCE * max(
         1.0,
         abs(selected_second_moment),
-        mean_physical_steps**2,
+        mean_steps**2,
     )
     if variance < -variance_tolerance:
         raise RuntimeError("Physical-step variance is negative")
     standard_deviation = float(np.sqrt(max(0.0, variance)))
-    return mean_physical_steps, standard_deviation
+    return mean_steps, standard_deviation
 
 
 def _physical_reachability(passive: np.ndarray) -> tuple[frozenset[int], ...]:
@@ -898,8 +906,8 @@ _BEHAVIORAL_SWEEP_PARAMETERS = (
 _GATE_SWEEP_PARAMETERS = ("core_threshold", "core_exponent")
 
 
-def _supported_parameter_sweep_parameters(
-    template: HierarchyTemplate,
+def _sweep_parameters(
+    template: Template,
 ) -> tuple[str, ...]:
     supported = (*_BEHAVIORAL_SWEEP_PARAMETERS, "composition_exponent")
     if not template.basis.is_point_basis and template.basis.core_threshold is not None:
@@ -907,7 +915,7 @@ def _supported_parameter_sweep_parameters(
     return supported
 
 
-def _validated_parameter_sweep_values(
+def _validate_sweep_values(
     values: Sequence[float],
 ) -> tuple[float, ...]:
     try:
@@ -942,7 +950,7 @@ def _validated_parameter_sweep_values(
     return tuple(validated)
 
 
-def _model_parameter_snapshot(parameters: ModelParameters) -> dict[str, float | None]:
+def _model_parameter_snapshot(parameters: Parameters) -> dict[str, float | None]:
     threshold = parameters.core_threshold
     return {
         **{
@@ -954,14 +962,14 @@ def _model_parameter_snapshot(parameters: ModelParameters) -> dict[str, float | 
     }
 
 
-def _hierarchy_template_with_parameter(
-    template: HierarchyTemplate,
+def _template_with_parameter(
+    template: Template,
     parameter_name: str,
     value: float,
-) -> HierarchyTemplate:
+) -> Template:
     """Return a fresh template with one authoritative physical value replaced."""
 
-    supported = _supported_parameter_sweep_parameters(template)
+    supported = _sweep_parameters(template)
     if parameter_name not in supported:
         available = ", ".join(supported)
         if parameter_name in _GATE_SWEEP_PARAMETERS:
@@ -987,7 +995,7 @@ def _hierarchy_template_with_parameter(
         assert threshold is not None
         exponent = basis.core_exponent
         if parameter_name == "core_threshold":
-            template.validate_core_threshold_for_goals(value, template.maze.free_cells)
+            template.validate_threshold(value, template.maze.free_cells)
             threshold = value
         else:
             exponent = value
@@ -999,7 +1007,7 @@ def _hierarchy_template_with_parameter(
             labels=basis.labels,
         )
 
-    parameters = ModelParameters(**parameter_values)
+    parameters = Parameters(**parameter_values)
     baseline_parameters = dict(template.parameters.named_parameters())
     for name, candidate_parameter in parameters.named_parameters():
         baseline_parameter = baseline_parameters.get(name)
@@ -1017,26 +1025,26 @@ def _hierarchy_template_with_parameter(
 def _resolve_task(
     model: HierarchyModel,
     goal: Coordinate | None,
-) -> HierarchyTask:
-    if isinstance(model, HierarchyTask):
+) -> Task:
+    if isinstance(model, Task):
         if goal is not None and goal != model.goal:
-            raise ValueError("goal conflicts with the HierarchyTask goal")
+            raise ValueError("goal conflicts with the Task goal")
         return model
-    if not isinstance(model, HierarchyTemplate):
-        raise TypeError("model must be a HierarchyTask or HierarchyTemplate")
+    if not isinstance(model, Template):
+        raise TypeError("model must be a Task or Template")
     if goal is None:
-        raise ValueError("goal is required when model is a HierarchyTemplate")
+        raise ValueError("goal is required when model is a Template")
     # Use the authoritative constructor without populating the template cache.
-    return _build_hierarchy_task(model, goal)
+    return _build_task(model, goal)
 
 
-def get_expected_policy_entropy_for_pair(
+def pair_entropy(
     model: HierarchyModel,
     start: Coordinate,
     goal: Coordinate | None = None,
     *,
-    compute_condition_diagnostics: bool = False,
-) -> ExpectedPolicyEntropyPairData:
+    check_condition: bool = False,
+) -> PairEntropy:
     """Return exact physical first-departure entropy for one task pair.
 
     A template requires an explicit ``goal``.  A goal-conditioned task accepts
@@ -1044,8 +1052,8 @@ def get_expected_policy_entropy_for_pair(
     that do not almost surely reach the goal are reported as errors.
     """
 
-    if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
-        raise TypeError("compute_condition_diagnostics must be a boolean")
+    if not isinstance(check_condition, (bool, np.bool_)):
+        raise TypeError("check_condition must be a boolean")
     task = _resolve_task(model, goal)
     start_state = task.maze.state_index(start)
     if start == task.goal:
@@ -1055,74 +1063,74 @@ def get_expected_policy_entropy_for_pair(
     if goal_state not in physical_reachability[start_state]:
         raise ValueError("goal is not topologically reachable from start")
 
-    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
+    instrumentation = _ENTROPY_TIMING.get()
     if instrumentation is not None:
-        instrumentation.start_goal_pair_count += 1
-    pair_data = _expected_policy_entropy_for_pair(
+        instrumentation.pairs += 1
+    pair_data = _pair_entropy(
         task,
         start,
-        compute_condition_diagnostics=compute_condition_diagnostics,
+        check_condition=check_condition,
     )
     if pair_data is None:
         raise RuntimeError("Policy is nonabsorbing for the requested start-goal pair")
     return pair_data
 
 
-def _expected_pair_diagnostics_for_task(
-    task: HierarchyTask,
+def _diagnose_task(
+    task: Task,
     start: Coordinate,
-    shortest_physical_steps: int,
+    shortest_steps: int,
     *,
-    compute_condition_diagnostics: bool,
-) -> ExpectedPairDiagnosticsData:
+    check_condition: bool,
+) -> PairDiagnostics:
     """Evaluate both exact pair metrics from one physical-step kernel."""
 
-    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
+    instrumentation = _ENTROPY_TIMING.get()
     if instrumentation is not None:
-        instrumentation.start_goal_pair_count += 1
+        instrumentation.pairs += 1
         dynamics_started = perf_counter()
-    physical_steps = _hierarchical_physical_step_dynamics(task, start)
-    departure = _first_departure_dynamics_from_physical_steps(
+    physical_steps = _step_dynamics(task, start)
+    departure = _departure_dynamics(
         task,
         physical_steps,
     )
     if instrumentation is not None:
-        instrumentation.first_departure_seconds += perf_counter() - dynamics_started
+        instrumentation.departure_seconds += perf_counter() - dynamics_started
 
-    entropy = _expected_policy_entropy_for_pair(
+    entropy = _pair_entropy(
         task,
         start,
         departure=departure,
-        compute_condition_diagnostics=compute_condition_diagnostics,
+        check_condition=check_condition,
     )
-    moments = _expected_physical_step_moments(
+    moments = _step_moments(
         task,
         start,
         physical_steps,
-        compute_condition_diagnostics=compute_condition_diagnostics,
+        check_condition=check_condition,
     )
     if entropy is None or moments is None:
         raise RuntimeError("Policy is nonabsorbing for the requested start-goal pair")
-    mean_physical_steps, standard_deviation_physical_steps = moments
-    return ExpectedPairDiagnosticsData(
+    mean_steps, step_sd = moments
+    return PairDiagnostics(
         policy_entropy=entropy,
-        mean_physical_steps=mean_physical_steps,
-        standard_deviation_physical_steps=standard_deviation_physical_steps,
-        shortest_physical_steps=shortest_physical_steps,
+        mean_steps=mean_steps,
+        step_sd=step_sd,
+        shortest_steps=shortest_steps,
     )
 
 
-def get_expected_pair_diagnostics(
+def diagnose_pair(
     model: HierarchyModel,
     start: Coordinate,
     goal: Coordinate | None = None,
     *,
-    compute_condition_diagnostics: bool = False,
-) -> ExpectedPairDiagnosticsData:
+    check_condition: bool = False,
+) -> PairDiagnostics:
     """Return exact entropy and physical-step moments for one task pair."""
 
-    if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
-        raise TypeError("compute_condition_diagnostics must be a boolean")
+    if not isinstance(check_condition, (bool, np.bool_)):
+        raise TypeError("check_condition must be a boolean")
     task = _resolve_task(model, goal)
     start_state = task.maze.state_index(start)
     if start == task.goal:
@@ -1132,61 +1140,61 @@ def get_expected_pair_diagnostics(
     if goal_state not in physical_reachability[start_state]:
         raise ValueError("goal is not topologically reachable from start")
 
-    return _expected_pair_diagnostics_for_task(
+    return _diagnose_task(
         task,
         start,
         shortest_path_length(task.maze, start, task.goal),
-        compute_condition_diagnostics=compute_condition_diagnostics,
+        check_condition=check_condition,
     )
 
 
-def _print_expected_pair_diagnostics_sweep_progress(
+def _print_sweep_progress(
     *,
     index: int,
     total: int,
     parameter_name: str,
     value: float,
-    construction_seconds: float,
+    build_seconds: float,
     diagnostics_seconds: float,
-    instrumentation: _ExpectedPolicyEntropyInstrumentation,
+    instrumentation: _EntropyTiming,
     status: str,
 ) -> None:
     """Print one combined pair-sweep progress record."""
 
-    condition_number = instrumentation.maximum_transient_condition_number
+    condition_number = instrumentation.max_condition
     print(
         f"[{index + 1}/{total}] {parameter_name}={value:.17g}"
-        f" | construction={construction_seconds:.3f}s"
+        f" | construction={build_seconds:.3f}s"
         f" | pair_diagnostics={diagnostics_seconds:.3f}s"
-        f" | pairs={instrumentation.start_goal_pair_count}"
-        f" | entropy_solves={instrumentation.occupancy_solve_count}"
-        f" | max_states={instrumentation.maximum_transient_state_count}"
+        f" | pairs={instrumentation.pairs}"
+        f" | entropy_solves={instrumentation.solves}"
+        f" | max_states={instrumentation.max_states}"
         f" | max_condition={condition_number:.3e}"
         f" | status={status}",
         flush=True,
     )
 
 
-def sweep_expected_pair_diagnostics(
-    template: HierarchyTemplate,
+def sweep_diagnostics(
+    template: Template,
     parameter_name: str,
     values: Sequence[float],
     *,
     start: Coordinate,
     goal: Coordinate,
     progress: bool = False,
-    compute_condition_diagnostics: bool = False,
-) -> ExpectedPairDiagnosticsSweepData:
+    check_condition: bool = False,
+) -> DiagnosticSweep:
     """Sweep exact entropy and physical-step moments for one selected pair."""
 
-    if not isinstance(template, HierarchyTemplate):
-        raise TypeError("template must be a HierarchyTemplate")
+    if not isinstance(template, Template):
+        raise TypeError("template must be a Template")
     if not isinstance(parameter_name, str):
         raise TypeError("parameter_name must be a string")
     if not isinstance(progress, (bool, np.bool_)):
         raise TypeError("progress must be a boolean")
-    if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
-        raise TypeError("compute_condition_diagnostics must be a boolean")
+    if not isinstance(check_condition, (bool, np.bool_)):
+        raise TypeError("check_condition must be a boolean")
 
     start_state = template.maze.state_index(start)
     goal_state = template.maze.state_index(goal)
@@ -1195,17 +1203,17 @@ def sweep_expected_pair_diagnostics(
     physical_reachability = _physical_reachability(template.environment.passive)
     if goal_state not in physical_reachability[start_state]:
         raise ValueError("goal is not topologically reachable from start")
-    shortest_physical_steps = shortest_path_length(
+    shortest_steps = shortest_path_length(
         template.maze,
         start,
         goal,
     )
 
-    supported = _supported_parameter_sweep_parameters(template)
+    supported = _sweep_parameters(template)
     if parameter_name not in supported:
-        _hierarchy_template_with_parameter(template, parameter_name, 0.0)
+        _template_with_parameter(template, parameter_name, 0.0)
         raise AssertionError("unreachable")
-    parameter_values = _validated_parameter_sweep_values(values)
+    parameter_values = _validate_sweep_values(values)
 
     results = []
     construction_times = []
@@ -1214,123 +1222,126 @@ def sweep_expected_pair_diagnostics(
     for index, value in enumerate(parameter_values):
         construction_started = perf_counter()
         try:
-            candidate = _hierarchy_template_with_parameter(
+            candidate = _template_with_parameter(
                 template,
                 parameter_name,
                 value,
             )
         except (TypeError, ValueError) as error:
-            construction_seconds = perf_counter() - construction_started
+            build_seconds = perf_counter() - construction_started
             if progress:
-                _print_expected_pair_diagnostics_sweep_progress(
+                _print_sweep_progress(
                     index=index,
                     total=total,
                     parameter_name=parameter_name,
                     value=value,
-                    construction_seconds=construction_seconds,
+                    build_seconds=build_seconds,
                     diagnostics_seconds=0.0,
-                    instrumentation=_ExpectedPolicyEntropyInstrumentation(),
+                    instrumentation=_EntropyTiming(),
                     status=f"construction_error={type(error).__name__}: {error}",
                 )
             raise ValueError(
                 f"Invalid {parameter_name!r} value at index {index} "
                 f"({value!r}): {error}"
             ) from error
-        construction_seconds = perf_counter() - construction_started
+        build_seconds = perf_counter() - construction_started
 
-        instrumentation = _ExpectedPolicyEntropyInstrumentation()
-        token = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.set(instrumentation)
+        instrumentation = _EntropyTiming()
+        token = _ENTROPY_TIMING.set(instrumentation)
         diagnostics_started = perf_counter()
         try:
-            task = _build_hierarchy_task(candidate, goal)
-            result = _expected_pair_diagnostics_for_task(
+            task = _build_task(candidate, goal)
+            result = _diagnose_task(
                 task,
                 start,
-                shortest_physical_steps,
-                compute_condition_diagnostics=compute_condition_diagnostics,
+                shortest_steps,
+                check_condition=check_condition,
             )
         except Exception as error:
             diagnostics_seconds = perf_counter() - diagnostics_started
             if progress:
-                _print_expected_pair_diagnostics_sweep_progress(
+                _print_sweep_progress(
                     index=index,
                     total=total,
                     parameter_name=parameter_name,
                     value=value,
-                    construction_seconds=construction_seconds,
+                    build_seconds=build_seconds,
                     diagnostics_seconds=diagnostics_seconds,
                     instrumentation=instrumentation,
                     status=f"diagnostics_error={type(error).__name__}: {error}",
                 )
             raise
         finally:
-            _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.reset(token)
+            _ENTROPY_TIMING.reset(token)
         diagnostics_seconds = perf_counter() - diagnostics_started
 
         results.append(result)
-        construction_times.append(construction_seconds)
+        construction_times.append(build_seconds)
         diagnostics_times.append(diagnostics_seconds)
         if progress:
-            _print_expected_pair_diagnostics_sweep_progress(
+            _print_sweep_progress(
                 index=index,
                 total=total,
                 parameter_name=parameter_name,
                 value=value,
-                construction_seconds=construction_seconds,
+                build_seconds=build_seconds,
                 diagnostics_seconds=diagnostics_seconds,
                 instrumentation=instrumentation,
                 status="ok",
             )
 
-    return ExpectedPairDiagnosticsSweepData(
+    return DiagnosticSweep(
         parameter_name=parameter_name,
         parameter_values=np.asarray(parameter_values),
         start=start,
         goal=goal,
-        shortest_physical_steps=shortest_physical_steps,
-        policy_entropy_normalized=np.asarray(
-            [result.policy_entropy.entropy_normalized for result in results]
+        shortest_steps=shortest_steps,
+        normalized_entropy=np.asarray(
+            [result.policy_entropy.normalized_entropy for result in results]
         ),
-        policy_entropy_raw=np.asarray(
-            [result.policy_entropy.entropy_raw for result in results]
+        entropy=np.asarray(
+            [result.policy_entropy.entropy for result in results]
         ),
-        mean_physical_steps=np.asarray(
-            [result.mean_physical_steps for result in results]
+        mean_steps=np.asarray(
+            [result.mean_steps for result in results]
         ),
-        standard_deviation_physical_steps=np.asarray(
-            [result.standard_deviation_physical_steps for result in results]
+        step_sd=np.asarray(
+            [result.step_sd for result in results]
         ),
-        candidate_construction_seconds=np.asarray(construction_times),
-        expected_pair_diagnostics_seconds=np.asarray(diagnostics_times),
+        build_seconds=np.asarray(construction_times),
+        diagnostic_seconds=np.asarray(diagnostics_times),
     )
 
 
-def _subgoal_labels(task: HierarchyTask) -> tuple[str, ...]:
+# Policy inspection ---------------------------------------------------------
+
+
+def _subgoal_labels(task: Task) -> tuple[str, ...]:
     if task.basis.labels is not None:
         return task.basis.labels
-    return tuple(f"SG{index + 1}" for index in range(task.number_of_subtasks))
+    return tuple(f"SG{index + 1}" for index in range(task.n_subtasks))
 
 
-def _execution_access_on_physical_grid(task: HierarchyTask) -> np.ndarray:
+def _physical_access(task: Task) -> np.ndarray:
     result = np.zeros(
-        (len(task.maze.free_cells), task.number_of_subtasks),
+        (len(task.maze.free_cells), task.n_subtasks),
         dtype=np.float64,
     )
-    result[task.interior_states, :] = task.lower_subtask_passive.T
+    result[task.interior_states, :] = task.subtask_access.T
     return result
 
 
 def _display_coordinates(
-    task: HierarchyTask,
-    execution_access_probabilities: np.ndarray,
+    task: Task,
+    access_probabilities: np.ndarray,
     representative: Literal["peak", "centroid"],
 ) -> tuple[DisplayCoordinate, ...]:
     if representative not in {"peak", "centroid"}:
         raise ValueError("representative must be 'peak' or 'centroid'")
     coordinates = np.asarray(task.maze.free_cells, dtype=np.float64)
     display: list[DisplayCoordinate] = []
-    for subgoal in range(task.number_of_subtasks):
-        weights = execution_access_probabilities[:, subgoal]
+    for subgoal in range(task.n_subtasks):
+        weights = access_probabilities[:, subgoal]
         if representative == "peak":
             coordinate = coordinates[int(np.argmax(weights))]
         else:
@@ -1342,36 +1353,36 @@ def _display_coordinates(
     return tuple(display)
 
 
-def get_upper_graph_data(
+def upper_graph(
     model: HierarchyModel,
     goal: Coordinate | None = None,
     *,
     start_state: Coordinate | None = None,
     representative: Literal["peak", "centroid"] = "peak",
-) -> UpperGraphData:
+) -> UpperGraph:
     """Extract access representations and upper dynamics without mutation."""
 
     task = _resolve_task(model, goal)
-    execution = _execution_access_on_physical_grid(task)
+    execution = _physical_access(task)
     initial_passive = None
     initial_controlled = None
     start_interpretation = None
     if start_state is not None:
         plan = task.plan(start_state)
-        initial_passive = plan.passive_abstract
-        initial_controlled = plan.controlled_abstract
+        initial_passive = plan.upper_passive
+        initial_controlled = plan.upper_policy
         if task.basis.locations is not None and start_state in task.basis.locations:
             start_interpretation = "entered_upper_state"
         else:
             start_interpretation = "first_hit"
-    return UpperGraphData(
+    return UpperGraph(
         maze=task.maze,
         goal=task.goal,
         labels=_subgoal_labels(task),
-        original_nmf_profiles=task.basis.profiles,
+        source_profiles=task.basis.profiles,
         gated_profiles=task.basis.access_profiles,
-        execution_access_probabilities=execution,
-        display_coordinates=_display_coordinates(task, execution, representative),
+        access_probabilities=execution,
+        positions=_display_coordinates(task, execution, representative),
         upper_passive=task.upper_dynamics.passive,
         upper_controlled=task.upper_controlled,
         start_state=start_state,
@@ -1382,51 +1393,51 @@ def get_upper_graph_data(
 
 
 def _physical_projection(
-    task: HierarchyTask,
+    task: Task,
     augmented: np.ndarray,
 ) -> np.ndarray:
-    number_of_physical_states = len(task.maze.free_cells)
-    number_of_interior = len(task.interior_states)
+    n_physical = len(task.maze.free_cells)
+    n_interior = len(task.interior_states)
     result = np.zeros(
-        (number_of_physical_states, number_of_physical_states),
+        (n_physical, n_physical),
         dtype=np.float64,
     )
     result[np.ix_(task.interior_states, task.interior_states)] = augmented[
-        :number_of_interior
+        :n_interior
     ]
     result[task.maze.state_index(task.goal), task.interior_states] = augmented[-1]
     return result
 
 
-def _continuation_plan(task: HierarchyTask, upper_state: int) -> LayerOnePlan:
+def _continuation_plan(task: Task, upper_state: int) -> Plan:
     planning_coordinate = task.maze.coordinate(int(task.interior_states[0]))
     return task.plan(planning_coordinate, upper_state=upper_state)
 
 
-def get_continuation_policy_data(
+def continuation_policies(
     model: HierarchyModel,
     goal: Coordinate | None = None,
-) -> tuple[ContinuationPolicyData, ...]:
+) -> tuple[ContinuationPolicy, ...]:
     """Return stationary continuation plans and exact refractory projections."""
 
     task = _resolve_task(model, goal)
-    number_of_interior = len(task.interior_states)
-    number_of_subtasks = task.number_of_subtasks
+    n_interior = len(task.interior_states)
+    n_subtasks = task.n_subtasks
     labels = _subgoal_labels(task)
-    results: list[ContinuationPolicyData] = []
-    for upper_state in range(number_of_subtasks):
+    results: list[ContinuationPolicy] = []
+    for upper_state in range(n_subtasks):
         plan = _continuation_plan(task, upper_state)
         with np.errstate(divide="ignore", invalid="ignore"):
-            log_desirability = np.log(plan.physical_desirability)
+            log_desirability = np.log(plan.desirability)
         value = task.parameters.lower_control_cost.item() * log_desirability
-        refractory = np.zeros_like(plan.layer_one_controlled)
-        refractory_valid = np.zeros(number_of_interior, dtype=bool)
-        for current_interior in range(number_of_interior):
+        refractory = np.zeros_like(plan.lower_policy)
+        refractory_valid = np.zeros(n_interior, dtype=bool)
+        for current_interior in range(n_interior):
             column = _rollout_column(
                 plan,
                 current_interior,
-                number_of_interior,
-                number_of_subtasks,
+                n_interior,
+                n_subtasks,
                 suppress_access=True,
             )
             if column is not None:
@@ -1435,41 +1446,41 @@ def get_continuation_policy_data(
         physical_passive = _physical_projection(task, task.lower_dynamics.passive)
         physical_controlled = _physical_projection(
             task,
-            plan.layer_one_controlled,
+            plan.lower_policy,
         )
         results.append(
-            ContinuationPolicyData(
+            ContinuationPolicy(
                 upper_state=upper_state,
                 label=labels[upper_state],
-                passive_abstract=plan.passive_abstract,
-                controlled_abstract=plan.controlled_abstract,
-                desirability=plan.physical_desirability,
+                upper_passive=plan.upper_passive,
+                upper_policy=plan.upper_policy,
+                desirability=plan.desirability,
                 log_desirability=log_desirability,
                 value=value,
                 augmented_passive=task.lower_dynamics.passive,
-                augmented_controlled=plan.layer_one_controlled,
+                augmented_controlled=plan.lower_policy,
                 physical_passive=physical_passive,
                 physical_controlled=physical_controlled,
-                physical_control_delta=physical_controlled - physical_passive,
-                passive_execution_access=task.lower_subtask_passive,
-                controlled_execution_access=plan.layer_one_controlled[
-                    number_of_interior : number_of_interior + number_of_subtasks
+                policy_delta=physical_controlled - physical_passive,
+                passive_access=task.subtask_access,
+                policy_access=plan.lower_policy[
+                    n_interior : n_interior + n_subtasks
                 ],
                 refractory_adjusted=refractory,
                 refractory_physical=_physical_projection(task, refractory),
-                refractory_valid_sources=refractory_valid,
+                valid_refractory_sources=refractory_valid,
             )
         )
     return tuple(results)
 
 
-def get_composition_weight_data(
+def composition_trace(
     model: HierarchyModel,
     goal: Coordinate | None = None,
     *,
     start_state: Coordinate | None = None,
     continuation_subgoal: int | None = None,
-) -> CompositionWeightData:
+) -> CompositionTrace:
     """Return the exact raw, composition-input, and final weight vectors."""
 
     if (start_state is None) == (continuation_subgoal is None):
@@ -1488,7 +1499,7 @@ def get_composition_weight_data(
         ):
             raise ValueError("continuation_subgoal must be an integer")
         upper_state = int(continuation_subgoal)
-        if not 0 <= upper_state < task.number_of_subtasks:
+        if not 0 <= upper_state < task.n_subtasks:
             raise ValueError("continuation_subgoal is out of range")
         plan = _continuation_plan(task, upper_state)
         plan_kind = "continuation"
@@ -1506,23 +1517,26 @@ def get_composition_weight_data(
         effective = None
         entropy = None
         maximum_share = None
-    return CompositionWeightData(
+    return CompositionTrace(
         plan_kind=plan_kind,
         current=plan.current,
         upper_state=plan.upper_state,
         labels=(*_subgoal_labels(task), "GOAL"),
         raw_weights=plan.raw_weights,
-        composition_input_weights=plan.composition_input_weights,
-        final_weights=plan.weights,
+        clipped_weights=plan.clipped_weights,
+        weights=plan.weights,
         subgoal_mass=subgoal_mass,
-        subgoal_fraction_of_total=fraction,
-        effective_subgoal_count=effective,
+        subgoal_share=fraction,
+        effective_subgoals=effective,
         subgoal_entropy=entropy,
-        maximum_subgoal_share=maximum_share,
+        max_subgoal_share=maximum_share,
     )
 
 
-def sample_hierarchical_rollouts(
+# Sampled rollout summaries -------------------------------------------------
+
+
+def sample_rollouts(
     model: HierarchyModel,
     start: Coordinate,
     goal: Coordinate | None = None,
@@ -1536,7 +1550,7 @@ def sample_hierarchical_rollouts(
     max_steps: int = 500,
     max_abstract_accesses: int = 500,
 ) -> RolloutEnsemble:
-    """Sample a reproducible ensemble through ``HierarchyTask.rollout``."""
+    """Sample a reproducible ensemble through ``Task.rollout``."""
 
     if (
         isinstance(n_rollouts, (bool, np.bool_))
@@ -1596,9 +1610,9 @@ def _route_counts(
     maze: Maze,
     trajectories: Sequence[Sequence[Coordinate]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    number_of_states = len(maze.free_cells)
-    edges = np.zeros((number_of_states, number_of_states), dtype=np.float64)
-    occupancy = np.zeros(number_of_states, dtype=np.float64)
+    n_states = len(maze.free_cells)
+    edges = np.zeros((n_states, n_states), dtype=np.float64)
+    occupancy = np.zeros(n_states, dtype=np.float64)
     physical_steps = np.empty(len(trajectories), dtype=np.int64)
     self_transitions = 0
     for trajectory_index, trajectory in enumerate(trajectories):
@@ -1649,7 +1663,7 @@ def summarize_rollouts(
     ensemble: RolloutEnsemble,
     *,
     observed_trajectories: Iterable[Sequence[Coordinate]] | None = None,
-) -> RolloutDistributionData:
+) -> RolloutSummary:
     """Summarize physical routes using physical steps as trajectory length."""
 
     task = ensemble.task
@@ -1704,23 +1718,23 @@ def summarize_rollouts(
             observed_steps,
             observed_self_transitions,
         ) = _route_counts(task.maze, observed)
-    return RolloutDistributionData(
+    return RolloutSummary(
         maze=task.maze,
         start=ensemble.start,
         goal=task.goal,
         directed_edge_mean=edges,
         occupancy_mean=occupancy,
-        all_physical_steps=all_steps,
-        successful_physical_steps=successful_steps,
-        shortest_physical_steps=shortest,
-        excess_physical_steps=excess,
+        steps=all_steps,
+        successful_steps=successful_steps,
+        shortest_steps=shortest,
+        excess_steps=excess,
         completion_rate=float(successful_steps.size / len(ensemble.rollouts)),
         status_counts=status_counts,
-        physical_step_quantiles=quantiles,
+        step_quantiles=quantiles,
         mean_self_transitions=self_transitions,
         observed_directed_edge_mean=observed_edges,
         observed_occupancy_mean=observed_occupancy,
-        observed_physical_steps=observed_steps,
+        observed_steps=observed_steps,
         observed_mean_self_transitions=observed_self_transitions,
     )
 
@@ -1738,11 +1752,11 @@ def _latent_sequence(rollout: Rollout) -> tuple[str, ...]:
     return tuple(sequence)
 
 
-def summarize_rollout_subgoal_sequences(
+def summarize_routes(
     ensemble: RolloutEnsemble,
     *,
     top_n: int = 10,
-) -> LatentRouteData:
+) -> RouteSummary:
     """Summarize entered subgoals, termination decisions, and outcomes."""
 
     if (
@@ -1755,7 +1769,7 @@ def summarize_rollout_subgoal_sequences(
     token_set = {token for sequence in sequences for token in sequence}
     preferred = ["START"]
     preferred.extend(
-        f"SG{index + 1}" for index in range(ensemble.task.number_of_subtasks)
+        f"SG{index + 1}" for index in range(ensemble.task.n_subtasks)
     )
     preferred.extend(["TERMINATE", "GOAL"])
     tokens = tuple(token for token in preferred if token in token_set) + tuple(
@@ -1775,7 +1789,7 @@ def summarize_rollout_subgoal_sequences(
         (sequence, count, count / len(sequences))
         for sequence, count in sequence_counts.most_common(int(top_n))
     )
-    return LatentRouteData(
+    return RouteSummary(
         tokens=tokens,
         transition_counts=counts,
         transition_probabilities=probabilities,

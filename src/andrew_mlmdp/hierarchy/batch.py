@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from andrew_mlmdp.dataset import MovementTrial
-from andrew_mlmdp.hierarchy.torch_likelihood import (
+from andrew_mlmdp.dataset import Trial
+from andrew_mlmdp.hierarchy.autodiff import (
     PINV_RCOND,
-    TorchHierarchyNumericalError,
-    _build_torch_hierarchy,
-    _composition_weights,
-    _policy_from_complete_desirability,
+    NumericalError,
+    _build_hierarchy,
+    _Hierarchy,
+    _lower_policy,
     _require_finite,
+    _shape_weights,
     _solve_first_exit,
-    _TorchHierarchy,
     _validated_parameter_values,
 )
 from andrew_mlmdp.maze import Coordinate
@@ -26,7 +26,7 @@ from andrew_mlmdp.maze import Coordinate
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-    from andrew_mlmdp.hierarchy.core import HierarchyTemplate
+    from andrew_mlmdp.hierarchy.model import Template
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ class _PreparedTrial:
 
 
 @dataclass(frozen=True)
-class PreparedHierarchicalLikelihoodBatch:
+class PreparedBatch:
     """Parameter-independent integer metadata reused across optimizer steps."""
 
     goals: tuple[_PreparedGoal, ...]
@@ -57,14 +57,14 @@ class PreparedHierarchicalLikelihoodBatch:
     closure_x_states: Tensor
     operator_closure_indices: Tensor
     operator_y_states: Tensor
-    number_of_shared_keys: int
-    number_of_closures: int
-    number_of_operators: int
+    n_shared: int
+    n_closures: int
+    n_operators: int
     has_impossible_trial: bool
 
 
 @dataclass
-class BatchLikelihoodDiagnostics:
+class BatchTimings:
     """Optional stage measurements for exact full-batch benchmarks."""
 
     stage_seconds: dict[str, float] = field(default_factory=dict)
@@ -76,12 +76,12 @@ class BatchLikelihoodDiagnostics:
         self.stage_seconds[name] = self.stage_seconds.get(name, 0.0) + elapsed
 
 
-def prepare_hierarchical_likelihood_batch(
-    template: "HierarchyTemplate",
-    trials: "Iterable[MovementTrial]",
+def prepare_batch(
+    template: "Template",
+    trials: "Iterable[Trial]",
     *,
     device: torch.device | None = None,
-) -> PreparedHierarchicalLikelihoodBatch:
+) -> PreparedBatch:
     """Collapse trajectories and build reusable context/operator indices."""
 
     materialized = tuple(trials)
@@ -197,16 +197,16 @@ def prepare_hierarchical_likelihood_batch(
             for current, following in departures
         )
         prepared_trials.append(_PreparedTrial(_long(indices, device), impossible))
-    return PreparedHierarchicalLikelihoodBatch(
+    return PreparedBatch(
         goals=tuple(goal_metadata),
         trials=tuple(prepared_trials),
         closure_shared_indices=_long(global_shared_indices, device),
         closure_x_states=_long(global_x_states, device),
         operator_closure_indices=_long(operator_closure_indices, device),
         operator_y_states=_long(operator_y_states, device),
-        number_of_shared_keys=shared_offset,
-        number_of_closures=closure_offset,
-        number_of_operators=len(operator_closure_indices),
+        n_shared=shared_offset,
+        n_closures=closure_offset,
+        n_operators=len(operator_closure_indices),
         has_impossible_trial=any(trial.impossible for trial in prepared_trials),
     )
 
@@ -215,12 +215,12 @@ def _long(values, device: torch.device) -> Tensor:
     return torch.tensor(tuple(values), dtype=torch.long, device=device)
 
 
-def total_prepared_hierarchical_log_likelihood_torch(
-    template: "HierarchyTemplate",
-    prepared: PreparedHierarchicalLikelihoodBatch,
+def total_prepared_log_likelihood(
+    template: "Template",
+    prepared: PreparedBatch,
     *,
     parameter_values: "Mapping[str, Tensor]",
-    diagnostics: BatchLikelihoodDiagnostics | None = None,
+    diagnostics: BatchTimings | None = None,
 ) -> Tensor:
     """Evaluate a prepared exact batch with graph-local differentiable banks."""
 
@@ -241,7 +241,7 @@ def total_prepared_hierarchical_log_likelihood_torch(
         return zero
 
     started = perf_counter()
-    number_of_subtasks = template.basis.number_of_subgoals
+    n_subtasks = template.basis.n_subgoals
     boundary = torch.tensor(
         template.task_library.boundary_desirability,
         dtype=torch.float64,
@@ -254,7 +254,7 @@ def total_prepared_hierarchical_log_likelihood_torch(
     initial_banks = []
     for goal_metadata in prepared.goals:
         started = perf_counter()
-        model = _build_torch_hierarchy(
+        model = _build_hierarchy(
             template,
             goal_metadata.goal,
             values,
@@ -309,7 +309,7 @@ def total_prepared_hierarchical_log_likelihood_torch(
 
     started = perf_counter()
     closure_indices = torch.arange(
-        prepared.number_of_closures,
+        prepared.n_closures,
         dtype=torch.long,
         device=device,
     )
@@ -338,10 +338,10 @@ def total_prepared_hierarchical_log_likelihood_torch(
 
     started = perf_counter()
     total = zero
-    number_of_modes = number_of_subtasks + 2
+    n_modes = n_subtasks + 2
     initial_forward = torch.nn.functional.one_hot(
         torch.tensor(0, device=device),
-        num_classes=number_of_modes,
+        num_classes=n_modes,
     ).to(dtype=torch.float64)
     for trial in prepared.trials:
         if trial.impossible:
@@ -352,7 +352,7 @@ def total_prepared_hierarchical_log_likelihood_torch(
             next_forward = operators[operator_index] @ forward
             _require_finite(next_forward)
             if bool(torch.any(next_forward < -1e-12)):
-                raise TorchHierarchyNumericalError(
+                raise NumericalError(
                     "First-departure operator produced negative probability mass"
                 )
             next_forward = torch.clamp_min(next_forward, 0.0)
@@ -367,7 +367,7 @@ def total_prepared_hierarchical_log_likelihood_torch(
 
 
 def _record(
-    diagnostics: BatchLikelihoodDiagnostics | None,
+    diagnostics: BatchTimings | None,
     name: str,
     started: float,
 ) -> None:
@@ -376,7 +376,7 @@ def _record(
 
 
 def _plan_policy_bank(
-    model: _TorchHierarchy,
+    model: _Hierarchy,
     passive: Tensor,
     controlled: Tensor,
     boundary_pinv: Tensor,
@@ -384,7 +384,7 @@ def _plan_policy_bank(
     values = model.parameter_values
     inpainted = values["beta"] * (controlled - passive)
     target = torch.exp(inpainted / values["lower_control_cost"])
-    weights = _composition_weights(
+    weights = _shape_weights(
         torch.clamp_min(target @ boundary_pinv.T, 0.0),
         exponent=model.template.composition_exponent,
         mode=model.template.composition_mode,
@@ -397,21 +397,21 @@ def _plan_policy_bank(
 
 
 def _continuation_policy_bank(
-    model: _TorchHierarchy,
+    model: _Hierarchy,
     boundary_pinv: Tensor,
 ) -> Tensor:
-    number_of_subtasks = model.number_of_subtasks
-    passive = model.upper_dynamics.passive[:, :number_of_subtasks].T
-    controlled = model.upper_controlled[:, :number_of_subtasks].T
+    n_subtasks = model.n_subtasks
+    passive = model.upper_dynamics.passive[:, :n_subtasks].T
+    controlled = model.upper_controlled[:, :n_subtasks].T
     return _plan_policy_bank(model, passive, controlled, boundary_pinv)
 
 
 def _initial_policy_bank(
-    model: _TorchHierarchy,
+    model: _Hierarchy,
     metadata: _PreparedGoal,
     boundary_pinv: Tensor,
 ) -> Tensor:
-    passive_from_physical = model.first_hit_probabilities[
+    passive_from_physical = model.first_hit[
         :, metadata.start_interior
     ].T
     controlled_from_physical = passive_from_physical * model.upper_desirability
@@ -431,8 +431,8 @@ def _initial_policy_bank(
     return _plan_policy_bank(model, passive, controlled, boundary_pinv)
 
 
-def _goal_only_policy(model: _TorchHierarchy) -> Tensor:
-    number_of_boundaries = model.number_of_subtasks + 1
+def _goal_only_policy(model: _Hierarchy) -> Tensor:
+    n_boundaries = model.n_subtasks + 1
     goal_desirability = torch.exp(
         model.parameter_values["goal_reward"]
         / model.parameter_values["lower_control_cost"]
@@ -440,7 +440,7 @@ def _goal_only_policy(model: _TorchHierarchy) -> Tensor:
     boundary = torch.cat(
         (
             torch.zeros(
-                number_of_boundaries - 1,
+                n_boundaries - 1,
                 dtype=model.dtype,
                 device=model.device,
             ),
@@ -452,7 +452,7 @@ def _goal_only_policy(model: _TorchHierarchy) -> Tensor:
         / model.parameter_values["lower_control_cost"]
     )
     interior = _solve_first_exit(model.lower_dynamics, boundary, q_interior)
-    _, controlled = _policy_from_complete_desirability(
+    _, controlled = _lower_policy(
         model,
         interior,
         boundary,
@@ -460,11 +460,11 @@ def _goal_only_policy(model: _TorchHierarchy) -> Tensor:
     return controlled
 
 
-def _physical_projection(model: _TorchHierarchy) -> Tensor:
-    number_of_rows = model.lower_dynamics.passive.shape[0]
-    number_of_states = len(model.template.maze.free_cells)
+def _physical_projection(model: _Hierarchy) -> Tensor:
+    n_rows = model.lower_dynamics.passive.shape[0]
+    n_states = len(model.template.maze.free_cells)
     projection = torch.zeros(
-        (number_of_rows, number_of_states),
+        (n_rows, n_states),
         dtype=model.dtype,
         device=model.device,
     )
@@ -485,41 +485,41 @@ def _suppressed_physical(probabilities: Tensor, projection: Tensor) -> Tensor:
 
 
 def _shared_column_bank(
-    model: _TorchHierarchy,
+    model: _Hierarchy,
     metadata: _PreparedGoal,
     continuation_policies: Tensor,
     goal_policy: Tensor,
     projection: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    number_of_subtasks = model.number_of_subtasks
-    number_of_modes = number_of_subtasks + 2
-    number_of_interior = len(model.interior_states)
-    number_of_x = len(metadata.shared_x_states)
+    n_subtasks = model.n_subtasks
+    n_modes = n_subtasks + 2
+    n_interior = len(model.interior_states)
+    n_x = len(metadata.shared_x_states)
 
     source_probabilities = continuation_policies[
         :, :, metadata.shared_x_interior
     ].permute(2, 0, 1)
     direct = source_probabilities @ projection
     access = source_probabilities[
-        :, :, number_of_interior : number_of_interior + number_of_subtasks
+        :, :, n_interior : n_interior + n_subtasks
     ]
     if model.template.basis.locations is None:
         access_interior = metadata.shared_x_interior[:, None].expand(
-            -1, number_of_subtasks
+            -1, n_subtasks
         )
     else:
         point_interior = torch.tensor(
             [
-                model.interior_state_by_coordinate[coordinate]
+                model.interior_index[coordinate]
                 for coordinate in model.template.basis.locations
             ],
             dtype=torch.long,
             device=model.device,
         )
-        access_interior = point_interior.unsqueeze(0).expand(number_of_x, -1)
+        access_interior = point_interior.unsqueeze(0).expand(n_x, -1)
     subtask_indices = torch.arange(
-        number_of_subtasks, dtype=torch.long, device=model.device
-    ).unsqueeze(0).expand(number_of_x, -1)
+        n_subtasks, dtype=torch.long, device=model.device
+    ).unsqueeze(0).expand(n_x, -1)
     continuation_after_access = continuation_policies[
         subtask_indices, :, access_interior
     ]
@@ -529,7 +529,7 @@ def _shared_column_bank(
     goal_after_access = goal_policy[:, access_interior].permute(1, 2, 0)
     goal_after_access = _suppressed_physical(goal_after_access, projection)
 
-    termination = model.upper_controlled[-1, :number_of_subtasks]
+    termination = model.upper_controlled[-1, :n_subtasks]
     continuation = torch.einsum(
         "xqj,xjn,j->xnjq",
         access,
@@ -537,7 +537,7 @@ def _shared_column_bank(
         1.0 - termination,
     )
     source_identity = torch.eye(
-        number_of_subtasks, dtype=model.dtype, device=model.device
+        n_subtasks, dtype=model.dtype, device=model.device
     )
     continuation = continuation + torch.einsum(
         "xqn,jq->xnjq", direct, source_identity
@@ -548,7 +548,7 @@ def _shared_column_bank(
     enabled = torch.cat(
         (
             torch.zeros(
-                (number_of_x, direct.shape[-1], 1, number_of_subtasks),
+                (n_x, direct.shape[-1], 1, n_subtasks),
                 dtype=model.dtype,
                 device=model.device,
             ),
@@ -560,7 +560,7 @@ def _shared_column_bank(
     goal_at_x = goal_policy[:, metadata.shared_x_interior].T
     goal_at_x = _suppressed_physical(goal_at_x, projection)
     goal_source = torch.zeros(
-        (number_of_x, direct.shape[-1], number_of_modes),
+        (n_x, direct.shape[-1], n_modes),
         dtype=model.dtype,
         device=model.device,
     )
@@ -570,15 +570,15 @@ def _shared_column_bank(
 
 
 def _initial_column_bank(
-    model: _TorchHierarchy,
+    model: _Hierarchy,
     metadata: _PreparedGoal,
     initial_policies: Tensor,
     continuation_after_access: Tensor,
     goal_after_access: Tensor,
     projection: Tensor,
 ) -> Tensor:
-    number_of_subtasks = model.number_of_subtasks
-    number_of_interior = len(model.interior_states)
+    n_subtasks = model.n_subtasks
+    n_interior = len(model.interior_states)
     probabilities = initial_policies[
         metadata.closure_start_indices,
         :,
@@ -586,13 +586,13 @@ def _initial_column_bank(
     ]
     direct = probabilities @ projection
     access = probabilities[
-        :, number_of_interior : number_of_interior + number_of_subtasks
+        :, n_interior : n_interior + n_subtasks
     ]
     continuation_physical = continuation_after_access[
         metadata.closure_shared_indices
     ]
     goal_physical = goal_after_access[metadata.closure_shared_indices]
-    termination = model.upper_controlled[-1, :number_of_subtasks]
+    termination = model.upper_controlled[-1, :n_subtasks]
     continuation = torch.einsum(
         "cj,cjn,j->cnj",
         access,
@@ -606,9 +606,9 @@ def _initial_column_bank(
 
 
 def _batched_departure_closures(self_kernels: Tensor) -> Tensor:
-    number_of_modes = self_kernels.shape[-1]
+    n_modes = self_kernels.shape[-1]
     identity = torch.eye(
-        number_of_modes,
+        n_modes,
         dtype=self_kernels.dtype,
         device=self_kernels.device,
     )
@@ -619,7 +619,7 @@ def _batched_departure_closures(self_kernels: Tensor) -> Tensor:
             identity.expand(self_kernels.shape[0], -1, -1),
         )
     except RuntimeError as error:
-        raise TorchHierarchyNumericalError(
+        raise NumericalError(
             "Hierarchy batched first-departure systems could not be solved"
         ) from error
     _require_finite(result)

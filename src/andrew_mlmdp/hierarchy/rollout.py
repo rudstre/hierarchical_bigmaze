@@ -5,15 +5,15 @@ from typing import Literal
 
 import numpy as np
 
-from andrew_mlmdp.hierarchy.core import (
-    HierarchyTask,
-    LayerOnePlan,
+from andrew_mlmdp.hierarchy.model import (
+    Plan,
+    Task,
     _goal_only_plan,
-    _layer_one_plan,
-    _plan_with_goal_desirability,
-    _validated_goal_desirability,
+    _goal_plan,
+    _plan_from_weights,
+    _validate_goal_desirability,
 )
-from andrew_mlmdp.lmdp import z_iteration_step
+from andrew_mlmdp.lmdp import desirability_step
 from andrew_mlmdp.maze import Coordinate
 
 
@@ -67,12 +67,12 @@ class RolloutEvent:
     event: str
     coordinate: Coordinate
     trajectory: tuple[Coordinate, ...]
-    plan: LayerOnePlan | None
+    plan: Plan | None
     entered_state: int | None
     physical_steps: int
     abstract_accesses: int
-    passive_access_probability: float | None
-    controlled_access_probability: float | None
+    passive_access: float | None
+    policy_access: float | None
     refractory: bool
     goal_desirability: np.ndarray | None = None
     z_iterations: int = 0
@@ -91,7 +91,7 @@ class _EngineResult:
     goal_desirability_history: list[np.ndarray] | None = None
     z_iterations: int = 0
 def _rollout_from_engine(
-    model: HierarchyTask,
+    model: Task,
     result: _EngineResult,
     goal_learning: Literal["exact", "online"],
 ) -> Rollout:
@@ -130,10 +130,10 @@ def _rollout_from_engine(
 
 
 def _rollout_columns(
-    plans: tuple[LayerOnePlan, ...],
+    plans: tuple[Plan, ...],
     current_interiors: np.ndarray,
-    number_of_interior: int,
-    number_of_subtasks: int,
+    n_interior: int,
+    n_subtasks: int,
     *,
     suppress_access: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -144,13 +144,13 @@ def _rollout_columns(
         raise ValueError("Each rollout plan requires one current interior state")
     probabilities = np.column_stack(
         [
-            plan.layer_one_controlled[:, current_index]
+            plan.lower_policy[:, current_index]
             for plan, current_index in zip(plans, current_indices)
         ]
     )
     if suppress_access:
         probabilities[
-            number_of_interior : number_of_interior + number_of_subtasks,
+            n_interior : n_interior + n_subtasks,
             :,
         ] = 0.0
     probability_mass = probabilities.sum(axis=0)
@@ -165,10 +165,10 @@ def _rollout_columns(
 
 
 def _rollout_column(
-    plan: LayerOnePlan,
+    plan: Plan,
     current_interior: int,
-    number_of_interior: int,
-    number_of_subtasks: int,
+    n_interior: int,
+    n_subtasks: int,
     *,
     suppress_access: bool,
 ) -> np.ndarray | None:
@@ -177,8 +177,8 @@ def _rollout_column(
     probabilities, usable = _rollout_columns(
         (plan,),
         np.asarray([current_interior]),
-        number_of_interior,
-        number_of_subtasks,
+        n_interior,
+        n_subtasks,
         suppress_access=suppress_access,
     )
     if not usable[0]:
@@ -186,8 +186,8 @@ def _rollout_column(
     return probabilities[:, 0]
 
 
-def _run_hierarchical_rollout(
-    model: HierarchyTask,
+def _run_rollout(
+    model: Task,
     start: Coordinate,
     *,
     beta: float | None,
@@ -219,7 +219,7 @@ def _run_hierarchical_rollout(
                 dtype=np.float64,
             )
         else:
-            goal_desirability = _validated_goal_desirability(
+            goal_desirability = _validate_goal_desirability(
                 model,
                 initial_goal_desirability,
             ).copy()
@@ -231,7 +231,7 @@ def _run_hierarchical_rollout(
             / model.parameters.lower_control_cost.item()
         )
         goal_boundary = np.zeros(
-            model.lower_dynamics.number_of_boundary_states,
+            model.lower_dynamics.n_boundary,
             dtype=np.float64,
         )
         goal_boundary[-1] = np.exp(
@@ -257,8 +257,8 @@ def _run_hierarchical_rollout(
             entered_state=None,
             physical_steps=0,
             abstract_accesses=0,
-            passive_access_probability=None,
-            controlled_access_probability=None,
+            passive_access=None,
+            policy_access=None,
             refractory=False,
             goal_desirability=(
                 None
@@ -282,7 +282,7 @@ def _run_hierarchical_rollout(
     trajectory = [start]
     upper_transitions: list[_UpperTransition] = []
     current = start
-    current_plan = _layer_one_plan(
+    current_plan = _plan_from_weights(
         model,
         current,
         beta=beta,
@@ -302,8 +302,8 @@ def _run_hierarchical_rollout(
             entered_state=None,
             physical_steps=0,
             abstract_accesses=0,
-            passive_access_probability=None,
-            controlled_access_probability=None,
+            passive_access=None,
+            policy_access=None,
             refractory=False,
             goal_desirability=(
                 None
@@ -328,8 +328,8 @@ def _run_hierarchical_rollout(
                     entered_state=None,
                     physical_steps=physical_steps,
                     abstract_accesses=len(upper_transitions),
-                    passive_access_probability=None,
-                    controlled_access_probability=None,
+                    passive_access=None,
+                    policy_access=None,
                     refractory=refractory or hierarchy_disabled,
                     goal_desirability=(
                         None
@@ -357,14 +357,14 @@ def _run_hierarchical_rollout(
         )
 
     while physical_steps < max_steps:
-        current_state = model.interior_state_by_coordinate[current]
-        number_of_interior = len(model.interior_states)
-        number_of_subtasks = model.number_of_subtasks
+        current_state = model.interior_index[current]
+        n_interior = len(model.interior_states)
+        n_subtasks = model.n_subtasks
         probabilities = _rollout_column(
             current_plan,
             current_state,
-            number_of_interior,
-            number_of_subtasks,
+            n_interior,
+            n_subtasks,
             suppress_access=refractory or hierarchy_disabled,
         )
         if probabilities is None:
@@ -373,7 +373,7 @@ def _run_hierarchical_rollout(
             random_generator.choice(len(probabilities), p=probabilities)
         )
 
-        if next_state < number_of_interior:
+        if next_state < n_interior:
             physical_state = int(model.interior_states[next_state])
             current = model.maze.coordinate(physical_state)
             trajectory.append(current)
@@ -387,7 +387,7 @@ def _run_hierarchical_rollout(
                 assert goal_history is not None
                 assert z_sweeps_per_step is not None
                 for _ in range(z_sweeps_per_step):
-                    goal_desirability = z_iteration_step(
+                    goal_desirability = desirability_step(
                         model.lower_dynamics,
                         goal_desirability,
                         goal_boundary,
@@ -395,7 +395,7 @@ def _run_hierarchical_rollout(
                     )
                     z_iterations += 1
                 goal_history.append(goal_desirability.copy())
-                current_plan = _plan_with_goal_desirability(
+                current_plan = _goal_plan(
                     model,
                     current_plan,
                     goal_desirability,
@@ -410,8 +410,8 @@ def _run_hierarchical_rollout(
                     entered_state=None,
                     physical_steps=physical_steps,
                     abstract_accesses=len(upper_transitions),
-                    passive_access_probability=None,
-                    controlled_access_probability=None,
+                    passive_access=None,
+                    policy_access=None,
                     refractory=hierarchy_disabled,
                     goal_desirability=(
                         None
@@ -423,8 +423,8 @@ def _run_hierarchical_rollout(
             )
             continue
 
-        boundary_state = next_state - number_of_interior
-        if boundary_state == number_of_subtasks:
+        boundary_state = next_state - n_interior
+        if boundary_state == n_subtasks:
             current = model.goal
             trajectory.append(current)
             physical_steps += 1
@@ -437,8 +437,8 @@ def _run_hierarchical_rollout(
                     entered_state=None,
                     physical_steps=physical_steps,
                     abstract_accesses=len(upper_transitions),
-                    passive_access_probability=None,
-                    controlled_access_probability=None,
+                    passive_access=None,
+                    policy_access=None,
                     refractory=hierarchy_disabled,
                     goal_desirability=(
                         None
@@ -464,8 +464,8 @@ def _run_hierarchical_rollout(
             ]
         )
         controlled_access = float(
-            current_plan.layer_one_controlled[
-                number_of_interior + entered_state,
+            current_plan.lower_policy[
+                n_interior + entered_state,
                 current_state,
             ]
         )
@@ -479,8 +479,8 @@ def _run_hierarchical_rollout(
                 entered_state=entered_state,
                 physical_steps=physical_steps,
                 abstract_accesses=next_access_count,
-                passive_access_probability=passive_access,
-                controlled_access_probability=controlled_access,
+                passive_access=passive_access,
+                policy_access=controlled_access,
                 refractory=False,
                 goal_desirability=(
                     None
@@ -509,11 +509,11 @@ def _run_hierarchical_rollout(
             current_plan = _goal_only_plan(
                 model,
                 current,
-                goal_interior_desirability=goal_desirability,
+                goal_desirability=goal_desirability,
             )
             event_name = "upper_termination"
         else:
-            current_plan = _layer_one_plan(
+            current_plan = _plan_from_weights(
                 model,
                 current,
                 upper_state=entered_state,
@@ -531,8 +531,8 @@ def _run_hierarchical_rollout(
                 entered_state=entered_state,
                 physical_steps=physical_steps,
                 abstract_accesses=len(upper_transitions),
-                passive_access_probability=passive_access,
-                controlled_access_probability=controlled_access,
+                passive_access=passive_access,
+                policy_access=controlled_access,
                 refractory=True,
                 goal_desirability=(
                     None

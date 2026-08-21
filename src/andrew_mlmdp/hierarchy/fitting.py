@@ -12,19 +12,19 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as functional
 
-from andrew_mlmdp.dataset import MovementTrial
-from andrew_mlmdp.hierarchy.torch_batch_likelihood import (
-    prepare_hierarchical_likelihood_batch,
-    total_prepared_hierarchical_log_likelihood_torch,
+from andrew_mlmdp.dataset import Trial
+from andrew_mlmdp.hierarchy.autodiff import (
+    NumericalError,
+    parameter_values,
+    required_parameters,
 )
-from andrew_mlmdp.hierarchy.torch_likelihood import (
-    TorchHierarchyNumericalError,
-    hierarchical_parameter_values,
-    required_hierarchical_parameter_names,
+from andrew_mlmdp.hierarchy.batch import (
+    prepare_batch,
+    total_prepared_log_likelihood,
 )
 
 if TYPE_CHECKING:
-    from andrew_mlmdp.hierarchy.core import HierarchyTemplate
+    from andrew_mlmdp.hierarchy.model import Template
 
 
 DOMAIN_EPS = torch.finfo(torch.float64).eps
@@ -49,7 +49,7 @@ _POSITIVE_PARAMETER_NAMES = {
 
 
 @dataclass(frozen=True)
-class FittedParameterValues(Mapping[str, Tensor]):
+class ParameterValues(Mapping[str, Tensor]):
     """Immutable CPU float64 snapshot of physical parameter values."""
 
     _items: tuple[tuple[str, float], ...]
@@ -71,14 +71,14 @@ class FittedParameterValues(Mapping[str, Tensor]):
 
 
 @dataclass(frozen=True)
-class HierarchicalFitEvaluation:
+class FitStep:
     """Diagnostics aligned to one evaluated raw parameter state."""
 
     evaluation: int
-    updates_completed: int
-    learning_rate: float
+    updates: int
+    lr: float
     loss: float
-    total_log_likelihood: float
+    log_likelihood: float
     best_loss: float | None
     parameter_values: Mapping[str, float]
     gradients: Mapping[str, float]
@@ -86,56 +86,56 @@ class HierarchicalFitEvaluation:
 
 
 @dataclass(frozen=True)
-class HierarchicalFitResult:
+class FitResult:
     """Immutable outcome and diagnostics from hierarchical MLE fitting."""
 
-    parameter_names: tuple[str, ...]
-    initial_parameter_values: FittedParameterValues
-    best_parameter_values: FittedParameterValues | None
-    last_parameter_values: FittedParameterValues
-    history: tuple[HierarchicalFitEvaluation, ...]
-    updates_completed: int
+    names: tuple[str, ...]
+    initial_values: ParameterValues
+    best_values: ParameterValues | None
+    last_values: ParameterValues
+    history: tuple[FitStep, ...]
+    updates: int
     converged: bool
-    termination_reason: str
+    reason: str
 
     @property
     def loss_history(self) -> tuple[float, ...]:
         return tuple(evaluation.loss for evaluation in self.history)
 
     @property
-    def total_log_likelihood_history(self) -> tuple[float, ...]:
-        return tuple(evaluation.total_log_likelihood for evaluation in self.history)
+    def log_likelihood_history(self) -> tuple[float, ...]:
+        return tuple(evaluation.log_likelihood for evaluation in self.history)
 
     @property
     def gradient_norm_history(self) -> tuple[float, ...]:
         return tuple(evaluation.gradient_norm for evaluation in self.history)
 
     @property
-    def learning_rate_history(self) -> tuple[float, ...]:
-        return tuple(evaluation.learning_rate for evaluation in self.history)
+    def lr_history(self) -> tuple[float, ...]:
+        return tuple(evaluation.lr for evaluation in self.history)
 
 
-class _RawFittingParameters(nn.Module):
+class _RawParameters(nn.Module):
     def __init__(
         self,
         initial_values: Mapping[str, Tensor],
-        parameter_names: tuple[str, ...],
+        names: tuple[str, ...],
         *,
-        core_threshold_maximum: float | None,
+        threshold_max: float | None,
     ) -> None:
         super().__init__()
-        self.parameter_names = parameter_names
-        self.core_threshold_maximum = core_threshold_maximum
+        self.names = names
+        self.threshold_max = threshold_max
         self.raw = nn.ParameterDict(
             {
                 name: nn.Parameter(
                     _inverse_transform(
                         name,
                         initial_values[name],
-                        core_threshold_maximum=core_threshold_maximum,
+                        threshold_max=threshold_max,
                     )
                 )
-                for name in parameter_names
+                for name in names
             }
         )
 
@@ -144,39 +144,39 @@ class _RawFittingParameters(nn.Module):
         frozen_values: Mapping[str, Tensor],
     ) -> dict[str, Tensor]:
         values = dict(frozen_values)
-        for name in self.parameter_names:
+        for name in self.names:
             values[name] = _physical_transform(
                 name,
                 self.raw[name],
-                core_threshold_maximum=self.core_threshold_maximum,
+                threshold_max=self.threshold_max,
             )
         return values
 
     def clone_raw_state(self) -> dict[str, Tensor]:
-        return {name: self.raw[name].detach().clone() for name in self.parameter_names}
+        return {name: self.raw[name].detach().clone() for name in self.names}
 
     def restore_raw_state(self, state: Mapping[str, Tensor]) -> None:
         with torch.no_grad():
-            for name in self.parameter_names:
+            for name in self.names:
                 self.raw[name].copy_(state[name])
 
 
-def fit_hierarchical_model_parameters(
-    template: "HierarchyTemplate",
-    trials: Iterable[MovementTrial],
+def fit_parameters(
+    template: "Template",
+    trials: Iterable[Trial],
     *,
-    parameter_names: Sequence[str],
-    learning_rate: float = 5e-2,
+    names: Sequence[str],
+    lr: float = 5e-2,
     max_steps: int = 1000,
-    relative_tolerance: float = 1e-8,
-    scheduler_relative_threshold: float | None = None,
-    convergence_relative_threshold: float | None = None,
+    tolerance: float = 1e-8,
+    scheduler_tolerance: float | None = None,
+    convergence_tolerance: float | None = None,
     patience: int = 20,
-    learning_rate_decay_factor: float = 0.3,
-    learning_rate_decay_patience: int = 7,
-    minimum_learning_rate: float = 1e-5,
-    progress_callback: Callable[[HierarchicalFitEvaluation], None] | None = None,
-) -> HierarchicalFitResult:
+    lr_decay: float = 0.3,
+    lr_patience: int = 7,
+    min_lr: float = 1e-5,
+    callback: Callable[[FitStep], None] | None = None,
+) -> FitResult:
     """Fit selected parameters without mutating model objects or caches."""
 
     materialized_trials = tuple(trials)
@@ -192,15 +192,15 @@ def fit_hierarchical_model_parameters(
         )
     if not materialized_trials:
         raise ValueError("Fitting requires at least one trial")
-    selected = tuple(parameter_names)
+    selected = tuple(names)
     if not selected:
         raise ValueError("At least one parameter name must be selected")
     if len(set(selected)) != len(selected):
-        raise ValueError("parameter_names must not contain duplicates")
+        raise ValueError("names must not contain duplicates")
     unknown = set(selected) - _ALL_PARAMETER_NAMES
     if unknown:
         raise ValueError("Unknown parameter names: " + ", ".join(sorted(unknown)))
-    inactive = set(selected) - set(required_hierarchical_parameter_names(template))
+    inactive = set(selected) - set(required_parameters(template))
     if inactive:
         raise ValueError(
             "Inactive gate parameters cannot be fitted: " + ", ".join(sorted(inactive))
@@ -217,114 +217,116 @@ def fit_hierarchical_model_parameters(
         or patience < 1
     ):
         raise ValueError("patience must be a positive integer")
-    if not np.isfinite(learning_rate) or learning_rate <= 0.0:
-        raise ValueError("learning_rate must be finite and positive")
-    if not np.isfinite(relative_tolerance) or relative_tolerance < 0.0:
-        raise ValueError("relative_tolerance must be finite and non-negative")
-    scheduler_relative_threshold = _resolved_relative_threshold(
-        "scheduler_relative_threshold",
-        scheduler_relative_threshold,
-        fallback=relative_tolerance,
+    if not np.isfinite(lr) or lr <= 0.0:
+        raise ValueError("lr must be finite and positive")
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("tolerance must be finite and non-negative")
+    scheduler_tolerance = _resolve_tolerance(
+        "scheduler_tolerance",
+        scheduler_tolerance,
+        fallback=tolerance,
     )
-    convergence_relative_threshold = _resolved_relative_threshold(
-        "convergence_relative_threshold",
-        convergence_relative_threshold,
-        fallback=relative_tolerance,
+    convergence_tolerance = _resolve_tolerance(
+        "convergence_tolerance",
+        convergence_tolerance,
+        fallback=tolerance,
     )
     if (
-        not np.isfinite(learning_rate_decay_factor)
-        or not 0.0 < learning_rate_decay_factor < 1.0
+        not np.isfinite(lr_decay)
+        or not 0.0 < lr_decay < 1.0
     ):
-        raise ValueError("learning_rate_decay_factor must be finite and in (0, 1)")
+        raise ValueError("lr_decay must be finite and in (0, 1)")
     if (
-        isinstance(learning_rate_decay_patience, (bool, np.bool_))
-        or not isinstance(learning_rate_decay_patience, (int, np.integer))
-        or learning_rate_decay_patience < 0
+        isinstance(lr_patience, (bool, np.bool_))
+        or not isinstance(lr_patience, (int, np.integer))
+        or lr_patience < 0
     ):
-        raise ValueError("learning_rate_decay_patience must be a non-negative integer")
+        raise ValueError("lr_patience must be a non-negative integer")
     if (
-        not np.isfinite(minimum_learning_rate)
-        or minimum_learning_rate <= 0.0
-        or minimum_learning_rate > learning_rate
+        not np.isfinite(min_lr)
+        or min_lr <= 0.0
+        or min_lr > lr
     ):
         raise ValueError(
-            "minimum_learning_rate must be finite, positive, and no greater "
-            "than learning_rate"
+            "min_lr must be finite, positive, and no greater "
+            "than lr"
         )
 
-    initial_values = hierarchical_parameter_values(template)
-    core_threshold_maximum = None
-    if "core_threshold" in required_hierarchical_parameter_names(template):
+    # Prepare reusable trial structure before entering the optimizer loop.
+    initial_values = parameter_values(template)
+    threshold_max = None
+    if "core_threshold" in required_parameters(template):
         goals = tuple(dict.fromkeys(trial.goal for trial in materialized_trials))
-        domain = template.validate_core_threshold_for_goals(
+        domain = template.validate_threshold(
             initial_values["core_threshold"],
             goals,
         )
-        core_threshold_maximum = domain.maximum
-    prepared_trials = prepare_hierarchical_likelihood_batch(
+        threshold_max = domain.maximum
+    prepared_trials = prepare_batch(
         template, materialized_trials
     )
-    raw_parameters = _RawFittingParameters(
+    raw_parameters = _RawParameters(
         initial_values,
         selected,
-        core_threshold_maximum=core_threshold_maximum,
+        threshold_max=threshold_max,
     )
-    optimizer = _adam_optimizer(raw_parameters, learning_rate)
+    optimizer = _adam_optimizer(raw_parameters, lr)
     scheduler = _plateau_scheduler(
         optimizer,
-        factor=learning_rate_decay_factor,
-        patience=learning_rate_decay_patience,
-        relative_threshold=scheduler_relative_threshold,
-        minimum_learning_rate=minimum_learning_rate,
+        factor=lr_decay,
+        patience=lr_patience,
+        relative_threshold=scheduler_tolerance,
+        min_lr=min_lr,
     )
     initial_snapshot = _snapshot(initial_values)
-    history: list[HierarchicalFitEvaluation] = []
+    history: list[FitStep] = []
     best_loss: float | None = None
     best_raw_state: dict[str, Tensor] | None = None
-    checkpoint_best_loss: float | None = None
-    without_meaningful_improvement = 0
-    convergence_at_minimum_learning_rate = False
-    updates_completed = 0
+    stage_best_loss: float | None = None
+    stale_steps = 0
+    at_final_rate = False
+    updates = 0
     converged = False
-    termination_reason = "max_steps"
+    reason = "max_steps"
     last_values = initial_values
 
+    # One loop iteration evaluates a state, records it, then optionally updates.
     while True:
-        current_learning_rate = float(optimizer.param_groups[0]["lr"])
+        learning_rate_now = float(optimizer.param_groups[0]["lr"])
         optimizer.zero_grad()
         current_values = raw_parameters.physical_values(initial_values)
         last_values = current_values
         try:
-            total_log_likelihood = total_prepared_hierarchical_log_likelihood_torch(
+            log_likelihood = total_prepared_log_likelihood(
                 template,
                 prepared_trials,
                 parameter_values=current_values,
             )
-        except TorchHierarchyNumericalError:
-            termination_reason = "numerical_failure"
+        except NumericalError:
+            reason = "numerical_failure"
             break
-        loss = -total_log_likelihood
+        loss = -log_likelihood
         loss_value = float(loss.detach())
-        total_log_likelihood_value = float(total_log_likelihood.detach())
+        log_likelihood_value = float(log_likelihood.detach())
         current_float_values = _float_values(current_values)
 
         if not np.isfinite(loss_value):
             history.append(
                 _evaluation(
                     history,
-                    updates_completed,
-                    current_learning_rate,
+                    updates,
+                    learning_rate_now,
                     loss_value,
-                    total_log_likelihood_value,
+                    log_likelihood_value,
                     best_loss,
                     current_float_values,
                     {name: np.nan for name in selected},
                     np.nan,
                 )
             )
-            if progress_callback is not None:
-                progress_callback(history[-1])
-            termination_reason = "nonfinite_loss"
+            if callback is not None:
+                callback(history[-1])
+            reason = "nonfinite_loss"
             break
 
         # The evaluated loss belongs to this exact pre-step raw state.
@@ -335,7 +337,7 @@ def fit_hierarchical_model_parameters(
         try:
             loss.backward()
         except RuntimeError:
-            termination_reason = "numerical_failure"
+            reason = "numerical_failure"
             break
         gradients = {}
         squared_norm = 0.0
@@ -354,97 +356,98 @@ def fit_hierarchical_model_parameters(
         history.append(
             _evaluation(
                 history,
-                updates_completed,
-                current_learning_rate,
+                updates,
+                learning_rate_now,
                 loss_value,
-                total_log_likelihood_value,
+                log_likelihood_value,
                 best_loss,
                 current_float_values,
                 gradients,
                 gradient_norm,
             )
         )
-        if progress_callback is not None:
-            progress_callback(history[-1])
+        if callback is not None:
+            callback(history[-1])
         if not finite_gradients:
-            termination_reason = "nonfinite_gradient"
+            reason = "nonfinite_gradient"
             break
 
-        at_minimum_learning_rate = current_learning_rate <= minimum_learning_rate
-        if not at_minimum_learning_rate:
-            checkpoint_best_loss = best_loss
-            without_meaningful_improvement = 0
-            convergence_at_minimum_learning_rate = False
-        elif not convergence_at_minimum_learning_rate:
-            checkpoint_best_loss = best_loss
-            without_meaningful_improvement = 0
-            convergence_at_minimum_learning_rate = True
-        elif updates_completed > 0:
+        at_min_lr = learning_rate_now <= min_lr
+        if not at_min_lr:
+            stage_best_loss = best_loss
+            stale_steps = 0
+            at_final_rate = False
+        elif not at_final_rate:
+            stage_best_loss = best_loss
+            stale_steps = 0
+            at_final_rate = True
+        elif updates > 0:
             assert best_loss is not None
-            assert checkpoint_best_loss is not None
-            meaningful = convergence_relative_threshold * max(
+            assert stage_best_loss is not None
+            meaningful = convergence_tolerance * max(
                 1.0,
-                abs(checkpoint_best_loss),
+                abs(stage_best_loss),
             )
-            if checkpoint_best_loss - best_loss > meaningful:
-                checkpoint_best_loss = best_loss
-                without_meaningful_improvement = 0
+            if stage_best_loss - best_loss > meaningful:
+                stage_best_loss = best_loss
+                stale_steps = 0
             else:
-                without_meaningful_improvement += 1
-            if without_meaningful_improvement >= patience:
+                stale_steps += 1
+            if stale_steps >= patience:
                 converged = True
-                termination_reason = "patience"
+                reason = "patience"
                 break
 
-        if updates_completed >= max_steps:
-            termination_reason = "max_steps"
+        if updates >= max_steps:
+            reason = "max_steps"
             break
 
         optimizer.step()
-        updates_completed += 1
+        updates += 1
         scheduler.step(loss_value)
-        scheduled_learning_rate = float(optimizer.param_groups[0]["lr"])
-        if scheduled_learning_rate < current_learning_rate:
+        next_learning_rate = float(optimizer.param_groups[0]["lr"])
+        if next_learning_rate < learning_rate_now:
             # The triggering update belongs to the state evaluated before it, but
             # the scheduler changes the learning rate on the post-step optimizer.
             # Refine from the globally best aligned raw state with fresh Adam
             # moments and fresh stage-local scheduler bookkeeping.
             assert best_raw_state is not None
             raw_parameters.restore_raw_state(best_raw_state)
-            optimizer = _adam_optimizer(raw_parameters, scheduled_learning_rate)
+            optimizer = _adam_optimizer(raw_parameters, next_learning_rate)
             scheduler = _plateau_scheduler(
                 optimizer,
-                factor=learning_rate_decay_factor,
-                patience=learning_rate_decay_patience,
-                relative_threshold=scheduler_relative_threshold,
-                minimum_learning_rate=minimum_learning_rate,
+                factor=lr_decay,
+                patience=lr_patience,
+                relative_threshold=scheduler_tolerance,
+                min_lr=min_lr,
             )
-            checkpoint_best_loss = best_loss
-            without_meaningful_improvement = 0
-            convergence_at_minimum_learning_rate = False
+            stage_best_loss = best_loss
+            stale_steps = 0
+            at_final_rate = False
 
+    # Snapshots are detached so the result cannot retain the autograd graph.
     last_snapshot = _snapshot(last_values)
     best_snapshot = None
     if best_raw_state is not None:
         raw_parameters.restore_raw_state(best_raw_state)
         best_snapshot = _snapshot(raw_parameters.physical_values(initial_values))
-    return HierarchicalFitResult(
-        parameter_names=selected,
-        initial_parameter_values=initial_snapshot,
-        best_parameter_values=best_snapshot,
-        last_parameter_values=last_snapshot,
+    return FitResult(
+        names=selected,
+        initial_values=initial_snapshot,
+        best_values=best_snapshot,
+        last_values=last_snapshot,
         history=tuple(history),
-        updates_completed=updates_completed,
+        updates=updates,
         converged=converged,
-        termination_reason=termination_reason,
+        reason=reason,
     )
 
 
 def _adam_optimizer(
-    raw_parameters: _RawFittingParameters,
-    learning_rate: float,
+    raw_parameters: _RawParameters,
+    lr: float,
 ) -> torch.optim.Adam:
-    return torch.optim.Adam(raw_parameters.parameters(), lr=learning_rate)
+    return torch.optim.Adam(raw_parameters.parameters(), lr=lr)
 
 
 def _plateau_scheduler(
@@ -453,7 +456,7 @@ def _plateau_scheduler(
     factor: float,
     patience: int,
     relative_threshold: float,
-    minimum_learning_rate: float,
+    min_lr: float,
 ) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -462,11 +465,11 @@ def _plateau_scheduler(
         patience=patience,
         threshold=relative_threshold,
         threshold_mode="rel",
-        min_lr=minimum_learning_rate,
+        min_lr=min_lr,
     )
 
 
-def _resolved_relative_threshold(
+def _resolve_tolerance(
     name: str,
     value: float | None,
     *,
@@ -482,7 +485,7 @@ def _physical_transform(
     name: str,
     raw: Tensor,
     *,
-    core_threshold_maximum: float | None = None,
+    threshold_max: float | None = None,
 ) -> Tensor:
     margin = torch.as_tensor(DOMAIN_EPS, dtype=raw.dtype, device=raw.device)
     if name == "interior_reward":
@@ -491,7 +494,7 @@ def _physical_transform(
         return margin + functional.softplus(raw)
     if name == "core_threshold":
         upper = _core_threshold_interior_upper(
-            core_threshold_maximum,
+            threshold_max,
             reference=raw,
         )
         transformed = margin + (upper - margin) * torch.sigmoid(raw)
@@ -503,7 +506,7 @@ def _inverse_transform(
     name: str,
     physical: Tensor,
     *,
-    core_threshold_maximum: float | None = None,
+    threshold_max: float | None = None,
 ) -> Tensor:
     value = physical.detach().clone()
     margin = torch.as_tensor(DOMAIN_EPS, dtype=value.dtype, device=value.device)
@@ -517,7 +520,7 @@ def _inverse_transform(
         return _inverse_softplus(shifted)
     if name == "core_threshold":
         upper = _core_threshold_interior_upper(
-            core_threshold_maximum,
+            threshold_max,
             reference=value,
         )
         scaled = (value - margin) / (upper - margin)
@@ -570,8 +573,8 @@ def _require_positive_representable(name: str, shifted: Tensor) -> None:
         )
 
 
-def _snapshot(values: Mapping[str, Tensor]) -> FittedParameterValues:
-    return FittedParameterValues(
+def _snapshot(values: Mapping[str, Tensor]) -> ParameterValues:
+    return ParameterValues(
         tuple((name, float(value.detach().cpu())) for name, value in values.items())
     )
 
@@ -581,22 +584,22 @@ def _float_values(values: Mapping[str, Tensor]) -> dict[str, float]:
 
 
 def _evaluation(
-    history: list[HierarchicalFitEvaluation],
-    updates_completed: int,
-    learning_rate: float,
+    history: list[FitStep],
+    updates: int,
+    lr: float,
     loss: float,
-    total_log_likelihood: float,
+    log_likelihood: float,
     best_loss: float | None,
     parameter_values: Mapping[str, float],
     gradients: Mapping[str, float],
     gradient_norm: float,
-) -> HierarchicalFitEvaluation:
-    return HierarchicalFitEvaluation(
+) -> FitStep:
+    return FitStep(
         evaluation=len(history),
-        updates_completed=updates_completed,
-        learning_rate=learning_rate,
+        updates=updates,
+        lr=lr,
         loss=loss,
-        total_log_likelihood=total_log_likelihood,
+        log_likelihood=log_likelihood,
         best_loss=best_loss,
         parameter_values=MappingProxyType(dict(parameter_values)),
         gradients=MappingProxyType(dict(gradients)),

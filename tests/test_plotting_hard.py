@@ -7,17 +7,17 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.figure import Figure
 
-from andrew_mlmdp import LMDPEnvironment, Maze, SubgoalBasis, plotting
+from andrew_mlmdp import Environment, Maze, SubgoalBasis, plotting
 
 
 def test_fixed_animation_uses_unified_rollout_for_exact_and_online():
     maze = Maze.from_ascii("......")
-    task = LMDPEnvironment(maze).hierarchy(
+    task = Environment(maze).hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 1), (0, 4)))
-    ).for_goal((0, 5))
+    ).task((0, 5))
 
     for mode in ("exact", "online"):
-        animation = plotting.animate_hierarchical_rollout(
+        animation = plotting.animate_rollout(
             task,
             (0, 0),
             goal_learning=mode,
@@ -43,10 +43,10 @@ def test_fixed_animation_uses_unified_rollout_for_exact_and_online():
 
 def test_hard_interactive_composition_renders():
     maze = Maze.from_ascii("......")
-    task = LMDPEnvironment(maze).hierarchy(
+    task = Environment(maze).hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 1), (0, 4)))
-    ).for_goal((0, 5))
-    figure = plotting.plot_interactive_subgoal_desirability(task, (0, 0))
+    ).task((0, 5))
+    figure = plotting.explore_subgoal_desirability(task, (0, 0))
     figure.canvas.draw()
     assert any(ax.get_title().startswith("Start:") for ax in figure.axes)
     plt.close(figure)

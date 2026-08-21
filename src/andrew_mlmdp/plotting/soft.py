@@ -14,12 +14,12 @@ from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
-from andrew_mlmdp.discovery import NMFRankDiagnostics, SoftSubtaskDiscovery
+from andrew_mlmdp.discovery import RankDiagnostics, SubtaskDiscovery
 from andrew_mlmdp.hierarchy import (
-    HierarchyTask,
-    HierarchyTemplate,
     Rollout,
     RolloutEvent,
+    Task,
+    Template,
 )
 from andrew_mlmdp.lmdp import desirability_grid
 from andrew_mlmdp.maze import Coordinate
@@ -28,7 +28,7 @@ from andrew_mlmdp.plotting.shared import (
     _colormap,
     _event_title,
     _format_probability,
-    _SoftRolloutFrame,
+    _ProfileFrame,
 )
 
 
@@ -52,13 +52,13 @@ class _BoolValueWidget(Protocol):
     def value(self, _new_value: bool) -> None: ...
 
 
-class _SoftRunState(TypedDict):
+class _RunState(TypedDict):
     """Mutable state shared by the soft-rollout renderer callbacks."""
 
-    model: HierarchyTask
+    model: Task
     start: Coordinate
     rollout: Rollout
-    frames: list[_SoftRolloutFrame]
+    frames: list[_ProfileFrame]
 
 
 _LocationKind = Literal["start", "goal"]
@@ -76,20 +76,20 @@ class _LocationState(TypedDict):
 
 
 @dataclass(frozen=True)
-class SoftHierarchicalRolloutPlayer:
+class RolloutPlayer:
     """A paused notebook player for inspecting one rollout frame at a time."""
 
     figure: Figure
     controls: object
-    _renderer: "_SoftRolloutRenderer"
+    _renderer: "_RolloutRenderer"
     _frame_slider: _IntValueWidget
     _goal_component_checkbox: _BoolValueWidget
-    _frame_normalization_checkbox: _BoolValueWidget
+    _normalization_checkbox: _BoolValueWidget
     _recompute_callback: Callable[[], None]
     _location_state: _LocationState
 
     @property
-    def model(self) -> HierarchyTask:
+    def model(self) -> Task:
         """Return the model used by the currently displayed rollout."""
 
         return self._renderer.model
@@ -169,17 +169,17 @@ class SoftHierarchicalRolloutPlayer:
         self._goal_component_checkbox.value = bool(visible)
 
     @property
-    def framewise_normalization(self) -> bool:
+    def frame_normalization(self) -> bool:
         """Return whether the heatmap spans its finite range in every frame."""
 
-        return bool(self._frame_normalization_checkbox.value)
+        return bool(self._normalization_checkbox.value)
 
-    def show_framewise_normalization(self, enabled: bool) -> None:
+    def show_normalization(self, enabled: bool) -> None:
         """Toggle framewise normalization of the desirability heatmap."""
 
         if not isinstance(enabled, (bool, np.bool_)):
             raise ValueError("enabled must be a boolean")
-        self._frame_normalization_checkbox.value = bool(enabled)
+        self._normalization_checkbox.value = bool(enabled)
 
     def recompute(self) -> None:
         """Recompute from the staged locations with a fresh rollout seed."""
@@ -188,22 +188,22 @@ class SoftHierarchicalRolloutPlayer:
 
 
 @dataclass(frozen=True)
-class _SoftRolloutRenderer:
+class _RolloutRenderer:
     """Shared soft-rollout figure state used by players and animations."""
 
     figure: Figure
-    _run_state: _SoftRunState
+    _run_state: _RunState
     update: Callable[[int], tuple[object, ...]]
-    replace_run: Callable[[HierarchyTask, Coordinate, int | None], None]
+    replace_run: Callable[[Task, Coordinate, int | None], None]
     set_goal_component: Callable[[bool], None]
-    set_framewise_normalization: Callable[[bool], None]
+    set_normalization: Callable[[bool], None]
     maze_ax: Axes
     start_marker: Line2D
     goal_marker: Line2D
     desirability_goal_marker: Line2D
 
     @property
-    def model(self) -> HierarchyTask:
+    def model(self) -> Task:
         return self._run_state["model"]
 
     @property
@@ -215,13 +215,13 @@ class _SoftRolloutRenderer:
         return self._run_state["rollout"]
 
     @property
-    def frames(self) -> list[_SoftRolloutFrame]:
+    def frames(self) -> list[_ProfileFrame]:
         return self._run_state["frames"]
 
 
-def _composed_log_desirability_grid(
-    model: HierarchyTask,
-    frame: _SoftRolloutFrame,
+def _log_composition_grid(
+    model: Task,
+    frame: _ProfileFrame,
     *,
     include_goal_component: bool = True,
 ) -> np.ndarray:
@@ -233,7 +233,7 @@ def _composed_log_desirability_grid(
         include_goal_component or _is_goal_only_plan(frame)
     )
     if include_goal_component:
-        desirability = frame.plan.physical_desirability
+        desirability = frame.plan.desirability
     else:
         desirability = np.zeros(
             len(model.maze.free_cells),
@@ -246,7 +246,7 @@ def _composed_log_desirability_grid(
         goal_state = model.maze.state_index(model.goal)
         # Retain the full plan's goal value as a shared display reference so
         # hiding the contribution changes no other scale factor.
-        desirability[goal_state] = frame.plan.physical_desirability[goal_state]
+        desirability[goal_state] = frame.plan.desirability[goal_state]
     goal_state = model.maze.state_index(model.goal)
     goal_desirability = desirability[goal_state]
     relative_value = np.full_like(desirability, np.nan)
@@ -259,7 +259,7 @@ def _composed_log_desirability_grid(
     return desirability_grid(model.maze, relative_value)
 
 
-def _is_goal_only_plan(frame: _SoftRolloutFrame) -> bool:
+def _is_goal_only_plan(frame: _ProfileFrame) -> bool:
     """Return whether upper termination has selected the exact goal task."""
 
     return bool(
@@ -269,15 +269,15 @@ def _is_goal_only_plan(frame: _SoftRolloutFrame) -> bool:
     )
 
 
-def _framewise_normalized_composed_desirability_grid(
-    model: HierarchyTask,
-    frame: _SoftRolloutFrame,
+def _normalized_composition_grid(
+    model: Task,
+    frame: _ProfileFrame,
     *,
     include_goal_component: bool = True,
 ) -> np.ndarray:
     """Normalize the finite composed desirability range within one frame."""
 
-    values = _composed_log_desirability_grid(
+    values = _log_composition_grid(
         model,
         frame,
         include_goal_component=include_goal_component,
@@ -299,15 +299,15 @@ def _framewise_normalized_composed_desirability_grid(
     return normalized
 
 
-def _goal_anchored_composed_desirability_norm(
-    model: HierarchyTask,
-    frame: _SoftRolloutFrame,
+def _goal_anchored_norm(
+    model: Task,
+    frame: _ProfileFrame,
     *,
     include_goal_component: bool = True,
 ) -> Normalize:
     """Anchor the omitted goal at zero while adapting the lower limit."""
 
-    values = _composed_log_desirability_grid(
+    values = _log_composition_grid(
         model,
         frame,
         include_goal_component=include_goal_component,
@@ -322,8 +322,8 @@ def _goal_anchored_composed_desirability_norm(
     return Normalize(vmin=minimum, vmax=maximum)
 
 
-def plot_soft_subtasks(
-    discovery: SoftSubtaskDiscovery,
+def plot_subtasks(
+    discovery: SubtaskDiscovery,
     *,
     labels: list[str] | tuple[str, ...] | None = None,
     figsize: tuple[float, float] | None = None,
@@ -331,10 +331,10 @@ def plot_soft_subtasks(
     """Plot the discovered columns of D as shared-scale maze heatmaps."""
 
     maze = discovery.ensemble.maze
-    number_of_subtasks = discovery.number_of_subtasks
-    subtask_labels = _soft_subtask_labels(number_of_subtasks, labels)
-    columns = int(np.ceil(np.sqrt(number_of_subtasks)))
-    rows = int(np.ceil(number_of_subtasks / columns))
+    n_subtasks = discovery.n_subtasks
+    subtask_labels = _subtask_labels(n_subtasks, labels)
+    columns = int(np.ceil(np.sqrt(n_subtasks)))
+    rows = int(np.ceil(n_subtasks / columns))
     if figsize is None:
         figsize = (3.4 * columns, 3.1 * rows)
     figure, axes = plt.subplots(
@@ -358,11 +358,11 @@ def plot_soft_subtasks(
         images.append(image)
         _format_maze_axes(maze, ax, show_grid=False)
         ax.set_title(label)
-    for ax in tuple(axes.flat)[number_of_subtasks:]:
+    for ax in tuple(axes.flat)[n_subtasks:]:
         ax.set_visible(False)
     figure.colorbar(
         images[0],
-        ax=list(axes.flat[:number_of_subtasks]),
+        ax=list(axes.flat[:n_subtasks]),
         label="soft access profile",
         fraction=0.025,
         pad=0.03,
@@ -371,8 +371,8 @@ def plot_soft_subtasks(
     return figure
 
 
-def plot_soft_subtask_rank_diagnostics(
-    diagnostics: NMFRankDiagnostics,
+def plot_rank_diagnostics(
+    diagnostics: RankDiagnostics,
     *,
     figsize: tuple[float, float] = (6.5, 4.0),
 ) -> Figure:
@@ -395,15 +395,15 @@ def plot_soft_subtask_rank_diagnostics(
     return figure
 
 
-def _trace_soft_hierarchical_rollout(
-    model: HierarchyTask,
+def _trace_rollout(
+    model: Task,
     start: Coordinate,
     *,
     beta: float | None,
     max_steps: int,
     max_abstract_accesses: int,
     seed: int | None,
-) -> tuple[Rollout, list[_SoftRolloutFrame]]:
+) -> tuple[Rollout, list[_ProfileFrame]]:
     """Trace one soft rollout and translate its recorded engine events."""
 
     rollout = model.rollout(
@@ -413,11 +413,11 @@ def _trace_soft_hierarchical_rollout(
         max_abstract_accesses=max_abstract_accesses,
         seed=seed,
     )
-    return rollout, _soft_rollout_frames(list(rollout.events))
+    return rollout, _rollout_frames(list(rollout.events))
 
 
-def _build_soft_hierarchical_rollout_renderer(
-    model: HierarchyTask,
+def _build_renderer(
+    model: Task,
     start: Coordinate,
     *,
     beta: float | None = None,
@@ -426,10 +426,10 @@ def _build_soft_hierarchical_rollout_renderer(
     seed: int | None = None,
     subtask_labels: list[str] | tuple[str, ...] | None = None,
     figsize: tuple[float, float] = (14, 8),
-) -> _SoftRolloutRenderer:
+) -> _RolloutRenderer:
     """Build shared soft-rollout artists without starting a render timer."""
 
-    rollout, frames = _trace_soft_hierarchical_rollout(
+    rollout, frames = _trace_rollout(
         model,
         start,
         beta=beta,
@@ -437,14 +437,14 @@ def _build_soft_hierarchical_rollout_renderer(
         max_abstract_accesses=max_abstract_accesses,
         seed=seed,
     )
-    run_state: _SoftRunState = {
+    run_state: _RunState = {
         "model": model,
         "start": start,
         "rollout": rollout,
         "frames": frames,
     }
-    labels = _soft_subtask_labels(
-        model.number_of_subtasks,
+    labels = _subtask_labels(
+        model.n_subtasks,
         subtask_labels,
     )
     figure, axes = plt.subplot_mosaic(
@@ -535,7 +535,7 @@ def _build_soft_hierarchical_rollout_renderer(
     goal_component_state = {"included": True}
     frame_normalization_state = {"enabled": True}
     initial_desirability_grid = (
-        _framewise_normalized_composed_desirability_grid(
+        _normalized_composition_grid(
             model,
             frames[0],
             include_goal_component=goal_component_state["included"],
@@ -603,10 +603,10 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
     reward_limit = 0.125
-    reward_x = np.arange(model.number_of_subtasks)
+    reward_x = np.arange(model.n_subtasks)
     reward_bars = weights_ax.bar(
         reward_x,
-        np.zeros(model.number_of_subtasks),
+        np.zeros(model.n_subtasks),
         color="0.55",
         width=0.72,
     )
@@ -621,7 +621,7 @@ def _build_soft_hierarchical_rollout_renderer(
         for x in reward_x
     ]
     weights_ax.axhline(0.0, color="0.25", linewidth=0.9)
-    weights_ax.set_xlim(-0.6, model.number_of_subtasks - 0.4)
+    weights_ax.set_xlim(-0.6, model.n_subtasks - 0.4)
     weights_ax.set_ylim(-reward_limit, reward_limit)
     weights_ax.set_xticks(reward_x, labels)
     weights_ax.set_ylabel("inpainted reward")
@@ -713,7 +713,7 @@ def _build_soft_hierarchical_rollout_renderer(
                 )
         if frame_normalization_state["enabled"]:
             desirability_grid_values = (
-                _framewise_normalized_composed_desirability_grid(
+                _normalized_composition_grid(
                     current_model,
                     frame,
                     include_goal_component=goal_component_state["included"],
@@ -725,12 +725,12 @@ def _build_soft_hierarchical_rollout_renderer(
                 "normalized relative value within frame"
             )
         else:
-            desirability_grid_values = _composed_log_desirability_grid(
+            desirability_grid_values = _log_composition_grid(
                 current_model,
                 frame,
                 include_goal_component=goal_component_state["included"],
             )
-            desirability_norm = _goal_anchored_composed_desirability_norm(
+            desirability_norm = _goal_anchored_norm(
                 current_model,
                 frame,
                 include_goal_component=goal_component_state["included"],
@@ -760,13 +760,13 @@ def _build_soft_hierarchical_rollout_renderer(
 
         plan = frame.plan
         if plan is None or not np.all(
-            np.isfinite(plan.inpainted_rewards[:-1])
+            np.isfinite(plan.rewards[:-1])
         ):
             reward_command_disabled = True
-            reward_command = np.zeros(current_model.number_of_subtasks)
+            reward_command = np.zeros(current_model.n_subtasks)
         else:
             reward_command_disabled = False
-            reward_command = plan.inpainted_rewards[:-1]
+            reward_command = plan.rewards[:-1]
         reward_limit = 1.25 * max(
             0.1,
             float(np.max(np.abs(reward_command))),
@@ -805,7 +805,7 @@ def _build_soft_hierarchical_rollout_renderer(
             f"Physical state: {_event_title(frame.event)} "
             f"(move {frame.physical_steps}/{current_rollout.physical_steps})"
         )
-        status_text.set_text(_soft_communication_status(frame))
+        status_text.set_text(_communication_status(frame))
         entered = (
             "none"
             if frame.entered_subtask is None
@@ -823,9 +823,9 @@ def _build_soft_hierarchical_rollout_renderer(
             f"entered state:   {entered}\n"
             f"upper outcome:   {upper_outcome}\n"
             "passive access:  "
-            f"{_format_probability(frame.passive_access_probability)}\n"
+            f"{_format_probability(frame.passive_access)}\n"
             "controlled access:"
-            f"{_format_probability(frame.controlled_access_probability)}\n"
+            f"{_format_probability(frame.policy_access)}\n"
             f"refractory:      {'yes' if frame.refractory else 'no'}\n"
             f"current cell:    {frame.coordinate}\n"
             f"goal:            {current_model.goal}"
@@ -845,15 +845,15 @@ def _build_soft_hierarchical_rollout_renderer(
     def set_goal_component(visible: bool) -> None:
         goal_component_state["included"] = bool(visible)
 
-    def set_framewise_normalization(enabled: bool) -> None:
+    def set_normalization(enabled: bool) -> None:
         frame_normalization_state["enabled"] = bool(enabled)
 
     def replace_run(
-        new_model: HierarchyTask,
+        new_model: Task,
         new_start: Coordinate,
         new_seed: int | None,
     ) -> None:
-        new_rollout, new_frames = _trace_soft_hierarchical_rollout(
+        new_rollout, new_frames = _trace_rollout(
             new_model,
             new_start,
             beta=beta,
@@ -875,13 +875,13 @@ def _build_soft_hierarchical_rollout_renderer(
         goal_marker.set_data([goal_column], [goal_row])
         desirability_goal_marker.set_data([goal_column], [goal_row])
 
-    return _SoftRolloutRenderer(
+    return _RolloutRenderer(
         figure=figure,
         _run_state=run_state,
         update=update,
         replace_run=replace_run,
         set_goal_component=set_goal_component,
-        set_framewise_normalization=set_framewise_normalization,
+        set_normalization=set_normalization,
         maze_ax=maze_ax,
         start_marker=start_marker,
         goal_marker=goal_marker,
@@ -889,8 +889,8 @@ def _build_soft_hierarchical_rollout_renderer(
     )
 
 
-def plot_interactive_soft_hierarchical_rollout(
-    template: HierarchyTemplate,
+def explore_rollout(
+    template: Template,
     start: Coordinate,
     goal: Coordinate,
     *,
@@ -900,7 +900,7 @@ def plot_interactive_soft_hierarchical_rollout(
     seed: int | None = None,
     subtask_labels: list[str] | tuple[str, ...] | None = None,
     figsize: tuple[float, float] = (14, 8),
-) -> SoftHierarchicalRolloutPlayer:
+) -> RolloutPlayer:
     """Build a paused ipywidgets player for manual rollout inspection.
 
     The figure is created once. Moving the slider or pressing a step button
@@ -923,8 +923,8 @@ def plot_interactive_soft_hierarchical_rollout(
         raise ValueError(
             "The soft rollout player requires a distributed subgoal basis"
         )
-    model = template.for_goal(goal)
-    renderer = _build_soft_hierarchical_rollout_renderer(
+    model = template.task(goal)
+    renderer = _build_renderer(
         model,
         start,
         beta=beta,
@@ -963,7 +963,7 @@ def plot_interactive_soft_hierarchical_rollout(
             "this does not change rollout execution"
         ),
     )
-    frame_normalization_checkbox = widgets.Checkbox(
+    normalization_checkbox = widgets.Checkbox(
         value=True,
         description="Normalize desirability within each frame",
         indent=False,
@@ -1015,8 +1015,8 @@ def plot_interactive_soft_hierarchical_rollout(
         renderer.update(frame_slider.value)
         renderer.figure.canvas.draw_idle()
 
-    def toggle_framewise_normalization(change) -> None:
-        renderer.set_framewise_normalization(bool(change["new"]))
+    def toggle_normalization(change) -> None:
+        renderer.set_normalization(bool(change["new"]))
         renderer.update(frame_slider.value)
         renderer.figure.canvas.draw_idle()
 
@@ -1167,7 +1167,7 @@ def plot_interactive_soft_hierarchical_rollout(
             pending_start = location_state["pending_start"]
             pending_goal = location_state["pending_goal"]
             new_seed = next_rollout_seed()
-            new_model = template.for_goal(pending_goal)
+            new_model = template.task(pending_goal)
             renderer.replace_run(new_model, pending_start, new_seed)
             location_state["rollout_seed"] = new_seed
             frame_slider.max = len(renderer.frames) - 1
@@ -1192,8 +1192,8 @@ def plot_interactive_soft_hierarchical_rollout(
         toggle_goal_component,
         names="value",
     )
-    frame_normalization_checkbox.observe(
-        toggle_framewise_normalization,
+    normalization_checkbox.observe(
+        toggle_normalization,
         names="value",
     )
     previous_button.on_click(show_previous)
@@ -1203,8 +1203,8 @@ def plot_interactive_soft_hierarchical_rollout(
     renderer.figure.canvas.mpl_connect("motion_notify_event", on_motion)
     renderer.figure.canvas.mpl_connect("button_release_event", on_release)
     renderer.set_goal_component(goal_component_checkbox.value)
-    renderer.set_framewise_normalization(
-        frame_normalization_checkbox.value
+    renderer.set_normalization(
+        normalization_checkbox.value
     )
     renderer.update(0)
     update_button_state(0)
@@ -1217,14 +1217,14 @@ def plot_interactive_soft_hierarchical_rollout(
                     previous_button,
                     next_button,
                     goal_component_checkbox,
-                    frame_normalization_checkbox,
+                    normalization_checkbox,
                 ]
             ),
             frame_slider,
             widgets.HBox([recompute_button, location_status]),
         ]
     )
-    return SoftHierarchicalRolloutPlayer(
+    return RolloutPlayer(
         figure=renderer.figure,
         controls=controls,
         _renderer=renderer,
@@ -1232,21 +1232,21 @@ def plot_interactive_soft_hierarchical_rollout(
         _goal_component_checkbox=cast(
             _BoolValueWidget, goal_component_checkbox
         ),
-        _frame_normalization_checkbox=cast(
-            _BoolValueWidget, frame_normalization_checkbox
+        _normalization_checkbox=cast(
+            _BoolValueWidget, normalization_checkbox
         ),
         _recompute_callback=recompute_rollout,
         _location_state=location_state,
     )
 
 
-def _soft_rollout_frames(
+def _rollout_frames(
     events: list[RolloutEvent],
-) -> list[_SoftRolloutFrame]:
+) -> list[_ProfileFrame]:
     """Translate engine events without reconstructing or resampling plans."""
 
     return [
-        _SoftRolloutFrame(
+        _ProfileFrame(
             event=(
                 "subtask_access"
                 if event.event == "lower_access"
@@ -1267,8 +1267,8 @@ def _soft_rollout_frames(
             entered_subtask=event.entered_state,
             physical_steps=event.physical_steps,
             abstract_accesses=event.abstract_accesses,
-            passive_access_probability=event.passive_access_probability,
-            controlled_access_probability=event.controlled_access_probability,
+            passive_access=event.passive_access,
+            policy_access=event.policy_access,
             refractory=event.refractory,
             status=event.status,
         )
@@ -1276,18 +1276,18 @@ def _soft_rollout_frames(
     ]
 
 
-def _soft_subtask_labels(
-    number_of_subtasks: int,
+def _subtask_labels(
+    n_subtasks: int,
     labels: list[str] | tuple[str, ...] | None,
 ) -> tuple[str, ...]:
     if labels is None:
-        return tuple(f"S{index + 1}" for index in range(number_of_subtasks))
-    if len(labels) != number_of_subtasks:
+        return tuple(f"S{index + 1}" for index in range(n_subtasks))
+    if len(labels) != n_subtasks:
         raise ValueError("Labels must match the number of soft subtasks")
     return tuple(str(label) for label in labels)
 
 
-def _soft_communication_status(frame: _SoftRolloutFrame) -> str:
+def _communication_status(frame: _ProfileFrame) -> str:
     if frame.event == "terminal" and frame.status == "reached_goal":
         return "The physical goal boundary was reached."
     if frame.event == "terminal":

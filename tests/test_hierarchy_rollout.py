@@ -2,18 +2,18 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
-    LayerOneTaskLibrary,
-    LMDPEnvironment,
+    Environment,
     Maze,
-    ModelParameters,
+    Parameters,
     SubgoalBasis,
+    TaskLibrary,
 )
 
 
 def test_exact_rollout_records_one_event_trace_without_teleporting(
     soft_corridor_template,
 ):
-    task = soft_corridor_template.for_goal((1, 3))
+    task = soft_corridor_template.task((1, 3))
     rollout = task.rollout((0, 0), seed=4, max_steps=100)
 
     assert rollout.reached_goal
@@ -31,16 +31,16 @@ def test_exact_rollout_records_one_event_trace_without_teleporting(
 
 def test_online_z_iteration_updates_only_after_nonterminal_moves():
     maze = Maze.from_ascii("......")
-    task = LMDPEnvironment(maze).hierarchy(
+    task = Environment(maze).hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 1), (0, 4))),
-        parameters=ModelParameters(alpha=1.0),
-        task_library=LayerOneTaskLibrary.from_desirabilities(
+        parameters=Parameters(alpha=1.0),
+        task_library=TaskLibrary.from_desirabilities(
             2,
-            basis_target_desirability=np.exp(1.1 / 0.1),
-            basis_off_target_desirability=np.exp(-0.7 / 0.1),
-            basis_goal_desirability=np.exp(1.1 / 0.1),
+            target_value=np.exp(1.1 / 0.1),
+            off_target_value=np.exp(-0.7 / 0.1),
+            goal_value=np.exp(1.1 / 0.1),
         ),
-    ).for_goal((0, 5))
+    ).task((0, 5))
     rollout = task.rollout(
         (0, 0),
         goal_learning="online",
@@ -66,9 +66,9 @@ def test_online_z_iteration_updates_only_after_nonterminal_moves():
 
 def test_online_learning_can_continue_across_episodes():
     maze = Maze.from_ascii(".....")
-    task = LMDPEnvironment(maze).hierarchy(
+    task = Environment(maze).hierarchy(
         SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
-    ).for_goal((0, 4))
+    ).task((0, 4))
     first = task.rollout(
         (0, 0),
         goal_learning="online",

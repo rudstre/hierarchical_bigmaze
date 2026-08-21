@@ -81,17 +81,17 @@ def maze_from_labeled_edges(
 ) -> LabeledMaze:
     """Create a tower-state maze restricted to the supplied labeled edges."""
 
-    number_of_rows, number_of_columns = _validated_tower_shape(tower_shape)
+    n_rows, n_columns = _validated_tower_shape(tower_shape)
     if isinstance(edges, (str, bytes)):
         raise ValueError("Maze edges must be an iterable of edge labels")
 
     coordinate_by_label = {
         f"{chr(ord('A') + column)}{number}": (
-            number_of_rows - number,
+            n_rows - number,
             column,
         )
-        for column in range(number_of_columns)
-        for number in range(1, number_of_rows + 1)
+        for column in range(n_columns)
+        for number in range(1, n_rows + 1)
     }
     seen_edges: set[frozenset[str]] = set()
     connections: list[tuple[Coordinate, Coordinate]] = []
@@ -120,7 +120,7 @@ def maze_from_labeled_edges(
         connections.append((start, end))
 
     layout = "\n".join(
-        "." * number_of_columns for _ in range(number_of_rows)
+        "." * n_columns for _ in range(n_rows)
     )
     maze = Maze.from_ascii(layout).with_connections(connections)
     label_by_coordinate = {

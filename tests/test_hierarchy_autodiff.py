@@ -3,28 +3,28 @@ import pytest
 import torch
 
 from andrew_mlmdp import (
-    LMDPEnvironment,
+    Environment,
     Maze,
-    ModelParameters,
-    MovementTrial,
+    Parameters,
     SubgoalBasis,
-    hierarchical_movement_log_likelihood_torch,
-    hierarchical_parameter_values,
-    total_hierarchical_movement_log_likelihood_torch,
+    Trial,
+    log_likelihood,
+    parameter_values,
+    total_log_likelihood,
 )
-from andrew_mlmdp.hierarchy.core import _goal_only_plan as _numpy_goal_only_plan
-from andrew_mlmdp.hierarchy.likelihood import (
-    _hierarchical_physical_step_kernel as _numpy_step_kernel,
-)
-from andrew_mlmdp.hierarchy.torch_likelihood import (
+from andrew_mlmdp.hierarchy.autodiff import (
     PINV_RCOND,
-    _build_torch_hierarchy,
-    _composition_weights,
-    _first_departure_forward_torch,
+    _build_hierarchy,
+    _first_departure_forward,
     _goal_only_plan,
     _physical_step_kernel,
     _plan,
+    _shape_weights,
 )
+from andrew_mlmdp.hierarchy.likelihood import (
+    _step_kernel as _numpy_step_kernel,
+)
+from andrew_mlmdp.hierarchy.model import _goal_only_plan as _numpy_goal_only_plan
 
 
 def _parameters(**overrides):
@@ -37,7 +37,7 @@ def _parameters(**overrides):
         "beta": 0.7,
     }
     values.update(overrides)
-    return ModelParameters(**values)
+    return Parameters(**values)
 
 
 def _gated_template():
@@ -58,27 +58,27 @@ def _gated_template():
         core_threshold=0.2,
         core_exponent=0.7,
     )
-    # These legacy gate fields deliberately disagree with the basis.  The
+    # These inactive gate fields deliberately disagree with the basis.  The
     # differentiable path must follow the basis to match the NumPy oracle.
     parameters = _parameters(core_threshold=0.75, core_exponent=2.0)
-    return LMDPEnvironment(maze).hierarchy(basis, parameters=parameters)
+    return Environment(maze).hierarchy(basis, parameters=parameters)
 
 
 def _tensor_values(template, *, requires_grad=False):
     return {
         name: value.detach().clone().requires_grad_(requires_grad)
-        for name, value in hierarchical_parameter_values(template).items()
+        for name, value in parameter_values(template).items()
     }
 
 
 def _numpy_plans(task, start):
     return (
         task.plan(start),
-        *(task.plan(start, upper_state=j) for j in range(task.number_of_subtasks)),
+        *(task.plan(start, upper_state=j) for j in range(task.n_subtasks)),
         _numpy_goal_only_plan(
             task,
             start,
-            goal_interior_desirability=None,
+            goal_desirability=None,
         ),
     )
 
@@ -86,7 +86,7 @@ def _numpy_plans(task, start):
 def _torch_plans(model, start):
     return (
         _plan(model, start),
-        *(_plan(model, start, upper_state=j) for j in range(model.number_of_subtasks)),
+        *(_plan(model, start, upper_state=j) for j in range(model.n_subtasks)),
         _goal_only_plan(model),
     )
 
@@ -103,7 +103,7 @@ def test_torch_composition_has_finite_weight_and_exponent_gradients(exponent_val
         dtype=torch.float64,
         requires_grad=True,
     )
-    composed = _composition_weights(weights, exponent=exponent, mode="power")
+    composed = _shape_weights(weights, exponent=exponent, mode="power")
     objective = (composed * torch.arange(5, dtype=torch.float64)).sum()
     weight_gradient, exponent_gradient = torch.autograd.grad(
         objective,
@@ -122,7 +122,7 @@ def test_torch_winner_take_all_splits_ties_and_preserves_goal_weight():
         [[4.0, 4.0, 2.0, 7.0], [0.0, 0.0, 0.0, 3.0]],
         dtype=torch.float64,
     )
-    composed = _composition_weights(
+    composed = _shape_weights(
         weights,
         exponent=1.0,
         mode="winner_take_all",
@@ -144,10 +144,10 @@ def test_finite_composition_full_likelihood_has_finite_behavioral_gradients(
         composition_exponent=composition_exponent,
     )
     values = _tensor_values(template, requires_grad=True)
-    total = total_hierarchical_movement_log_likelihood_torch(
+    total = total_log_likelihood(
         template,
         (
-            MovementTrial(
+            Trial(
                 "s",
                 1,
                 (0, 5),
@@ -181,16 +181,16 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
                 point.profiles,
                 core_threshold=None,
             )
-        template = LMDPEnvironment(maze).hierarchy(
+        template = Environment(maze).hierarchy(
             basis,
             parameters=_parameters(),
         )
         goal = (0, 5)
         trajectory = ((0, 0), (0, 1), (0, 3), (0, 5))
 
-    task = template.for_goal(goal)
-    values = hierarchical_parameter_values(template)
-    torch_model = _build_torch_hierarchy(template, goal, values)
+    task = template.task(goal)
+    values = parameter_values(template)
+    torch_model = _build_hierarchy(template, goal, values)
     torch_plan = _plan(torch_model, trajectory[0])
     numpy_plan = task.plan(trajectory[0])
 
@@ -201,8 +201,8 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
         task.lower_dynamics.passive,
         abs=1e-12,
     )
-    assert torch_model.first_hit_probabilities.detach().numpy() == pytest.approx(
-        task.first_hit_probabilities,
+    assert torch_model.first_hit.detach().numpy() == pytest.approx(
+        task.first_hit,
         abs=1e-12,
     )
     assert torch_model.upper_dynamics.passive.detach().numpy() == pytest.approx(
@@ -228,8 +228,8 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
         numpy_plan.weights,
         abs=1e-11,
     )
-    assert torch_plan.layer_one_controlled.detach().numpy() == pytest.approx(
-        numpy_plan.layer_one_controlled,
+    assert torch_plan.lower_policy.detach().numpy() == pytest.approx(
+        numpy_plan.lower_policy,
         abs=1e-11,
     )
 
@@ -245,7 +245,7 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
     )
     assert torch_kernel.detach().numpy() == pytest.approx(numpy_kernel, abs=1e-11)
 
-    torch_ll = hierarchical_movement_log_likelihood_torch(
+    torch_ll = log_likelihood(
         template,
         goal,
         trajectory,
@@ -253,12 +253,12 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
     )
     assert torch_ll.dtype == torch.float64
     assert torch_ll == pytest.approx(
-        task.movement_log_likelihood(trajectory), abs=1e-11
+        task.log_likelihood(trajectory), abs=1e-11
     )
     assert torch_ll <= 0.0
-    batch_ll = total_hierarchical_movement_log_likelihood_torch(
+    batch_ll = total_log_likelihood(
         template,
-        (MovementTrial("s", 1, goal, trajectory),),
+        (Trial("s", 1, goal, trajectory),),
         parameter_values=values,
     )
     assert batch_ll.detach() == pytest.approx(torch_ll.detach(), abs=1e-11)
@@ -267,13 +267,13 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
 def test_probability_orientation_and_likelihood_invariants():
     template = _gated_template()
     goal = (0, 5)
-    values = hierarchical_parameter_values(template)
-    model = _build_torch_hierarchy(template, goal, values)
+    values = parameter_values(template)
+    model = _build_hierarchy(template, goal, values)
     plans = _torch_plans(model, (0, 1))
 
     for controlled in (
         model.upper_controlled,
-        *(plan.layer_one_controlled for plan in plans),
+        *(plan.lower_policy for plan in plans),
     ):
         assert torch.all(torch.isfinite(controlled))
         assert torch.all(controlled >= -1e-14)
@@ -297,12 +297,12 @@ def test_probability_orientation_and_likelihood_invariants():
         torch.tensor(0),
         num_classes=kernel.shape[1],
     ).to(torch.float64)
-    departure = _first_departure_forward_torch(kernel, 1, 2, forward).sum()
+    departure = _first_departure_forward(kernel, 1, 2, forward).sum()
     assert 0.0 <= departure <= 1.0
 
-    assert template.torch_movement_log_likelihood(goal, [(0, 1)]) == 0.0
+    assert template.log_likelihood(goal, [(0, 1)]) == 0.0
     repeated = [(0, 1), (0, 1), (0, 1)]
-    assert template.torch_movement_log_likelihood(goal, repeated) == 0.0
+    assert template.log_likelihood(goal, repeated) == 0.0
 
 
 def test_complete_mode_first_departure_uses_full_occupancy_system():
@@ -325,7 +325,7 @@ def test_complete_mode_first_departure_uses_full_occupancy_system():
         forward,
     )
     expected = exit_kernel @ expected_occupancy
-    actual = _first_departure_forward_torch(kernel, 0, 1, forward)
+    actual = _first_departure_forward(kernel, 0, 1, forward)
     assert actual == pytest.approx(expected, abs=1e-14)
     assert actual[1] > 0.0
     assert actual[2] > 0.0
@@ -354,10 +354,10 @@ def test_masked_fractional_core_gate_has_finite_nonzero_gradients():
     goal = (0, 5)
     trajectory = ((0, 1), (0, 2), (0, 3), (0, 4), (0, 5))
     values = _tensor_values(template, requires_grad=True)
-    model = _build_torch_hierarchy(template, goal, values)
+    model = _build_hierarchy(template, goal, values)
     assert torch.count_nonzero(model.access_profiles == 0.0) >= 3
 
-    total_log_likelihood = hierarchical_movement_log_likelihood_torch(
+    total_log_likelihood = log_likelihood(
         template,
         goal,
         trajectory,
@@ -376,13 +376,13 @@ def test_autograd_matches_central_finite_differences():
     goal = (0, 5)
     trajectory = ((0, 1), (0, 2), (0, 3), (0, 4), (0, 5))
     values = _tensor_values(template, requires_grad=True)
-    log_likelihood = hierarchical_movement_log_likelihood_torch(
+    score = log_likelihood(
         template,
         goal,
         trajectory,
         parameter_values=values,
     )
-    log_likelihood.backward()
+    score.backward()
 
     for name, value in values.items():
         step = 1e-6
@@ -390,13 +390,13 @@ def test_autograd_matches_central_finite_differences():
         minus = {key: tensor.detach().clone() for key, tensor in values.items()}
         plus[name] = plus[name] + step
         minus[name] = minus[name] - step
-        plus_ll = hierarchical_movement_log_likelihood_torch(
+        plus_ll = log_likelihood(
             template,
             goal,
             trajectory,
             parameter_values=plus,
         )
-        minus_ll = hierarchical_movement_log_likelihood_torch(
+        minus_ll = log_likelihood(
             template,
             goal,
             trajectory,
@@ -409,23 +409,23 @@ def test_autograd_matches_central_finite_differences():
 def test_total_likelihood_materializes_sum_and_preserves_impossible_semantics():
     template = _gated_template()
     trials = (
-        MovementTrial("s", 1, (0, 5), ((0, 1), (0, 2), (0, 5))),
-        MovementTrial("s", 2, (0, 5), ((0, 2), (0, 3), (0, 5))),
+        Trial("s", 1, (0, 5), ((0, 1), (0, 2), (0, 5))),
+        Trial("s", 2, (0, 5), ((0, 2), (0, 3), (0, 5))),
     )
-    values = hierarchical_parameter_values(template)
+    values = parameter_values(template)
     expected = sum(
-        template.for_goal(trial.goal).movement_log_likelihood(trial.trajectory)
+        template.task(trial.goal).log_likelihood(trial.trajectory)
         for trial in trials
     )
-    actual = total_hierarchical_movement_log_likelihood_torch(
+    actual = total_log_likelihood(
         template,
         (trial for trial in trials),
         parameter_values=values,
     )
     assert actual == pytest.approx(expected, abs=1e-11)
 
-    impossible = MovementTrial("s", 3, (0, 5), ((0, 0), (0, 4)))
-    result = total_hierarchical_movement_log_likelihood_torch(
+    impossible = Trial("s", 3, (0, 5), ((0, 0), (0, 4)))
+    result = total_log_likelihood(
         template,
         (impossible,),
         parameter_values=values,
@@ -437,19 +437,19 @@ def test_prepared_batch_preserves_empty_singleton_and_early_goal_semantics():
     template = _gated_template()
     values = _tensor_values(template, requires_grad=True)
 
-    empty = total_hierarchical_movement_log_likelihood_torch(
+    empty = total_log_likelihood(
         template,
         (),
         parameter_values=values,
     )
-    singleton = total_hierarchical_movement_log_likelihood_torch(
+    singleton = total_log_likelihood(
         template,
-        (MovementTrial("s", 1, (0, 5), ((0, 1),)),),
+        (Trial("s", 1, (0, 5), ((0, 1),)),),
         parameter_values=values,
     )
-    early_goal = total_hierarchical_movement_log_likelihood_torch(
+    early_goal = total_log_likelihood(
         template,
-        (MovementTrial("s", 2, (0, 5), ((0, 5), (0, 4))),),
+        (Trial("s", 2, (0, 5), ((0, 5), (0, 4))),),
         parameter_values=values,
     )
 
@@ -462,14 +462,14 @@ def test_prepared_batch_preserves_empty_singleton_and_early_goal_semantics():
 
 def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
     template = _gated_template()
-    values = hierarchical_parameter_values(template)
+    values = parameter_values(template)
     assert values["core_threshold"] == pytest.approx(template.basis.core_threshold)
     assert values["core_exponent"] == pytest.approx(template.basis.core_exponent)
 
     missing = dict(values)
     del missing["alpha"]
     with pytest.raises(ValueError, match="missing alpha"):
-        hierarchical_movement_log_likelihood_torch(
+        log_likelihood(
             template,
             (0, 5),
             ((0, 1),),
@@ -478,7 +478,7 @@ def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
     wrong_dtype = dict(values)
     wrong_dtype["alpha"] = torch.tensor(0.8, dtype=torch.float32)
     with pytest.raises(ValueError, match="float64"):
-        hierarchical_movement_log_likelihood_torch(
+        log_likelihood(
             template,
             (0, 5),
             ((0, 1),),
@@ -486,7 +486,7 @@ def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
         )
 
     maze = Maze.from_ascii("....")
-    ungated = LMDPEnvironment(maze).hierarchy(
+    ungated = Environment(maze).hierarchy(
         SubgoalBasis.from_profiles(
             maze,
             np.asarray([[1.0], [0.7], [0.3], [0.0]]),
@@ -495,25 +495,25 @@ def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
         parameters=_parameters(),
     )
     with pytest.raises(ValueError, match="Inactive or unknown"):
-        hierarchical_parameter_values(
+        parameter_values(
             ungated,
             overrides={"core_exponent": torch.tensor(0.7, dtype=torch.float64)},
         )
 
 
 def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypatch):
-    from andrew_mlmdp.hierarchy import torch_batch_likelihood as batch_module
+    from andrew_mlmdp.hierarchy import batch as batch_module
 
     template = _gated_template()
     trials = (
-        MovementTrial("s", 1, (0, 5), ((0, 0), (0, 1), (0, 2))),
-        MovementTrial("s", 2, (0, 5), ((0, 0), (0, 1), (0, 2))),
-        MovementTrial("s", 3, (0, 5), ((0, 1), (0, 2), (0, 3))),
+        Trial("s", 1, (0, 5), ((0, 0), (0, 1), (0, 2))),
+        Trial("s", 2, (0, 5), ((0, 0), (0, 1), (0, 2))),
+        Trial("s", 3, (0, 5), ((0, 1), (0, 2), (0, 3))),
     )
-    prepared = batch_module.prepare_hierarchical_likelihood_batch(
+    prepared = batch_module.prepare_batch(
         template, trials
     )
-    assert prepared.number_of_shared_keys < prepared.number_of_closures
+    assert prepared.n_shared < prepared.n_closures
 
     calls = {"pinv": 0, "closure": 0}
     original_pinv = torch.linalg.pinv
@@ -525,7 +525,7 @@ def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypa
 
     def counted_closure(self_kernels):
         calls["closure"] += 1
-        assert self_kernels.shape[0] == prepared.number_of_closures
+        assert self_kernels.shape[0] == prepared.n_closures
         return original_closure(self_kernels)
 
     monkeypatch.setattr(torch.linalg, "pinv", counted_pinv)
@@ -533,7 +533,7 @@ def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypa
         batch_module, "_batched_departure_closures", counted_closure
     )
     cached_values = _tensor_values(template, requires_grad=True)
-    cached = batch_module.total_prepared_hierarchical_log_likelihood_torch(
+    cached = batch_module.total_prepared_log_likelihood(
         template,
         prepared,
         parameter_values=cached_values,
@@ -543,7 +543,7 @@ def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypa
 
     reference_values = _tensor_values(template, requires_grad=True)
     reference = sum(
-        hierarchical_movement_log_likelihood_torch(
+        log_likelihood(
             template,
             trial.goal,
             trial.trajectory,
@@ -560,13 +560,13 @@ def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypa
 
 
 def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
-    from andrew_mlmdp.hierarchy import torch_batch_likelihood as batch_module
+    from andrew_mlmdp.hierarchy import batch as batch_module
 
     template = _gated_template()
     trials = (
-        MovementTrial("s", 1, (0, 5), ((0, 0), (0, 1), (0, 2))),
+        Trial("s", 1, (0, 5), ((0, 0), (0, 1), (0, 2))),
     )
-    prepared = batch_module.prepare_hierarchical_likelihood_batch(
+    prepared = batch_module.prepare_batch(
         template, trials
     )
     first_values = _tensor_values(template, requires_grad=True)
@@ -575,10 +575,10 @@ def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
         second_values["alpha"].detach() * 0.8
     ).requires_grad_(True)
 
-    first = batch_module.total_prepared_hierarchical_log_likelihood_torch(
+    first = batch_module.total_prepared_log_likelihood(
         template, prepared, parameter_values=first_values
     )
-    second = batch_module.total_prepared_hierarchical_log_likelihood_torch(
+    second = batch_module.total_prepared_log_likelihood(
         template, prepared, parameter_values=second_values
     )
     first.backward()
@@ -589,26 +589,26 @@ def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
 
 
 def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts():
-    from andrew_mlmdp.hierarchy import torch_batch_likelihood as batch_module
+    from andrew_mlmdp.hierarchy import batch as batch_module
 
     template = _gated_template()
     goal = (0, 5)
     trials = (
-        MovementTrial("s", 1, goal, ((0, 0), (0, 1), (0, 2))),
-        MovementTrial("s", 2, goal, ((0, 1), (0, 2), (0, 3))),
+        Trial("s", 1, goal, ((0, 0), (0, 1), (0, 2))),
+        Trial("s", 2, goal, ((0, 1), (0, 2), (0, 3))),
     )
-    prepared = batch_module.prepare_hierarchical_likelihood_batch(
+    prepared = batch_module.prepare_batch(
         template, trials
     )
     metadata = prepared.goals[0]
-    values = hierarchical_parameter_values(template)
+    values = parameter_values(template)
     boundary = torch.tensor(
         template.task_library.boundary_desirability,
         dtype=torch.float64,
         device=torch.device("cpu"),
     )
     boundary_pinv = torch.linalg.pinv(boundary, rtol=PINV_RCOND)
-    model = _build_torch_hierarchy(
+    model = _build_hierarchy(
         template, goal, values, task_boundary=boundary
     )
     continuation = batch_module._continuation_policy_bank(
@@ -637,7 +637,7 @@ def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts(
         projection,
     )
 
-    for closure_index in range(prepared.number_of_closures):
+    for closure_index in range(prepared.n_closures):
         start_slot = int(metadata.closure_start_indices[closure_index])
         start_interior = int(metadata.start_interior[start_slot])
         start = template.maze.coordinate(model.interior_states[start_interior])

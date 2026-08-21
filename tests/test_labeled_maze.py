@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
-    LMDPEnvironment,
+    Environment,
     load_doohan_maze,
     maze_from_labeled_edges,
 )
@@ -100,15 +100,15 @@ def test_doohan_loader_reads_an_explicit_configuration(tmp_path) -> None:
     reason="Doohan experiment_info data has not been downloaded",
 )
 @pytest.mark.parametrize(
-    ("maze_name", "number_of_states"),
+    ("maze_name", "n_states"),
     [("maze_1", 49), ("maze_2", 49), ("rooms_maze", 49)],
 )
-def test_downloaded_doohan_mazes_are_connected(maze_name, number_of_states) -> None:
+def test_downloaded_doohan_mazes_are_connected(maze_name, n_states) -> None:
     definition = load_doohan_maze(maze_name)
     maze = definition.maze
 
     assert maze.shape == (7, 7)
-    assert len(maze.free_cells) == number_of_states
+    assert len(maze.free_cells) == n_states
     assert definition.coordinate_for("A1") == (6, 0)
     assert definition.coordinate_for("G7") == (0, 6)
     assert maze.reachable_cells(definition.coordinate_for("A1")) == set(
@@ -122,8 +122,8 @@ def test_downloaded_doohan_mazes_are_connected(maze_name, number_of_states) -> N
 )
 def test_downloaded_doohan_maze_solves_as_an_lmdp() -> None:
     definition = load_doohan_maze("maze_1")
-    environment = LMDPEnvironment(definition.maze)
-    solution = environment.solve_flat(definition.coordinate_for("G7"))
+    environment = Environment(definition.maze)
+    solution = environment.solve(definition.coordinate_for("G7"))
 
     assert np.allclose(environment.passive.sum(axis=0), 1.0)
     assert np.allclose(solution.controlled.sum(axis=0), 1.0)

@@ -7,19 +7,19 @@ from sklearn.decomposition import NMF
 from sklearn.utils.extmath import randomized_svd
 
 from andrew_mlmdp.lmdp import (
-    LMDPEnvironment,
-    ModelParameters,
+    Environment,
+    Parameters,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 
 
 @dataclass(frozen=True)
-class NMFDiscoveryParameters:
+class NMFConfig:
     """Task-family parameters used only to discover soft subtask profiles.
 
     These values define the fixed desirability ensemble and optional spatial
     penalty supplied to NMF. They are intentionally separate from
-    ``ModelParameters`` so execution tuning cannot silently rediscover a
+    ``Parameters`` so execution tuning cannot silently rediscover a
     different hierarchy.
     """
 
@@ -48,12 +48,12 @@ class NMFDiscoveryParameters:
 
 
 @dataclass(frozen=True)
-class GoalTaskEnsemble:
+class GoalTasks:
     """Flat goal tasks whose state-by-task desirabilities form ``Z``."""
 
     maze: Maze
     goals: tuple[Coordinate, ...]
-    parameters: NMFDiscoveryParameters
+    parameters: NMFConfig
     desirability: np.ndarray
 
     def __post_init__(self) -> None:
@@ -79,10 +79,10 @@ class GoalTaskEnsemble:
 
 
 @dataclass(frozen=True)
-class SoftSubtaskDiscovery:
+class SubtaskDiscovery:
     """A KL-NMF decomposition ``Z ~= D W`` with inspectable factors."""
 
-    ensemble: GoalTaskEnsemble
+    ensemble: GoalTasks
     profiles: np.ndarray
     task_weights: np.ndarray
     reconstruction: np.ndarray
@@ -99,20 +99,20 @@ class SoftSubtaskDiscovery:
             dtype=np.float64,
             copy=True,
         )
-        number_of_states, number_of_tasks = (
+        n_states, n_tasks = (
             self.ensemble.desirability.shape
         )
-        if profiles.ndim != 2 or profiles.shape[0] != number_of_states:
+        if profiles.ndim != 2 or profiles.shape[0] != n_states:
             raise ValueError(
                 "Soft profiles must have one row per physical state"
             )
-        expected_weight_shape = (profiles.shape[1], number_of_tasks)
+        expected_weight_shape = (profiles.shape[1], n_tasks)
         if weights.shape != expected_weight_shape:
             raise ValueError(
                 "Task weights must have shape "
                 f"{expected_weight_shape}, got {weights.shape}"
             )
-        if reconstruction.shape != (number_of_states, number_of_tasks):
+        if reconstruction.shape != (n_states, n_tasks):
             raise ValueError("Reconstruction must have the ensemble shape")
         if (
             np.any(profiles < 0.0)
@@ -151,11 +151,13 @@ class SoftSubtaskDiscovery:
         object.__setattr__(self, "objective_history", objective_history)
 
     @property
-    def number_of_subtasks(self) -> int:
+    def n_subtasks(self) -> int:
+        """Number of discovered soft subtasks."""
+
         return self.profiles.shape[1]
 
 @dataclass(frozen=True)
-class NMFRankDiagnostics:
+class RankDiagnostics:
     """Normalized KL reconstruction errors for candidate NMF ranks."""
 
     ranks: np.ndarray
@@ -180,15 +182,15 @@ class NMFRankDiagnostics:
 class NMFStudy:
     """One goal ensemble and a cached factorization for every requested rank."""
 
-    ensemble: GoalTaskEnsemble
-    discoveries: dict[int, SoftSubtaskDiscovery]
+    ensemble: GoalTasks
+    discoveries: dict[int, SubtaskDiscovery]
 
     def __post_init__(self) -> None:
         if not self.discoveries:
             raise ValueError("An NMF study requires at least one rank")
         ordered = dict(sorted(self.discoveries.items()))
         for rank, discovery in ordered.items():
-            if rank != discovery.number_of_subtasks:
+            if rank != discovery.n_subtasks:
                 raise ValueError(
                     "Discovery rank does not match its profile count"
                 )
@@ -203,8 +205,8 @@ class NMFStudy:
         return tuple(self.discoveries)
 
     @property
-    def diagnostics(self) -> NMFRankDiagnostics:
-        return NMFRankDiagnostics(
+    def diagnostics(self) -> RankDiagnostics:
+        return RankDiagnostics(
             ranks=np.asarray(self.ranks, dtype=int),
             reconstruction_errors=np.asarray(
                 [
@@ -215,7 +217,7 @@ class NMFStudy:
             ),
         )
 
-    def result(self, rank: int) -> SoftSubtaskDiscovery:
+    def result(self, rank: int) -> SubtaskDiscovery:
         """Return the already-fitted result for ``rank``."""
 
         try:
@@ -226,11 +228,11 @@ class NMFStudy:
             ) from error
 
 
-def discover_soft_subgoals(
-    environment: LMDPEnvironment,
+def discover_subgoals(
+    environment: Environment,
     *,
     ranks: list[int] | tuple[int, ...] | np.ndarray,
-    parameters: NMFDiscoveryParameters = NMFDiscoveryParameters(),
+    parameters: NMFConfig = NMFConfig(),
     goals: list[Coordinate] | tuple[Coordinate, ...] | None = None,
     seed: int | None = 0,
     max_iter: int = 2000,
@@ -250,21 +252,21 @@ def discover_soft_subgoals(
         raise ValueError("A task ensemble must contain at least one goal")
     if len(set(ordered_goals)) != len(ordered_goals):
         raise ValueError("Task goals must be unique")
-    solver_parameters = ModelParameters(
+    solver_parameters = Parameters(
         interior_reward=parameters.interior_reward,
         goal_reward=parameters.goal_reward,
         lower_control_cost=parameters.control_cost,
     )
     desirability = np.column_stack(
         [
-            environment.solve_flat(
+            environment.solve(
                 goal,
                 parameters=solver_parameters,
             ).desirability
             for goal in ordered_goals
         ]
     )
-    ensemble = GoalTaskEnsemble(
+    ensemble = GoalTasks(
         maze=environment.maze,
         goals=ordered_goals,
         parameters=parameters,
@@ -301,13 +303,13 @@ def discover_soft_subgoals(
 
 
 def _factorize_soft_subtasks(
-    ensemble: GoalTaskEnsemble,
+    ensemble: GoalTasks,
     n_subtasks: int,
     *,
     seed: int | None = 0,
     max_iter: int = 2000,
     tolerance: float = 1e-5,
-) -> SoftSubtaskDiscovery:
+) -> SubtaskDiscovery:
     """Factor the ensemble with the paper's beta=1 (KL) NMF objective."""
 
     maximum_rank = min(ensemble.desirability.shape)
@@ -333,7 +335,7 @@ def _factorize_soft_subtasks(
     )
     reconstruction = profiles @ task_weights
 
-    return SoftSubtaskDiscovery(
+    return SubtaskDiscovery(
         ensemble=ensemble,
         profiles=profiles,
         task_weights=task_weights,
@@ -433,7 +435,7 @@ def _generalized_kl_divergence(
     return float(divergence)
 
 def _factorize_regularized_soft_subtasks(
-    ensemble: GoalTaskEnsemble,
+    ensemble: GoalTasks,
     n_subtasks: int,
     *,
     adjacency: np.ndarray,
@@ -441,7 +443,7 @@ def _factorize_regularized_soft_subtasks(
     seed: int | None = 0,
     max_iter: int = 2000,
     tolerance: float = 1e-5,
-) -> SoftSubtaskDiscovery:
+) -> SubtaskDiscovery:
     """Fit graph-regularized KL-NMF with non-negative MU updates.
 
     The graph multiplicative update is derived for the unconstrained objective.
@@ -461,7 +463,7 @@ def _factorize_regularized_soft_subtasks(
     target = ensemble.desirability
     adjacency_values = _validated_graph_adjacency(
         adjacency,
-        number_of_states=target.shape[0],
+        n_states=target.shape[0],
     )
     degree = adjacency_values.sum(axis=1)
     profiles, task_weights = _initialize_regularized_factors(
@@ -543,7 +545,7 @@ def _factorize_regularized_soft_subtasks(
             break
 
     reconstruction = profiles @ task_weights
-    return SoftSubtaskDiscovery(
+    return SubtaskDiscovery(
         ensemble=ensemble,
         profiles=profiles,
         task_weights=task_weights,
@@ -582,10 +584,10 @@ def _graph_adjacency_from_passive(passive: np.ndarray) -> np.ndarray:
 def _validated_graph_adjacency(
     adjacency: np.ndarray,
     *,
-    number_of_states: int,
+    n_states: int,
 ) -> np.ndarray:
     values = np.asarray(adjacency, dtype=np.float64)
-    expected_shape = (number_of_states, number_of_states)
+    expected_shape = (n_states, n_states)
     if values.shape != expected_shape:
         raise ValueError(
             f"Graph adjacency must have shape {expected_shape}, "

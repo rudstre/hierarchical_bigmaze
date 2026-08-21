@@ -38,7 +38,7 @@ def plot_trajectory_overlay(
     """Plot a trajectory over an existing map without changing its styling.
 
     Repeated corridor traversals use connected parallel lanes when
-    overlap_spacing is positive. Set it to zero for the original rendering.
+    overlap_spacing is positive. Set it to zero for the standard rendering.
     """
 
     if not trajectory:
@@ -72,7 +72,7 @@ def plot_trajectory_overlay(
         pass_occurrences = _plot_offset_trajectory(ax, trajectory, traversals)
         endpoint_zorder = 7
     else:
-        _plot_legacy_trajectory(ax, trajectory)
+        _plot_standard_trajectory(ax, trajectory)
         endpoint_zorder = 6
 
     start_row, start_column = trajectory[0]
@@ -118,8 +118,8 @@ def plot_trajectory_overlay(
     return ax
 
 
-def _plot_legacy_trajectory(ax, trajectory: Sequence[Coordinate]) -> None:
-    """Draw a trajectory using the original line-and-marker styling."""
+def _plot_standard_trajectory(ax, trajectory: Sequence[Coordinate]) -> None:
+    """Draw a trajectory using the standard line-and-marker styling."""
 
     rows = []
     columns = []
@@ -466,7 +466,7 @@ def plot_trajectory(
     """Plot a sampled trajectory over the maze geometry.
 
     overlap_spacing controls the parallel lanes used for repeated edges.
-    Set it to zero for the original rendering.
+    Set it to zero for the standard rendering.
     """
 
     if ax is None:

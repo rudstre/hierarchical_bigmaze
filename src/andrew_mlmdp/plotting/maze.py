@@ -59,17 +59,17 @@ def _draw_connections(maze: Maze, ax, *, color: str) -> None:
 def _format_maze_axes(maze: Maze, ax, *, show_grid: bool) -> None:
     """Apply the shared alphanumeric tower coordinate system to a maze plot."""
 
-    number_of_rows, number_of_columns = maze.shape
-    ax.set_xlim(-0.5, number_of_columns - 0.5)
-    ax.set_ylim(number_of_rows - 0.5, -0.5)
+    n_rows, n_columns = maze.shape
+    ax.set_xlim(-0.5, n_columns - 0.5)
+    ax.set_ylim(n_rows - 0.5, -0.5)
     ax.set_aspect("equal")
     ax.set_xticks(
-        np.arange(number_of_columns),
-        [_tower_column_label(column) for column in range(number_of_columns)],
+        np.arange(n_columns),
+        [_tower_column_label(column) for column in range(n_columns)],
     )
     ax.set_yticks(
-        np.arange(number_of_rows),
-        [str(number) for number in range(number_of_rows, 0, -1)],
+        np.arange(n_rows),
+        [str(number) for number in range(n_rows, 0, -1)],
     )
     if show_grid:
         ax.grid(color="0.86", linewidth=0.6)
@@ -144,15 +144,15 @@ def plot_subgoal_passive_dynamics(
     """
 
     ordered_subgoals = tuple(subgoals)
-    number_of_subgoals = len(ordered_subgoals)
+    n_subgoals = len(ordered_subgoals)
     values = np.asarray(passive, dtype=np.float64)
-    expected_shape = (number_of_subgoals, number_of_subgoals)
+    expected_shape = (n_subgoals, n_subgoals)
     if values.shape != expected_shape:
         raise ValueError(
             f"Passive dynamics must have shape {expected_shape}, "
             f"got {values.shape}"
         )
-    if labels is not None and len(labels) != number_of_subgoals:
+    if labels is not None and len(labels) != n_subgoals:
         raise ValueError("Labels must match the number of subgoals")
 
     for coordinate in ordered_subgoals:
@@ -170,8 +170,8 @@ def plot_subgoal_passive_dynamics(
     )
 
     edges = []
-    for first in range(number_of_subgoals):
-        for second in range(first + 1, number_of_subgoals):
+    for first in range(n_subgoals):
+        for second in range(first + 1, n_subgoals):
             probability = 0.5 * (
                 values[second, first] + values[first, second]
             )
@@ -249,9 +249,9 @@ def plot_controlled_dynamics(
     direction on the grid.
     """
 
-    number_of_states = len(maze.free_cells)
+    n_states = len(maze.free_cells)
     values = np.asarray(controlled, dtype=np.float64)
-    expected_shape = (number_of_states, number_of_states)
+    expected_shape = (n_states, n_states)
     if values.shape != expected_shape:
         raise ValueError(
             f"Controlled dynamics must have shape {expected_shape}, "

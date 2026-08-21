@@ -13,10 +13,10 @@ def _reference():
 
 def test_canonical_matrices_and_initial_plan(four_room_template):
     reference = _reference()
-    task = four_room_template.for_goal(FOUR_ROOM_GOAL)
+    task = four_room_template.task(FOUR_ROOM_GOAL)
     plan = task.plan((1, 0))
 
-    assert four_room_template.passive_dynamics == pytest.approx(
+    assert four_room_template.upper_passive == pytest.approx(
         np.asarray(reference["subgoal_passive"]),
         abs=1e-11,
     )
@@ -32,7 +32,7 @@ def test_canonical_matrices_and_initial_plan(four_room_template):
         reference["initial_weights"],
         abs=1e-11,
     )
-    assert plan.inpainted_rewards == pytest.approx(
+    assert plan.rewards == pytest.approx(
         reference["initial_inpainted_rewards"],
         abs=1e-11,
     )
@@ -44,9 +44,9 @@ def test_canonical_seeded_rollouts(
     regression_parameters,
 ):
     reference = _reference()
-    task = four_room_template.for_goal(FOUR_ROOM_GOAL)
+    task = four_room_template.task(FOUR_ROOM_GOAL)
     hierarchical = task.rollout((1, 0), seed=28)
-    flat = four_room_environment.solve_flat(
+    flat = four_room_environment.solve(
         FOUR_ROOM_GOAL,
         parameters=regression_parameters,
     ).rollout((0, 0), seed=7)
@@ -76,7 +76,7 @@ def test_canonical_seeded_rollouts(
 
 
 def test_canonical_arrays_are_finite_and_stochastic(four_room_template):
-    task = four_room_template.for_goal(FOUR_ROOM_GOAL)
+    task = four_room_template.task(FOUR_ROOM_GOAL)
     for matrix in (
         task.lower_dynamics.passive,
         task.upper_dynamics.passive,

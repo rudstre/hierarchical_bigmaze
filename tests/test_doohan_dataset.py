@@ -6,13 +6,13 @@ import numpy as np
 import pytest
 
 from andrew_mlmdp import (
-    DoohanMovementDataset,
-    LMDPEnvironment,
-    MovementDatasetLikelihood,
-    MovementTrialExclusion,
+    DatasetScore,
+    DoohanDataset,
+    Environment,
+    ExcludedTrial,
     SubgoalBasis,
-    score_flat_movement_dataset,
-    score_hierarchical_movement_dataset,
+    score_flat_dataset,
+    score_hierarchy_dataset,
 )
 
 
@@ -148,7 +148,7 @@ def doohan_data_root(tmp_path):
 
 
 def test_session_ids_select_exact_sessions_in_catalog_order(doohan_data_root):
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         doohan_data_root,
         session_ids=[
             "m2/2022-01-02.maze",
@@ -168,7 +168,7 @@ def test_session_ids_select_exact_sessions_in_catalog_order(doohan_data_root):
 def test_subject_date_and_maze_selectors_are_inclusive_intersections(
     doohan_data_root,
 ):
-    subject = DoohanMovementDataset.from_data_root(
+    subject = DoohanDataset.from_data_root(
         doohan_data_root,
         subject_ids=["m2"],
         maze_name="maze_1",
@@ -178,7 +178,7 @@ def test_subject_date_and_maze_selectors_are_inclusive_intersections(
         "m2/2022-01-02.maze",
     ]
 
-    dates = DoohanMovementDataset.from_data_root(
+    dates = DoohanDataset.from_data_root(
         doohan_data_root,
         start_date="2022-01-02",
         end_date=date(2022, 1, 2),
@@ -189,7 +189,7 @@ def test_subject_date_and_maze_selectors_are_inclusive_intersections(
         "m3/2022-01-02.maze",
     ]
 
-    intersection = DoohanMovementDataset.from_data_root(
+    intersection = DoohanDataset.from_data_root(
         doohan_data_root,
         subject_ids=["m3"],
         start_date="2022-01-02",
@@ -225,11 +225,11 @@ def test_invalid_or_ambiguous_selections_raise(
     message,
 ):
     with pytest.raises(ValueError, match=message):
-        DoohanMovementDataset.from_data_root(doohan_data_root, **kwargs)
+        DoohanDataset.from_data_root(doohan_data_root, **kwargs)
 
 
 def test_trial_extraction_and_exclusions_are_auditable(doohan_data_root):
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         doohan_data_root,
         session_ids=[
             "m2/2022-01-01.maze",
@@ -255,30 +255,30 @@ def test_trial_extraction_and_exclusions_are_auditable(doohan_data_root):
 
     trial_record = dataset.trial_records()[0]
     assert trial_record["trajectory_labels"] == ("A1", "A2")
-    assert trial_record["number_of_transitions"] == 1
+    assert trial_record["n_transitions"] == 1
     assert len(dataset.session_records()) == 2
     assert len(dataset.exclusion_records()) == 4
 
 
 def test_dataset_trials_feed_flat_and_hierarchical_scorers(doohan_data_root):
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         doohan_data_root,
         session_ids=["m2/2022-01-02.maze"],
     )
-    environment = LMDPEnvironment(dataset.definition.maze)
-    flat = score_flat_movement_dataset(environment, dataset.trials)
+    environment = Environment(dataset.definition.maze)
+    flat = score_flat_dataset(environment, dataset.trials)
     basis = SubgoalBasis.from_locations(
         dataset.definition.maze,
         ((0, 6),),
     )
     hierarchy = environment.hierarchy(basis)
-    hierarchical = score_hierarchical_movement_dataset(
+    hierarchical = score_hierarchy_dataset(
         hierarchy,
         dataset.trials,
     )
 
-    assert flat.number_of_scored_trials == 1
-    assert hierarchical.number_of_scored_trials == 1
+    assert flat.n_scored == 1
+    assert hierarchical.n_scored == 1
     assert not flat.exclusions
     assert not hierarchical.exclusions
     assert np.isfinite(flat.total_log_likelihood)
@@ -288,15 +288,15 @@ def test_dataset_trials_feed_flat_and_hierarchical_scorers(doohan_data_root):
 def test_report_summarizes_one_model_and_all_exclusion_sources(
     doohan_data_root,
 ):
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         doohan_data_root,
         session_ids=[
             "m2/2022-01-01.maze",
             "m4/2022-01-04.maze",
         ],
     )
-    environment = LMDPEnvironment(dataset.definition.maze)
-    result = score_flat_movement_dataset(environment, dataset.trials)
+    environment = Environment(dataset.definition.maze)
+    result = score_flat_dataset(environment, dataset.trials)
 
     report = dataset.report(result)
 
@@ -331,16 +331,16 @@ def test_report_summarizes_one_model_and_all_exclusion_sources(
 
 
 def test_report_represents_a_model_scoring_exclusion(doohan_data_root):
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         doohan_data_root,
         session_ids=["m2/2022-01-02.maze"],
     )
     trial = dataset.trials[0]
-    result = MovementDatasetLikelihood(
+    result = DatasetScore(
         model="flat",
         trial_likelihoods=(),
         exclusions=(
-            MovementTrialExclusion(
+            ExcludedTrial(
                 session_id=trial.session_id,
                 trial_id=trial.trial_id,
                 goal=trial.goal,
@@ -363,11 +363,11 @@ def test_report_represents_a_model_scoring_exclusion(doohan_data_root):
 def test_report_rejects_a_result_that_does_not_cover_the_dataset(
     doohan_data_root,
 ):
-    dataset = DoohanMovementDataset.from_data_root(
+    dataset = DoohanDataset.from_data_root(
         doohan_data_root,
         session_ids=["m2/2022-01-02.maze"],
     )
-    empty_result = MovementDatasetLikelihood(
+    empty_result = DatasetScore(
         model="hierarchical",
         trial_likelihoods=(),
         exclusions=(),
