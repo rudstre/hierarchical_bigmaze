@@ -9,6 +9,7 @@ from matplotlib.figure import Figure
 
 from andrew_mlmdp import plotting
 from andrew_mlmdp.hierarchy import (
+    ExpectedPairDiagnosticsSweepData,
     ExpectedPolicyEntropySweepData,
     sample_hierarchical_rollouts,
 )
@@ -108,6 +109,94 @@ def test_rollout_plots_reject_sampling_options_with_ensemble(
             ensemble=ensemble,
             n_rollouts=2,
         )
+
+
+def _pair_diagnostics_sweep_plot_data():
+    return ExpectedPairDiagnosticsSweepData(
+        parameter_name="lower_control_cost",
+        parameter_values=np.asarray([0.1, 0.2, 0.3]),
+        start=(0, 0),
+        goal=(0, 2),
+        shortest_physical_steps=2,
+        policy_entropy_normalized=np.asarray([0.2, 0.3, 0.1]),
+        policy_entropy_raw=np.asarray([0.4, 0.5, 0.3]),
+        mean_physical_steps=np.asarray([5.0, 4.0, 3.0]),
+        standard_deviation_physical_steps=np.asarray([1.0, 0.5, 0.25]),
+    )
+
+
+def test_expected_pair_diagnostics_sweep_plot_renders_comparison():
+    data = _pair_diagnostics_sweep_plot_data()
+
+    figure, (entropy_ax, length_ax) = (
+        plotting.plot_expected_pair_diagnostics_sweep(data)
+    )
+
+    np.testing.assert_array_equal(
+        entropy_ax.lines[0].get_xdata(),
+        data.parameter_values,
+    )
+    np.testing.assert_array_equal(
+        entropy_ax.lines[0].get_ydata(),
+        data.policy_entropy_normalized,
+    )
+    np.testing.assert_array_equal(
+        length_ax.lines[0].get_ydata(),
+        data.mean_physical_steps,
+    )
+    np.testing.assert_array_equal(
+        length_ax.lines[1].get_ydata(),
+        np.full(2, data.shortest_physical_steps),
+    )
+    assert len(length_ax.collections) == 1
+    assert entropy_ax.get_ylabel() == (
+        "Expected policy entropy (normalized)"
+    )
+    assert length_ax.get_ylabel() == "Trajectory length (physical steps)"
+    assert length_ax.get_xlabel() == "Lower control cost"
+    assert entropy_ax.get_shared_x_axes().joined(entropy_ax, length_ax)
+    assert entropy_ax.get_legend() is not None
+    assert length_ax.get_legend() is not None
+    figure.canvas.draw()
+    plt.close(figure)
+
+
+def test_expected_pair_diagnostics_sweep_plot_uses_supplied_axes():
+    data = _pair_diagnostics_sweep_plot_data()
+    supplied_figure, supplied_axes = plt.subplots(2, 1, sharex=True)
+
+    figure, axes = plotting.plot_expected_pair_diagnostics_sweep(
+        data,
+        axes=supplied_axes,
+    )
+
+    assert figure is supplied_figure
+    assert axes == tuple(supplied_axes)
+    figure.canvas.draw()
+    plt.close(figure)
+
+
+def test_expected_pair_diagnostics_sweep_plot_validates_inputs():
+    with pytest.raises(TypeError, match="ExpectedPairDiagnosticsSweepData"):
+        plotting.plot_expected_pair_diagnostics_sweep("not sweep data")
+
+    figure, ax = plt.subplots()
+    with pytest.raises(ValueError, match="exactly two"):
+        plotting.plot_expected_pair_diagnostics_sweep(
+            _pair_diagnostics_sweep_plot_data(),
+            axes=(ax,),
+        )
+    plt.close(figure)
+
+    first_figure, first_ax = plt.subplots()
+    second_figure, second_ax = plt.subplots()
+    with pytest.raises(ValueError, match="same figure"):
+        plotting.plot_expected_pair_diagnostics_sweep(
+            _pair_diagnostics_sweep_plot_data(),
+            axes=(first_ax, second_ax),
+        )
+    plt.close(first_figure)
+    plt.close(second_figure)
 
 
 def _entropy_sweep_plot_data():

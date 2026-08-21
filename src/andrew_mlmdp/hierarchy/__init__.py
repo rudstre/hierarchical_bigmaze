@@ -17,6 +17,8 @@ from andrew_mlmdp.hierarchy.core import (
 from andrew_mlmdp.hierarchy.diagnostics import (
     CompositionWeightData,
     ContinuationPolicyData,
+    ExpectedPairDiagnosticsData,
+    ExpectedPairDiagnosticsSweepData,
     ExpectedPolicyEntropyData,
     ExpectedPolicyEntropyPairData,
     ExpectedPolicyEntropySweepData,
@@ -26,6 +28,7 @@ from andrew_mlmdp.hierarchy.diagnostics import (
     UpperGraphData,
     get_composition_weight_data,
     get_continuation_policy_data,
+    get_expected_pair_diagnostics,
     get_expected_policy_entropy,
     get_expected_policy_entropy_for_pair,
     get_upper_graph_data,
@@ -33,6 +36,7 @@ from andrew_mlmdp.hierarchy.diagnostics import (
     shortest_path_length,
     summarize_rollout_subgoal_sequences,
     summarize_rollouts,
+    sweep_expected_pair_diagnostics,
     sweep_expected_policy_entropy,
 )
 from andrew_mlmdp.hierarchy.fitting import (
@@ -58,6 +62,8 @@ __all__ = [
     "CompositionWeightData",
     "ContinuationPolicyData",
     "CoreThresholdDomain",
+    "ExpectedPairDiagnosticsData",
+    "ExpectedPairDiagnosticsSweepData",
     "ExpectedPolicyEntropyData",
     "ExpectedPolicyEntropyPairData",
     "ExpectedPolicyEntropySweepData",
@@ -82,6 +88,7 @@ __all__ = [
     "compute_hierarchy_plan",
     "get_composition_weight_data",
     "get_continuation_policy_data",
+    "get_expected_pair_diagnostics",
     "get_expected_policy_entropy",
     "get_expected_policy_entropy_for_pair",
     "get_upper_graph_data",
@@ -92,6 +99,7 @@ __all__ = [
     "shortest_path_length",
     "summarize_rollout_subgoal_sequences",
     "summarize_rollouts",
+    "sweep_expected_pair_diagnostics",
     "sweep_expected_policy_entropy",
     "total_hierarchical_movement_log_likelihood_torch",
 ]

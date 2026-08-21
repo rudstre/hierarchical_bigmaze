@@ -290,6 +290,24 @@ class ExpectedPolicyEntropyPairData:
 
 
 @dataclass(frozen=True)
+class ExpectedPairDiagnosticsData:
+    """Exact entropy and physical-step moments for one navigation pair."""
+
+    policy_entropy: ExpectedPolicyEntropyPairData
+    mean_physical_steps: float
+    standard_deviation_physical_steps: float
+    shortest_physical_steps: int
+
+    @property
+    def start(self) -> Coordinate:
+        return self.policy_entropy.start
+
+    @property
+    def goal(self) -> Coordinate:
+        return self.policy_entropy.goal
+
+
+@dataclass(frozen=True)
 class ExpectedPolicyEntropyData:
     """Uniform-pair expected entropy at encountered physical decisions."""
 
@@ -421,16 +439,81 @@ class ExpectedPolicyEntropySweepData:
             object.__setattr__(self, name, values)
 
 
-def _hierarchical_first_departure_dynamics(
+@dataclass(frozen=True)
+class ExpectedPairDiagnosticsSweepData:
+    """Exact pair diagnostics and runtime data over one parameter grid."""
+
+    parameter_name: str
+    parameter_values: np.ndarray
+    start: Coordinate
+    goal: Coordinate
+    shortest_physical_steps: int
+    policy_entropy_normalized: np.ndarray
+    policy_entropy_raw: np.ndarray
+    mean_physical_steps: np.ndarray
+    standard_deviation_physical_steps: np.ndarray
+    candidate_construction_seconds: np.ndarray | None = None
+    expected_pair_diagnostics_seconds: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parameter_name, str) or not self.parameter_name:
+            raise ValueError("parameter_name must be a nonempty string")
+        if (
+            isinstance(self.shortest_physical_steps, (bool, np.bool_))
+            or not isinstance(self.shortest_physical_steps, (int, np.integer))
+            or self.shortest_physical_steps < 1
+        ):
+            raise ValueError("shortest_physical_steps must be a positive integer")
+
+        metric_names = (
+            "parameter_values",
+            "policy_entropy_normalized",
+            "policy_entropy_raw",
+            "mean_physical_steps",
+            "standard_deviation_physical_steps",
+        )
+        metrics = {
+            name: _read_only_array(getattr(self, name), dtype=np.float64)
+            for name in metric_names
+        }
+        expected_shape = metrics["parameter_values"].shape
+        if len(expected_shape) != 1 or not expected_shape[0]:
+            raise ValueError("Sweep arrays must be nonempty and one-dimensional")
+        for name, values in metrics.items():
+            if values.shape != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got {values.shape}"
+                )
+            object.__setattr__(self, name, values)
+
+        for name in (
+            "candidate_construction_seconds",
+            "expected_pair_diagnostics_seconds",
+        ):
+            supplied = getattr(self, name)
+            raw_values = (
+                np.full(expected_shape, np.nan, dtype=np.float64)
+                if supplied is None
+                else supplied
+            )
+            values = _read_only_array(raw_values, dtype=np.float64)
+            if values.shape != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got {values.shape}"
+                )
+            object.__setattr__(self, name, values)
+
+
+def _hierarchical_pair_plans(
     task: HierarchyTask,
     start: Coordinate,
-) -> np.ndarray:
-    """Return ``D[next_physical, next_mode, current_physical, current_mode]``."""
+) -> tuple[LayerOnePlan, ...]:
+    """Return the initial, continuation, and goal-only plans for one pair."""
 
     task.maze.state_index(start)
     if start == task.goal:
         raise ValueError("start must differ from the physical goal")
-    plans = (
+    return (
         task.plan(start),
         *(
             task.plan(start, upper_state=upper_state)
@@ -443,6 +526,15 @@ def _hierarchical_first_departure_dynamics(
             tolerate_unreachable=True,
         ),
     )
+
+
+def _hierarchical_physical_step_dynamics(
+    task: HierarchyTask,
+    start: Coordinate,
+) -> np.ndarray:
+    """Return one-step controller dynamics for a selected navigation pair."""
+
+    plans = _hierarchical_pair_plans(task, start)
     number_of_physical = len(task.maze.free_cells)
     number_of_modes = task.number_of_subtasks + 2
     result = np.zeros(
@@ -456,14 +548,38 @@ def _hierarchical_first_departure_dynamics(
     )
     goal_state = task.maze.state_index(task.goal)
     for current_state, current in enumerate(task.maze.free_cells):
-        if current_state == goal_state:
-            continue
-        step_kernel = _hierarchical_physical_step_kernel(task, current, plans)
-        result[:, :, current_state, :] = _first_departure_kernel(
-            step_kernel,
-            current_state,
-        )
+        if current_state != goal_state:
+            result[:, :, current_state, :] = (
+                _hierarchical_physical_step_kernel(task, current, plans)
+            )
     return result
+
+
+def _first_departure_dynamics_from_physical_steps(
+    task: HierarchyTask,
+    physical_steps: np.ndarray,
+) -> np.ndarray:
+    """Collapse same-location steps into first physical departures."""
+
+    result = np.zeros_like(physical_steps)
+    goal_state = task.maze.state_index(task.goal)
+    for current_state in range(len(task.maze.free_cells)):
+        if current_state != goal_state:
+            result[:, :, current_state, :] = _first_departure_kernel(
+                physical_steps[:, :, current_state, :],
+                current_state,
+            )
+    return result
+
+
+def _hierarchical_first_departure_dynamics(
+    task: HierarchyTask,
+    start: Coordinate,
+) -> np.ndarray:
+    """Return ``D[next_physical, next_mode, current_physical, current_mode]``."""
+
+    physical_steps = _hierarchical_physical_step_dynamics(task, start)
+    return _first_departure_dynamics_from_physical_steps(task, physical_steps)
 
 
 @dataclass(frozen=True)
@@ -1241,6 +1357,155 @@ def _expected_policy_entropy_for_pair(
     )
 
 
+def _expected_physical_step_moments(
+    task: HierarchyTask,
+    start: Coordinate,
+    physical_steps: np.ndarray,
+    *,
+    compute_condition_diagnostics: bool,
+) -> tuple[float, float] | None:
+    """Return exact physical-step mean and SD, or none for nonabsorption."""
+
+    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
+    number_of_physical, number_of_modes = physical_steps.shape[:2]
+    number_of_controller_states = number_of_physical * number_of_modes
+    goal_state = task.maze.state_index(task.goal)
+    initial_full_state = task.maze.state_index(start) * number_of_modes
+    goal_full_states = np.arange(
+        goal_state * number_of_modes,
+        (goal_state + 1) * number_of_modes,
+    )
+    transient_full_states = np.asarray(
+        [
+            physical_state * number_of_modes + mode
+            for physical_state in range(number_of_physical)
+            if physical_state != goal_state
+            for mode in range(number_of_modes)
+        ],
+        dtype=np.int64,
+    )
+
+    full_transition = physical_steps.reshape(
+        number_of_controller_states,
+        number_of_controller_states,
+    ).copy()
+    transient_transition = full_transition[
+        np.ix_(transient_full_states, transient_full_states)
+    ]
+    initial_transient = int(
+        np.flatnonzero(transient_full_states == initial_full_state)[0]
+    )
+    reachable_local = _support_reachable(
+        transient_transition,
+        initial_transient,
+    )
+    reachable_full = transient_full_states[reachable_local]
+
+    reachable_columns = full_transition[:, reachable_full]
+    if not np.all(np.isfinite(reachable_columns)):
+        raise RuntimeError("Physical-step kernel contains nonfinite values")
+    if np.any(reachable_columns < -_PROBABILITY_TOLERANCE):
+        raise RuntimeError("Physical-step kernel contains negative probabilities")
+    reachable_columns[reachable_columns < 0.0] = 0.0
+    step_mass = reachable_columns.sum(axis=0)
+    if np.any(step_mass > 1.0 + _PROBABILITY_TOLERANCE):
+        raise RuntimeError("Physical-step kernel has excess probability mass")
+    if np.any(step_mass < 1.0 - _PROBABILITY_TOLERANCE):
+        return None
+    reachable_columns /= step_mass[np.newaxis, :]
+    full_transition[:, reachable_full] = reachable_columns
+
+    transient_transition = full_transition[
+        np.ix_(transient_full_states, transient_full_states)
+    ]
+    restricted_transition = transient_transition[
+        np.ix_(reachable_local, reachable_local)
+    ]
+    goal_probability = full_transition[
+        np.ix_(goal_full_states, reachable_full)
+    ].sum(axis=0)
+    stochastic_mass = restricted_transition.sum(axis=0) + goal_probability
+    if not np.allclose(
+        stochastic_mass,
+        1.0,
+        atol=_PROBABILITY_TOLERANCE,
+        rtol=0.0,
+    ):
+        raise RuntimeError("Reachable physical-step chain is not stochastic")
+    if not _all_states_can_reach_goal(
+        restricted_transition,
+        goal_probability,
+    ):
+        return None
+
+    moment_system = (
+        np.eye(len(reachable_local), dtype=np.float64)
+        - restricted_transition.T
+    )
+    if instrumentation is not None:
+        instrumentation.maximum_transient_state_count = max(
+            instrumentation.maximum_transient_state_count,
+            len(reachable_local),
+        )
+        if compute_condition_diagnostics:
+            condition_started = perf_counter()
+            try:
+                condition_number = float(np.linalg.cond(moment_system))
+            except np.linalg.LinAlgError:
+                condition_number = float("inf")
+            instrumentation.condition_number_seconds += (
+                perf_counter() - condition_started
+            )
+            if not np.isfinite(condition_number):
+                condition_number = float("inf")
+            instrumentation.record_condition_number(condition_number)
+    try:
+        fundamental = np.linalg.solve(
+            moment_system,
+            np.eye(len(reachable_local), dtype=np.float64),
+        )
+    except np.linalg.LinAlgError as error:
+        raise RuntimeError(
+            "Absorbing physical-step chain could not be solved"
+        ) from error
+    if not np.all(np.isfinite(fundamental)):
+        raise RuntimeError("Physical-step moments contain nonfinite values")
+
+    ones = np.ones(len(reachable_local), dtype=np.float64)
+    mean = fundamental @ ones
+    second_moment = fundamental @ (
+        ones + 2.0 * restricted_transition.T @ mean
+    )
+    goal_hitting_probability = fundamental @ goal_probability
+    initial_position = int(
+        np.flatnonzero(reachable_local == initial_transient)[0]
+    )
+    initial_hitting = float(goal_hitting_probability[initial_position])
+    if initial_hitting < 1.0 - _PROBABILITY_TOLERANCE:
+        return None
+    if initial_hitting > 1.0 + _PROBABILITY_TOLERANCE:
+        raise RuntimeError("Goal-hitting probability exceeds one")
+
+    mean_physical_steps = float(mean[initial_position])
+    selected_second_moment = float(second_moment[initial_position])
+    if (
+        not np.isfinite(mean_physical_steps)
+        or not np.isfinite(selected_second_moment)
+        or mean_physical_steps <= 0.0
+    ):
+        raise RuntimeError("Physical-step moments are invalid")
+    variance = selected_second_moment - mean_physical_steps**2
+    variance_tolerance = _PROBABILITY_TOLERANCE * max(
+        1.0,
+        abs(selected_second_moment),
+        mean_physical_steps**2,
+    )
+    if variance < -variance_tolerance:
+        raise RuntimeError("Physical-step variance is negative")
+    standard_deviation = float(np.sqrt(max(0.0, variance)))
+    return mean_physical_steps, standard_deviation
+
+
 def _solve_prepared_occupancy(
     system: np.ndarray,
     right_hand_side: np.ndarray,
@@ -1622,7 +1887,7 @@ _BEHAVIORAL_SWEEP_PARAMETERS = (
 _GATE_SWEEP_PARAMETERS = ("core_threshold", "core_exponent")
 
 
-def _supported_entropy_sweep_parameters(
+def _supported_parameter_sweep_parameters(
     template: HierarchyTemplate,
 ) -> tuple[str, ...]:
     supported = (*_BEHAVIORAL_SWEEP_PARAMETERS, "composition_exponent")
@@ -1631,7 +1896,9 @@ def _supported_entropy_sweep_parameters(
     return supported
 
 
-def _validated_entropy_sweep_values(values: Sequence[float]) -> tuple[float, ...]:
+def _validated_parameter_sweep_values(
+    values: Sequence[float],
+) -> tuple[float, ...]:
     try:
         candidates = tuple(values)
     except TypeError as error:
@@ -1683,7 +1950,7 @@ def _hierarchy_template_with_parameter(
 ) -> HierarchyTemplate:
     """Return a fresh template with one authoritative physical value replaced."""
 
-    supported = _supported_entropy_sweep_parameters(template)
+    supported = _supported_parameter_sweep_parameters(template)
     if parameter_name not in supported:
         available = ", ".join(supported)
         if parameter_name in _GATE_SWEEP_PARAMETERS:
@@ -1693,7 +1960,7 @@ def _hierarchy_template_with_parameter(
         else:
             detail = "the parameter is unknown or inactive"
         raise ValueError(
-            f"Unsupported entropy sweep parameter {parameter_name!r}: {detail}. "
+            f"Unsupported sweep parameter {parameter_name!r}: {detail}. "
             f"Supported parameters for this template: {available}"
         )
 
@@ -1791,12 +2058,12 @@ def sweep_expected_policy_entropy(
         raise TypeError("compute_condition_diagnostics must be a boolean")
     if (start is None) != (goal is None):
         raise ValueError("start and goal must be provided together")
-    supported = _supported_entropy_sweep_parameters(template)
+    supported = _supported_parameter_sweep_parameters(template)
     if parameter_name not in supported:
         # Use the common replacement validator for one consistent public error.
         _hierarchy_template_with_parameter(template, parameter_name, 0.0)
         raise AssertionError("unreachable")
-    parameter_values = _validated_entropy_sweep_values(values)
+    parameter_values = _validated_parameter_sweep_values(values)
 
     results = []
     construction_times = []
@@ -2001,6 +2268,254 @@ def get_expected_policy_entropy_for_pair(
             "Policy is nonabsorbing for the requested start-goal pair"
         )
     return pair_data
+
+
+def _expected_pair_diagnostics_for_task(
+    task: HierarchyTask,
+    start: Coordinate,
+    shortest_physical_steps: int,
+    *,
+    compute_condition_diagnostics: bool,
+) -> ExpectedPairDiagnosticsData:
+    """Evaluate both exact pair metrics from one physical-step kernel."""
+
+    instrumentation = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.get()
+    if instrumentation is not None:
+        instrumentation.start_goal_pair_count += 1
+        dynamics_started = perf_counter()
+    physical_steps = _hierarchical_physical_step_dynamics(task, start)
+    departure = _first_departure_dynamics_from_physical_steps(
+        task,
+        physical_steps,
+    )
+    if instrumentation is not None:
+        instrumentation.first_departure_seconds += (
+            perf_counter() - dynamics_started
+        )
+
+    entropy = _expected_policy_entropy_for_pair(
+        task,
+        start,
+        departure=departure,
+        compute_condition_diagnostics=compute_condition_diagnostics,
+    )
+    moments = _expected_physical_step_moments(
+        task,
+        start,
+        physical_steps,
+        compute_condition_diagnostics=compute_condition_diagnostics,
+    )
+    if entropy is None or moments is None:
+        raise RuntimeError(
+            "Policy is nonabsorbing for the requested start-goal pair"
+        )
+    mean_physical_steps, standard_deviation_physical_steps = moments
+    return ExpectedPairDiagnosticsData(
+        policy_entropy=entropy,
+        mean_physical_steps=mean_physical_steps,
+        standard_deviation_physical_steps=standard_deviation_physical_steps,
+        shortest_physical_steps=shortest_physical_steps,
+    )
+
+
+def get_expected_pair_diagnostics(
+    model: HierarchyModel,
+    start: Coordinate,
+    goal: Coordinate | None = None,
+    *,
+    compute_condition_diagnostics: bool = False,
+) -> ExpectedPairDiagnosticsData:
+    """Return exact entropy and physical-step moments for one task pair."""
+
+    if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
+        raise TypeError("compute_condition_diagnostics must be a boolean")
+    task = _resolve_task(model, goal)
+    start_state = task.maze.state_index(start)
+    if start == task.goal:
+        raise ValueError("start must differ from the physical goal")
+    goal_state = task.maze.state_index(task.goal)
+    physical_reachability = _physical_reachability(
+        task.template.environment.passive
+    )
+    if goal_state not in physical_reachability[start_state]:
+        raise ValueError("goal is not topologically reachable from start")
+
+    return _expected_pair_diagnostics_for_task(
+        task,
+        start,
+        shortest_path_length(task.maze, start, task.goal),
+        compute_condition_diagnostics=compute_condition_diagnostics,
+    )
+
+
+def _print_expected_pair_diagnostics_sweep_progress(
+    *,
+    index: int,
+    total: int,
+    parameter_name: str,
+    value: float,
+    construction_seconds: float,
+    diagnostics_seconds: float,
+    instrumentation: _ExpectedPolicyEntropyInstrumentation,
+    status: str,
+) -> None:
+    """Print one combined pair-sweep progress record."""
+
+    condition_number = instrumentation.maximum_transient_condition_number
+    print(
+        f"[{index + 1}/{total}] {parameter_name}={value:.17g}"
+        f" | construction={construction_seconds:.3f}s"
+        f" | pair_diagnostics={diagnostics_seconds:.3f}s"
+        f" | pairs={instrumentation.start_goal_pair_count}"
+        f" | entropy_solves={instrumentation.occupancy_solve_count}"
+        f" | max_states={instrumentation.maximum_transient_state_count}"
+        f" | max_condition={condition_number:.3e}"
+        f" | status={status}",
+        flush=True,
+    )
+
+
+def sweep_expected_pair_diagnostics(
+    template: HierarchyTemplate,
+    parameter_name: str,
+    values: Sequence[float],
+    *,
+    start: Coordinate,
+    goal: Coordinate,
+    progress: bool = False,
+    compute_condition_diagnostics: bool = False,
+) -> ExpectedPairDiagnosticsSweepData:
+    """Sweep exact entropy and physical-step moments for one selected pair."""
+
+    if not isinstance(template, HierarchyTemplate):
+        raise TypeError("template must be a HierarchyTemplate")
+    if not isinstance(parameter_name, str):
+        raise TypeError("parameter_name must be a string")
+    if not isinstance(progress, (bool, np.bool_)):
+        raise TypeError("progress must be a boolean")
+    if not isinstance(compute_condition_diagnostics, (bool, np.bool_)):
+        raise TypeError("compute_condition_diagnostics must be a boolean")
+
+    start_state = template.maze.state_index(start)
+    goal_state = template.maze.state_index(goal)
+    if start == goal:
+        raise ValueError("start must differ from the physical goal")
+    physical_reachability = _physical_reachability(
+        template.environment.passive
+    )
+    if goal_state not in physical_reachability[start_state]:
+        raise ValueError("goal is not topologically reachable from start")
+    shortest_physical_steps = shortest_path_length(
+        template.maze,
+        start,
+        goal,
+    )
+
+    supported = _supported_parameter_sweep_parameters(template)
+    if parameter_name not in supported:
+        _hierarchy_template_with_parameter(template, parameter_name, 0.0)
+        raise AssertionError("unreachable")
+    parameter_values = _validated_parameter_sweep_values(values)
+
+    results = []
+    construction_times = []
+    diagnostics_times = []
+    total = len(parameter_values)
+    for index, value in enumerate(parameter_values):
+        construction_started = perf_counter()
+        try:
+            candidate = _hierarchy_template_with_parameter(
+                template,
+                parameter_name,
+                value,
+            )
+        except (TypeError, ValueError) as error:
+            construction_seconds = perf_counter() - construction_started
+            if progress:
+                _print_expected_pair_diagnostics_sweep_progress(
+                    index=index,
+                    total=total,
+                    parameter_name=parameter_name,
+                    value=value,
+                    construction_seconds=construction_seconds,
+                    diagnostics_seconds=0.0,
+                    instrumentation=_ExpectedPolicyEntropyInstrumentation(),
+                    status=f"construction_error={type(error).__name__}: {error}",
+                )
+            raise ValueError(
+                f"Invalid {parameter_name!r} value at index {index} "
+                f"({value!r}): {error}"
+            ) from error
+        construction_seconds = perf_counter() - construction_started
+
+        instrumentation = _ExpectedPolicyEntropyInstrumentation()
+        token = _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.set(instrumentation)
+        diagnostics_started = perf_counter()
+        try:
+            task = _build_hierarchy_task(candidate, goal)
+            result = _expected_pair_diagnostics_for_task(
+                task,
+                start,
+                shortest_physical_steps,
+                compute_condition_diagnostics=compute_condition_diagnostics,
+            )
+        except Exception as error:
+            diagnostics_seconds = perf_counter() - diagnostics_started
+            if progress:
+                _print_expected_pair_diagnostics_sweep_progress(
+                    index=index,
+                    total=total,
+                    parameter_name=parameter_name,
+                    value=value,
+                    construction_seconds=construction_seconds,
+                    diagnostics_seconds=diagnostics_seconds,
+                    instrumentation=instrumentation,
+                    status=f"diagnostics_error={type(error).__name__}: {error}",
+                )
+            raise
+        finally:
+            _EXPECTED_POLICY_ENTROPY_INSTRUMENTATION.reset(token)
+        diagnostics_seconds = perf_counter() - diagnostics_started
+
+        results.append(result)
+        construction_times.append(construction_seconds)
+        diagnostics_times.append(diagnostics_seconds)
+        if progress:
+            _print_expected_pair_diagnostics_sweep_progress(
+                index=index,
+                total=total,
+                parameter_name=parameter_name,
+                value=value,
+                construction_seconds=construction_seconds,
+                diagnostics_seconds=diagnostics_seconds,
+                instrumentation=instrumentation,
+                status="ok",
+            )
+
+    return ExpectedPairDiagnosticsSweepData(
+        parameter_name=parameter_name,
+        parameter_values=np.asarray(parameter_values),
+        start=start,
+        goal=goal,
+        shortest_physical_steps=shortest_physical_steps,
+        policy_entropy_normalized=np.asarray(
+            [result.policy_entropy.entropy_normalized for result in results]
+        ),
+        policy_entropy_raw=np.asarray(
+            [result.policy_entropy.entropy_raw for result in results]
+        ),
+        mean_physical_steps=np.asarray(
+            [result.mean_physical_steps for result in results]
+        ),
+        standard_deviation_physical_steps=np.asarray(
+            [
+                result.standard_deviation_physical_steps
+                for result in results
+            ]
+        ),
+        candidate_construction_seconds=np.asarray(construction_times),
+        expected_pair_diagnostics_seconds=np.asarray(diagnostics_times),
+    )
 
 
 def _subgoal_labels(task: HierarchyTask) -> tuple[str, ...]:

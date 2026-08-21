@@ -11,6 +11,7 @@ from andrew_mlmdp.plotting.hard import (
 from andrew_mlmdp.plotting.hierarchy import (
     plot_composition_weights,
     plot_continuation_policies,
+    plot_expected_pair_diagnostics_sweep,
     plot_expected_policy_entropy_sweep,
     plot_rollout_distribution,
     plot_rollout_subgoal_sequences,
@@ -38,6 +39,7 @@ __all__ = [
     "animate_hierarchical_rollout",
     "plot_composition_weights",
     "plot_continuation_policies",
+    "plot_expected_pair_diagnostics_sweep",
     "plot_expected_policy_entropy_sweep",
     "plot_controlled_dynamics",
     "plot_interactive_soft_hierarchical_rollout",

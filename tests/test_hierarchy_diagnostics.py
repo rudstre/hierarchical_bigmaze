@@ -6,10 +6,12 @@ import pytest
 import andrew_mlmdp.hierarchy.diagnostics as hierarchy_diagnostics
 from andrew_mlmdp import LMDPEnvironment, Maze, ModelParameters, SubgoalBasis
 from andrew_mlmdp.hierarchy import (
+    ExpectedPairDiagnosticsSweepData,
     ExpectedPolicyEntropyData,
     ExpectedPolicyEntropySweepData,
     get_composition_weight_data,
     get_continuation_policy_data,
+    get_expected_pair_diagnostics,
     get_expected_policy_entropy,
     get_expected_policy_entropy_for_pair,
     get_upper_graph_data,
@@ -17,6 +19,7 @@ from andrew_mlmdp.hierarchy import (
     shortest_path_length,
     summarize_rollout_subgoal_sequences,
     summarize_rollouts,
+    sweep_expected_pair_diagnostics,
     sweep_expected_policy_entropy,
 )
 from andrew_mlmdp.hierarchy.rollout import _rollout_column
@@ -385,6 +388,260 @@ def test_expected_policy_entropy_for_pair_rejects_nonabsorbing_policy(
 
     with pytest.raises(RuntimeError, match="nonabsorbing"):
         get_expected_policy_entropy_for_pair(template, (0, 0), (0, 2))
+
+
+@pytest.mark.parametrize(
+    ("goal_probability", "expected_mean", "expected_standard_deviation"),
+    [
+        (1.0, 1.0, 0.0),
+        (0.4, 2.5, np.sqrt(0.6) / 0.4),
+    ],
+)
+def test_expected_pair_diagnostics_matches_geometric_physical_steps(
+    monkeypatch,
+    goal_probability,
+    expected_mean,
+    expected_standard_deviation,
+):
+    maze = Maze.from_ascii("...")
+    template = _uniform_profile_template(maze)
+    start = (0, 1)
+    goal = (0, 2)
+    calls = []
+
+    def geometric_kernel(task, current, plans):
+        calls.append(current)
+        number_of_modes = len(plans)
+        kernel = np.zeros((3, number_of_modes, number_of_modes))
+        current_state = task.maze.state_index(current)
+        goal_state = task.maze.state_index(task.goal)
+        for mode in range(number_of_modes):
+            if current == start:
+                kernel[current_state, mode, mode] = 1.0 - goal_probability
+                kernel[goal_state, mode, mode] = goal_probability
+            else:
+                kernel[goal_state, mode, mode] = 1.0
+        return kernel
+
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "_hierarchical_physical_step_kernel",
+        geometric_kernel,
+    )
+
+    result = get_expected_pair_diagnostics(template, start, goal)
+
+    assert calls == [(0, 0), (0, 1)]
+    assert result.start == start
+    assert result.goal == goal
+    assert result.shortest_physical_steps == 1
+    assert result.policy_entropy.entropy_normalized == pytest.approx(0.0)
+    assert result.policy_entropy.entropy_raw == pytest.approx(0.0)
+    assert result.mean_physical_steps == pytest.approx(expected_mean)
+    assert result.standard_deviation_physical_steps == pytest.approx(
+        expected_standard_deviation
+    )
+
+
+def test_expected_pair_diagnostics_matches_standalone_entropy_and_task_call():
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    start = (0, 0)
+    goal = (0, 2)
+
+    combined = get_expected_pair_diagnostics(template, start, goal)
+    standalone = get_expected_policy_entropy_for_pair(template, start, goal)
+
+    assert template._task_cache == {}
+    for field in (
+        "expected_entropy_sum_normalized",
+        "expected_entropy_sum_raw",
+        "expected_decision_count",
+        "entropy_normalized",
+        "entropy_raw",
+    ):
+        assert getattr(combined.policy_entropy, field) == pytest.approx(
+            getattr(standalone, field),
+            rel=1e-11,
+            abs=1e-12,
+        )
+    task_result = get_expected_pair_diagnostics(
+        template.for_goal(goal),
+        start,
+    )
+    assert task_result == combined
+
+
+def test_expected_pair_physical_step_moments_match_seeded_rollouts():
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    start = (0, 0)
+    goal = (0, 2)
+    exact = get_expected_pair_diagnostics(template, start, goal)
+    task = template.for_goal(goal)
+    physical_steps = np.asarray(
+        [
+            task.rollout(start, seed=seed, max_steps=100).physical_steps
+            for seed in range(3000)
+        ]
+    )
+
+    assert physical_steps.mean() == pytest.approx(
+        exact.mean_physical_steps,
+        abs=0.04,
+    )
+    assert physical_steps.std() == pytest.approx(
+        exact.standard_deviation_physical_steps,
+        abs=0.04,
+    )
+
+
+def test_expected_pair_diagnostics_validates_pair_and_absorption(monkeypatch):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    task = template.for_goal((0, 2))
+
+    with pytest.raises(ValueError, match="goal is required"):
+        get_expected_pair_diagnostics(template, (0, 0))
+    with pytest.raises(ValueError, match="must differ"):
+        get_expected_pair_diagnostics(template, (0, 2), (0, 2))
+    with pytest.raises(ValueError, match="conflicts"):
+        get_expected_pair_diagnostics(task, (0, 0), (0, 1))
+    with pytest.raises(TypeError, match="compute_condition_diagnostics"):
+        get_expected_pair_diagnostics(
+            task,
+            (0, 0),
+            compute_condition_diagnostics="yes",
+        )
+
+    disconnected = _uniform_profile_template(Maze.from_ascii("..#.."))
+    with pytest.raises(ValueError, match="topologically reachable"):
+        get_expected_pair_diagnostics(disconnected, (0, 0), (0, 3))
+
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "_expected_physical_step_moments",
+        lambda *_args, **_kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="nonabsorbing"):
+        get_expected_pair_diagnostics(task, (0, 0))
+
+
+def test_pair_diagnostics_sweep_matches_direct_and_computes_shortest_once(
+    monkeypatch,
+    capsys,
+):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    parameter_values = (0.2, 0.08, 0.2)
+    start = (0, 0)
+    goal = (0, 2)
+    original_shortest_path = hierarchy_diagnostics.shortest_path_length
+    shortest_path_calls = []
+
+    def counted_shortest_path(maze, selected_start, selected_goal):
+        shortest_path_calls.append((selected_start, selected_goal))
+        return original_shortest_path(maze, selected_start, selected_goal)
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            hierarchy_diagnostics,
+            "shortest_path_length",
+            counted_shortest_path,
+        )
+        sweep = sweep_expected_pair_diagnostics(
+            template,
+            "lower_control_cost",
+            parameter_values,
+            start=start,
+            goal=goal,
+            progress=True,
+        )
+
+    assert shortest_path_calls == [(start, goal)]
+    direct = [
+        get_expected_pair_diagnostics(
+            hierarchy_diagnostics._hierarchy_template_with_parameter(
+                template,
+                "lower_control_cost",
+                value,
+            ),
+            start,
+            goal,
+        )
+        for value in parameter_values
+    ]
+    assert isinstance(sweep, ExpectedPairDiagnosticsSweepData)
+    assert sweep.start == start
+    assert sweep.goal == goal
+    assert sweep.shortest_physical_steps == 2
+    expected_metrics = {
+        "policy_entropy_normalized": [
+            result.policy_entropy.entropy_normalized for result in direct
+        ],
+        "policy_entropy_raw": [
+            result.policy_entropy.entropy_raw for result in direct
+        ],
+        "mean_physical_steps": [
+            result.mean_physical_steps for result in direct
+        ],
+        "standard_deviation_physical_steps": [
+            result.standard_deviation_physical_steps for result in direct
+        ],
+    }
+    for name, expected in expected_metrics.items():
+        np.testing.assert_allclose(
+            getattr(sweep, name),
+            expected,
+            rtol=1e-11,
+            atol=1e-12,
+        )
+        assert not getattr(sweep, name).flags.writeable
+    for name in (
+        "parameter_values",
+        "candidate_construction_seconds",
+        "expected_pair_diagnostics_seconds",
+    ):
+        assert not getattr(sweep, name).flags.writeable
+    assert template._task_cache == {}
+    assert template._passive_dynamics is None
+    progress_output = capsys.readouterr().out
+    assert progress_output.count("pair_diagnostics=") == len(parameter_values)
+    assert progress_output.count("status=ok") == len(parameter_values)
+
+
+def test_pair_diagnostics_sweep_rejects_parameters_and_reports_errors(
+    monkeypatch,
+    capsys,
+):
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+
+    with pytest.raises(ValueError, match="Unsupported sweep parameter"):
+        sweep_expected_pair_diagnostics(
+            template,
+            "not_a_parameter",
+            (0.2,),
+            start=(0, 0),
+            goal=(0, 2),
+        )
+
+    def fail_diagnostics(*_args, **_kwargs):
+        raise RuntimeError("pathological pair")
+
+    monkeypatch.setattr(
+        hierarchy_diagnostics,
+        "_expected_pair_diagnostics_for_task",
+        fail_diagnostics,
+    )
+    with pytest.raises(RuntimeError, match="pathological pair"):
+        sweep_expected_pair_diagnostics(
+            template,
+            "lower_control_cost",
+            (0.2,),
+            start=(0, 0),
+            goal=(0, 2),
+            progress=True,
+        )
+    assert (
+        "status=diagnostics_error=RuntimeError: pathological pair"
+        in capsys.readouterr().out
+    )
 
 
 def test_first_departure_dynamics_has_full_orientation_and_direct_goal_mass():

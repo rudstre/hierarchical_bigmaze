@@ -13,6 +13,7 @@ from matplotlib.patches import FancyArrowPatch
 
 from andrew_mlmdp.hierarchy.diagnostics import (
     ContinuationPolicyData,
+    ExpectedPairDiagnosticsSweepData,
     ExpectedPolicyEntropySweepData,
     HierarchyModel,
     LatentRouteData,
@@ -71,6 +72,70 @@ def plot_expected_policy_entropy_sweep(
     ax.set_xlabel(sweep_data.parameter_name.replace("_", " ").capitalize())
     ax.set_ylabel(_ENTROPY_SWEEP_METRIC_LABELS[metric])
     return figure, ax
+
+
+def plot_expected_pair_diagnostics_sweep(
+    sweep_data: ExpectedPairDiagnosticsSweepData,
+    *,
+    axes=None,
+):
+    """Plot exact pair entropy and trajectory-length diagnostics."""
+
+    if not isinstance(sweep_data, ExpectedPairDiagnosticsSweepData):
+        raise TypeError(
+            "sweep_data must be an ExpectedPairDiagnosticsSweepData"
+        )
+    if axes is None:
+        figure, created_axes = plt.subplots(2, 1, sharex=True)
+        entropy_ax, length_ax = created_axes
+    else:
+        try:
+            entropy_ax, length_ax = axes
+        except (TypeError, ValueError) as error:
+            raise ValueError("axes must contain exactly two axes") from error
+        figure = entropy_ax.figure
+        if length_ax.figure is not figure:
+            raise ValueError("axes must belong to the same figure")
+
+    parameter_values = sweep_data.parameter_values
+    entropy_ax.plot(
+        parameter_values,
+        sweep_data.policy_entropy_normalized,
+        marker="o",
+        label="Policy entropy",
+    )
+    entropy_ax.set_ylabel("Expected policy entropy (normalized)")
+    entropy_ax.legend()
+
+    mean = sweep_data.mean_physical_steps
+    standard_deviation = sweep_data.standard_deviation_physical_steps
+    length_ax.plot(
+        parameter_values,
+        mean,
+        marker="o",
+        label="Mean physical steps",
+    )
+    length_ax.fill_between(
+        parameter_values,
+        mean - standard_deviation,
+        mean + standard_deviation,
+        alpha=0.2,
+        label="±1 SD",
+    )
+    length_ax.axhline(
+        sweep_data.shortest_physical_steps,
+        color="black",
+        linestyle="--",
+        label=(
+            f"Shortest path = {sweep_data.shortest_physical_steps} steps"
+        ),
+    )
+    length_ax.set_xlabel(
+        sweep_data.parameter_name.replace("_", " ").capitalize()
+    )
+    length_ax.set_ylabel("Trajectory length (physical steps)")
+    length_ax.legend()
+    return figure, (entropy_ax, length_ax)
 
 
 def _subgoal_colors(number_of_subgoals: int) -> tuple[tuple[float, ...], ...]:

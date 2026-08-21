@@ -8,6 +8,11 @@ NOTEBOOK = PROJECT_ROOT / "notebooks" / "maze_lmdp_workflows.ipynb"
 DOOHAN_NOTEBOOK = (
     PROJECT_ROOT / "doohan_data_interaction" / "doohan_trial_lmdp.ipynb"
 )
+DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK = (
+    PROJECT_ROOT
+    / "doohan_data_interaction"
+    / "doohan_hierarchy_fit_diagnostics.ipynb"
+)
 
 
 def test_canonical_notebook_executes_top_to_bottom():
@@ -60,3 +65,34 @@ def test_doohan_notebook_compiles_and_fit_cells_are_unexecuted():
     for cell in fit_cells.values():
         assert cell.execution_count is None
         assert cell.outputs == []
+
+
+def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
+    notebook = nbformat.read(
+        DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK,
+        as_version=4,
+    )
+    code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
+    notebook_source = "\n".join(cell.source for cell in code_cells)
+
+    assert "sweep_expected_pair_diagnostics" in notebook_source
+    assert "plot_expected_pair_diagnostics_sweep" in notebook_source
+    assert "start=example_start" in notebook_source
+    assert "goal=example_goal" in notebook_source
+    assert "sweep_expected_policy_entropy" not in notebook_source
+    for cell in code_cells:
+        compile(
+            cell.source,
+            str(DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK),
+            "exec",
+        )
+
+    sweep_cells = {
+        cell.id: cell
+        for cell in code_cells
+        if cell.id == "sweep-pair-diagnostics"
+    }
+    assert set(sweep_cells) == {"sweep-pair-diagnostics"}
+    sweep_cell = sweep_cells["sweep-pair-diagnostics"]
+    assert sweep_cell.execution_count is None
+    assert sweep_cell.outputs == []
