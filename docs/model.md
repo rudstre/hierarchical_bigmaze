@@ -226,6 +226,11 @@ The upper layer is another first-exit LMDP:
 `task.upper_desirability` and then reweights the passive upper dynamics to
 obtain `task.upper_controlled`.
 
+The default reward gauge is `interior_reward = -1` and `goal_reward = 0`.
+Before fixing this gauge, multiplying `interior_reward`, both control costs,
+and `beta` by one positive constant left every policy unchanged. The rescaled
+default costs and `beta` preserve the pre-gauge dimensionless behavior.
+
 At a physical state `s` that is not an entered point subgoal, the passive
 abstract prediction is the first-hit column
 
@@ -288,12 +293,11 @@ r^1_t = \beta\,(u^2_t - p^2_t).
 ```
 
 The active physical-goal reward is the same probability-difference term, not
-the behavioral `goal_reward`. Exponentiating these rewards with
-`lower_control_cost` produces a target boundary desirability `z_target`.
-`goal_reward` instead remains active in upper termination and in the
-behavioral goal-only policy installed after upper termination; that goal-only
-policy is solved directly and does not depend on the fixed goal-library
-column.
+`goal_reward`. Exponentiating these rewards with `lower_control_cost` produces
+a target boundary desirability `z_target`. The configured `goal_reward` only
+multiplies the single-boundary upper and goal-only desirabilities by a common
+factor. Column normalization cancels that factor, so `goal_reward` does not
+change upper termination, the goal-only policy, or trajectory likelihood.
 
 Second, the target is approximated with the reusable task basis:
 
@@ -376,7 +380,9 @@ loops. `Rollout.events` records the state machine explicitly using
 
 For ordinary pre-termination plans, exact execution uses the fixed final
 goal-library column in `Z_i`. After upper termination, the goal-only plan is
-instead solved directly from behavioral `goal_reward`.
+solved as a single-boundary first-exit task. Its configured `goal_reward` sets
+only a common desirability scale and therefore cancels from its normalized
+policy.
 
 With `goal_learning="online"`, that column is replaced by a learned vector,
 initialized to zero or supplied through `initial_goal_desirability`. Each
@@ -585,12 +591,18 @@ values requires separately constructing a fresh basis and template.
 
 The fixed task library and `composition_exponent` are not Adam variables.
 Adam fitting currently fixes `composition_exponent = c = 1.0` and rejects a
-template configured with another value. The behavioral fit contains
-`interior_reward`, `goal_reward`, `lower_control_cost`, `upper_control_cost`,
-`alpha`, `beta`, and, when the basis gate is active, `core_threshold` and
-`core_exponent`. The former behavioral `off_target_reward` no longer exists;
-canonical task-library metadata calls its replacement
-`off_target_value` and never repurposes it as a fitted reward.
+template configured with another value. The canonical reward gauge uses
+`interior_reward = -1` and `goal_reward = 0`. Both remain configurable
+construction inputs, but Adam holds their configured values fixed and rejects
+selecting them. The identifiable reward-cost groups are
+$\rho_1 = 1 / \lambda_1$, $\rho_2 = 1 / \lambda_2$, and
+$\beta / \lambda_1$.
+
+`fittable_parameters(template)` returns `lower_control_cost`,
+`upper_control_cost`, `alpha`, and `beta`, plus `core_threshold` (`tau`) and
+`core_exponent` (`eta`) for an active gated basis. The former behavioral
+`off_target_reward` no longer exists; canonical task-library metadata calls
+its replacement `off_target_value` and never repurposes it as a fitted reward.
 
 Adam uses PyTorch's `ReduceLROnPlateau` with the evaluated pre-update loss passed to
 the scheduler only after its aligned optimizer update. When the scheduler lowers

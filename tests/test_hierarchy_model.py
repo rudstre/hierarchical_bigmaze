@@ -8,7 +8,9 @@ from andrew_mlmdp import (
     Parameters,
     SubgoalBasis,
     TaskLibrary,
+    fittable_parameters,
     point_parameters,
+    required_parameters,
     soft_parameters,
 )
 from andrew_mlmdp.hierarchy.model import (
@@ -27,12 +29,12 @@ def _parameter_values(parameters: Parameters) -> dict[str, float]:
 def test_model_parameters_are_trainable_float64_scalars():
     parameters = Parameters()
     expected = {
-        "interior_reward": -0.1,
-        "goal_reward": 1.1,
-        "lower_control_cost": 0.1,
-        "upper_control_cost": 0.25,
+        "interior_reward": -1.0,
+        "goal_reward": 0.0,
+        "lower_control_cost": 1.0,
+        "upper_control_cost": 2.5,
         "alpha": 0.2,
-        "beta": 16.0,
+        "beta": 160.0,
         "core_exponent": 1.0,
     }
 
@@ -40,7 +42,7 @@ def test_model_parameters_are_trainable_float64_scalars():
     assert parameters.core_threshold is None
     assert _parameter_values(parameters) == pytest.approx(expected)
     assert set(parameters.state_dict()) == set(expected)
-    assert "interior_reward=-0.1" in repr(parameters)
+    assert "interior_reward=-1" in repr(parameters)
     assert "core_threshold=None" in repr(parameters)
     assert all(
         isinstance(parameter, torch.nn.Parameter)
@@ -70,15 +72,136 @@ def test_hierarchy_factories_preserve_core_defaults():
     assert isinstance(soft.core_threshold, torch.nn.Parameter)
     assert _parameter_values(soft) == pytest.approx(
         {
-            "interior_reward": -0.1,
-            "goal_reward": 1.1,
-            "lower_control_cost": 0.1,
-            "upper_control_cost": 0.25,
+            "interior_reward": -1.0,
+            "goal_reward": 0.0,
+            "lower_control_cost": 1.0,
+            "upper_control_cost": 2.5,
             "alpha": 0.2,
-            "beta": 16.0,
+            "beta": 160.0,
             "core_threshold": 0.8,
             "core_exponent": 1.0,
         }
+    )
+
+
+def test_fittable_parameters_exclude_rewards_and_follow_basis_gate():
+    maze = Maze.from_ascii(".....")
+    environment = Environment(maze)
+    point = environment.hierarchy(
+        SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    )
+    gated = environment.hierarchy(
+        SubgoalBasis.from_profiles(
+            maze,
+            np.asarray(
+                [
+                    [1.0, 0.0],
+                    [0.8, 0.2],
+                    [0.5, 0.5],
+                    [0.2, 0.8],
+                    [0.0, 1.0],
+                ]
+            ),
+            core_threshold=0.4,
+        )
+    )
+
+    complete = (
+        "interior_reward",
+        "goal_reward",
+        "lower_control_cost",
+        "upper_control_cost",
+        "alpha",
+        "beta",
+    )
+    fittable = (
+        "lower_control_cost",
+        "upper_control_cost",
+        "alpha",
+        "beta",
+    )
+    assert required_parameters(point) == complete
+    assert fittable_parameters(point) == fittable
+    assert required_parameters(gated) == complete + (
+        "core_threshold",
+        "core_exponent",
+    )
+    assert fittable_parameters(gated) == fittable + (
+        "core_threshold",
+        "core_exponent",
+    )
+
+
+def test_canonical_gauge_preserves_old_hierarchical_policy_and_likelihood():
+    maze = Maze.from_ascii("......")
+    environment = Environment(maze)
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 4)))
+    old = environment.hierarchy(
+        basis,
+        parameters=Parameters(
+            interior_reward=-0.1,
+            goal_reward=1.1,
+            lower_control_cost=0.1,
+            upper_control_cost=0.25,
+            alpha=0.2,
+            beta=16.0,
+        ),
+    ).task((0, 5))
+    canonical = environment.hierarchy(
+        basis,
+        parameters=Parameters(),
+    ).task((0, 5))
+
+    assert canonical.upper_controlled == pytest.approx(old.upper_controlled)
+    for upper_state in (None, 0, 1):
+        old_plan = old.plan((0, 2), upper_state=upper_state)
+        canonical_plan = canonical.plan((0, 2), upper_state=upper_state)
+        assert (
+            canonical_plan.rewards
+            / canonical.parameters.lower_control_cost.item()
+        ) == pytest.approx(
+            old_plan.rewards / old.parameters.lower_control_cost.item()
+        )
+        assert canonical_plan.weights == pytest.approx(old_plan.weights)
+        assert canonical_plan.lower_policy == pytest.approx(
+            old_plan.lower_policy
+        )
+
+    trajectory = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5))
+    assert canonical.log_likelihood(trajectory) == pytest.approx(
+        old.log_likelihood(trajectory),
+        abs=2e-11,
+    )
+
+
+def test_goal_reward_alone_does_not_change_hierarchical_behavior():
+    maze = Maze.from_ascii("......")
+    environment = Environment(maze)
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 4)))
+    low = environment.hierarchy(
+        basis,
+        parameters=Parameters(goal_reward=-2.0),
+    ).task((0, 5))
+    high = environment.hierarchy(
+        basis,
+        parameters=Parameters(goal_reward=3.0),
+    ).task((0, 5))
+
+    assert high.upper_controlled == pytest.approx(low.upper_controlled)
+    for upper_state in (None, 0, 1):
+        low_plan = low.plan((0, 2), upper_state=upper_state)
+        high_plan = high.plan((0, 2), upper_state=upper_state)
+        assert high_plan.weights == pytest.approx(low_plan.weights)
+        assert high_plan.lower_policy == pytest.approx(low_plan.lower_policy)
+
+    low_goal = _goal_only_plan(low, (0, 2), goal_desirability=None)
+    high_goal = _goal_only_plan(high, (0, 2), goal_desirability=None)
+    assert high_goal.lower_policy == pytest.approx(low_goal.lower_policy)
+
+    trajectory = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5))
+    assert high.log_likelihood(trajectory) == pytest.approx(
+        low.log_likelihood(trajectory),
+        abs=2e-11,
     )
 
 
@@ -397,12 +520,12 @@ def test_point_hierarchy_uses_swept_hard_defaults():
     template = Environment(maze).hierarchy(basis)
 
     expected = Parameters(
-        interior_reward=-0.1,
-        goal_reward=1.1,
-        lower_control_cost=0.06,
-        upper_control_cost=0.3,
+        interior_reward=-1.0,
+        goal_reward=0.0,
+        lower_control_cost=0.6,
+        upper_control_cost=3.0,
         alpha=0.4,
-        beta=16.0,
+        beta=160.0,
     )
     assert _parameter_values(point_parameters()) == pytest.approx(
         _parameter_values(expected)

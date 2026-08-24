@@ -23,9 +23,9 @@ class NMFConfig:
     different hierarchy.
     """
 
-    interior_reward: float = -0.4
-    goal_reward: float = 6.5
-    control_cost: float = 1.2
+    interior_reward: float = -1.0
+    goal_reward: float = 0.0
+    control_cost: float = 3.0
     lambda_smooth: float = 0.0
 
     def __post_init__(self) -> None:

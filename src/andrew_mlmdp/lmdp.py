@@ -18,7 +18,7 @@ PassiveMode = Literal["five_commands", "valid_neighbors"]
 
 
 class Parameters(nn.Module):
-    """Trainable scalar parameters for flat and hierarchical execution.
+    """Scalar parameters for flat and hierarchical execution.
 
     The lower cost governs flat and physical-layer calculations, including the
     task basis and reward inpainting. The upper cost governs the abstract LMDP.
@@ -30,12 +30,12 @@ class Parameters(nn.Module):
 
     def __init__(
         self,
-        interior_reward: float = -0.1,
-        goal_reward: float = 1.1,
-        lower_control_cost: float = 0.1,
-        upper_control_cost: float = 0.25,
+        interior_reward: float = -1.0,
+        goal_reward: float = 0.0,
+        lower_control_cost: float = 1.0,
+        upper_control_cost: float = 2.5,
         alpha: float = 0.2,
-        beta: float = 16.0,
+        beta: float = 160.0,
         core_threshold: float | None = None,
         core_exponent: float = 1.0,
     ) -> None:
@@ -115,12 +115,12 @@ def _scalar_parameter(value: float) -> nn.Parameter:
 
 def point_parameters(
     *,
-    interior_reward: float = -0.1,
-    goal_reward: float = 1.1,
-    lower_control_cost: float = 0.06,
-    upper_control_cost: float = 0.3,
+    interior_reward: float = -1.0,
+    goal_reward: float = 0.0,
+    lower_control_cost: float = 0.6,
+    upper_control_cost: float = 3.0,
     alpha: float = 0.4,
-    beta: float = 16.0,
+    beta: float = 160.0,
     core_threshold: float | None = None,
     core_exponent: float = 1.0,
 ) -> Parameters:

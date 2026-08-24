@@ -146,6 +146,30 @@ def test_flat_and_hierarchical_tasks_use_selected_passive_mode(
     assert task.rollout((0, 0), seed=4).reached_goal
 
 
+def test_flat_canonical_gauge_preserves_old_policy_and_likelihood():
+    environment = Environment(Maze.from_ascii("....."))
+    old = environment.solve(
+        (0, 4),
+        parameters=Parameters(
+            interior_reward=-0.1,
+            goal_reward=1.1,
+            lower_control_cost=0.1,
+        ),
+    )
+    canonical = environment.solve((0, 4))
+    goal_state = environment.maze.state_index((0, 4))
+
+    assert canonical.parameters.interior_reward.item() == -1.0
+    assert canonical.parameters.goal_reward.item() == 0.0
+    assert canonical.parameters.lower_control_cost.item() == 1.0
+    assert canonical.desirability[goal_state] == 1.0
+    assert canonical.controlled == pytest.approx(old.controlled)
+    trajectory = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4))
+    assert canonical.log_likelihood(trajectory) == pytest.approx(
+        old.log_likelihood(trajectory)
+    )
+
+
 @pytest.mark.parametrize(
     "layout,goal",
     [

@@ -5,9 +5,45 @@ from andrew_mlmdp import (
     Environment,
     Maze,
     NMFConfig,
+    Parameters,
     SubgoalBasis,
     discover_subgoals,
 )
+
+
+def test_nmf_defaults_use_canonical_unsmoothed_gauge_and_intended_rho():
+    parameters = NMFConfig()
+    assert parameters == NMFConfig(
+        interior_reward=-1.0,
+        goal_reward=0.0,
+        control_cost=3.0,
+        lambda_smooth=0.0,
+    )
+    assert np.exp(parameters.goal_reward / parameters.control_cost) == 1.0
+    assert -parameters.interior_reward / parameters.control_cost == pytest.approx(
+        1.0 / 3.0
+    )
+
+    environment = Environment(Maze.from_ascii("...."))
+    goals = ((0, 0), (0, 3))
+    study = discover_subgoals(
+        environment,
+        ranks=(1,),
+        goals=goals,
+        parameters=parameters,
+        seed=0,
+    )
+    flat_parameters = Parameters(
+        interior_reward=parameters.interior_reward,
+        goal_reward=parameters.goal_reward,
+        lower_control_cost=parameters.control_cost,
+    )
+    for column, goal in enumerate(goals):
+        goal_state = environment.maze.state_index(goal)
+        assert study.ensemble.desirability[goal_state, column] == 1.0
+        assert study.ensemble.desirability[:, column] == pytest.approx(
+            environment.solve(goal, parameters=flat_parameters).desirability
+        )
 
 
 def test_rank_study_fits_each_requested_rank_once(monkeypatch):
@@ -170,7 +206,7 @@ def test_graph_adjacency_uses_passive_connectivity_and_state_order():
     maze = Maze.from_ascii("...").with_connections(
         [((0, 0), (0, 1))]
     )
-    environment = Environment(maze)
+    environment = Environment(maze, passive_mode="five_commands")
 
     assert discovery._graph_adjacency_from_passive(
         environment.passive

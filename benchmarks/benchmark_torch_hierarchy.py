@@ -115,7 +115,7 @@ def _load_problem():
     )
     template = environment.hierarchy(
         basis,
-        parameters=soft_parameters(8, upper_control_cost=0.18),
+        parameters=soft_parameters(8, upper_control_cost=1.8),
     )
     return template, tuple(dataset.trials)
 

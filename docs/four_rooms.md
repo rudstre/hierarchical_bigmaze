@@ -37,12 +37,12 @@ Calling `Environment.hierarchy(basis)` without explicit parameters selects:
 
 ```python
 point_parameters(
-    interior_reward=-0.1,
-    goal_reward=1.1,
-    lower_control_cost=0.06,
-    upper_control_cost=0.3,
+    interior_reward=-1.0,
+    goal_reward=0.0,
+    lower_control_cost=0.6,
+    upper_control_cost=3.0,
     alpha=0.4,
-    beta=16.0,
+    beta=160.0,
 )
 ```
 
@@ -59,20 +59,20 @@ defaults.
 uses goal `(1, 9)` and the hard defaults above with one explicit override:
 
 ```python
-hard_parameters = point_parameters(upper_control_cost=0.65)
+hard_parameters = point_parameters(upper_control_cost=6.5)
 ```
 
 While the hierarchy is active, plans combine the six fixed subgoal tasks with
 the fixed physical-goal library component. The goal coefficient is determined
-by reward inpainting. Upper termination then installs a behavioral goal-only
-task, constructed directly from `goal_reward`, permanently.
+by reward inpainting. Upper termination then installs a normalized goal-only
+task with the same lower-layer discount, permanently.
 
 The notebook's distributed example fits several NMF ranks, selects one after
 inspecting the diagnostics, and applies an 80%-of-peak execution core. The
 selected rank is also passed to the execution-parameter helper:
 
 ```python
-soft_parameters(k=soft_rank, upper_control_cost=0.18)
+soft_parameters(k=soft_rank, upper_control_cost=1.8)
 ```
 
 These upper-cost overrides are example tuning, not package-wide defaults.
@@ -82,9 +82,9 @@ defaults:
 
 ```python
 NMFConfig(
-    interior_reward=-0.4,
-    goal_reward=6.5,
-    control_cost=1.2,
+    interior_reward=-1.0,
+    goal_reward=0.0,
+    control_cost=3.0,
     lambda_smooth=0.0,
 )
 ```

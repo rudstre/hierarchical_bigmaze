@@ -34,6 +34,12 @@ _BASE_PARAMETER_NAMES = (
     "alpha",
     "beta",
 )
+_FITTABLE_BASE_PARAMETER_NAMES = (
+    "lower_control_cost",
+    "upper_control_cost",
+    "alpha",
+    "beta",
+)
 _GATE_PARAMETER_NAMES = ("core_threshold", "core_exponent")
 
 
@@ -113,6 +119,22 @@ def required_parameters(
     return _BASE_PARAMETER_NAMES
 
 
+def fittable_parameters(
+    template: "Template",
+) -> tuple[str, ...]:
+    """Return parameters supported by constrained Adam fitting.
+
+    The canonical defaults use ``interior_reward=-1`` and
+    ``goal_reward=0``. Adam holds both rewards fixed at their configured
+    constructor values. Gate parameters are active only for an already-gated
+    distributed basis.
+    """
+
+    if _basis_is_gated(template):
+        return _FITTABLE_BASE_PARAMETER_NAMES + _GATE_PARAMETER_NAMES
+    return _FITTABLE_BASE_PARAMETER_NAMES
+
+
 def parameter_values(
     template: "Template",
     *,
@@ -120,7 +142,7 @@ def parameter_values(
 ) -> dict[str, Tensor]:
     """Assemble physical tensors for the template's differentiable path.
 
-    The seven execution parameters come from ``template.parameters``.  For a
+    The complete execution parameters come from ``template.parameters``. For a
     gated soft basis, gate defaults come exclusively from
     ``template.basis.core_threshold`` and ``core_exponent`` so unused gate fields on
     ``Parameters`` cannot silently change the NumPy oracle's structure.

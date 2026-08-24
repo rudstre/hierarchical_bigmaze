@@ -122,7 +122,7 @@ basis = SubgoalBasis.from_locations(maze, subgoals)
 task_library = TaskLibrary.from_desirabilities(len(subgoals))
 hierarchy = environment.hierarchy(
     basis,
-    parameters=point_parameters(upper_control_cost=0.65),
+    parameters=point_parameters(upper_control_cost=6.5),
     task_library=task_library,
 )
 task = hierarchy.task(goal)
@@ -167,6 +167,11 @@ command_sampling = Environment(
 A `Solution` contains its desirability, controlled policy, rollout method,
 and `log_likelihood` method for scoring observed discrete movement
 trajectories. Consecutive repeated observations are collapsed before scoring.
+
+The canonical reward gauge is `interior_reward=-1` and `goal_reward=0`.
+Behavior is determined by the dimensionless groups `1/lower_control_cost`,
+`1/upper_control_cost`, and `beta/lower_control_cost`; changing the single-goal
+boundary reward only rescales desirability and cancels from normalized policy.
 
 For a dataset, keep trials separate so each trajectory starts with a fresh
 controller state and uses its own goal. The dataset helpers retain per-trial
@@ -243,7 +248,7 @@ soft_basis = SubgoalBasis.from_profiles(
 )
 soft_hierarchy = environment.hierarchy(
     soft_basis,
-    parameters=soft_parameters(8, upper_control_cost=0.18),
+    parameters=soft_parameters(8, upper_control_cost=1.8),
 )
 soft_task = soft_hierarchy.task(goal)
 soft_rollout = soft_task.rollout((3, 2), seed=0)

@@ -56,6 +56,14 @@ def test_doohan_notebook_compiles_and_fit_cells_are_unexecuted():
     assert "flat_by_trial" not in notebook_source
     assert "groupby" not in notebook_source
     assert "viz.plot_subtasks(soft_discovery)" in notebook_source
+    assert "fittable_parameters" in notebook_source
+    assert "required_parameters" not in notebook_source
+    assert "discovery_control_cost = 3.0" in notebook_source
+    assert "NMFConfig(control_cost=discovery_control_cost)" in notebook_source
+    assert "lambda_smooth" not in notebook_source
+    assert "upper_control_cost=1.8" in notebook_source
+    assert "interior_reward" not in notebook_source
+    assert "goal_reward" not in notebook_source
     for cell in code_cells:
         compile(cell.source, str(DOOHAN_NOTEBOOK), "exec")
     fit_cells = {
@@ -80,12 +88,32 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     assert "start=example_start" in notebook_source
     assert "goal=example_goal" in notebook_source
     assert "sweep_expected_policy_entropy" not in notebook_source
+    assert "N_RESTARTS = 5" in notebook_source
+    assert "initial_conditions" in notebook_source
+    assert "restart_results" in notebook_source
+    assert "fittable_parameters" in notebook_source
+    assert "required_parameters" not in notebook_source
+    assert "DISCOVERY_CONTROL_COST = 3.0" in notebook_source
+    assert "NMFConfig(control_cost=DISCOVERY_CONTROL_COST)" in notebook_source
+    assert "lambda_smooth" not in notebook_source
+    assert "upper_control_cost=1.8" in notebook_source
+    assert "interior_reward" not in notebook_source
+    assert "goal_reward" not in notebook_source
+    assert "GOAL_REWARD_RESTART_SD" not in notebook_source
     for cell in code_cells:
         compile(
             cell.source,
             str(DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK),
             "exec",
         )
+
+    fit_cells = {
+        cell.id: cell for cell in code_cells if cell.id == "run-adam-fit"
+    }
+    assert set(fit_cells) == {"run-adam-fit"}
+    fit_cell = fit_cells["run-adam-fit"]
+    assert fit_cell.execution_count is None
+    assert fit_cell.outputs == []
 
     sweep_cells = {
         cell.id: cell

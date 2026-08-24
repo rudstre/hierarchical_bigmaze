@@ -15,6 +15,7 @@ from torch.nn import functional as functional
 from andrew_mlmdp.dataset import Trial
 from andrew_mlmdp.hierarchy.autodiff import (
     NumericalError,
+    fittable_parameters,
     parameter_values,
     required_parameters,
 )
@@ -39,6 +40,7 @@ _ALL_PARAMETER_NAMES = {
     "core_threshold",
     "core_exponent",
 }
+_FIXED_GAUGE_PARAMETER_NAMES = {"interior_reward", "goal_reward"}
 _POSITIVE_PARAMETER_NAMES = {
     "lower_control_cost",
     "upper_control_cost",
@@ -200,7 +202,13 @@ def fit_parameters(
     unknown = set(selected) - _ALL_PARAMETER_NAMES
     if unknown:
         raise ValueError("Unknown parameter names: " + ", ".join(sorted(unknown)))
-    inactive = set(selected) - set(required_parameters(template))
+    fixed = set(selected) & _FIXED_GAUGE_PARAMETER_NAMES
+    if fixed:
+        raise ValueError(
+            "Fixed reward-gauge parameters cannot be fitted with Adam: "
+            + ", ".join(sorted(fixed))
+        )
+    inactive = set(selected) - set(fittable_parameters(template))
     if inactive:
         raise ValueError(
             "Inactive gate parameters cannot be fitted: " + ", ".join(sorted(inactive))

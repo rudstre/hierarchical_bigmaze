@@ -9,6 +9,7 @@ from andrew_mlmdp import (
     SubgoalBasis,
     Trial,
     fit_parameters,
+    fittable_parameters,
     total_log_likelihood,
 )
 from andrew_mlmdp.hierarchy.fitting import (
@@ -122,6 +123,51 @@ def test_fitting_improves_likelihood_restores_aligned_best_and_mutates_nothing()
     original_alpha = result.best_values["alpha"]
     original_alpha.add_(100.0)
     assert result.best_values["alpha"] < 100.0
+
+
+@pytest.mark.parametrize("name", ["interior_reward", "goal_reward"])
+def test_fitting_rejects_fixed_reward_gauge_parameters(name):
+    with pytest.raises(
+        ValueError,
+        match=rf"Fixed reward-gauge parameters.*{name}",
+    ):
+        fit_parameters(
+            _template(),
+            _trials(),
+            names=(name,),
+            max_steps=0,
+        )
+
+
+def test_gated_fitting_accepts_all_six_supported_parameters():
+    template = _template()
+    names = fittable_parameters(template)
+
+    result = fit_parameters(
+        template,
+        _trials(),
+        names=names,
+        lr=0.01,
+        max_steps=1,
+        patience=20,
+    )
+
+    assert names == (
+        "lower_control_cost",
+        "upper_control_cost",
+        "alpha",
+        "beta",
+        "core_threshold",
+        "core_exponent",
+    )
+    assert result.names == names
+    assert result.updates == 1
+    assert result.best_values is not None
+    assert set(result.best_values) >= {
+        "interior_reward",
+        "goal_reward",
+        *names,
+    }
 
 
 def test_progress_callback_receives_every_evaluated_state():

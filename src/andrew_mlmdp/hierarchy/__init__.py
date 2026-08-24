@@ -6,6 +6,7 @@ movement likelihoods live in focused modules.
 
 from andrew_mlmdp.hierarchy.autodiff import (
     NumericalError,
+    fittable_parameters,
     log_likelihood,
     parameter_values,
     required_parameters,
@@ -83,6 +84,7 @@ __all__ = [
     "continuation_policies",
     "diagnose_pair",
     "fit_parameters",
+    "fittable_parameters",
     "log_likelihood",
     "pair_entropy",
     "parameter_values",
