@@ -264,7 +264,7 @@ soft_rollout = soft_task.rollout((3, 2), seed=0)
 ```
 
 NMF discovery and hierarchy execution have separate parameters. The original
-peak-normalized NMF profiles and their gated access profiles are immutable.
+unit-norm NMF profiles and their gated access profiles are immutable.
 Changing the goal builds or retrieves only a goal-conditioned hierarchy; it
 does not rerun NMF or apply the gate again.
 

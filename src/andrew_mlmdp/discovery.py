@@ -329,7 +329,7 @@ def _factorize_soft_subtasks(
     raw_profiles = factorization.fit_transform(target)
     raw_weights = factorization.components_
 
-    profiles, task_weights = _peak_normalize_nmf_factors(
+    profiles, task_weights = _unit_normalize_nmf_factors(
         raw_profiles,
         raw_weights,
     )
@@ -349,15 +349,14 @@ def _factorize_soft_subtasks(
     )
 
 
-def _peak_normalize_nmf_factors(
+def _unit_normalize_nmf_factors(
     profiles: np.ndarray,
     task_weights: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fix every NMF component gauge without changing its reconstruction.
 
-    Each profile column is scaled to peak at one and its scale is absorbed by
-    the corresponding task-weight row. This makes ``alpha`` in
-    ``P_t = alpha D.T`` the maximum local passive access strength.
+    Each profile column is scaled to Euclidean norm one and its scale is
+    absorbed by the corresponding task-weight row.
     """
 
     profile_values = np.asarray(profiles, dtype=np.float64)
@@ -377,7 +376,7 @@ def _peak_normalize_nmf_factors(
     ):
         raise ValueError("NMF factors must be finite and non-negative")
 
-    component_scales = profile_values.max(axis=0)
+    component_scales = np.linalg.norm(profile_values, axis=0)
     if np.any(component_scales <= 0.0):
         raise ValueError("NMF produced an empty subtask profile")
     normalized_profiles = profile_values / component_scales[np.newaxis, :]
@@ -447,8 +446,8 @@ def _factorize_regularized_soft_subtasks(
     """Fit graph-regularized KL-NMF with non-negative MU updates.
 
     The graph multiplicative update is derived for the unconstrained objective.
-    Peak-normalizing each profile after a sweep fixes the NMF scale ambiguity
-    by additionally imposing ``max(D[:, j]) == 1``. The standard unconstrained
+    Unit-normalizing each profile after a sweep fixes the NMF scale ambiguity
+    by additionally imposing ``||D[:, j]||_2 == 1``. The standard unconstrained
     MU descent guarantee therefore does not automatically apply to the tracked
     post-normalization objective; its monotonicity is tested empirically.
     """
@@ -471,7 +470,7 @@ def _factorize_regularized_soft_subtasks(
         n_subtasks,
         seed=seed,
     )
-    profiles, task_weights = _peak_normalize_nmf_factors(
+    profiles, task_weights = _unit_normalize_nmf_factors(
         profiles,
         task_weights,
     )
@@ -517,7 +516,7 @@ def _factorize_regularized_soft_subtasks(
             profile_denominator,
             epsilon,
         )
-        profiles, task_weights = _peak_normalize_nmf_factors(
+        profiles, task_weights = _unit_normalize_nmf_factors(
             profiles,
             task_weights,
         )

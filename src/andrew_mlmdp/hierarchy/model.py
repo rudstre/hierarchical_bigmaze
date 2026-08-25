@@ -135,7 +135,7 @@ class ThresholdRange:
 class SubgoalBasis:
     """A reusable point or distributed subgoal basis for any maze.
 
-    ``profiles`` retains the caller's immutable, peak-normalized profiles.
+    ``profiles`` retains the caller's immutable, unit-norm profiles.
     ``access_profiles`` contains the optional core-gated execution view.
     Point subgoals are represented by one-hot profile columns and therefore
     use the exact same hierarchy construction as distributed subtasks.
@@ -224,8 +224,7 @@ class SubgoalBasis:
         )
         exponent = _detached_scalar(core_exponent)
         supplied = _validate_profiles(maze, profiles)
-        peaks = supplied.max(axis=0, keepdims=True)
-        normalized = supplied / peaks
+        normalized = _unit_normalize_profile_columns(supplied)
         access = _soft_core_profiles(
             normalized,
             threshold=threshold,
@@ -325,6 +324,7 @@ class Template:
         if not goal_coordinates:
             raise ValueError("At least one physical goal is required")
         profiles = self.basis.profiles
+        relative_profiles = profiles / profiles.max(axis=0, keepdims=True)
         candidates: list[tuple[float, Coordinate, int]] = []
         for goal in goal_coordinates:
             goal_state = self.maze.state_index(goal)
@@ -333,7 +333,7 @@ class Template:
                 raise ValueError(
                     "A goal-conditioned hierarchy requires a non-goal state"
                 )
-            maxima = profiles[keep].max(axis=0)
+            maxima = relative_profiles[keep].max(axis=0)
             candidates.extend(
                 (float(value), goal, subgoal_index)
                 for subgoal_index, value in enumerate(maxima)
@@ -1142,7 +1142,17 @@ def _soft_core_profiles(
     )
     if exponent != 1.0:
         core = core**exponent
-    return core
+    return _unit_normalize_profile_columns(core)
+
+
+def _unit_normalize_profile_columns(profiles: np.ndarray) -> np.ndarray:
+    """Scale every nonempty profile column to Euclidean norm one."""
+
+    values = np.asarray(profiles, dtype=np.float64)
+    norms = np.linalg.norm(values, axis=0, keepdims=True)
+    if np.any(norms <= 0.0) or not np.all(np.isfinite(norms)):
+        raise ValueError("Every soft subtask profile must be nonempty")
+    return values / norms
 
 
 def _interior_partition(

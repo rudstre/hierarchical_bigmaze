@@ -29,7 +29,7 @@ The main symbols are:
 | Symbol | Shape | Meaning |
 | --- | ---: | --- |
 | `P` | `n x n` | Passive physical maze dynamics |
-| `D` | `n x k` | Peak-normalized subgoal profiles |
+| `D` | `n x k` | Unit-norm subgoal profiles |
 | `D_hat` | `n x k` | Profiles used for subgoal access, possibly core-gated |
 | `P_i^1` | `m x m` | Layer-1 transitions that remain in the physical interior |
 | `P_t^1` | `k x m` | Layer-1 transitions into subgoal boundary copies |
@@ -115,15 +115,18 @@ zero-mass policy column.
 state-by-subgoal profile matrix `D`:
 
 - `SubgoalBasis.from_locations` creates one-hot columns.
-- `SubgoalBasis.from_profiles` peak-normalizes non-negative distributed
+- `SubgoalBasis.from_profiles` L2-normalizes non-negative distributed
   profiles.
 
 Distributed profiles also have a separate immutable execution view `D_hat`.
-For core threshold `tau` and exponent `gamma`, access is
+Let `D_tilde[:, j] = D[:, j] / max(D[:, j])`. For core threshold `tau`
+and exponent `gamma`, the unnormalized gated access profile is
 
 ```math
-\widehat D_{sj}
-= \left[\max\left(0,\frac{D_{sj}-\tau}{1-\tau}\right)\right]^\gamma.
+G_{sj}
+= \left[\max\left(0,\frac{\widetilde D_{sj}-\tau}{1-\tau}\right)\right]^\gamma,
+\qquad
+\widehat D_{:j}=\frac{G_{:j}}{\lVert G_{:j}\rVert_2}.
 ```
 
 `D` describes the learned or supplied representation. `D_hat` determines
@@ -167,7 +170,7 @@ the original physical states remain in the maze interior. `alpha` controls the
 strength of this passive access relative to ordinary movement.
 
 These three quantities must not be conflated: `basis.profiles` contains the
-original peak-normalized NMF representation, `basis.access_profiles` contains
+original unit-norm NMF representation, `basis.access_profiles` contains
 the reusable gated profile, and `task.subtask_access` contains `P_t^1`,
 the goal-conditioned execution-access transition probabilities after the full
 augmented passive matrix has been normalized. The last quantity is not `D`,
@@ -461,7 +464,7 @@ D \leftarrow D \odot
 
 These updates preserve non-negativity. They are derived for the unconstrained
 objective. After each regularized sweep, the implementation additionally
-fixes the NMF scale gauge by enforcing `max(D[:, j]) = 1` and absorbing the
+fixes the NMF scale gauge by enforcing `||D[:, j]||_2 = 1` and absorbing the
 scale into row `j` of `W`. Post-normalization objective descent is therefore
 verified empirically rather than assumed from the standard MU guarantee.
 
@@ -470,7 +473,7 @@ requested rank once, and `study.result(k)` retrieves that cached fit.
 Regularized results expose the initial full objective and one value per
 iteration through `objective_history`. The existing
 `reconstruction_error` remains normalized generalized KL only, with no
-smoothness penalty. The returned peak-normalized `D` can then be passed to
+smoothness penalty. The returned unit-norm `D` can then be passed to
 `SubgoalBasis.from_profiles`, optionally applying the execution gate
 described above.
 
@@ -581,7 +584,8 @@ exponent defaults come from the basis rather than unused gate fields on
 Entries below threshold have no local branch gradient, although gradients from
 active entries may move the global threshold enough to activate them later. If
 only exact profile peaks remain active, threshold and exponent can be weakly
-identified or have zero gradients because gated peaks remain exactly one.
+identified or have zero gradients because the gated column remains the same
+unit-norm one-hot vector.
 
 For a set of physical goals `G`, the complete hierarchy is structurally
 defined only below

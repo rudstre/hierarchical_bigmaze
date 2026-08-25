@@ -5,3 +5,6 @@ inherit = "all"
 set = {
   PATH = "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin:/usr/local/bin:/usr/bin:/bin"
 }
+
+[features]
+use_legacy_landlock = true

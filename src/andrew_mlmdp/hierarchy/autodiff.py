@@ -295,10 +295,12 @@ def _dynamic_access_profiles(
 
     threshold = values["core_threshold"]
     exponent = values["core_exponent"]
-    scaled = (profiles - threshold) / (1.0 - threshold)
+    relative = profiles / profiles.max(dim=0, keepdim=True).values
+    scaled = (relative - threshold) / (1.0 - threshold)
     positive = scaled > 0.0
     powered = scaled[positive].pow(exponent)
-    return torch.zeros_like(scaled).masked_scatter(positive, powered)
+    gated = torch.zeros_like(scaled).masked_scatter(positive, powered)
+    return gated / torch.linalg.vector_norm(gated, dim=0, keepdim=True)
 
 
 def _build_hierarchy(

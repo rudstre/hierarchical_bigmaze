@@ -85,7 +85,7 @@ def test_goal_ensemble_matches_environment_flat_solutions():
     assert study.ensemble.goals == ((0, 0), (0, 3))
 
 
-def test_nmf_profiles_are_nonnegative_peak_normalized_and_reconstruct():
+def test_nmf_profiles_are_nonnegative_unit_normalized_and_reconstruct():
     environment = Environment(Maze.from_ascii("...\n...\n..."))
     result = discover_subgoals(
         environment,
@@ -96,7 +96,7 @@ def test_nmf_profiles_are_nonnegative_peak_normalized_and_reconstruct():
     assert result.profiles.shape == (9, 3)
     assert result.task_weights.shape == (3, 9)
     assert np.all(result.profiles >= 0.0)
-    assert result.profiles.max(axis=0) == pytest.approx(np.ones(3))
+    assert np.linalg.norm(result.profiles, axis=0) == pytest.approx(np.ones(3))
     assert result.reconstruction == pytest.approx(
         result.profiles @ result.task_weights
     )
@@ -266,7 +266,7 @@ def test_regularized_objective_decreases_and_matches_returned_factors():
     assert np.all(result.profiles >= 0.0)
     assert np.all(result.task_weights >= 0.0)
     assert np.all(result.reconstruction >= 0.0)
-    assert result.profiles.max(axis=0) == pytest.approx(np.ones(2))
+    assert np.linalg.norm(result.profiles, axis=0) == pytest.approx(np.ones(2))
 
 
 def test_regularized_convergence_and_iteration_exhaustion():

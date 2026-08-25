@@ -535,7 +535,8 @@ def test_structural_threshold_transform_stays_one_ulp_inside_goal_domain():
         for goal in goals:
             goal_state = template.maze.state_index(goal)
             keep = np.arange(len(profiles)) != goal_state
-            assert np.all(np.max(profiles[keep], axis=0) > float(threshold))
+            relative = profiles / profiles.max(axis=0, keepdims=True)
+            assert np.all(np.max(relative[keep], axis=0) > float(threshold))
 
     for invalid in (float(interior_upper), domain.maximum, 0.9):
         with pytest.raises(ValueError, match="strictly inside"):
