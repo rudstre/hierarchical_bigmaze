@@ -4,5 +4,6 @@
         "${workspaceFolder}/src",
         "${workspaceFolder}/tests",
         "${workspaceFolder}/external/GridMaze-mFC-ephys-DATA/code"
-    ]
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

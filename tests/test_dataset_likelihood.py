@@ -80,8 +80,11 @@ def test_flat_dataset_matches_trial_sum_and_caches_unique_goals(monkeypatch):
     assert solved_goals == [(0, 3), (0, 0)]
 
 
-def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks():
+def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks(
+    monkeypatch,
+):
     template = _hierarchy_template()
+    expected_template = _hierarchy_template()
     trials = (
         Trial(
             "session-a",
@@ -102,11 +105,19 @@ def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks():
             ((0, 1), (0, 2), (0, 3), (0, 4)),
         ),
     )
-    result = score_hierarchy_dataset(template, trials)
     expected_scores = [
-        template.task(trial.goal).log_likelihood(trial.trajectory)
+        expected_template.task(trial.goal).log_likelihood(trial.trajectory)
         for trial in trials
     ]
+    original_task = type(template).task
+    requested_goals = []
+
+    def counted_task(self, goal):
+        requested_goals.append(goal)
+        return original_task(self, goal)
+
+    monkeypatch.setattr(type(template), "task", counted_task)
+    result = score_hierarchy_dataset(template, trials)
 
     assert [score.log_likelihood for score in result.trial_likelihoods] == (
         pytest.approx(expected_scores)
@@ -114,6 +125,7 @@ def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks():
     assert result.total_log_likelihood == pytest.approx(sum(expected_scores))
     assert result.total_transitions == 9
     assert result.n_excluded == 0
+    assert requested_goals == [(0, 4), (0, 0)]
     assert set(template._task_cache) == {(0, 0), (0, 4)}
     assert result.trial_likelihoods[0].log_likelihood == pytest.approx(
         result.trial_likelihoods[2].log_likelihood

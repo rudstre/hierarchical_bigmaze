@@ -231,6 +231,32 @@ def test_rollout_is_seeded_legal_and_handles_terminal_start():
     assert solution.rollout((1, 3), seed=7) == [(1, 3)]
 
 
+def test_flat_trajectory_length_moments_are_exact():
+    maze = Maze.from_ascii("..")
+    solution = Environment(maze, passive_mode="five_commands").solve((0, 1))
+    start_state = maze.state_index((0, 0))
+    goal_state = maze.state_index((0, 1))
+    success_probability = solution.controlled[goal_state, start_state]
+
+    mean_steps, step_sd = solution.trajectory_length_moments((0, 0))
+
+    assert mean_steps == pytest.approx(1.0 / success_probability)
+    assert step_sd == pytest.approx(
+        np.sqrt(1.0 - success_probability) / success_probability
+    )
+    assert solution.trajectory_length_moments((0, 1)) == (0.0, 0.0)
+
+
+def test_flat_trajectory_length_moments_validate_absorption_and_start():
+    maze = Maze.from_ascii("..#..")
+    solution = Environment(maze).solve((0, 4))
+
+    with pytest.raises(RuntimeError, match="almost surely reach"):
+        solution.trajectory_length_moments((0, 0))
+    with pytest.raises(ValueError, match="not a free cell"):
+        solution.trajectory_length_moments((0, 2))
+
+
 def test_log_likelihood_conditions_on_leaving_each_state():
     maze = Maze.from_ascii("...")
     solution = Environment(maze).solve((0, 2))

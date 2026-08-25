@@ -115,6 +115,7 @@ goal = (1, 9)
 # A flat LMDP solves directly for this physical goal.
 flat = environment.solve(goal)
 flat_rollout = flat.rollout((3, 0), seed=0)
+flat_mean_steps, flat_step_sd = flat.trajectory_length_moments((3, 0))
 
 # The hierarchy reuses six subgoal task solutions.
 subgoals = ((0, 0), (9, 2), (2, 3), (3, 7), (9, 7), (7, 9))

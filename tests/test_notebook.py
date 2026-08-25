@@ -74,6 +74,35 @@ def test_doohan_notebook_compiles_and_fit_cells_are_unexecuted():
         assert cell.execution_count is None
         assert cell.outputs == []
 
+def test_doohan_hierarchy_diagnostics_has_flat_sweep_after_section_two():
+    notebook = nbformat.read(
+        DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK,
+        as_version=4,
+    )
+    matching = [
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.id == "flat-control-cost-sweep"
+    ]
+
+    assert len(matching) == 1
+    index = matching[0]
+    cell = notebook.cells[index]
+    assert notebook.cells[index - 1].id == "5f6173e1"
+    assert notebook.cells[index + 1].id == "discover-hierarchy"
+    assert all(
+        output.get("output_type") != "error"
+        for output in cell.outputs
+    )
+    assert "FLAT_CONTROL_COST_SWEEP_VALUES" in cell.source
+    assert "trajectory_length_moments" in cell.source
+    compile(
+        cell.source,
+        str(DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK),
+        "exec",
+    )
+
+
 
 def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     notebook = nbformat.read(

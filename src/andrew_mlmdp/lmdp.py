@@ -326,6 +326,84 @@ class Solution:
             seed=seed,
         )
 
+    def trajectory_length_moments(
+        self,
+        start: Coordinate,
+    ) -> tuple[float, float]:
+        """Return exact trajectory-length mean and SD in physical steps.
+
+        The trajectory ends on its first visit to this solution's goal.  The
+        calculation uses absorbing-chain moments of the controlled dynamics,
+        rather than sampled rollouts.  A start at the goal has zero length.
+        """
+
+        maze = self.environment.maze
+        start_state = maze.state_index(start)
+        goal_state = maze.state_index(self.goal)
+        if start_state == goal_state:
+            return 0.0, 0.0
+
+        reachable_states = [start_state]
+        reached = {start_state}
+        for current_state in reachable_states:
+            for next_state in np.flatnonzero(
+                self.controlled[:, current_state] > 0.0
+            ):
+                next_index = int(next_state)
+                if next_index != goal_state and next_index not in reached:
+                    reached.add(next_index)
+                    reachable_states.append(next_index)
+
+        transient = np.asarray(reachable_states, dtype=np.int64)
+        transient_transition = self.controlled[np.ix_(transient, transient)]
+        goal_probability = self.controlled[goal_state, transient]
+        system = np.eye(len(transient)) - transient_transition.T
+
+        try:
+            hitting_probability = np.linalg.solve(system, goal_probability)
+        except np.linalg.LinAlgError as error:
+            raise RuntimeError(
+                "Flat policy does not almost surely reach the goal from start"
+            ) from error
+        if (
+            not np.all(np.isfinite(hitting_probability))
+            or hitting_probability[0] < 1.0 - 1e-10
+            or hitting_probability[0] > 1.0 + 1e-10
+        ):
+            raise RuntimeError(
+                "Flat policy does not almost surely reach the goal from start"
+            )
+
+        ones = np.ones(len(transient), dtype=np.float64)
+        try:
+            mean = np.linalg.solve(system, ones)
+            second_moment = np.linalg.solve(
+                system,
+                ones + 2.0 * transient_transition.T @ mean,
+            )
+        except np.linalg.LinAlgError as error:
+            raise RuntimeError(
+                "Flat trajectory-length moments could not be solved"
+            ) from error
+
+        mean_steps = float(mean[0])
+        selected_second_moment = float(second_moment[0])
+        if (
+            not np.isfinite(mean_steps)
+            or not np.isfinite(selected_second_moment)
+            or mean_steps <= 0.0
+        ):
+            raise RuntimeError("Flat trajectory-length moments are invalid")
+        variance = selected_second_moment - mean_steps**2
+        variance_tolerance = 1e-10 * max(
+            1.0,
+            abs(selected_second_moment),
+            mean_steps**2,
+        )
+        if variance < -variance_tolerance:
+            raise RuntimeError("Flat trajectory-length variance is negative")
+        return mean_steps, float(np.sqrt(max(0.0, variance)))
+
 
 @dataclass(frozen=True)
 class Environment:

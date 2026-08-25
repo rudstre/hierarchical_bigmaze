@@ -112,8 +112,13 @@ def score_hierarchy_dataset(
 ) -> DatasetScore:
     """Score independent trials with hierarchy tasks cached by trial goal."""
 
+    tasks = {}
+
     def score(trial: Trial) -> float:
-        task = template.task(trial.goal)
+        task = tasks.get(trial.goal)
+        if task is None:
+            task = template.task(trial.goal)
+            tasks[trial.goal] = task
         return task.log_likelihood(trial.trajectory, beta=beta)
 
     return _score_movement_dataset("hierarchical", trials, score)
