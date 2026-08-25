@@ -263,10 +263,13 @@ soft_task = soft_hierarchy.task(goal)
 soft_rollout = soft_task.rollout((3, 2), seed=0)
 ```
 
-NMF discovery and hierarchy execution have separate parameters. The original
-unit-norm NMF profiles and their gated access profiles are immutable.
-Changing the goal builds or retrieves only a goal-conditioned hierarchy; it
-does not rerun NMF or apply the gate again.
+NMF discovery and hierarchy execution have separate parameters. Profiles
+and their gated access views are peak-normalized by default. To use the
+previous unit-L2 gauge, pass `profile_normalization="l2"` to both
+`NMFConfig` and `SubgoalBasis.from_profiles`; using one shared mode keeps
+discovery and execution on the same scale. The selected profiles and gated
+access views are immutable. Changing the goal builds or retrieves only a
+goal-conditioned hierarchy; it does not rerun NMF or apply the gate again.
 
 Set `lambda_smooth` to a positive value in `NMFConfig` to
 penalize neighboring states with different profile values over the
