@@ -109,6 +109,22 @@ For a physical component disconnected from the goal, desirability is zero.
 The high-level flat solver retains passive dynamics in an otherwise undefined
 zero-mass policy column.
 
+### Fitting flat control cost
+
+`Environment.fit` estimates the flat policy parameter
+`lower_control_cost` with exact full-batch maximum likelihood:
+
+```python
+parameters = Parameters(lower_control_cost=2.0)
+result = environment.fit(trials, parameters=parameters)
+fitted_cost = result.best_values["lower_control_cost"]
+```
+
+The supplied `interior_reward` and `goal_reward` define the fixed reward gauge.
+Only `lower_control_cost` is optimized. Fitting uses a differentiable float64
+Torch version of the same first-exit solve and movement likelihood as
+`Environment.solve`, and does not mutate the environment or `parameters`.
+
 ## 3. One representation for point and distributed subgoals
 
 [`SubgoalBasis`](../src/andrew_mlmdp/hierarchy/model.py) always stores a

@@ -65,6 +65,7 @@ from andrew_mlmdp.lmdp import (
     solve_first_exit,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
+from andrew_mlmdp.profiles import ProfileNormalization
 
 __all__ = [
     "Coordinate",
@@ -87,6 +88,7 @@ __all__ = [
     "Parameters",
     "PassiveMode",
     "Plan",
+    "ProfileNormalization",
     "RankDiagnostics",
     "Rollout",
     "RolloutEvent",

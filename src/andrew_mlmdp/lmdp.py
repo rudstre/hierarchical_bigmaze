@@ -5,14 +5,19 @@ All transition matrices use the convention
 distributions over the next state.
 """
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
 from torch import nn
 
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
+
+if TYPE_CHECKING:
+    from andrew_mlmdp.dataset import Trial
+    from andrew_mlmdp.fitting import FitResult, FitStep
 
 PassiveMode = Literal["five_commands", "valid_neighbors"]
 
@@ -588,6 +593,48 @@ class Environment:
             parameters=parameters,
             desirability=desirability,
             controlled=controlled,
+        )
+
+    def fit(
+        self,
+        trials: Iterable["Trial"],
+        *,
+        parameters: Parameters | None = None,
+        lr: float = 5e-2,
+        max_steps: int = 1000,
+        tolerance: float = 1e-8,
+        scheduler_tolerance: float | None = None,
+        convergence_tolerance: float | None = None,
+        patience: int = 20,
+        lr_decay: float = 0.3,
+        lr_patience: int = 7,
+        min_lr: float = 1e-5,
+        callback: Callable[["FitStep"], None] | None = None,
+    ) -> "FitResult":
+        """Fit ``lower_control_cost`` by exact flat movement likelihood.
+
+        The reward gauge is held at the supplied ``parameters`` values. The
+        environment and parameter module are not mutated.
+        """
+
+        from andrew_mlmdp.flat_fitting import fit_environment
+
+        if parameters is None:
+            parameters = Parameters()
+        return fit_environment(
+            self,
+            trials,
+            parameters=parameters,
+            lr=lr,
+            max_steps=max_steps,
+            tolerance=tolerance,
+            scheduler_tolerance=scheduler_tolerance,
+            convergence_tolerance=convergence_tolerance,
+            patience=patience,
+            lr_decay=lr_decay,
+            lr_patience=lr_patience,
+            min_lr=min_lr,
+            callback=callback,
         )
 
     def hierarchy(
