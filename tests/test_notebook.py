@@ -154,6 +154,12 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     fit_cell = fit_cells["run-adam-fit"]
     assert fit_cell.execution_count is None
     assert fit_cell.outputs == []
+    assert "FIT_CACHE_PATH.is_file()" in fit_cell.source
+    assert "fit_result_from_payload" in fit_cell.source
+    assert "fit_result_to_payload" in fit_cell.source
+    assert "Loaded cached Adam fit" in fit_cell.source
+    assert "Cached best Adam fit" in fit_cell.source
+    assert "temporary_cache_path.replace(FIT_CACHE_PATH)" in fit_cell.source
 
     sweep_cells = {
         cell.id: cell

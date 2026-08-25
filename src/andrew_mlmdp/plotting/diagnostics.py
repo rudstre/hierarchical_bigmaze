@@ -45,7 +45,15 @@ def plot_diagnostic_sweep(
     expected_axes = 3 if has_likelihood else 2
     expected_axes_text = "three" if has_likelihood else "two"
     if axes is None:
-        figure, created_axes = plt.subplots(expected_axes, 1, sharex=True)
+        height_ratios = [1.0, 1.15, 1.0] if has_likelihood else [1.0, 1.15]
+        figure, created_axes = plt.subplots(
+            expected_axes,
+            1,
+            figsize=(10.0, 2.9 * expected_axes),
+            sharex=True,
+            layout="constrained",
+            gridspec_kw={"height_ratios": height_ratios},
+        )
         resolved_axes = tuple(created_axes)
     else:
         try:
@@ -73,7 +81,8 @@ def plot_diagnostic_sweep(
         label="Policy entropy",
     )
     entropy_ax.set_ylabel("Expected policy entropy (normalized)")
-    entropy_ax.legend()
+    _style_sweep_axis(entropy_ax)
+    _place_sweep_legend(entropy_ax)
 
     mean = sweep_data.mean_steps
     standard_deviation = sweep_data.step_sd
@@ -97,7 +106,8 @@ def plot_diagnostic_sweep(
         label=(f"Shortest path = {sweep_data.shortest_steps} steps"),
     )
     length_ax.set_ylabel("Trajectory length (physical steps)")
-    length_ax.legend()
+    _style_sweep_axis(length_ax)
+    _place_sweep_legend(length_ax)
 
     if has_likelihood:
         likelihood_ax = resolved_axes[2]
@@ -108,12 +118,45 @@ def plot_diagnostic_sweep(
             label="All observed trials",
         )
         likelihood_ax.set_ylabel("Total log likelihood")
-        likelihood_ax.legend()
+        _style_sweep_axis(likelihood_ax)
+        _place_sweep_legend(likelihood_ax)
 
     resolved_axes[-1].set_xlabel(
         sweep_data.parameter_name.replace("_", " ").capitalize()
     )
+    for ax in resolved_axes:
+        ax.margins(x=0.02)
+        ax.yaxis.labelpad = 12
+    figure.align_ylabels(resolved_axes)
     return figure, resolved_axes
+
+
+def _style_sweep_axis(ax) -> None:
+    """Apply a quiet, comparison-friendly style to one sweep panel."""
+
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color="0.88", linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="both", direction="out")
+
+
+def _place_sweep_legend(ax) -> None:
+    """Keep legends above the data and distribute entries across the panel."""
+
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(
+        handles,
+        labels,
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.02, 1.0, 0.2),
+        mode="expand",
+        ncols=len(handles),
+        borderaxespad=0.0,
+        frameon=False,
+        handlelength=2.4,
+        columnspacing=1.4,
+    )
 
 
 def _subgoal_colors(n_subgoals: int) -> tuple[tuple[float, ...], ...]:

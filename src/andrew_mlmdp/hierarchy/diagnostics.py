@@ -71,8 +71,8 @@ def _read_only_optional(values: np.ndarray | None) -> np.ndarray | None:
 class UpperGraph:
     """Goal-conditioned access representations and upper-layer dynamics.
 
-    ``source_profiles`` are the reusable unit-norm profiles.
-    ``gated_profiles`` are the reusable profiles after core gating.
+    ``source_profiles`` are the reusable normalized profiles.
+    ``gated_profiles`` use the same normalization after core gating.
     ``access_probabilities`` are the normalized, goal-conditioned
     passive transition probabilities into subgoal boundary copies.
     ``positions`` are plotting coordinates only, never entry states.
@@ -1016,6 +1016,7 @@ def _template_with_parameter(
             core_threshold=threshold,
             core_exponent=exponent,
             labels=basis.labels,
+            profile_normalization=basis.profile_normalization,
         )
 
     parameters = Parameters(**parameter_values)

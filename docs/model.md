@@ -29,7 +29,7 @@ The main symbols are:
 | Symbol | Shape | Meaning |
 | --- | ---: | --- |
 | `P` | `n x n` | Passive physical maze dynamics |
-| `D` | `n x k` | Unit-norm subgoal profiles |
+| `D` | `n x k` | Subgoal profiles, peak-normalized by default or optionally L2-normalized |
 | `D_hat` | `n x k` | Profiles used for subgoal access, possibly core-gated |
 | `P_i^1` | `m x m` | Layer-1 transitions that remain in the physical interior |
 | `P_t^1` | `k x m` | Layer-1 transitions into subgoal boundary copies |
@@ -115,8 +115,9 @@ zero-mass policy column.
 state-by-subgoal profile matrix `D`:
 
 - `SubgoalBasis.from_locations` creates one-hot columns.
-- `SubgoalBasis.from_profiles` L2-normalizes non-negative distributed
-  profiles.
+- `SubgoalBasis.from_profiles` normalizes non-negative distributed profiles
+  by their peak by default, or by their L2 norm when
+  `profile_normalization="l2"`.
 
 Distributed profiles also have a separate immutable execution view `D_hat`.
 Let `D_tilde[:, j] = D[:, j] / max(D[:, j])`. For core threshold `tau`
@@ -126,7 +127,15 @@ and exponent `gamma`, the unnormalized gated access profile is
 G_{sj}
 = \left[\max\left(0,\frac{\widetilde D_{sj}-\tau}{1-\tau}\right)\right]^\gamma,
 \qquad
-\widehat D_{:j}=\frac{G_{:j}}{\lVert G_{:j}\rVert_2}.
+\widehat D_{:j}=\mathcal N_m(G_{:j}),
+```
+
+where `m` is the configured normalization mode,
+
+```math
+\mathcal N_{peak}(x)=\frac{x}{\max_s x_s},
+\qquad
+\mathcal N_{l2}(x)=\frac{x}{\lVert x\rVert_2}.
 ```
 
 `D` describes the learned or supplied representation. `D_hat` determines
@@ -170,8 +179,9 @@ the original physical states remain in the maze interior. `alpha` controls the
 strength of this passive access relative to ordinary movement.
 
 These three quantities must not be conflated: `basis.profiles` contains the
-original unit-norm NMF representation, `basis.access_profiles` contains
-the reusable gated profile, and `task.subtask_access` contains `P_t^1`,
+original normalized NMF representation, `basis.access_profiles` contains
+the reusable gated profile in the same normalization mode, and
+`task.subtask_access` contains `P_t^1`,
 the goal-conditioned execution-access transition probabilities after the full
 augmented passive matrix has been normalized. The last quantity is not `D`,
 `D_hat`, or an NMF profile.
@@ -464,18 +474,22 @@ D \leftarrow D \odot
 
 These updates preserve non-negativity. They are derived for the unconstrained
 objective. After each regularized sweep, the implementation additionally
-fixes the NMF scale gauge by enforcing `||D[:, j]||_2 = 1` and absorbing the
-scale into row `j` of `W`. Post-normalization objective descent is therefore
-verified empirically rather than assumed from the standard MU guarantee.
+fixes the NMF scale gauge using the configured profile normalization and
+absorbs the scale into row `j` of `W`. Peak normalization is the default;
+`profile_normalization="l2"` selects the unit-L2 gauge. Reconstruction is
+unchanged under either rescaling. Post-normalization objective descent is
+therefore verified empirically rather than assumed from the standard MU
+guarantee.
 
 [`discover_subgoals`](../src/andrew_mlmdp/discovery.py) fits every
 requested rank once, and `study.result(k)` retrieves that cached fit.
 Regularized results expose the initial full objective and one value per
 iteration through `objective_history`. The existing
 `reconstruction_error` remains normalized generalized KL only, with no
-smoothness penalty. The returned unit-norm `D` can then be passed to
+smoothness penalty. The returned normalized `D` can then be passed to
 `SubgoalBasis.from_profiles`, optionally applying the execution gate
-described above.
+described above. For an explicit L2 configuration, pass the same
+`profile_normalization="l2"` option to discovery and basis construction.
 
 ## End-to-end implementation map
 
@@ -564,8 +578,9 @@ The NumPy hierarchy remains the rollout and regression implementation. The
 Torch likelihood rebuilds every parameter-dependent quantity in float64 for
 each forward graph, while retaining the `P[next_state, current_state]`
 orientation and exact latent controller-mode semantics. Only topology,
-indices, physical passive dynamics, and fixed normalized subgoal profiles are
-safe to retain across optimizer steps. Gated access profiles, lower and upper
+indices, physical passive dynamics, fixed normalized subgoal profiles, and
+their normalization mode are safe to retain across optimizer steps. Gated
+access profiles, lower and upper
 dynamics, task bases, plans, policies, latent kernels, and first-departure
 occupancies must be recomputed.
 
@@ -585,7 +600,7 @@ Entries below threshold have no local branch gradient, although gradients from
 active entries may move the global threshold enough to activate them later. If
 only exact profile peaks remain active, threshold and exponent can be weakly
 identified or have zero gradients because the gated column remains the same
-unit-norm one-hot vector.
+one-hot vector under either normalization mode.
 
 For a set of physical goals `G`, the complete hierarchy is structurally
 defined only below

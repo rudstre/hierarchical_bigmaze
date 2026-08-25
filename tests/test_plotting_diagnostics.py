@@ -156,6 +156,11 @@ def test_expected_pair_diagnostics_sweep_plot_renders_comparison():
     assert entropy_ax.get_shared_x_axes().joined(entropy_ax, length_ax)
     assert entropy_ax.get_legend() is not None
     assert length_ax.get_legend() is not None
+    assert figure.get_size_inches() == pytest.approx([10.0, 5.8])
+    assert figure.get_layout_engine() is not None
+    assert not entropy_ax.spines["top"].get_visible()
+    assert not length_ax.spines["right"].get_visible()
+    assert entropy_ax.get_legend().get_frame_on() is False
     figure.canvas.draw()
     plt.close(figure)
 
@@ -193,6 +198,8 @@ def test_expected_pair_diagnostics_sweep_plot_adds_dataset_likelihood_panel():
     assert likelihood_ax.get_xlabel() == "Lower control cost"
     assert length_ax.get_xlabel() == ""
     assert entropy_ax.get_shared_x_axes().joined(entropy_ax, likelihood_ax)
+    assert figure.get_size_inches() == pytest.approx([10.0, 8.7])
+    assert all(ax.get_legend().get_frame_on() is False for ax in figure.axes)
     figure.canvas.draw()
     plt.close(figure)
 

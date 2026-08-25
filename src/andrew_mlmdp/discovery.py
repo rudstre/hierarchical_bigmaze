@@ -11,14 +11,20 @@ from andrew_mlmdp.lmdp import (
     Parameters,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
+from andrew_mlmdp.profiles import (
+    ProfileNormalization,
+    _normalize_profile_columns,
+    _validate_profile_normalization,
+)
 
 
 @dataclass(frozen=True)
 class NMFConfig:
     """Task-family parameters used only to discover soft subtask profiles.
 
-    These values define the fixed desirability ensemble and optional spatial
-    penalty supplied to NMF. They are intentionally separate from
+    These values define the fixed desirability ensemble, optional spatial
+    penalty, and NMF scale gauge. Peak normalization is the default; ``"l2"``
+    selects a unit-L2 gauge. They are intentionally separate from
     ``Parameters`` so execution tuning cannot silently rediscover a
     different hierarchy.
     """
@@ -27,6 +33,7 @@ class NMFConfig:
     goal_reward: float = 0.0
     control_cost: float = 3.0
     lambda_smooth: float = 0.0
+    profile_normalization: ProfileNormalization = "peak"
 
     def __post_init__(self) -> None:
         values = (
@@ -45,6 +52,7 @@ class NMFConfig:
             raise ValueError(
                 "Discovery smoothness strength must be non-negative"
             )
+        _validate_profile_normalization(self.profile_normalization)
 
 
 @dataclass(frozen=True)
@@ -329,9 +337,10 @@ def _factorize_soft_subtasks(
     raw_profiles = factorization.fit_transform(target)
     raw_weights = factorization.components_
 
-    profiles, task_weights = _unit_normalize_nmf_factors(
+    profiles, task_weights = _normalize_nmf_factors(
         raw_profiles,
         raw_weights,
+        ensemble.parameters.profile_normalization,
     )
     reconstruction = profiles @ task_weights
 
@@ -349,14 +358,15 @@ def _factorize_soft_subtasks(
     )
 
 
-def _unit_normalize_nmf_factors(
+def _normalize_nmf_factors(
     profiles: np.ndarray,
     task_weights: np.ndarray,
+    profile_normalization: ProfileNormalization,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fix every NMF component gauge without changing its reconstruction.
 
-    Each profile column is scaled to Euclidean norm one and its scale is
-    absorbed by the corresponding task-weight row.
+    Each profile column is peak- or L2-normalized and its scale is absorbed by
+    the corresponding task-weight row.
     """
 
     profile_values = np.asarray(profiles, dtype=np.float64)
@@ -376,10 +386,11 @@ def _unit_normalize_nmf_factors(
     ):
         raise ValueError("NMF factors must be finite and non-negative")
 
-    component_scales = np.linalg.norm(profile_values, axis=0)
-    if np.any(component_scales <= 0.0):
-        raise ValueError("NMF produced an empty subtask profile")
-    normalized_profiles = profile_values / component_scales[np.newaxis, :]
+    normalized_profiles, component_scales = _normalize_profile_columns(
+        profile_values,
+        profile_normalization,
+        empty_message="NMF produced an empty subtask profile",
+    )
     normalized_weights = weight_values * component_scales[:, np.newaxis]
     return normalized_profiles, normalized_weights
 
@@ -446,9 +457,9 @@ def _factorize_regularized_soft_subtasks(
     """Fit graph-regularized KL-NMF with non-negative MU updates.
 
     The graph multiplicative update is derived for the unconstrained objective.
-    Unit-normalizing each profile after a sweep fixes the NMF scale ambiguity
-    by additionally imposing ``||D[:, j]||_2 == 1``. The standard unconstrained
-    MU descent guarantee therefore does not automatically apply to the tracked
+    Normalizing each profile after a sweep fixes the NMF scale ambiguity using
+    the configured peak or L2 gauge. The standard unconstrained MU descent
+    guarantee therefore does not automatically apply to the tracked
     post-normalization objective; its monotonicity is tested empirically.
     """
 
@@ -470,9 +481,10 @@ def _factorize_regularized_soft_subtasks(
         n_subtasks,
         seed=seed,
     )
-    profiles, task_weights = _unit_normalize_nmf_factors(
+    profiles, task_weights = _normalize_nmf_factors(
         profiles,
         task_weights,
+        ensemble.parameters.profile_normalization,
     )
 
     objective_history = [
@@ -516,9 +528,10 @@ def _factorize_regularized_soft_subtasks(
             profile_denominator,
             epsilon,
         )
-        profiles, task_weights = _unit_normalize_nmf_factors(
+        profiles, task_weights = _normalize_nmf_factors(
             profiles,
             task_weights,
+            ensemble.parameters.profile_normalization,
         )
 
         objective = _regularized_objective(

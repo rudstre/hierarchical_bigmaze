@@ -702,13 +702,13 @@ def test_core_gate_is_peak_relative_and_applied_once():
         core_threshold=parameters.core_threshold,
         core_exponent=parameters.core_exponent,
     )
-    expected_profile = raw[:, 0] / np.linalg.norm(raw[:, 0])
-    gated = np.asarray([1.0, 0.36, 0.0, 0.0])
-    expected_access = gated / np.linalg.norm(gated)
+    expected_profile = raw[:, 0] / raw[:, 0].max()
+    expected_access = np.asarray([1.0, 0.36, 0.0, 0.0])
+    assert basis.profile_normalization == "peak"
     assert basis.profiles[:, 0] == pytest.approx(expected_profile)
     assert basis.access_profiles[:, 0] == pytest.approx(expected_access)
-    assert np.linalg.norm(basis.profiles[:, 0]) == pytest.approx(1.0)
-    assert np.linalg.norm(basis.access_profiles[:, 0]) == pytest.approx(1.0)
+    assert basis.profiles[:, 0].max() == pytest.approx(1.0)
+    assert basis.access_profiles[:, 0].max() == pytest.approx(1.0)
     assert isinstance(basis.profiles, np.ndarray)
     assert isinstance(basis.access_profiles, np.ndarray)
     assert not basis.profiles.flags.writeable
@@ -719,6 +719,33 @@ def test_core_gate_is_peak_relative_and_applied_once():
     second = template.task((0, 2))
     assert first.basis is second.basis is basis
     assert first.subtask_profiles is basis.access_profiles
+
+
+def test_core_gate_supports_explicit_l2_normalization():
+    maze = Maze.from_ascii("....")
+    raw = np.asarray([[2.0], [1.6], [1.0], [0.0]])
+    basis = SubgoalBasis.from_profiles(
+        maze,
+        raw,
+        core_threshold=0.5,
+        core_exponent=2.0,
+        profile_normalization="l2",
+    )
+
+    gated = np.asarray([1.0, 0.36, 0.0, 0.0])
+    assert basis.profile_normalization == "l2"
+    assert basis.profiles[:, 0] == pytest.approx(
+        raw[:, 0] / np.linalg.norm(raw[:, 0])
+    )
+    assert basis.access_profiles[:, 0] == pytest.approx(
+        gated / np.linalg.norm(gated)
+    )
+    with pytest.raises(ValueError, match="profile_normalization"):
+        SubgoalBasis.from_profiles(
+            maze,
+            raw,
+            profile_normalization="unit",
+        )
 
 
 def test_point_and_equivalent_profile_basis_match():

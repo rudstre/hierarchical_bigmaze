@@ -22,6 +22,11 @@ from andrew_mlmdp.lmdp import (
     solve_first_exit,
 )
 from andrew_mlmdp.maze import Coordinate, Maze
+from andrew_mlmdp.profiles import (
+    ProfileNormalization,
+    _normalize_profile_columns,
+    _validate_profile_normalization,
+)
 
 if TYPE_CHECKING:
     from andrew_mlmdp.dataset import Trial
@@ -135,7 +140,7 @@ class ThresholdRange:
 class SubgoalBasis:
     """A reusable point or distributed subgoal basis for any maze.
 
-    ``profiles`` retains the caller's immutable, unit-norm profiles.
+    ``profiles`` retains the caller's immutable normalized profiles.
     ``access_profiles`` contains the optional core-gated execution view.
     Point subgoals are represented by one-hot profile columns and therefore
     use the exact same hierarchy construction as distributed subtasks.
@@ -148,8 +153,10 @@ class SubgoalBasis:
     labels: tuple[str, ...] | None = None
     core_threshold: float | None = None
     core_exponent: float = 1.0
+    profile_normalization: ProfileNormalization = "peak"
 
     def __post_init__(self) -> None:
+        _validate_profile_normalization(self.profile_normalization)
         profiles = _validate_profiles(self.maze, self.profiles).copy()
         access = _validate_profiles(
             self.maze,
@@ -214,8 +221,13 @@ class SubgoalBasis:
         core_threshold: float | Tensor | None = 0.8,
         core_exponent: float | Tensor = 1.0,
         labels: list[str] | tuple[str, ...] | None = None,
+        profile_normalization: ProfileNormalization = "peak",
     ) -> "SubgoalBasis":
-        """Create a distributed basis and apply its execution gate once."""
+        """Create a normalized distributed basis and gate it once.
+
+        Peak normalization is the default. Pass ``profile_normalization="l2"``
+        to normalize both the stored and gated profiles to unit L2 norm.
+        """
 
         threshold = (
             None
@@ -224,11 +236,16 @@ class SubgoalBasis:
         )
         exponent = _detached_scalar(core_exponent)
         supplied = _validate_profiles(maze, profiles)
-        normalized = _unit_normalize_profile_columns(supplied)
+        normalized, _ = _normalize_profile_columns(
+            supplied,
+            profile_normalization,
+            empty_message="Every soft subtask profile must be nonempty",
+        )
         access = _soft_core_profiles(
             normalized,
             threshold=threshold,
             exponent=exponent,
+            profile_normalization=profile_normalization,
         )
         return cls(
             maze=maze,
@@ -237,6 +254,7 @@ class SubgoalBasis:
             labels=None if labels is None else tuple(labels),
             core_threshold=threshold,
             core_exponent=exponent,
+            profile_normalization=profile_normalization,
         )
 
     @property
@@ -1113,6 +1131,7 @@ def _soft_core_profiles(
     *,
     threshold: float | None,
     exponent: float,
+    profile_normalization: ProfileNormalization,
 ) -> np.ndarray:
     """Restrict soft access to the peak-relative core of each profile."""
 
@@ -1142,17 +1161,12 @@ def _soft_core_profiles(
     )
     if exponent != 1.0:
         core = core**exponent
-    return _unit_normalize_profile_columns(core)
-
-
-def _unit_normalize_profile_columns(profiles: np.ndarray) -> np.ndarray:
-    """Scale every nonempty profile column to Euclidean norm one."""
-
-    values = np.asarray(profiles, dtype=np.float64)
-    norms = np.linalg.norm(values, axis=0, keepdims=True)
-    if np.any(norms <= 0.0) or not np.all(np.isfinite(norms)):
-        raise ValueError("Every soft subtask profile must be nonempty")
-    return values / norms
+    normalized_core, _ = _normalize_profile_columns(
+        core,
+        profile_normalization,
+        empty_message="Every soft subtask profile must be nonempty",
+    )
+    return normalized_core
 
 
 def _interior_partition(

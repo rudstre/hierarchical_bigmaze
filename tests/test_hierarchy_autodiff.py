@@ -40,7 +40,7 @@ def _parameters(**overrides):
     return Parameters(**values)
 
 
-def _gated_template():
+def _gated_template(profile_normalization="peak"):
     maze = Maze.from_ascii("......")
     profiles = np.asarray(
         [
@@ -57,6 +57,7 @@ def _gated_template():
         profiles,
         core_threshold=0.2,
         core_exponent=0.7,
+        profile_normalization=profile_normalization,
     )
     # These inactive gate fields deliberately disagree with the basis.  The
     # differentiable path must follow the basis to match the NumPy oracle.
@@ -163,10 +164,15 @@ def test_finite_composition_full_likelihood_has_finite_behavioral_gradients(
     assert all(torch.isfinite(value.grad) for value in values.values())
 
 
-@pytest.mark.parametrize("kind", ["point", "ungated", "gated"])
+@pytest.mark.parametrize(
+    "kind",
+    ["point", "ungated", "gated_peak", "gated_l2"],
+)
 def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
-    if kind == "gated":
-        template = _gated_template()
+    if kind.startswith("gated"):
+        template = _gated_template(
+            profile_normalization="l2" if kind == "gated_l2" else "peak"
+        )
         goal = (0, 5)
         trajectory = ((0, 1), (0, 2), (0, 3), (0, 5))
     else:

@@ -300,7 +300,11 @@ def _dynamic_access_profiles(
     positive = scaled > 0.0
     powered = scaled[positive].pow(exponent)
     gated = torch.zeros_like(scaled).masked_scatter(positive, powered)
-    return gated / torch.linalg.vector_norm(gated, dim=0, keepdim=True)
+    if template.basis.profile_normalization == "peak":
+        scales = gated.max(dim=0, keepdim=True).values
+    else:
+        scales = torch.linalg.vector_norm(gated, dim=0, keepdim=True)
+    return gated / scales
 
 
 def _build_hierarchy(

@@ -11,13 +11,14 @@ from andrew_mlmdp import (
 )
 
 
-def test_nmf_defaults_use_canonical_unsmoothed_gauge_and_intended_rho():
+def test_nmf_defaults_use_peak_normalization_and_intended_rho():
     parameters = NMFConfig()
     assert parameters == NMFConfig(
         interior_reward=-1.0,
         goal_reward=0.0,
         control_cost=3.0,
         lambda_smooth=0.0,
+        profile_normalization="peak",
     )
     assert np.exp(parameters.goal_reward / parameters.control_cost) == 1.0
     assert -parameters.interior_reward / parameters.control_cost == pytest.approx(
@@ -85,7 +86,7 @@ def test_goal_ensemble_matches_environment_flat_solutions():
     assert study.ensemble.goals == ((0, 0), (0, 3))
 
 
-def test_nmf_profiles_are_nonnegative_unit_normalized_and_reconstruct():
+def test_nmf_profiles_are_nonnegative_peak_normalized_and_reconstruct():
     environment = Environment(Maze.from_ascii("...\n...\n..."))
     result = discover_subgoals(
         environment,
@@ -96,11 +97,26 @@ def test_nmf_profiles_are_nonnegative_unit_normalized_and_reconstruct():
     assert result.profiles.shape == (9, 3)
     assert result.task_weights.shape == (3, 9)
     assert np.all(result.profiles >= 0.0)
-    assert np.linalg.norm(result.profiles, axis=0) == pytest.approx(np.ones(3))
+    assert result.profiles.max(axis=0) == pytest.approx(np.ones(3))
     assert result.reconstruction == pytest.approx(
         result.profiles @ result.task_weights
     )
     assert result.reconstruction_error >= 0.0
+
+
+def test_nmf_profiles_support_explicit_l2_normalization():
+    environment = Environment(Maze.from_ascii("...\n...\n..."))
+    result = discover_subgoals(
+        environment,
+        ranks=(3,),
+        parameters=NMFConfig(profile_normalization="l2"),
+        seed=4,
+    ).result(3)
+
+    assert np.linalg.norm(result.profiles, axis=0) == pytest.approx(np.ones(3))
+    assert result.reconstruction == pytest.approx(
+        result.profiles @ result.task_weights
+    )
 
 
 def test_discovery_is_reproducible_for_seed():
@@ -200,6 +216,11 @@ def test_discovery_validates_smoothness_strength(lambda_smooth, match):
         NMFConfig(lambda_smooth=lambda_smooth)
 
 
+def test_discovery_validates_profile_normalization():
+    with pytest.raises(ValueError, match="profile_normalization"):
+        NMFConfig(profile_normalization="unit")
+
+
 def test_graph_adjacency_uses_passive_connectivity_and_state_order():
     import andrew_mlmdp.discovery as discovery
 
@@ -221,7 +242,10 @@ def test_graph_adjacency_uses_passive_connectivity_and_state_order():
     )
 
 
-def test_regularized_objective_decreases_and_matches_returned_factors():
+@pytest.mark.parametrize("profile_normalization", ["peak", "l2"])
+def test_regularized_objective_decreases_and_matches_returned_factors(
+    profile_normalization,
+):
     import andrew_mlmdp.discovery as discovery
 
     environment = Environment(Maze.from_ascii("....\n...."))
@@ -230,7 +254,8 @@ def test_regularized_objective_decreases_and_matches_returned_factors():
         environment,
         ranks=(2,),
         parameters=NMFConfig(
-            lambda_smooth=lambda_smooth
+            lambda_smooth=lambda_smooth,
+            profile_normalization=profile_normalization,
         ),
         seed=0,
         max_iter=500,
@@ -266,7 +291,11 @@ def test_regularized_objective_decreases_and_matches_returned_factors():
     assert np.all(result.profiles >= 0.0)
     assert np.all(result.task_weights >= 0.0)
     assert np.all(result.reconstruction >= 0.0)
-    assert np.linalg.norm(result.profiles, axis=0) == pytest.approx(np.ones(2))
+    if profile_normalization == "peak":
+        scales = result.profiles.max(axis=0)
+    else:
+        scales = np.linalg.norm(result.profiles, axis=0)
+    assert scales == pytest.approx(np.ones(2))
 
 
 def test_regularized_convergence_and_iteration_exhaustion():

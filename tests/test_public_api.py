@@ -9,6 +9,13 @@ def test_hierarchy_names_are_reexported():
     assert hierarchy.PairEntropy is andrew_mlmdp.PairEntropy
 
 
+def test_profile_normalization_type_is_reexported():
+    import andrew_mlmdp
+    from andrew_mlmdp.profiles import ProfileNormalization
+
+    assert andrew_mlmdp.ProfileNormalization is ProfileNormalization
+
+
 def test_plotting_names_are_reexported():
     import andrew_mlmdp.plotting as direct_plotting
     from andrew_mlmdp import plotting
