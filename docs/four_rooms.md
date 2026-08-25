@@ -39,16 +39,22 @@ Calling `Environment.hierarchy(basis)` without explicit parameters selects:
 point_parameters(
     interior_reward=-1.0,
     goal_reward=0.0,
-    lower_control_cost=0.6,
-    upper_control_cost=3.0,
-    alpha=0.4,
-    beta=160.0,
+    lower_control_cost=1.0,
+    upper_control_cost=1.0,
+    alpha=0.75,
+    beta=1.0,
 )
 ```
 
 This fallback applies to point bases and equivalent one-hot profile bases so
 both representations execute identically. Active plans always include the
 physical-goal component with its inpainted mixture weight.
+
+The accompanying default `TaskLibrary` is the identity boundary basis:
+target and physical-goal values are `1`, and off-target values are `0`. With
+the default unsharpened composition this represents every inpainted boundary
+target exactly. Historical finite off-target leakage, including the former
+`exp(-18)` default, must now be supplied explicitly.
 
 Flat tasks use `Parameters()` defaults rather than these hard-hierarchy
 defaults.
@@ -76,6 +82,7 @@ soft_parameters(k=soft_rank, upper_control_cost=1.8)
 ```
 
 These upper-cost overrides are example tuning, not package-wide defaults.
+Unlike earlier releases, soft execution defaults do not vary with NMF rank.
 
 NMF discovery itself uses a separate flat-task ensemble and the independent
 defaults:

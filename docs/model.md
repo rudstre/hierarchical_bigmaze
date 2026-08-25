@@ -228,8 +228,9 @@ obtain `task.upper_controlled`.
 
 The default reward gauge is `interior_reward = -1` and `goal_reward = 0`.
 Before fixing this gauge, multiplying `interior_reward`, both control costs,
-and `beta` by one positive constant left every policy unchanged. The rescaled
-default costs and `beta` preserve the pre-gauge dimensionless behavior.
+and `beta` by one positive constant left every policy unchanged. Hierarchy
+factory defaults are execution choices distinct from flat `Parameters()` and
+NMF discovery defaults.
 
 At a physical state `s` that is not an entered point subgoal, the passive
 abstract prediction is the first-hit column
@@ -255,14 +256,23 @@ interior basis `Z_i` from the fixed boundary matrix `Q_b` stored by
 or control costs. The standard canonical library has:
 
 - target subgoal desirability `1`;
-- off-target subgoal desirability `exp(-18)`;
+- off-target subgoal desirability `0`;
 - the physical-goal row is zero in every subgoal task; and
 - a final physical-goal component with desirability `1`.
 
-For eight subgoals this is a full-rank `9 x 9` matrix: one common subgoal
-mode, seven subgoal-contrast modes, and one physical-goal mode. Its condition
-number is approximately `1.00000012184`. `from_desirabilities(...)` records
-the three canonical construction values as metadata;
+Thus `Q_b` is the `(k + 1) x (k + 1)` identity matrix, with every singular
+value and its condition number equal to `1`. The zero off-target value is the
+desirability-space representation of an exclusive terminal task. It is not
+derived from `interior_reward`: the latter governs every nonterminal state
+while the former is a boundary condition.
+
+Before the canonical reward gauge was introduced, the default library retained
+a relative off-target desirability of `exp(-18)`. That positive value produces
+finite leakage from every selected subgoal task into all other subgoal
+boundaries. It remains available for historical reproduction by passing
+`off_target_value=np.exp(-18.0)` explicitly, but is no longer the canonical
+default. `from_desirabilities(...)` records the three construction values as
+metadata;
 `TaskLibrary.from_matrix(...)` instead accepts any validated finite,
 non-negative, full-rank matrix and leaves that optional metadata unset. The
 immutable matrix itself is always the source of truth.
@@ -299,7 +309,7 @@ multiplies the single-boundary upper and goal-only desirabilities by a common
 factor. Column normalization cancels that factor, so `goal_reward` does not
 change upper termination, the goal-only policy, or trajectory likelihood.
 
-Second, the target is approximated with the reusable task basis:
+Second, the target is expressed in the reusable task basis:
 
 ```math
 w_{raw} = Q_b^+ z_{target},
@@ -307,7 +317,12 @@ w_{raw} = Q_b^+ z_{target},
 w = \max(0, w_{raw}).
 ```
 
-`Q_b^+` is the pseudoinverse. Clipping makes the mixture non-negative. With
+`Q_b^+` is the pseudoinverse. For the canonical identity library,
+`w_raw = z_target`, so every coefficient is positive, clipping is a no-op, and
+the boundary target is reconstructed exactly. For a custom library with
+positive off-target entries, an inpainted target can lie outside the
+non-negative cone of `Q_b`; its exact linear coefficients then include
+negative values and clipping introduces an approximation. With
 `composition_exponent = c`, only the first `k` positive subgoal weights are
 then redistributed:
 
@@ -322,11 +337,12 @@ The transform preserves total subgoal weight mass and leaves the final
 physical-goal weight exactly unchanged. Consequently it does not directly
 change subgoal-versus-goal allocation in weight space, although the physical
 policy can change because mass moves among distinct `Z_i` columns. `c = 1`
-is the exact unsharpened path, `c < 1` is more diffuse, and `c > 1` is more
-competitive. Fractional powers are evaluated only at strictly positive
-weights, preserving exact zeros and finite inactive-entry gradients. The
-diagnostic hard winner-take-all mode preserves subgoal mass, splits exact ties,
-and cannot be used with Adam.
+preserves the coefficients produced by pseudoinversion and clipping; for the
+identity library this reconstructs the target exactly. `c < 1` is more
+diffuse, and `c > 1` is more competitive. Fractional powers are evaluated only
+at strictly positive weights, preserving exact zeros and finite inactive-entry
+gradients. The diagnostic hard winner-take-all mode preserves subgoal mass,
+splits exact ties, and cannot be used with Adam.
 
 Third, the lower desirability is composed linearly:
 
@@ -601,8 +617,10 @@ $\beta / \lambda_1$.
 `fittable_parameters(template)` returns `lower_control_cost`,
 `upper_control_cost`, `alpha`, and `beta`, plus `core_threshold` (`tau`) and
 `core_exponent` (`eta`) for an active gated basis. The former behavioral
-`off_target_reward` no longer exists; canonical task-library metadata calls
-its replacement `off_target_value` and never repurposes it as a fitted reward.
+`off_target_reward` no longer exists. `off_target_value` is an optional
+structural boundary leakage value, defaults to zero, and is never repurposed as
+a behavioral or fitted reward. The historical `exp(-18)` value must be
+requested explicitly.
 
 Adam uses PyTorch's `ReduceLROnPlateau` with the evaluated pre-update loss passed to
 the scheduler only after its aligned optimizer update. When the scheduler lowers

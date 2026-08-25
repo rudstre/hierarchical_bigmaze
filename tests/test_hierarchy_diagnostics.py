@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 import andrew_mlmdp.hierarchy.diagnostics as hierarchy_diagnostics
-from andrew_mlmdp import Environment, Maze, Parameters, SubgoalBasis
+from andrew_mlmdp import Environment, Maze, Parameters, SubgoalBasis, Trial
 from andrew_mlmdp.hierarchy import (
     DiagnosticSweep,
     composition_trace,
@@ -538,6 +538,38 @@ def test_pair_diagnostics_sweep_matches_direct_and_computes_shortest_once(
     progress_output = capsys.readouterr().out
     assert progress_output.count("pair_diagnostics=") == len(parameter_values)
     assert progress_output.count("status=ok") == len(parameter_values)
+
+
+def test_pair_diagnostics_sweep_optionally_scores_all_trials():
+    template = _uniform_profile_template(Maze.from_ascii("..."))
+    values = (0.2, 0.08)
+    trials = (
+        Trial("session", 1, (0, 2), ((0, 0), (0, 1), (0, 2))),
+        Trial("session", 2, (0, 0), ((0, 2), (0, 1), (0, 0))),
+    )
+
+    sweep = sweep_diagnostics(
+        template,
+        "lower_control_cost",
+        values,
+        start=(0, 0),
+        goal=(0, 2),
+        trials=(trial for trial in trials),
+    )
+
+    expected = []
+    for value in values:
+        candidate = hierarchy_diagnostics._template_with_parameter(
+            template,
+            "lower_control_cost",
+            value,
+        )
+        expected.append(float(candidate.total_log_likelihood(trials).detach()))
+
+    np.testing.assert_allclose(sweep.total_log_likelihood, expected)
+    assert not sweep.total_log_likelihood.flags.writeable
+    assert sweep.likelihood_seconds.shape == sweep.parameter_values.shape
+    assert np.all(sweep.likelihood_seconds >= 0.0)
 
 
 def test_pair_diagnostics_sweep_rejects_parameters_and_reports_errors(

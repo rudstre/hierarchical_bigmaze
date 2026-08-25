@@ -6,6 +6,7 @@ def test_hierarchy_names_are_reexported():
     assert hierarchy.Template is andrew_mlmdp.Template
     assert hierarchy.Rollout is andrew_mlmdp.Rollout
     assert hierarchy.SubgoalBasis is andrew_mlmdp.SubgoalBasis
+    assert hierarchy.PairEntropy is andrew_mlmdp.PairEntropy
 
 
 def test_plotting_names_are_reexported():

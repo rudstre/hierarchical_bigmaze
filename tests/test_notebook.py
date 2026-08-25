@@ -95,7 +95,12 @@ def test_doohan_hierarchy_diagnostics_has_flat_sweep_after_section_two():
         for output in cell.outputs
     )
     assert "FLAT_CONTROL_COST_SWEEP_VALUES" in cell.source
+    assert "flat_solutions" in cell.source
     assert "trajectory_length_moments" in cell.source
+    assert "policy_entropy" in cell.source
+    assert ".normalized_entropy" in cell.source
+    assert "flat_entropy_ax" in cell.source
+    assert "sharex=True" in cell.source
     compile(
         cell.source,
         str(DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK),
@@ -119,13 +124,19 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     assert "sweep_expected_policy_entropy" not in notebook_source
     assert "N_RESTARTS = 5" in notebook_source
     assert "initial_conditions" in notebook_source
+    assert "Adam initial conditions:" in notebook_source
+    assert "display(initial_condition_table)" in notebook_source
     assert "restart_results" in notebook_source
     assert "fittable_parameters" in notebook_source
     assert "required_parameters" not in notebook_source
     assert "DISCOVERY_CONTROL_COST = 3.0" in notebook_source
     assert "NMFConfig(control_cost=DISCOVERY_CONTROL_COST)" in notebook_source
     assert "lambda_smooth" not in notebook_source
-    assert "upper_control_cost=1.8" in notebook_source
+    assert "parameters=soft_parameters(DISCOVERY_RANK)" in notebook_source
+    assert '"lower_control_cost": 1.0' in notebook_source
+    assert '"upper_control_cost": 1.0' in notebook_source
+    assert '"alpha": 0.75' in notebook_source
+    assert '"beta": 1.0' in notebook_source
     assert "interior_reward" not in notebook_source
     assert "goal_reward" not in notebook_source
     assert "GOAL_REWARD_RESTART_SD" not in notebook_source
@@ -153,3 +164,11 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     sweep_cell = sweep_cells["sweep-pair-diagnostics"]
     assert sweep_cell.execution_count is None
     assert sweep_cell.outputs == []
+    assert 'SWEEP_PARAMETER_NAME = "alpha"' in sweep_cell.source
+    assert "parameter_name=SWEEP_PARAMETER_NAME" in sweep_cell.source
+    assert "values=SWEEP_VALUES" in sweep_cell.source
+    assert "fitted_parameter_value" in sweep_cell.source
+    assert "parameter_values()[" in sweep_cell.source
+    assert "axis.set_xlim(sweep_min, sweep_max)" in sweep_cell.source
+    assert "fitted_lower_control_cost" not in sweep_cell.source
+    assert "lower_control_cost_pair_sweep" not in sweep_cell.source

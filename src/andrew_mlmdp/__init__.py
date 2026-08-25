@@ -53,6 +53,7 @@ from andrew_mlmdp.labeled_maze import (
 from andrew_mlmdp.lmdp import (
     Dynamics,
     Environment,
+    PairEntropy,
     Parameters,
     PassiveMode,
     Solution,
@@ -81,6 +82,7 @@ __all__ = [
     "NMFConfig",
     "NMFStudy",
     "NumericalError",
+    "PairEntropy",
     "ParameterValues",
     "Parameters",
     "PassiveMode",

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -169,6 +171,28 @@ def test_expected_pair_diagnostics_sweep_plot_uses_supplied_axes():
 
     assert figure is supplied_figure
     assert axes == tuple(supplied_axes)
+    figure.canvas.draw()
+    plt.close(figure)
+
+
+def test_expected_pair_diagnostics_sweep_plot_adds_dataset_likelihood_panel():
+    data = replace(
+        _pair_diagnostics_sweep_plot_data(),
+        total_log_likelihood=np.asarray([-30.0, -20.0, -25.0]),
+    )
+
+    figure, (entropy_ax, length_ax, likelihood_ax) = (
+        plotting.plot_diagnostic_sweep(data)
+    )
+
+    np.testing.assert_array_equal(
+        likelihood_ax.lines[0].get_ydata(),
+        data.total_log_likelihood,
+    )
+    assert likelihood_ax.get_ylabel() == "Total log likelihood"
+    assert likelihood_ax.get_xlabel() == "Lower control cost"
+    assert length_ax.get_xlabel() == ""
+    assert entropy_ax.get_shared_x_axes().joined(entropy_ax, likelihood_ax)
     figure.canvas.draw()
     plt.close(figure)
 

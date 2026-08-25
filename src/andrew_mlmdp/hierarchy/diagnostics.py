@@ -17,7 +17,16 @@ from types import MappingProxyType
 from typing import Literal
 
 import numpy as np
+import torch
 
+from andrew_mlmdp.dataset import Trial
+from andrew_mlmdp.hierarchy.autodiff import (
+    parameter_values as _autodiff_parameter_values,
+)
+from andrew_mlmdp.hierarchy.batch import (
+    prepare_batch,
+    total_prepared_log_likelihood,
+)
 from andrew_mlmdp.hierarchy.likelihood import (
     _first_departure_kernel,
     _step_kernel,
@@ -31,7 +40,7 @@ from andrew_mlmdp.hierarchy.model import (
     _goal_only_plan,
 )
 from andrew_mlmdp.hierarchy.rollout import Rollout, _rollout_column
-from andrew_mlmdp.lmdp import Parameters
+from andrew_mlmdp.lmdp import PairEntropy, Parameters
 from andrew_mlmdp.maze import Coordinate, Maze
 
 HierarchyModel = Task | Template
@@ -278,19 +287,6 @@ class RouteSummary:
 
 
 @dataclass(frozen=True)
-class PairEntropy:
-    """Exact departure-occupancy entropy for one ordered navigation task."""
-
-    start: Coordinate
-    goal: Coordinate
-    normalized_entropy_sum: float
-    entropy_sum: float
-    expected_decisions: float
-    normalized_entropy: float
-    entropy: float
-
-
-@dataclass(frozen=True)
 class PairDiagnostics:
     """Exact entropy and physical-step moments for one navigation pair."""
 
@@ -337,7 +333,7 @@ _ENTROPY_TIMING: ContextVar[
 
 @dataclass(frozen=True)
 class DiagnosticSweep:
-    """Exact pair diagnostics and runtime data over one parameter grid."""
+    """Exact pair diagnostics and optional dataset score over a parameter grid."""
 
     parameter_name: str
     parameter_values: np.ndarray
@@ -348,8 +344,10 @@ class DiagnosticSweep:
     entropy: np.ndarray
     mean_steps: np.ndarray
     step_sd: np.ndarray
+    total_log_likelihood: np.ndarray | None = None
     build_seconds: np.ndarray | None = None
     diagnostic_seconds: np.ndarray | None = None
+    likelihood_seconds: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.parameter_name, str) or not self.parameter_name:
@@ -385,6 +383,7 @@ class DiagnosticSweep:
         for name in (
             "build_seconds",
             "diagnostic_seconds",
+            "likelihood_seconds",
         ):
             supplied = getattr(self, name)
             raw_values = (
@@ -398,6 +397,18 @@ class DiagnosticSweep:
                     f"{name} must have shape {expected_shape}, got {values.shape}"
                 )
             object.__setattr__(self, name, values)
+
+        if self.total_log_likelihood is not None:
+            values = _read_only_array(
+                self.total_log_likelihood,
+                dtype=np.float64,
+            )
+            if values.shape != expected_shape:
+                raise ValueError(
+                    "total_log_likelihood must have shape "
+                    f"{expected_shape}, got {values.shape}"
+                )
+            object.__setattr__(self, "total_log_likelihood", values)
 
 
 # Exact pair metrics --------------------------------------------------------
@@ -1156,6 +1167,7 @@ def _print_sweep_progress(
     value: float,
     build_seconds: float,
     diagnostics_seconds: float,
+    likelihood_seconds: float,
     instrumentation: _EntropyTiming,
     status: str,
 ) -> None:
@@ -1166,6 +1178,7 @@ def _print_sweep_progress(
         f"[{index + 1}/{total}] {parameter_name}={value:.17g}"
         f" | construction={build_seconds:.3f}s"
         f" | pair_diagnostics={diagnostics_seconds:.3f}s"
+        f" | dataset_likelihood={likelihood_seconds:.3f}s"
         f" | pairs={instrumentation.pairs}"
         f" | entropy_solves={instrumentation.solves}"
         f" | max_states={instrumentation.max_states}"
@@ -1182,10 +1195,17 @@ def sweep_diagnostics(
     *,
     start: Coordinate,
     goal: Coordinate,
+    trials: Iterable[Trial] | None = None,
     progress: bool = False,
     check_condition: bool = False,
 ) -> DiagnosticSweep:
-    """Sweep exact entropy and physical-step moments for one selected pair."""
+    """Sweep pair diagnostics and optionally score all supplied trials.
+
+    Pair entropy and step moments describe only ``start`` to ``goal``. When
+    ``trials`` is supplied, ``total_log_likelihood`` instead sums the exact
+    movement log likelihood across those independent, goal-conditioned trials.
+    Trial metadata is prepared once and reused for every parameter candidate.
+    """
 
     if not isinstance(template, Template):
         raise TypeError("template must be a Template")
@@ -1214,10 +1234,15 @@ def sweep_diagnostics(
         _template_with_parameter(template, parameter_name, 0.0)
         raise AssertionError("unreachable")
     parameter_values = _validate_sweep_values(values)
+    prepared_trials = None
+    if trials is not None:
+        prepared_trials = prepare_batch(template, tuple(trials))
 
     results = []
+    log_likelihoods = []
     construction_times = []
     diagnostics_times = []
+    likelihood_times = []
     total = len(parameter_values)
     for index, value in enumerate(parameter_values):
         construction_started = perf_counter()
@@ -1237,6 +1262,7 @@ def sweep_diagnostics(
                     value=value,
                     build_seconds=build_seconds,
                     diagnostics_seconds=0.0,
+                    likelihood_seconds=0.0,
                     instrumentation=_EntropyTiming(),
                     status=f"construction_error={type(error).__name__}: {error}",
                 )
@@ -1267,6 +1293,7 @@ def sweep_diagnostics(
                     value=value,
                     build_seconds=build_seconds,
                     diagnostics_seconds=diagnostics_seconds,
+                    likelihood_seconds=0.0,
                     instrumentation=instrumentation,
                     status=f"diagnostics_error={type(error).__name__}: {error}",
                 )
@@ -1275,9 +1302,22 @@ def sweep_diagnostics(
             _ENTROPY_TIMING.reset(token)
         diagnostics_seconds = perf_counter() - diagnostics_started
 
+        likelihood_seconds = 0.0
+        if prepared_trials is not None:
+            likelihood_started = perf_counter()
+            with torch.no_grad():
+                total_log_likelihood = total_prepared_log_likelihood(
+                    candidate,
+                    prepared_trials,
+                    parameter_values=_autodiff_parameter_values(candidate),
+                )
+            log_likelihoods.append(float(total_log_likelihood.detach()))
+            likelihood_seconds = perf_counter() - likelihood_started
+
         results.append(result)
         construction_times.append(build_seconds)
         diagnostics_times.append(diagnostics_seconds)
+        likelihood_times.append(likelihood_seconds)
         if progress:
             _print_sweep_progress(
                 index=index,
@@ -1286,6 +1326,7 @@ def sweep_diagnostics(
                 value=value,
                 build_seconds=build_seconds,
                 diagnostics_seconds=diagnostics_seconds,
+                likelihood_seconds=likelihood_seconds,
                 instrumentation=instrumentation,
                 status="ok",
             )
@@ -1308,8 +1349,14 @@ def sweep_diagnostics(
         step_sd=np.asarray(
             [result.step_sd for result in results]
         ),
+        total_log_likelihood=(
+            np.asarray(log_likelihoods)
+            if prepared_trials is not None
+            else None
+        ),
         build_seconds=np.asarray(construction_times),
         diagnostic_seconds=np.asarray(diagnostics_times),
+        likelihood_seconds=np.asarray(likelihood_times),
     )
 
 

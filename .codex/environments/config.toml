@@ -1,0 +1,7 @@
+allow_login_shell = false
+
+[shell_environment_policy]
+inherit = "all"
+set = {
+  PATH = "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin:/usr/local/bin:/usr/bin:/bin"
+}

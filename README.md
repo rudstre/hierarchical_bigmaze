@@ -174,6 +174,14 @@ Behavior is determined by the dimensionless groups `1/lower_control_cost`,
 `1/upper_control_cost`, and `beta/lower_control_cost`; changing the single-goal
 boundary reward only rescales desirability and cancels from normalized policy.
 
+The canonical `TaskLibrary` is an identity boundary basis: target and physical-
+goal desirabilities are `1`, while off-target desirabilities are exactly `0`.
+Consequently, with `composition_exponent=1`, every positive inpainted boundary
+target is represented exactly and non-negative clipping is inactive. A positive
+`off_target_value` is still supported explicitly for historical reproduction or
+for a deliberately leaky task dictionary; it is a structural boundary value,
+not the hierarchy's `interior_reward` and not an NMF-discovery parameter.
+
 For a dataset, keep trials separate so each trajectory starts with a fresh
 controller state and uses its own goal. The dataset helpers retain per-trial
 scores while summing their log-likelihoods:

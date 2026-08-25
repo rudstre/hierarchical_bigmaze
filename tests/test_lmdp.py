@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import cast
 
 import numpy as np
@@ -229,6 +230,80 @@ def test_rollout_is_seeded_legal_and_handles_terminal_start():
     assert first[-1] == (1, 3)
     assert all(maze.is_free(coordinate) for coordinate in first)
     assert solution.rollout((1, 3), seed=7) == [(1, 3)]
+
+
+def test_flat_policy_entropy_conditions_out_self_transition_waiting():
+    maze = Maze.from_ascii("..")
+    solution = Environment(maze, passive_mode="five_commands").solve((0, 1))
+
+    entropy = solution.policy_entropy((0, 0))
+    mean_steps, _ = solution.trajectory_length_moments((0, 0))
+
+    assert entropy.start == (0, 0)
+    assert entropy.goal == (0, 1)
+    assert entropy.expected_decisions == pytest.approx(1.0)
+    assert entropy.entropy_sum == pytest.approx(0.0)
+    assert entropy.normalized_entropy_sum == pytest.approx(0.0)
+    assert entropy.entropy == pytest.approx(0.0)
+    assert entropy.normalized_entropy == pytest.approx(0.0)
+    assert mean_steps > entropy.expected_decisions
+
+
+def test_flat_policy_entropy_uses_exact_departure_occupancy():
+    maze = Maze.from_ascii("...")
+    environment = Environment(maze)
+    solution = environment.solve((0, 2))
+    probability_to_goal = 0.4
+    controlled = np.zeros_like(solution.controlled)
+    controlled[1, 0] = 1.0
+    controlled[0, 1] = 1.0 - probability_to_goal
+    controlled[2, 1] = probability_to_goal
+    controlled[2, 2] = 1.0
+    solution = replace(solution, controlled=controlled)
+
+    entropy = solution.policy_entropy((0, 1))
+
+    branch_entropy = -(
+        probability_to_goal * np.log(probability_to_goal)
+        + (1.0 - probability_to_goal) * np.log(1.0 - probability_to_goal)
+    )
+    expected_middle_visits = 1.0 / probability_to_goal
+    expected_left_visits = (1.0 - probability_to_goal) / probability_to_goal
+    expected_decisions = expected_middle_visits + expected_left_visits
+    expected_entropy_sum = expected_middle_visits * branch_entropy
+    expected_normalized_sum = expected_entropy_sum / np.log(2.0)
+
+    assert entropy.expected_decisions == pytest.approx(expected_decisions)
+    assert entropy.entropy_sum == pytest.approx(expected_entropy_sum)
+    assert entropy.normalized_entropy_sum == pytest.approx(
+        expected_normalized_sum
+    )
+    assert entropy.entropy == pytest.approx(
+        expected_entropy_sum / expected_decisions
+    )
+    assert entropy.normalized_entropy == pytest.approx(
+        expected_normalized_sum / expected_decisions
+    )
+
+
+def test_flat_policy_entropy_validates_pair_and_absorption():
+    disconnected = Environment(Maze.from_ascii("..#..")).solve((0, 4))
+    with pytest.raises(ValueError, match="topologically reachable"):
+        disconnected.policy_entropy((0, 0))
+    with pytest.raises(ValueError, match="not a free cell"):
+        disconnected.policy_entropy((0, 2))
+    with pytest.raises(ValueError, match="must differ"):
+        disconnected.policy_entropy((0, 4))
+
+    maze = Maze.from_ascii("...")
+    solution = Environment(maze).solve((0, 2))
+    closed_controlled = np.zeros_like(solution.controlled)
+    closed_controlled[1, 0] = 1.0
+    closed_controlled[0, 1] = 1.0
+    closed_controlled[2, 2] = 1.0
+    closed_solution = replace(solution, controlled=closed_controlled)
+    with pytest.raises(RuntimeError, match="nonabsorbing"):
+        closed_solution.policy_entropy((0, 0))
 
 
 def test_flat_trajectory_length_moments_are_exact():

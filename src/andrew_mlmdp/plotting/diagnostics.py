@@ -37,21 +37,33 @@ def plot_diagnostic_sweep(
     *,
     axes=None,
 ):
-    """Plot exact pair entropy and trajectory-length diagnostics."""
+    """Plot pair diagnostics and an optional full-dataset likelihood."""
 
     if not isinstance(sweep_data, DiagnosticSweep):
         raise TypeError("sweep_data must be an DiagnosticSweep")
+    has_likelihood = sweep_data.total_log_likelihood is not None
+    expected_axes = 3 if has_likelihood else 2
+    expected_axes_text = "three" if has_likelihood else "two"
     if axes is None:
-        figure, created_axes = plt.subplots(2, 1, sharex=True)
-        entropy_ax, length_ax = created_axes
+        figure, created_axes = plt.subplots(expected_axes, 1, sharex=True)
+        resolved_axes = tuple(created_axes)
     else:
         try:
-            entropy_ax, length_ax = axes
+            resolved_axes = tuple(axes)
         except (TypeError, ValueError) as error:
-            raise ValueError("axes must contain exactly two axes") from error
+            raise ValueError(
+                f"axes must contain exactly {expected_axes_text} axes"
+            ) from error
+        if len(resolved_axes) != expected_axes:
+            raise ValueError(
+                f"axes must contain exactly {expected_axes_text} axes"
+            )
+        entropy_ax, length_ax = resolved_axes[:2]
         figure = entropy_ax.figure
-        if length_ax.figure is not figure:
+        if any(ax.figure is not figure for ax in resolved_axes[1:]):
             raise ValueError("axes must belong to the same figure")
+
+    entropy_ax, length_ax = resolved_axes[:2]
 
     parameter_values = sweep_data.parameter_values
     entropy_ax.plot(
@@ -84,10 +96,24 @@ def plot_diagnostic_sweep(
         linestyle="--",
         label=(f"Shortest path = {sweep_data.shortest_steps} steps"),
     )
-    length_ax.set_xlabel(sweep_data.parameter_name.replace("_", " ").capitalize())
     length_ax.set_ylabel("Trajectory length (physical steps)")
     length_ax.legend()
-    return figure, (entropy_ax, length_ax)
+
+    if has_likelihood:
+        likelihood_ax = resolved_axes[2]
+        likelihood_ax.plot(
+            parameter_values,
+            sweep_data.total_log_likelihood,
+            marker="o",
+            label="All observed trials",
+        )
+        likelihood_ax.set_ylabel("Total log likelihood")
+        likelihood_ax.legend()
+
+    resolved_axes[-1].set_xlabel(
+        sweep_data.parameter_name.replace("_", " ").capitalize()
+    )
+    return figure, resolved_axes
 
 
 def _subgoal_colors(n_subgoals: int) -> tuple[tuple[float, ...], ...]:

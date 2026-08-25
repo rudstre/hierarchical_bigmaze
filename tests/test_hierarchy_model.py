@@ -63,6 +63,7 @@ def test_model_parameters_are_trainable_float64_scalars():
 def test_hierarchy_factories_preserve_core_defaults():
     hard = point_parameters()
     soft = soft_parameters()
+    other_rank_soft = soft_parameters(2)
     ungated_soft = soft_parameters(core_threshold=None)
 
     assert hard.core_threshold is None
@@ -75,12 +76,15 @@ def test_hierarchy_factories_preserve_core_defaults():
             "interior_reward": -1.0,
             "goal_reward": 0.0,
             "lower_control_cost": 1.0,
-            "upper_control_cost": 2.5,
-            "alpha": 0.2,
-            "beta": 160.0,
+            "upper_control_cost": 1.0,
+            "alpha": 0.75,
+            "beta": 1.0,
             "core_threshold": 0.8,
             "core_exponent": 1.0,
         }
+    )
+    assert _parameter_values(other_rank_soft) == pytest.approx(
+        _parameter_values(soft)
     )
 
 
@@ -210,23 +214,13 @@ def test_canonical_layer_one_task_library_is_immutable_full_rank_and_normalized(
     boundary = library.boundary_desirability
 
     assert boundary.shape == (9, 9)
-    assert np.diag(boundary) == pytest.approx(np.ones(9))
-    assert boundary[0, 1] == pytest.approx(np.exp(-18.0))
-    assert np.all(boundary[:-1, -1] == 0.0)
-    assert np.all(boundary[-1, :-1] == 0.0)
+    assert np.array_equal(boundary, np.eye(9))
     assert library.target_value == 1.0
-    assert library.off_target_value == pytest.approx(np.exp(-18.0))
+    assert library.off_target_value == 0.0
     assert library.goal_value == 1.0
     assert library.effective_rank == 9
-    assert library.singular_values[:2] == pytest.approx(
-        [1.00000010661, 1.0],
-        abs=5e-13,
-    )
-    assert library.singular_values[2:] == pytest.approx(
-        np.full(7, 0.999999984770),
-        abs=5e-13,
-    )
-    assert library.condition_number == pytest.approx(1.00000012184, abs=5e-13)
+    assert np.array_equal(library.singular_values, np.ones(9))
+    assert library.condition_number == 1.0
     with pytest.raises(ValueError, match="read-only"):
         boundary[0, 0] = 2.0
     with pytest.raises(ValueError, match="read-only"):
@@ -522,10 +516,10 @@ def test_point_hierarchy_uses_swept_hard_defaults():
     expected = Parameters(
         interior_reward=-1.0,
         goal_reward=0.0,
-        lower_control_cost=0.6,
-        upper_control_cost=3.0,
-        alpha=0.4,
-        beta=160.0,
+        lower_control_cost=1.0,
+        upper_control_cost=1.0,
+        alpha=0.75,
+        beta=1.0,
     )
     assert _parameter_values(point_parameters()) == pytest.approx(
         _parameter_values(expected)
@@ -620,7 +614,7 @@ def test_first_hit_and_upper_dynamics_are_stochastic():
     assert np.allclose(task.upper_controlled.sum(axis=0), 1.0)
 
 
-def test_plan_inpaints_goal_and_composes_exact_goal_column():
+def test_plan_inpaints_and_exactly_composes_canonical_boundary():
     maze = Maze.from_ascii(".....")
     environment = Environment(maze)
     basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
@@ -636,11 +630,12 @@ def test_plan_inpaints_goal_and_composes_exact_goal_column():
     )
 
     assert plan.rewards == pytest.approx(expected_rewards)
+    assert plan.raw_weights == pytest.approx(plan.target_boundary)
+    assert plan.clipped_weights == pytest.approx(plan.target_boundary)
+    assert plan.weights == pytest.approx(plan.target_boundary)
+    assert plan.boundary_desirability == pytest.approx(plan.target_boundary)
     assert plan.weights[-1] == pytest.approx(expected_goal_weight)
     assert plan.weights[-1] > 0.0
-    assert plan.boundary_desirability[-1] == pytest.approx(
-        plan.target_boundary[-1]
-    )
     assert plan.desirability[task.interior_states] == pytest.approx(
         task.task_basis.interior_desirability @ plan.weights
     )

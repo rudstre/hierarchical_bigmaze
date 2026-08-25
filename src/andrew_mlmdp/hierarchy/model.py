@@ -32,9 +32,6 @@ if TYPE_CHECKING:
     from andrew_mlmdp.hierarchy.rollout import Rollout
 
 
-DEFAULT_OFF_TARGET = float(np.exp(-18.0))
-
-
 @dataclass(frozen=True)
 class TaskLibrary:
     """Immutable boundary-desirability dictionary for Layer-1 composition."""
@@ -70,12 +67,15 @@ class TaskLibrary:
         n_subgoals: int,
         *,
         target_value: float = 1.0,
-        off_target_value: float = (
-            DEFAULT_OFF_TARGET
-        ),
+        off_target_value: float = 0.0,
         goal_value: float = 1.0,
     ) -> "TaskLibrary":
-        """Build the standard block-diagonal multitask dictionary."""
+        """Build the standard block-diagonal multitask dictionary.
+
+        The canonical defaults form an identity matrix. A positive
+        ``off_target_value`` explicitly opts into finite desirability leakage
+        between subgoal tasks.
+        """
 
         if (
             isinstance(n_subgoals, (bool, np.bool_))
@@ -811,7 +811,9 @@ def _compose_plan(
     )
 
     # Paper Equation 7, using its stated pseudoinverse-and-clipping
-    # approximation for tasks outside the exact span of Q_b.
+    # approximation when a target lies outside the non-negative cone of Q_b.
+    # For the canonical identity library, raw_weights equals target_boundary
+    # and clipping is a no-op.
     raw_weights = (
         np.linalg.pinv(model.task_basis.boundary_desirability)
         @ target_boundary

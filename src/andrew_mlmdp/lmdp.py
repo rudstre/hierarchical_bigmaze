@@ -117,10 +117,10 @@ def point_parameters(
     *,
     interior_reward: float = -1.0,
     goal_reward: float = 0.0,
-    lower_control_cost: float = 0.6,
-    upper_control_cost: float = 3.0,
-    alpha: float = 0.4,
-    beta: float = 160.0,
+    lower_control_cost: float = 1.0,
+    upper_control_cost: float = 1.0,
+    alpha: float = 0.75,
+    beta: float = 1.0,
     core_threshold: float | None = None,
     core_exponent: float = 1.0,
 ) -> Parameters:
@@ -157,14 +157,11 @@ def soft_parameters(
 ) -> Parameters:
     """Return soft-hierarchy execution parameters for rank ``k``.
 
-    The rank-eight reference was validated after component-wise NMF peak
-    normalization with the active exact-goal component disabled in the
-    hierarchy template. For ranks other than eight, the heuristic
-    keeps the physical-layer and inpainting parameters fixed while applying
-    ``alpha ~ 1 / sqrt(k)`` and ``upper_control_cost ~ sqrt(k)``; those derived
-    ranks have not received the same behavioral validation.
+    Defaults match :func:`point_parameters` and are independent of rank.
+    ``k`` validates and documents the basis rank but does not rescale any
+    execution parameter.
 
-    Any explicitly supplied parameter replaces its default or derived value.
+    Any explicitly supplied parameter replaces its default value.
     """
 
     if (
@@ -174,16 +171,13 @@ def soft_parameters(
     ):
         raise ValueError("Soft hierarchy rank k must be a positive integer")
 
-    reference = Parameters()
-    rank_scale = float(np.sqrt(float(k) / 8.0))
+    reference = point_parameters()
     derived = {
         "interior_reward": reference.interior_reward.item(),
         "goal_reward": reference.goal_reward.item(),
         "lower_control_cost": reference.lower_control_cost.item(),
-        "upper_control_cost": (
-            reference.upper_control_cost.item() * rank_scale
-        ),
-        "alpha": reference.alpha.item() / rank_scale,
+        "upper_control_cost": reference.upper_control_cost.item(),
+        "alpha": reference.alpha.item(),
         "beta": reference.beta.item(),
         "core_threshold": core_threshold,
         "core_exponent": core_exponent,
@@ -251,6 +245,19 @@ class Dynamics:
         """Number of terminal boundary states."""
 
         return self.boundary_passive.shape[0]
+
+
+@dataclass(frozen=True)
+class PairEntropy:
+    """Exact departure-occupancy entropy for one ordered navigation task."""
+
+    start: Coordinate
+    goal: Coordinate
+    normalized_entropy_sum: float
+    entropy_sum: float
+    expected_decisions: float
+    normalized_entropy: float
+    entropy: float
 
 
 @dataclass(frozen=True)
@@ -324,6 +331,131 @@ class Solution:
             self.goal,
             max_steps=max_steps,
             seed=seed,
+        )
+
+    def policy_entropy(self, start: Coordinate) -> PairEntropy:
+        """Return exact normalized first-departure entropy for this pair.
+
+        Entropy at each physical state is normalized by the logarithm of its
+        number of legal non-self departures, then weighted by the expected
+        number of visits before the goal is reached. Self-transition waiting
+        steps therefore affect physical trajectory length but not entropy or
+        the expected decision count.
+        """
+
+        maze = self.environment.maze
+        start_state = maze.state_index(start)
+        goal_state = maze.state_index(self.goal)
+        if start_state == goal_state:
+            raise ValueError("start must differ from the physical goal")
+
+        topologically_reachable = [start_state]
+        topologically_reached = {start_state}
+        for current_state in topologically_reachable:
+            for next_state in np.flatnonzero(
+                self.environment.passive[:, current_state] > 0.0
+            ):
+                next_index = int(next_state)
+                if next_index not in topologically_reached:
+                    topologically_reached.add(next_index)
+                    topologically_reachable.append(next_index)
+        if goal_state not in topologically_reached:
+            raise ValueError("goal is not topologically reachable from start")
+
+        controlled = np.asarray(self.controlled, dtype=np.float64)
+        leaving_probability = 1.0 - np.diag(controlled)
+        departure = np.divide(
+            controlled,
+            leaving_probability[np.newaxis, :],
+            out=np.zeros_like(controlled),
+            where=leaving_probability[np.newaxis, :] > 0.0,
+        )
+        np.fill_diagonal(departure, 0.0)
+
+        reachable_states = [start_state]
+        reached = {start_state}
+        for current_state in reachable_states:
+            for next_state in np.flatnonzero(
+                departure[:, current_state] > 0.0
+            ):
+                next_index = int(next_state)
+                if next_index != goal_state and next_index not in reached:
+                    reached.add(next_index)
+                    reachable_states.append(next_index)
+
+        transient = np.asarray(reachable_states, dtype=np.int64)
+        departure_mass = departure[:, transient].sum(axis=0)
+        if not np.all(np.isfinite(departure_mass)):
+            raise RuntimeError("Flat first-departure policy contains nonfinite mass")
+        if np.any(np.abs(departure_mass - 1.0) > 1e-10):
+            raise RuntimeError(
+                "Flat policy is nonabsorbing for the requested start-goal pair"
+            )
+        departure[:, transient] /= departure_mass[np.newaxis, :]
+
+        transient_transition = departure[np.ix_(transient, transient)]
+        goal_probability = departure[goal_state, transient]
+        initial = np.zeros(len(transient), dtype=np.float64)
+        initial[0] = 1.0
+        system = np.eye(len(transient), dtype=np.float64) - transient_transition
+        try:
+            occupancy = np.linalg.solve(system, initial)
+        except np.linalg.LinAlgError as error:
+            raise RuntimeError(
+                "Flat policy is nonabsorbing for the requested start-goal pair"
+            ) from error
+        if not np.all(np.isfinite(occupancy)) or np.any(occupancy < -1e-10):
+            raise RuntimeError("Flat departure occupancy is invalid")
+        np.maximum(occupancy, 0.0, out=occupancy)
+
+        goal_hitting_probability = float(goal_probability @ occupancy)
+        if (
+            goal_hitting_probability < 1.0 - 1e-10
+            or goal_hitting_probability > 1.0 + 1e-10
+        ):
+            raise RuntimeError(
+                "Flat policy is nonabsorbing for the requested start-goal pair"
+            )
+
+        raw_entropy = np.zeros(len(transient), dtype=np.float64)
+        normalized_entropy = np.zeros(len(transient), dtype=np.float64)
+        passive = self.environment.passive
+        for entropy_index, current_state in enumerate(transient):
+            probabilities = departure[:, current_state]
+            legal = passive[:, current_state] > 0.0
+            legal[current_state] = False
+            if np.any(probabilities[~legal] > 1e-10):
+                raise RuntimeError("Flat policy departed outside physical topology")
+
+            positive = probabilities > 0.0
+            entropy = float(
+                -np.sum(probabilities[positive] * np.log(probabilities[positive]))
+            )
+            raw_entropy[entropy_index] = entropy
+            degree = int(np.count_nonzero(legal))
+            if degree > 1:
+                normalized = entropy / float(np.log(degree))
+                if normalized < -1e-10 or normalized > 1.0 + 1e-10:
+                    raise RuntimeError(
+                        "Normalized physical entropy is outside [0, 1]"
+                    )
+                normalized_entropy[entropy_index] = float(
+                    np.clip(normalized, 0.0, 1.0)
+                )
+
+        expected_decisions = float(occupancy.sum())
+        if not np.isfinite(expected_decisions) or expected_decisions <= 0.0:
+            raise RuntimeError("Expected physical decision count is not positive")
+        entropy_sum = float(raw_entropy @ occupancy)
+        normalized_entropy_sum = float(normalized_entropy @ occupancy)
+        return PairEntropy(
+            start=start,
+            goal=self.goal,
+            normalized_entropy_sum=normalized_entropy_sum,
+            entropy_sum=entropy_sum,
+            expected_decisions=expected_decisions,
+            normalized_entropy=normalized_entropy_sum / expected_decisions,
+            entropy=entropy_sum / expected_decisions,
         )
 
     def trajectory_length_moments(
