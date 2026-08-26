@@ -237,6 +237,7 @@ desirabilities:
 ```python
 from andrew_mlmdp import (
     NMFConfig,
+    NMFConnectivityConfig,
     SubgoalBasis,
     discover_subgoals,
     soft_parameters,
@@ -246,9 +247,11 @@ study = discover_subgoals(
     environment,
     ranks=range(2, 13),
     parameters=NMFConfig(),
-    seed=0,
+    connectivity=NMFConnectivityConfig(restart_seeds=(0, 1, 2, 3)),
 )
-rank_eight = study.result(8)  # returns the already-fitted result
+rank_eight = study.result(8)
+if rank_eight is None:
+    raise RuntimeError("All rank-eight NMF restarts were excluded")
 
 soft_basis = SubgoalBasis.from_profiles(
     maze,
@@ -271,15 +274,15 @@ discovery and execution on the same scale. The selected profiles and gated
 access views are immutable. Changing the goal builds or retrieves only a
 goal-conditioned hierarchy; it does not rerun NMF or apply the gate again.
 
-Set `lambda_smooth` to a positive value in `NMFConfig` to
-penalize neighboring states with different profile values over the
-passive-dynamics connectivity graph. The useful scale is specific to the
-task ensemble because the optimization uses raw generalized KL. For a
-regularized result, `objective_history` contains the initial raw
-KL-plus-Laplacian objective followed by one value per iteration, while
-`reconstruction_error` remains the normalized KL-only diagnostic. The
-default zero strength retains the original scikit-learn solver and leaves
-`objective_history` unset.
+By default, discovery fits stochastic KL-NMF restarts and requires each
+profile's tie-safe 95%-mass support to be connected on the passive-dynamics
+maze graph. Secondary high-mass islands are persistently forbidden and the
+factors are genuinely refit with those entries fixed at zero. Low-mass tails
+remain free. `study.rank_result(k)` exposes every seed, before/after raw KL,
+forbidden mass, effective support, convergence status, and the selected
+restart. Its rank-level connectivity cost compares the best connected KL with
+the best unconstrained KL across seeds. Pass `connectivity=None` to retain the
+legacy single-fit NNDSVDa path without graph work.
 
 ## Doohan edge-list mazes
 

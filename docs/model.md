@@ -457,55 +457,46 @@ D \in \mathbb{R}_{\ge 0}^{n \times k},
 W \in \mathbb{R}_{\ge 0}^{k \times number\_of\_tasks}.
 ```
 
-With the default `lambda_smooth=0`, discovery uses the original
-scikit-learn multiplicative-update KL-NMF solver and performs no graph work.
+By default, each requested rank runs one ordinary stochastic
+multiplicative-update KL-NMF fit per explicit restart seed. Connected
+discovery uses `init="random"`; passing `connectivity=None` preserves the
+legacy single-fit `init="nndsvda"` path and performs no graph work.
 
-For a positive strength, binary adjacency `A` comes from supported non-self
-transitions in `environment.passive`. Thus it respects maze connections and
-state order without using Euclidean distance. With degree matrix `Delta` and
-`L = Delta - A`, the optimized objective is
+Binary adjacency comes from supported non-self transitions in
+`environment.passive`, symmetrized in physical-state order. For each column
+of `D`, discovery finds the largest cutoff whose superlevel set carries at
+least 95% of the column mass, including every state tied at the cutoff. If
+that effective support is disconnected, the highest-mass connected component
+is retained and states in its secondary components become persistent fixed
+zeros. Equal component masses use a tight numerical comparison and then the
+lowest physical-state index.
 
-```math
-J(D,W)
-= KL_{raw}(X \mid\mid D W)
-+ \lambda_{smooth}\,\operatorname{Tr}(D^T L D).
-```
+The current `D, W` initialize a custom MU refit with the forbidden entries of
+`D` exactly zero. Supports are recomputed after every refit, for at most three
+prune/refit rounds. Low-valued states below the mass cutoff are not forbidden.
+A restart is excluded if scikit-learn emits `ConvergenceWarning`, if a positive
+entry of `X` has exact-zero reconstruction, if a component becomes empty, or
+if effective support remains disconnected after the final round. No epsilon
+is inserted into the returned factors or reconstruction.
 
-The Laplacian term applies only to `D` and equals the sum of squared profile
-differences over undirected graph edges. Defining `R = X / (D W)`, one
-regularized multiplicative-update sweep is
+Every completed fit fixes the NMF gauge using the configured profile
+normalization and absorbs the scale into the corresponding row of `W`. Peak
+normalization is the default; `profile_normalization="l2"` selects unit L2
+norm. Reconstruction is unchanged by either rescaling.
 
-```math
-W \leftarrow W \odot
-\frac{D^T R}{D^T \mathbf{1}},
-```
+`study.rank_result(k)` retains every seed's original unconstrained `D0, W0`,
+final constrained factors when available, raw KL values, per-restart
+connectivity cost, cumulative forbidden mass measured against `D0`, effective
+support sizes, refit counts, feasibility, and exclusion reasons. Selection
+uses the lowest final connected raw KL. The rank-level connectivity cost is
+the winning connected KL minus the best finite converged unconstrained KL
+across all restarts. `study.result(k)` returns the selected immutable
+`SubtaskDiscovery`, or `None` if every restart was excluded; its existing
+`reconstruction_error` remains normalized generalized KL.
 
-followed by recomputing `R` and applying
-
-```math
-D \leftarrow D \odot
-\frac{R W^T + 2\lambda_{smooth} A D}
-     {\mathbf{1}W^T + 2\lambda_{smooth}\Delta D}.
-```
-
-These updates preserve non-negativity. They are derived for the unconstrained
-objective. After each regularized sweep, the implementation additionally
-fixes the NMF scale gauge using the configured profile normalization and
-absorbs the scale into row `j` of `W`. Peak normalization is the default;
-`profile_normalization="l2"` selects the unit-L2 gauge. Reconstruction is
-unchanged under either rescaling. Post-normalization objective descent is
-therefore verified empirically rather than assumed from the standard MU
-guarantee.
-
-[`discover_subgoals`](../src/andrew_mlmdp/discovery.py) fits every
-requested rank once, and `study.result(k)` retrieves that cached fit.
-Regularized results expose the initial full objective and one value per
-iteration through `objective_history`. The existing
-`reconstruction_error` remains normalized generalized KL only, with no
-smoothness penalty. The returned normalized `D` can then be passed to
-`SubgoalBasis.from_profiles`, optionally applying the execution gate
-described above. For an explicit L2 configuration, pass the same
-`profile_normalization="l2"` option to discovery and basis construction.
+The returned normalized `D` can be passed to `SubgoalBasis.from_profiles`,
+optionally applying the separate execution gate described above. For L2
+normalization, pass the same mode to discovery and basis construction.
 
 ## End-to-end implementation map
 

@@ -26,3 +26,12 @@ def test_plotting_names_are_reexported():
         plotting.explore_rollout
         is direct_plotting.explore_rollout
     )
+
+
+def test_connectivity_discovery_types_are_reexported():
+    import andrew_mlmdp
+    import andrew_mlmdp.discovery as discovery
+
+    assert andrew_mlmdp.NMFConnectivityConfig is discovery.NMFConnectivityConfig
+    assert andrew_mlmdp.NMFRestartResult is discovery.NMFRestartResult
+    assert andrew_mlmdp.NMFRankResult is discovery.NMFRankResult

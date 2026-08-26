@@ -92,7 +92,12 @@ NMFConfig(
     interior_reward=-1.0,
     goal_reward=0.0,
     control_cost=3.0,
-    lambda_smooth=0.0,
+)
+
+NMFConnectivityConfig(
+    support_mass=0.95,
+    max_prune_refits=3,
+    restart_seeds=(0,),
 )
 ```
 

@@ -1,10 +1,11 @@
 """Discover distributed MLMDP subtasks with non-negative factorization."""
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
 from sklearn.decomposition import NMF
-from sklearn.utils.extmath import randomized_svd
+from sklearn.exceptions import ConvergenceWarning
 
 from andrew_mlmdp.lmdp import (
     Environment,
@@ -22,17 +23,15 @@ from andrew_mlmdp.profiles import (
 class NMFConfig:
     """Task-family parameters used only to discover soft subtask profiles.
 
-    These values define the fixed desirability ensemble, optional spatial
-    penalty, and NMF scale gauge. Peak normalization is the default; ``"l2"``
-    selects a unit-L2 gauge. They are intentionally separate from
-    ``Parameters`` so execution tuning cannot silently rediscover a
-    different hierarchy.
+    These values define the fixed desirability ensemble and NMF scale gauge.
+    Peak normalization is the default; ``"l2"`` selects a unit-L2 gauge. They
+    are intentionally separate from ``Parameters`` so execution tuning cannot
+    silently rediscover a different hierarchy.
     """
 
     interior_reward: float = -1.0
     goal_reward: float = 0.0
     control_cost: float = 3.0
-    lambda_smooth: float = 0.0
     profile_normalization: ProfileNormalization = "peak"
 
     def __post_init__(self) -> None:
@@ -40,7 +39,6 @@ class NMFConfig:
             self.interior_reward,
             self.goal_reward,
             self.control_cost,
-            self.lambda_smooth,
         )
         if not np.all(np.isfinite(values)):
             raise ValueError("NMF discovery parameters must be finite")
@@ -48,11 +46,50 @@ class NMFConfig:
             raise ValueError("Discovery interior reward must be negative")
         if self.control_cost <= 0.0:
             raise ValueError("Discovery control cost must be positive")
-        if self.lambda_smooth < 0.0:
-            raise ValueError(
-                "Discovery smoothness strength must be non-negative"
-            )
         _validate_profile_normalization(self.profile_normalization)
+
+
+@dataclass(frozen=True)
+class NMFConnectivityConfig:
+    """Connected-effective-support settings for stochastic NMF restarts."""
+
+    support_mass: float = 0.95
+    max_prune_refits: int = 3
+    restart_seeds: tuple[int, ...] = (0,)
+
+    def __post_init__(self) -> None:
+        if (
+            not np.isfinite(self.support_mass)
+            or not 0.0 < self.support_mass <= 1.0
+        ):
+            raise ValueError("Connectivity support mass must be in (0, 1]")
+        if (
+            isinstance(self.max_prune_refits, (bool, np.bool_))
+            or not isinstance(self.max_prune_refits, (int, np.integer))
+            or self.max_prune_refits < 1
+        ):
+            raise ValueError(
+                "Maximum connectivity prune/refit rounds must be positive"
+            )
+        seeds = tuple(self.restart_seeds)
+        if not seeds:
+            raise ValueError("Connectivity requires at least one restart seed")
+        if len(set(seeds)) != len(seeds):
+            raise ValueError("Connectivity restart seeds must be unique")
+        for seed in seeds:
+            if (
+                isinstance(seed, (bool, np.bool_))
+                or not isinstance(seed, (int, np.integer))
+                or not 0 <= int(seed) <= np.iinfo(np.uint32).max
+            ):
+                raise ValueError(
+                    "Connectivity restart seeds must be uint32 integers"
+                )
+        object.__setattr__(
+            self,
+            "restart_seeds",
+            tuple(int(seed) for seed in seeds),
+        )
 
 
 @dataclass(frozen=True)
@@ -164,76 +201,376 @@ class SubtaskDiscovery:
 
         return self.profiles.shape[1]
 
+
+@dataclass(frozen=True)
+class NMFRestartResult:
+    """Inspectable unconstrained and connectivity-constrained restart."""
+
+    restart_id: int
+    seed: int | None
+    unconstrained_profiles: np.ndarray
+    unconstrained_task_weights: np.ndarray
+    unconstrained_kl: float
+    connected_profiles: np.ndarray | None
+    connected_task_weights: np.ndarray | None
+    connected_kl: float | None
+    forbidden_mask: np.ndarray
+    discarded_mass_fractions: np.ndarray
+    effective_support_sizes: np.ndarray | None
+    effective_support_fractions: np.ndarray | None
+    final_support_connected: np.ndarray
+    prune_refit_rounds: int
+    fit_iterations: tuple[int, ...]
+    fit_converged: tuple[bool, ...]
+    feasible: bool
+    eligible: bool
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        profiles = np.array(
+            self.unconstrained_profiles,
+            dtype=np.float64,
+            copy=True,
+        )
+        weights = np.array(
+            self.unconstrained_task_weights,
+            dtype=np.float64,
+            copy=True,
+        )
+        if profiles.ndim != 2 or weights.ndim != 2:
+            raise ValueError("Restart NMF factors must be matrices")
+        n_states, n_components = profiles.shape
+        if weights.shape[0] != n_components:
+            raise ValueError("Restart NMF factors have incompatible shapes")
+        if (
+            np.any(profiles < 0.0)
+            or np.any(weights < 0.0)
+            or not np.all(np.isfinite(profiles))
+            or not np.all(np.isfinite(weights))
+        ):
+            raise ValueError("Unconstrained restart factors must be finite")
+
+        connected_profiles = self.connected_profiles
+        connected_weights = self.connected_task_weights
+        if (connected_profiles is None) != (connected_weights is None):
+            raise ValueError("Connected D and W must both be present or absent")
+        if connected_profiles is not None:
+            connected_profiles = np.array(
+                connected_profiles,
+                dtype=np.float64,
+                copy=True,
+            )
+            connected_weights = np.array(
+                connected_weights,
+                dtype=np.float64,
+                copy=True,
+            )
+            if (
+                connected_profiles.shape != profiles.shape
+                or connected_weights.shape != weights.shape
+                or np.any(connected_profiles < 0.0)
+                or np.any(connected_weights < 0.0)
+                or not np.all(np.isfinite(connected_profiles))
+                or not np.all(np.isfinite(connected_weights))
+            ):
+                raise ValueError("Connected restart factors are invalid")
+
+        forbidden = np.array(self.forbidden_mask, dtype=bool, copy=True)
+        discarded = np.array(
+            self.discarded_mass_fractions,
+            dtype=np.float64,
+            copy=True,
+        )
+        support_connected = np.array(
+            self.final_support_connected,
+            dtype=bool,
+            copy=True,
+        )
+        if forbidden.shape != (n_states, n_components):
+            raise ValueError("Forbidden mask must have the shape of D")
+        if discarded.shape != (n_components,) or (
+            np.any(discarded < 0.0)
+            or np.any(discarded > 1.0)
+            or not np.all(np.isfinite(discarded))
+        ):
+            raise ValueError("Discarded masses must be component fractions")
+        if support_connected.shape != (n_components,):
+            raise ValueError("Connectivity flags must have one entry per component")
+
+        effective_sizes = self.effective_support_sizes
+        effective_fractions = self.effective_support_fractions
+        if (effective_sizes is None) != (effective_fractions is None):
+            raise ValueError("Effective support diagnostics must align")
+        if effective_sizes is not None:
+            effective_sizes = np.array(
+                effective_sizes,
+                dtype=np.float64,
+                copy=True,
+            )
+            effective_fractions = np.array(
+                effective_fractions,
+                dtype=np.float64,
+                copy=True,
+            )
+            if (
+                effective_sizes.shape != (n_components,)
+                or effective_fractions.shape != (n_components,)
+                or np.any(effective_sizes <= 0.0)
+                or not np.all(np.isfinite(effective_sizes))
+                or not np.all(np.isfinite(effective_fractions))
+            ):
+                raise ValueError("Effective support diagnostics are invalid")
+
+        iterations = tuple(int(value) for value in self.fit_iterations)
+        converged = tuple(bool(value) for value in self.fit_converged)
+        if not iterations or len(iterations) != len(converged):
+            raise ValueError("Restart fit diagnostics must align")
+        if any(value < 1 for value in iterations):
+            raise ValueError("Restart iteration counts must be positive")
+        if self.prune_refit_rounds != len(iterations) - 1:
+            raise ValueError("Prune/refit count must match fit diagnostics")
+        if np.isnan(self.unconstrained_kl) or (
+            self.connected_kl is not None and np.isnan(self.connected_kl)
+        ):
+            raise ValueError("Restart KL diagnostics cannot be NaN")
+        if self.eligible and (
+            not self.feasible
+            or connected_profiles is None
+            or self.connected_kl is None
+            or not np.isfinite(self.connected_kl)
+            or not np.all(support_connected)
+            or self.reason is not None
+        ):
+            raise ValueError("Eligible restart diagnostics are inconsistent")
+
+        for array in (
+            profiles,
+            weights,
+            forbidden,
+            discarded,
+            support_connected,
+            connected_profiles,
+            connected_weights,
+            effective_sizes,
+            effective_fractions,
+        ):
+            if array is not None:
+                array.flags.writeable = False
+        object.__setattr__(self, "unconstrained_profiles", profiles)
+        object.__setattr__(self, "unconstrained_task_weights", weights)
+        object.__setattr__(self, "connected_profiles", connected_profiles)
+        object.__setattr__(self, "connected_task_weights", connected_weights)
+        object.__setattr__(self, "forbidden_mask", forbidden)
+        object.__setattr__(self, "discarded_mass_fractions", discarded)
+        object.__setattr__(self, "final_support_connected", support_connected)
+        object.__setattr__(self, "effective_support_sizes", effective_sizes)
+        object.__setattr__(self, "effective_support_fractions", effective_fractions)
+        object.__setattr__(self, "fit_iterations", iterations)
+        object.__setattr__(self, "fit_converged", converged)
+
+    @property
+    def delta_kl_connectivity(self) -> float | None:
+        if self.connected_kl is None:
+            return None
+        return self.connected_kl - self.unconstrained_kl
+
+    @property
+    def relative_delta_kl_connectivity(self) -> float | None:
+        delta = self.delta_kl_connectivity
+        if delta is None or self.unconstrained_kl <= 0.0:
+            return None
+        return delta / self.unconstrained_kl
+
+
+@dataclass(frozen=True)
+class NMFRankResult:
+    """All restart outcomes and the selected connected factorization."""
+
+    rank: int
+    restarts: tuple[NMFRestartResult, ...]
+    selected_restart_id: int | None
+    discovery: SubtaskDiscovery | None
+
+    def __post_init__(self) -> None:
+        restarts = tuple(self.restarts)
+        if not restarts:
+            raise ValueError("A rank result requires at least one restart")
+        if tuple(result.restart_id for result in restarts) != tuple(
+            range(len(restarts))
+        ):
+            raise ValueError("Restart identifiers must follow configured order")
+        if self.discovery is not None and self.discovery.n_subtasks != self.rank:
+            raise ValueError("Rank result and discovery rank do not match")
+        if self.selected_restart_id is None:
+            if self.discovery is not None:
+                raise ValueError("Unselected rank cannot contain a discovery")
+        elif (
+            not 0 <= self.selected_restart_id < len(restarts)
+            or not restarts[self.selected_restart_id].eligible
+            or self.discovery is None
+        ):
+            raise ValueError("Selected restart is not eligible")
+        object.__setattr__(self, "restarts", restarts)
+
+    @property
+    def best_unconstrained_restart_id(self) -> int | None:
+        candidates = [
+            result
+            for result in self.restarts
+            if result.fit_converged[0]
+            and np.isfinite(result.unconstrained_kl)
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda result: (result.unconstrained_kl, result.restart_id),
+        ).restart_id
+
+    @property
+    def best_unconstrained_kl(self) -> float | None:
+        restart_id = self.best_unconstrained_restart_id
+        if restart_id is None:
+            return None
+        return self.restarts[restart_id].unconstrained_kl
+
+    @property
+    def best_connected_kl(self) -> float | None:
+        if self.selected_restart_id is None:
+            return None
+        return self.restarts[self.selected_restart_id].connected_kl
+
+    @property
+    def delta_kl_connectivity(self) -> float | None:
+        unconstrained = self.best_unconstrained_kl
+        connected = self.best_connected_kl
+        if unconstrained is None or connected is None:
+            return None
+        return connected - unconstrained
+
+
 @dataclass(frozen=True)
 class RankDiagnostics:
     """Normalized KL reconstruction errors for candidate NMF ranks."""
 
     ranks: np.ndarray
     reconstruction_errors: np.ndarray
+    available: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        ranks = np.asarray(self.ranks, dtype=int)
-        errors = np.asarray(self.reconstruction_errors, dtype=np.float64)
+        ranks = np.array(self.ranks, dtype=int, copy=True)
+        errors = np.array(
+            self.reconstruction_errors,
+            dtype=np.float64,
+            copy=True,
+        )
+        available = (
+            np.ones(ranks.shape, dtype=bool)
+            if self.available is None
+            else np.array(self.available, dtype=bool, copy=True)
+        )
         if ranks.ndim != 1 or not len(ranks):
             raise ValueError("Rank diagnostics require at least one rank")
         if errors.shape != ranks.shape:
             raise ValueError("Ranks and reconstruction errors must align")
+        if available.shape != ranks.shape:
+            raise ValueError("Rank availability must align with ranks")
         if np.any(ranks < 1):
             raise ValueError("NMF ranks must be positive")
-        if np.any(errors < 0.0) or not np.all(np.isfinite(errors)):
-            raise ValueError("Reconstruction errors must be finite")
+        if (
+            np.any(errors[available] < 0.0)
+            or not np.all(np.isfinite(errors[available]))
+            or np.any(~np.isnan(errors[~available]))
+        ):
+            raise ValueError(
+                "Available rank errors must be finite and unavailable errors NaN"
+            )
+        ranks.flags.writeable = False
+        errors.flags.writeable = False
+        available.flags.writeable = False
         object.__setattr__(self, "ranks", ranks)
         object.__setattr__(self, "reconstruction_errors", errors)
+        object.__setattr__(self, "available", available)
 
 
 @dataclass(frozen=True)
 class NMFStudy:
-    """One goal ensemble and a cached factorization for every requested rank."""
+    """One goal ensemble and a connected restart result for every rank."""
 
     ensemble: GoalTasks
-    discoveries: dict[int, SubtaskDiscovery]
+    rank_results: dict[int, NMFRankResult]
 
     def __post_init__(self) -> None:
-        if not self.discoveries:
+        if not self.rank_results:
             raise ValueError("An NMF study requires at least one rank")
-        ordered = dict(sorted(self.discoveries.items()))
-        for rank, discovery in ordered.items():
-            if rank != discovery.n_subtasks:
+        ordered = dict(sorted(self.rank_results.items()))
+        for rank, result in ordered.items():
+            if rank != result.rank:
                 raise ValueError(
-                    "Discovery rank does not match its profile count"
+                    "Rank-result key does not match its rank"
                 )
-            if discovery.ensemble is not self.ensemble:
+            if (
+                result.discovery is not None
+                and result.discovery.ensemble is not self.ensemble
+            ):
                 raise ValueError(
                     "All discoveries must use the study ensemble"
                 )
-        object.__setattr__(self, "discoveries", ordered)
+        object.__setattr__(self, "rank_results", ordered)
 
     @property
     def ranks(self) -> tuple[int, ...]:
-        return tuple(self.discoveries)
+        return tuple(self.rank_results)
+
+    @property
+    def discoveries(self) -> dict[int, SubtaskDiscovery]:
+        """Selected discoveries for ranks with an eligible restart."""
+
+        return {
+            rank: result.discovery
+            for rank, result in self.rank_results.items()
+            if result.discovery is not None
+        }
 
     @property
     def diagnostics(self) -> RankDiagnostics:
+        available = np.asarray(
+            [
+                self.rank_results[rank].discovery is not None
+                for rank in self.ranks
+            ],
+            dtype=bool,
+        )
         return RankDiagnostics(
             ranks=np.asarray(self.ranks, dtype=int),
             reconstruction_errors=np.asarray(
                 [
-                    self.discoveries[rank].reconstruction_error
+                    (
+                        self.rank_results[rank].discovery.reconstruction_error
+                        if self.rank_results[rank].discovery is not None
+                        else np.nan
+                    )
                     for rank in self.ranks
                 ],
                 dtype=np.float64,
             ),
+            available=available,
         )
 
-    def result(self, rank: int) -> SubtaskDiscovery:
-        """Return the already-fitted result for ``rank``."""
+    def rank_result(self, rank: int) -> NMFRankResult:
+        """Return all restart outcomes for the requested rank."""
 
         try:
-            return self.discoveries[rank]
+            return self.rank_results[rank]
         except KeyError as error:
             raise ValueError(
                 f"Rank {rank} was not fitted; available ranks: {self.ranks}"
             ) from error
+
+    def result(self, rank: int) -> SubtaskDiscovery | None:
+        """Return selected factors, or None when all restarts were excluded."""
+
+        return self.rank_result(rank).discovery
 
 
 def discover_subgoals(
@@ -242,11 +579,12 @@ def discover_subgoals(
     ranks: list[int] | tuple[int, ...] | np.ndarray,
     parameters: NMFConfig = NMFConfig(),
     goals: list[Coordinate] | tuple[Coordinate, ...] | None = None,
+    connectivity: NMFConnectivityConfig | None = NMFConnectivityConfig(),
     seed: int | None = 0,
     max_iter: int = 2000,
     tolerance: float = 1e-5,
 ) -> NMFStudy:
-    """Fit each requested rank once for an arbitrary maze task ensemble."""
+    """Fit connected stochastic restarts for every requested NMF rank."""
 
     ordered_ranks = tuple(ranks)
     if not ordered_ranks:
@@ -260,6 +598,7 @@ def discover_subgoals(
         raise ValueError("A task ensemble must contain at least one goal")
     if len(set(ordered_goals)) != len(ordered_goals):
         raise ValueError("Task goals must be unique")
+
     solver_parameters = Parameters(
         interior_reward=parameters.interior_reward,
         goal_reward=parameters.goal_reward,
@@ -280,33 +619,137 @@ def discover_subgoals(
         parameters=parameters,
         desirability=desirability,
     )
-    adjacency = None
-    if parameters.lambda_smooth > 0.0:
+
+    rank_results: dict[int, NMFRankResult] = {}
+    if connectivity is None:
+        for rank in ordered_ranks:
+            discovery = _factorize_soft_subtasks(
+                ensemble,
+                rank,
+                seed=seed,
+                max_iter=max_iter,
+                tolerance=tolerance,
+            )
+            rank_results[int(rank)] = _legacy_rank_result(discovery, seed)
+    else:
+        if not isinstance(connectivity, NMFConnectivityConfig):
+            raise TypeError("connectivity must be NMFConnectivityConfig or None")
+        connectivity = _connectivity_with_seed_shorthand(connectivity, seed)
         adjacency = _graph_adjacency_from_passive(environment.passive)
-    discoveries = {}
-    for rank in ordered_ranks:
-        if adjacency is None:
-            result = _factorize_soft_subtasks(
+        for rank in ordered_ranks:
+            rank_results[int(rank)] = _factorize_connected_soft_subtasks(
                 ensemble,
-                rank,
-                seed=seed,
-                max_iter=max_iter,
-                tolerance=tolerance,
-            )
-        else:
-            result = _factorize_regularized_soft_subtasks(
-                ensemble,
-                rank,
+                int(rank),
                 adjacency=adjacency,
-                lambda_smooth=parameters.lambda_smooth,
-                seed=seed,
+                connectivity=connectivity,
                 max_iter=max_iter,
                 tolerance=tolerance,
             )
-        discoveries[int(rank)] = result
+
     return NMFStudy(
         ensemble=ensemble,
-        discoveries=discoveries,
+        rank_results=rank_results,
+    )
+
+
+@dataclass(frozen=True)
+class _NMFFit:
+    profiles: np.ndarray
+    task_weights: np.ndarray
+    reconstruction: np.ndarray
+    n_iter: int
+    converged: bool
+
+
+class _EmptyComponentError(RuntimeError):
+    pass
+
+
+def _connectivity_with_seed_shorthand(
+    connectivity: NMFConnectivityConfig,
+    seed: int | None,
+) -> NMFConnectivityConfig:
+    seeds = connectivity.restart_seeds
+    if seeds == (0,):
+        if seed in (None, 0):
+            return connectivity
+        return NMFConnectivityConfig(
+            support_mass=connectivity.support_mass,
+            max_prune_refits=connectivity.max_prune_refits,
+            restart_seeds=(seed,),
+        )
+    if seed not in (None, 0):
+        raise ValueError(
+            "seed cannot be combined with explicit connectivity restart seeds"
+        )
+    return connectivity
+
+
+def _fit_nmf_factors(
+    target: np.ndarray,
+    n_subtasks: int,
+    *,
+    init: str,
+    profile_normalization: ProfileNormalization,
+    seed: int | None,
+    max_iter: int,
+    tolerance: float,
+    initial_profiles: np.ndarray | None = None,
+    initial_task_weights: np.ndarray | None = None,
+    reemit_warnings: bool = False,
+) -> _NMFFit:
+    factorization = NMF(
+        n_components=n_subtasks,
+        init=init,
+        solver="mu",
+        beta_loss="kullback-leibler",
+        max_iter=max_iter,
+        tol=tolerance,
+        random_state=seed,
+    )
+    fit_arguments = {}
+    if init == "custom":
+        if initial_profiles is None or initial_task_weights is None:
+            raise ValueError("Custom NMF initialization requires D and W")
+        fit_arguments = {
+            "W": np.array(initial_profiles, dtype=np.float64, copy=True),
+            "H": np.array(initial_task_weights, dtype=np.float64, copy=True),
+        }
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConvergenceWarning)
+        raw_profiles = factorization.fit_transform(target, **fit_arguments)
+        raw_weights = factorization.components_
+
+    convergence_warnings = [
+        item
+        for item in caught
+        if issubclass(item.category, ConvergenceWarning)
+    ]
+    for item in caught:
+        if reemit_warnings or not issubclass(item.category, ConvergenceWarning):
+            warnings.warn(item.message, item.category, stacklevel=3)
+
+    if (
+        not np.all(np.isfinite(raw_profiles))
+        or not np.all(np.isfinite(raw_weights))
+    ):
+        raise ValueError("NMF produced non-finite factors")
+    if np.any(raw_profiles.max(axis=0) <= 0.0):
+        raise _EmptyComponentError("NMF produced an empty subtask profile")
+
+    profiles, task_weights = _normalize_nmf_factors(
+        raw_profiles,
+        raw_weights,
+        profile_normalization,
+    )
+    reconstruction = profiles @ task_weights
+    return _NMFFit(
+        profiles=profiles,
+        task_weights=task_weights,
+        reconstruction=reconstruction,
+        n_iter=int(factorization.n_iter_),
+        converged=not convergence_warnings,
     )
 
 
@@ -318,43 +761,462 @@ def _factorize_soft_subtasks(
     max_iter: int = 2000,
     tolerance: float = 1e-5,
 ) -> SubtaskDiscovery:
-    """Factor the ensemble with the paper's beta=1 (KL) NMF objective."""
+    """Run the preserved single-fit NNDSVDa KL-NMF path."""
 
     maximum_rank = min(ensemble.desirability.shape)
     _validate_nmf_options(n_subtasks, maximum_rank, max_iter, tolerance)
-    # The discovered representation is a factorization of the actual task
-    # desirabilities Z, not a column-normalized plotting view of Z.
     target = ensemble.desirability
-    factorization = NMF(
-        n_components=n_subtasks,
+    fit = _fit_nmf_factors(
+        target,
+        n_subtasks,
         init="nndsvda",
-        solver="mu",
-        beta_loss="kullback-leibler",
+        profile_normalization=ensemble.parameters.profile_normalization,
+        seed=seed,
         max_iter=max_iter,
-        tol=tolerance,
-        random_state=seed,
+        tolerance=tolerance,
+        reemit_warnings=True,
     )
-    raw_profiles = factorization.fit_transform(target)
-    raw_weights = factorization.components_
-
-    profiles, task_weights = _normalize_nmf_factors(
-        raw_profiles,
-        raw_weights,
-        ensemble.parameters.profile_normalization,
-    )
-    reconstruction = profiles @ task_weights
-
     return SubtaskDiscovery(
         ensemble=ensemble,
-        profiles=profiles,
-        task_weights=task_weights,
-        reconstruction=reconstruction,
+        profiles=fit.profiles,
+        task_weights=fit.task_weights,
+        reconstruction=fit.reconstruction,
         reconstruction_error=_normalized_kl_divergence(
             target,
+            fit.reconstruction,
+        ),
+        n_iter=fit.n_iter,
+        converged=fit.converged,
+    )
+
+
+def _legacy_rank_result(
+    discovery: SubtaskDiscovery,
+    seed: int | None,
+) -> NMFRankResult:
+    profiles = discovery.profiles
+    weights = discovery.task_weights
+    raw_kl = _generalized_kl_divergence(
+        discovery.ensemble.desirability,
+        discovery.reconstruction,
+    )
+    effective = _effective_support_sizes(profiles)
+    restart = NMFRestartResult(
+        restart_id=0,
+        seed=seed,
+        unconstrained_profiles=profiles,
+        unconstrained_task_weights=weights,
+        unconstrained_kl=raw_kl,
+        connected_profiles=profiles,
+        connected_task_weights=weights,
+        connected_kl=raw_kl,
+        forbidden_mask=np.zeros_like(profiles, dtype=bool),
+        discarded_mass_fractions=np.zeros(profiles.shape[1]),
+        effective_support_sizes=effective,
+        effective_support_fractions=effective / profiles.shape[0],
+        final_support_connected=np.ones(profiles.shape[1], dtype=bool),
+        prune_refit_rounds=0,
+        fit_iterations=(discovery.n_iter,),
+        fit_converged=(discovery.converged,),
+        feasible=True,
+        eligible=True,
+    )
+    return NMFRankResult(
+        rank=discovery.n_subtasks,
+        restarts=(restart,),
+        selected_restart_id=0,
+        discovery=discovery,
+    )
+
+
+def _factorize_connected_soft_subtasks(
+    ensemble: GoalTasks,
+    n_subtasks: int,
+    *,
+    adjacency: np.ndarray,
+    connectivity: NMFConnectivityConfig,
+    max_iter: int,
+    tolerance: float,
+) -> NMFRankResult:
+    maximum_rank = min(ensemble.desirability.shape)
+    _validate_nmf_options(n_subtasks, maximum_rank, max_iter, tolerance)
+    adjacency_values = _validated_graph_adjacency(
+        adjacency,
+        n_states=ensemble.desirability.shape[0],
+    ).astype(bool)
+    restarts = tuple(
+        _connectivity_restart(
+            ensemble,
+            n_subtasks,
+            adjacency=adjacency_values,
+            connectivity=connectivity,
+            restart_id=restart_id,
+            seed=seed,
+            max_iter=max_iter,
+            tolerance=tolerance,
+        )
+        for restart_id, seed in enumerate(connectivity.restart_seeds)
+    )
+    eligible = [result for result in restarts if result.eligible]
+    if not eligible:
+        return NMFRankResult(
+            rank=n_subtasks,
+            restarts=restarts,
+            selected_restart_id=None,
+            discovery=None,
+        )
+
+    winner = min(
+        eligible,
+        key=lambda result: (result.connected_kl, result.restart_id),
+    )
+    assert winner.connected_profiles is not None
+    assert winner.connected_task_weights is not None
+    reconstruction = winner.connected_profiles @ winner.connected_task_weights
+    discovery = SubtaskDiscovery(
+        ensemble=ensemble,
+        profiles=winner.connected_profiles,
+        task_weights=winner.connected_task_weights,
+        reconstruction=reconstruction,
+        reconstruction_error=_normalized_kl_divergence(
+            ensemble.desirability,
             reconstruction,
         ),
-        n_iter=int(factorization.n_iter_),
-        converged=factorization.n_iter_ < max_iter,
+        n_iter=sum(winner.fit_iterations),
+        converged=True,
+    )
+    return NMFRankResult(
+        rank=n_subtasks,
+        restarts=restarts,
+        selected_restart_id=winner.restart_id,
+        discovery=discovery,
+    )
+
+
+def _connectivity_restart(
+    ensemble: GoalTasks,
+    n_subtasks: int,
+    *,
+    adjacency: np.ndarray,
+    connectivity: NMFConnectivityConfig,
+    restart_id: int,
+    seed: int,
+    max_iter: int,
+    tolerance: float,
+) -> NMFRestartResult:
+    target = ensemble.desirability
+    unconstrained = _fit_nmf_factors(
+        target,
+        n_subtasks,
+        init="random",
+        profile_normalization=ensemble.parameters.profile_normalization,
+        seed=seed,
+        max_iter=max_iter,
+        tolerance=tolerance,
+    )
+    unconstrained_kl = _strict_generalized_kl_divergence(
+        target,
+        unconstrained.reconstruction,
+    )
+    forbidden = np.zeros_like(unconstrained.profiles, dtype=bool)
+    fit_iterations = [unconstrained.n_iter]
+    fit_converged = [unconstrained.converged]
+    current = unconstrained
+    feasible = True
+    reason = _strict_kl_issue(target, unconstrained.reconstruction)
+    if reason is None and not unconstrained.converged:
+        reason = "unconstrained_not_converged"
+    if reason is not None and reason != "unconstrained_not_converged":
+        feasible = False
+
+    if reason is None:
+        for _ in range(connectivity.max_prune_refits):
+            expanded, additions, _ = _expand_forbidden_mask(
+                current.profiles,
+                adjacency,
+                connectivity.support_mass,
+                forbidden,
+            )
+            if not np.any(additions):
+                break
+            forbidden = expanded
+            refit, refit_reason = _masked_nmf_refit(
+                target,
+                current.profiles,
+                current.task_weights,
+                forbidden,
+                profile_normalization=ensemble.parameters.profile_normalization,
+                max_iter=max_iter,
+                tolerance=tolerance,
+            )
+            if refit is None:
+                feasible = False
+                reason = refit_reason
+                break
+            current = refit
+            fit_iterations.append(refit.n_iter)
+            fit_converged.append(refit.converged)
+            if refit_reason is not None:
+                feasible = refit_reason not in {
+                    "positive_target_zero_reconstruction",
+                    "nonfinite_factors_or_kl",
+                    "empty_component",
+                }
+                reason = refit_reason
+                break
+
+    final_connected = _component_support_connectivity(
+        current.profiles,
+        adjacency,
+        connectivity.support_mass,
+    )
+    if reason is None and not np.all(final_connected):
+        reason = "disconnected_after_max_rounds"
+
+    connected_profiles = None
+    connected_weights = None
+    connected_kl = None
+    if reason != "positive_target_zero_reconstruction" or len(fit_iterations) > 1:
+        issue = _strict_kl_issue(target, current.reconstruction)
+        if issue is None:
+            connected_profiles = current.profiles
+            connected_weights = current.task_weights
+            connected_kl = _strict_generalized_kl_divergence(
+                target,
+                current.reconstruction,
+            )
+
+    effective = _effective_support_sizes(current.profiles)
+    discarded = np.sum(
+        np.where(forbidden, unconstrained.profiles, 0.0),
+        axis=0,
+    ) / unconstrained.profiles.sum(axis=0)
+    eligible = reason is None
+    return NMFRestartResult(
+        restart_id=restart_id,
+        seed=seed,
+        unconstrained_profiles=unconstrained.profiles,
+        unconstrained_task_weights=unconstrained.task_weights,
+        unconstrained_kl=unconstrained_kl,
+        connected_profiles=connected_profiles,
+        connected_task_weights=connected_weights,
+        connected_kl=connected_kl,
+        forbidden_mask=forbidden,
+        discarded_mass_fractions=discarded,
+        effective_support_sizes=effective,
+        effective_support_fractions=effective / target.shape[0],
+        final_support_connected=final_connected,
+        prune_refit_rounds=len(fit_iterations) - 1,
+        fit_iterations=tuple(fit_iterations),
+        fit_converged=tuple(fit_converged),
+        feasible=feasible,
+        eligible=eligible,
+        reason=reason,
+    )
+
+
+def _masked_nmf_refit(
+    target: np.ndarray,
+    profiles: np.ndarray,
+    task_weights: np.ndarray,
+    forbidden: np.ndarray,
+    *,
+    profile_normalization: ProfileNormalization,
+    max_iter: int,
+    tolerance: float,
+) -> tuple[_NMFFit | None, str | None]:
+    initial_profiles = np.array(profiles, dtype=np.float64, copy=True)
+    initial_weights = np.array(task_weights, dtype=np.float64, copy=True)
+    initial_profiles[forbidden] = 0.0
+    issue = _strict_kl_issue(target, initial_profiles @ initial_weights)
+    if issue is not None:
+        return None, issue
+
+    try:
+        fit = _fit_nmf_factors(
+            target,
+            profiles.shape[1],
+            init="custom",
+            profile_normalization=profile_normalization,
+            seed=None,
+            max_iter=max_iter,
+            tolerance=tolerance,
+            initial_profiles=initial_profiles,
+            initial_task_weights=initial_weights,
+        )
+    except _EmptyComponentError:
+        return None, "empty_component"
+
+    if np.any(fit.profiles[forbidden] != 0.0):
+        raise RuntimeError("Masked NMF changed a forbidden profile entry")
+    issue = _strict_kl_issue(target, fit.reconstruction)
+    if issue is not None:
+        return fit, issue
+    if not fit.converged:
+        return fit, "constrained_not_converged"
+    return fit, None
+
+
+def _q_mass_support(
+    column: np.ndarray,
+    mass_fraction: float,
+) -> tuple[np.ndarray, float]:
+    values = np.asarray(column, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or np.any(values < 0.0)
+        or not np.all(np.isfinite(values))
+        or values.sum() <= 0.0
+    ):
+        raise ValueError("Mass support requires a positive non-negative vector")
+    if not np.isfinite(mass_fraction) or not 0.0 < mass_fraction <= 1.0:
+        raise ValueError("Mass fraction must be in (0, 1]")
+
+    required_mass = mass_fraction * values.sum()
+    levels, counts = np.unique(values, return_counts=True)
+    cumulative = 0.0
+    for cutoff, count in zip(levels[::-1], counts[::-1]):
+        cumulative += float(cutoff) * int(count)
+        if cumulative >= required_mass:
+            return values >= cutoff, float(cutoff)
+    raise RuntimeError("Failed to find a mass-support cutoff")
+
+
+def _support_components(
+    support: np.ndarray,
+    adjacency: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    support_values = np.asarray(support, dtype=bool)
+    adjacency_values = np.asarray(adjacency, dtype=bool)
+    if adjacency_values.shape != (len(support_values), len(support_values)):
+        raise ValueError("Support and adjacency shapes do not align")
+
+    remaining = set(int(state) for state in np.flatnonzero(support_values))
+    components: list[np.ndarray] = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        stack = [start]
+        component: list[int] = []
+        while stack:
+            state = stack.pop()
+            component.append(state)
+            neighbors = np.flatnonzero(
+                adjacency_values[state] & support_values
+            )
+            for neighbor_value in neighbors:
+                neighbor = int(neighbor_value)
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+        components.append(np.asarray(sorted(component), dtype=int))
+    return tuple(sorted(components, key=lambda component: int(component[0])))
+
+
+def _expand_forbidden_mask(
+    profiles: np.ndarray,
+    adjacency: np.ndarray,
+    mass_fraction: float,
+    forbidden: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(profiles, dtype=np.float64)
+    forbidden_values = np.asarray(forbidden, dtype=bool)
+    if forbidden_values.shape != values.shape:
+        raise ValueError("Forbidden mask must have the shape of D")
+    additions = np.zeros_like(forbidden_values)
+    connected = np.ones(values.shape[1], dtype=bool)
+
+    for component_index in range(values.shape[1]):
+        support, _ = _q_mass_support(
+            values[:, component_index],
+            mass_fraction,
+        )
+        components = _support_components(support, adjacency)
+        if len(components) <= 1:
+            continue
+        connected[component_index] = False
+        masses = np.asarray(
+            [
+                values[component, component_index].sum()
+                for component in components
+            ]
+        )
+        maximum = float(masses.max())
+        tied = [
+            component
+            for component, mass in zip(components, masses)
+            if np.isclose(mass, maximum, rtol=1e-12, atol=1e-15)
+        ]
+        retained = min(tied, key=lambda component: int(component.min()))
+        for component in components:
+            if component is not retained:
+                additions[component, component_index] = True
+
+    additions &= ~forbidden_values
+    return forbidden_values | additions, additions, connected
+
+
+def _component_support_connectivity(
+    profiles: np.ndarray,
+    adjacency: np.ndarray,
+    mass_fraction: float,
+) -> np.ndarray:
+    connected = np.ones(profiles.shape[1], dtype=bool)
+    for component_index in range(profiles.shape[1]):
+        support, _ = _q_mass_support(
+            profiles[:, component_index],
+            mass_fraction,
+        )
+        connected[component_index] = (
+            len(_support_components(support, adjacency)) <= 1
+        )
+    return connected
+
+
+def _effective_support_sizes(profiles: np.ndarray) -> np.ndarray:
+    values = np.asarray(profiles, dtype=np.float64)
+    denominator = np.square(values).sum(axis=0)
+    if np.any(denominator <= 0.0):
+        raise _EmptyComponentError("Effective support is undefined")
+    return np.square(values.sum(axis=0)) / denominator
+
+
+def _strict_kl_issue(
+    target: np.ndarray,
+    reconstruction: np.ndarray,
+) -> str | None:
+    target_values = np.asarray(target, dtype=np.float64)
+    reconstruction_values = np.asarray(reconstruction, dtype=np.float64)
+    if target_values.shape != reconstruction_values.shape:
+        raise ValueError("KL target and reconstruction shapes must match")
+    if (
+        np.any(reconstruction_values < 0.0)
+        or not np.all(np.isfinite(reconstruction_values))
+    ):
+        return "nonfinite_factors_or_kl"
+    if np.any(
+        (target_values > 0.0) & (reconstruction_values == 0.0)
+    ):
+        return "positive_target_zero_reconstruction"
+    return None
+
+
+def _strict_generalized_kl_divergence(
+    target: np.ndarray,
+    reconstruction: np.ndarray,
+) -> float:
+    issue = _strict_kl_issue(target, reconstruction)
+    if issue is not None:
+        return np.inf
+    target_values = np.asarray(target, dtype=np.float64)
+    reconstruction_values = np.asarray(reconstruction, dtype=np.float64)
+    logarithmic_term = np.zeros_like(target_values)
+    positive = target_values > 0.0
+    logarithmic_term[positive] = target_values[positive] * np.log(
+        target_values[positive] / reconstruction_values[positive]
+    )
+    return float(
+        np.sum(logarithmic_term - target_values + reconstruction_values)
     )
 
 
@@ -363,11 +1225,7 @@ def _normalize_nmf_factors(
     task_weights: np.ndarray,
     profile_normalization: ProfileNormalization,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fix every NMF component gauge without changing its reconstruction.
-
-    Each profile column is peak- or L2-normalized and its scale is absorbed by
-    the corresponding task-weight row.
-    """
+    """Fix every NMF component gauge without changing its reconstruction."""
 
     profile_values = np.asarray(profiles, dtype=np.float64)
     weight_values = np.asarray(task_weights, dtype=np.float64)
@@ -444,133 +1302,6 @@ def _generalized_kl_divergence(
     )
     return float(divergence)
 
-def _factorize_regularized_soft_subtasks(
-    ensemble: GoalTasks,
-    n_subtasks: int,
-    *,
-    adjacency: np.ndarray,
-    lambda_smooth: float,
-    seed: int | None = 0,
-    max_iter: int = 2000,
-    tolerance: float = 1e-5,
-) -> SubtaskDiscovery:
-    """Fit graph-regularized KL-NMF with non-negative MU updates.
-
-    The graph multiplicative update is derived for the unconstrained objective.
-    Normalizing each profile after a sweep fixes the NMF scale ambiguity using
-    the configured peak or L2 gauge. The standard unconstrained MU descent
-    guarantee therefore does not automatically apply to the tracked
-    post-normalization objective; its monotonicity is tested empirically.
-    """
-
-    maximum_rank = min(ensemble.desirability.shape)
-    _validate_nmf_options(n_subtasks, maximum_rank, max_iter, tolerance)
-    if not np.isfinite(lambda_smooth) or lambda_smooth <= 0.0:
-        raise ValueError(
-            "Regularized NMF requires positive smoothness strength"
-        )
-
-    target = ensemble.desirability
-    adjacency_values = _validated_graph_adjacency(
-        adjacency,
-        n_states=target.shape[0],
-    )
-    degree = adjacency_values.sum(axis=1)
-    profiles, task_weights = _initialize_regularized_factors(
-        target,
-        n_subtasks,
-        seed=seed,
-    )
-    profiles, task_weights = _normalize_nmf_factors(
-        profiles,
-        task_weights,
-        ensemble.parameters.profile_normalization,
-    )
-
-    objective_history = [
-        _regularized_objective(
-            target,
-            profiles,
-            task_weights,
-            adjacency_values,
-            degree,
-            lambda_smooth,
-        )
-    ]
-    epsilon = np.finfo(np.float64).eps
-    converged = False
-    n_iter = 0
-
-    for iteration in range(1, max_iter + 1):
-        reconstruction = np.maximum(profiles @ task_weights, epsilon)
-        ratio = target / reconstruction
-        weight_numerator = profiles.T @ ratio
-        weight_denominator = profiles.sum(axis=0)[:, np.newaxis]
-        task_weights *= weight_numerator / np.maximum(
-            weight_denominator,
-            epsilon,
-        )
-
-        reconstruction = np.maximum(profiles @ task_weights, epsilon)
-        ratio = target / reconstruction
-        profile_numerator = (
-            ratio @ task_weights.T
-            + 2.0 * lambda_smooth * (adjacency_values @ profiles)
-        )
-        profile_denominator = (
-            task_weights.sum(axis=1)[np.newaxis, :]
-            + 2.0
-            * lambda_smooth
-            * degree[:, np.newaxis]
-            * profiles
-        )
-        profiles *= profile_numerator / np.maximum(
-            profile_denominator,
-            epsilon,
-        )
-        profiles, task_weights = _normalize_nmf_factors(
-            profiles,
-            task_weights,
-            ensemble.parameters.profile_normalization,
-        )
-
-        objective = _regularized_objective(
-            target,
-            profiles,
-            task_weights,
-            adjacency_values,
-            degree,
-            lambda_smooth,
-        )
-        previous_objective = objective_history[-1]
-        objective_history.append(objective)
-        n_iter = iteration
-
-        improvement = previous_objective - objective
-        scale = max(abs(previous_objective), epsilon)
-        numerical_tolerance = 10.0 * epsilon * scale
-        if (
-            improvement >= -numerical_tolerance
-            and improvement / scale <= tolerance
-        ):
-            converged = iteration < max_iter
-            break
-
-    reconstruction = profiles @ task_weights
-    return SubtaskDiscovery(
-        ensemble=ensemble,
-        profiles=profiles,
-        task_weights=task_weights,
-        reconstruction=reconstruction,
-        reconstruction_error=_normalized_kl_divergence(
-            target,
-            reconstruction,
-        ),
-        n_iter=n_iter,
-        converged=converged,
-        objective_history=np.asarray(objective_history),
-    )
-
 
 def _graph_adjacency_from_passive(passive: np.ndarray) -> np.ndarray:
     """Return binary undirected connectivity in passive state order."""
@@ -614,87 +1345,3 @@ def _validated_graph_adjacency(
             "Graph adjacency must be symmetric, binary, and loop-free"
         )
     return values
-
-
-def _initialize_regularized_factors(
-    target: np.ndarray,
-    n_subtasks: int,
-    *,
-    seed: int | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return an NNDSVDa initialization compatible with sklearn's choice."""
-
-    left_vectors, singular_values, right_vectors = randomized_svd(
-        target,
-        n_components=n_subtasks,
-        random_state=seed,
-    )
-    profiles = np.zeros_like(left_vectors)
-    task_weights = np.zeros_like(right_vectors)
-
-    leading_scale = np.sqrt(singular_values[0])
-    profiles[:, 0] = leading_scale * np.abs(left_vectors[:, 0])
-    task_weights[0, :] = leading_scale * np.abs(right_vectors[0, :])
-
-    for component in range(1, n_subtasks):
-        left = left_vectors[:, component]
-        right = right_vectors[component, :]
-        left_positive = np.maximum(left, 0.0)
-        right_positive = np.maximum(right, 0.0)
-        left_negative = np.maximum(-left, 0.0)
-        right_negative = np.maximum(-right, 0.0)
-
-        positive_norms = (
-            np.linalg.norm(left_positive),
-            np.linalg.norm(right_positive),
-        )
-        negative_norms = (
-            np.linalg.norm(left_negative),
-            np.linalg.norm(right_negative),
-        )
-        positive_product = positive_norms[0] * positive_norms[1]
-        negative_product = negative_norms[0] * negative_norms[1]
-        if positive_product > negative_product:
-            selected_left = left_positive
-            selected_right = right_positive
-            selected_norms = positive_norms
-            selected_product = positive_product
-        else:
-            selected_left = left_negative
-            selected_right = right_negative
-            selected_norms = negative_norms
-            selected_product = negative_product
-
-        if selected_product == 0.0:
-            continue
-        scale = np.sqrt(singular_values[component] * selected_product)
-        profiles[:, component] = (
-            scale * selected_left / selected_norms[0]
-        )
-        task_weights[component, :] = (
-            scale * selected_right / selected_norms[1]
-        )
-
-    average = float(target.mean())
-    profiles[profiles == 0.0] = average
-    task_weights[task_weights == 0.0] = average
-    return profiles, task_weights
-
-
-def _regularized_objective(
-    target: np.ndarray,
-    profiles: np.ndarray,
-    task_weights: np.ndarray,
-    adjacency: np.ndarray,
-    degree: np.ndarray,
-    lambda_smooth: float,
-) -> float:
-    reconstruction = profiles @ task_weights
-    laplacian_profiles = (
-        degree[:, np.newaxis] * profiles - adjacency @ profiles
-    )
-    smoothness_penalty = float(np.sum(profiles * laplacian_profiles))
-    return (
-        _generalized_kl_divergence(target, reconstruction)
-        + lambda_smooth * smoothness_penalty
-    )

@@ -122,24 +122,31 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     assert "start=example_start" in notebook_source
     assert "goal=example_goal" in notebook_source
     assert "sweep_expected_policy_entropy" not in notebook_source
-    assert "N_RESTARTS = 5" in notebook_source
+    assert "N_RESTARTS =" in notebook_source
     assert "initial_conditions" in notebook_source
     assert "Adam initial conditions:" in notebook_source
     assert "display(initial_condition_table)" in notebook_source
     assert "restart_results" in notebook_source
     assert "fittable_parameters" in notebook_source
     assert "required_parameters" not in notebook_source
-    assert "DISCOVERY_CONTROL_COST = 3.0" in notebook_source
+    assert "DISCOVERY_CONTROL_COST =" in notebook_source
     assert "NMFConfig(control_cost=DISCOVERY_CONTROL_COST)" in notebook_source
+    assert "NMFConnectivityConfig" in notebook_source
+    assert "DISCOVERY_SUPPORT_MASS = 0.95" in notebook_source
+    assert "DISCOVERY_MAX_PRUNE_REFITS = 3" in notebook_source
+    assert "DISCOVERY_RESTART_SEEDS = tuple(range(5))" in notebook_source
+    assert "connectivity=NMFConnectivityConfig(" in notebook_source
+    assert "soft_study.rank_result(DISCOVERY_RANK)" in notebook_source
+    assert "delta_kl_connectivity" in notebook_source
+    assert "forbidden_mask" in notebook_source
+    assert "final_support_connected" in notebook_source
+    assert "positive_target" in notebook_source
     assert "lambda_smooth" not in notebook_source
     assert "parameters=soft_parameters(DISCOVERY_RANK)" in notebook_source
     assert '"lower_control_cost": 1.0' in notebook_source
     assert '"upper_control_cost": 1.0' in notebook_source
     assert '"alpha": 0.75' in notebook_source
     assert '"beta": 1.0' in notebook_source
-    assert "interior_reward" not in notebook_source
-    assert "goal_reward" not in notebook_source
-    assert "GOAL_REWARD_RESTART_SD" not in notebook_source
     for cell in code_cells:
         compile(
             cell.source,

@@ -18,6 +18,7 @@ from andrew_mlmdp import (  # noqa: E402
     DoohanDataset,
     Environment,
     NMFConfig,
+    NMFConnectivityConfig,
     SubgoalBasis,
     discover_subgoals,
     parameter_values,
@@ -105,8 +106,8 @@ def _load_problem():
     discovery = discover_subgoals(
         environment,
         ranks=(8,),
-        parameters=NMFConfig(lambda_smooth=1.0),
-        seed=0,
+        parameters=NMFConfig(),
+        connectivity=NMFConnectivityConfig(restart_seeds=(0, 1, 2, 3)),
     ).result(8)
     basis = SubgoalBasis.from_profiles(
         dataset.definition.maze,
