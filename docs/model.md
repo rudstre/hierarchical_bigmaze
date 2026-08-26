@@ -460,7 +460,7 @@ W \in \mathbb{R}_{\ge 0}^{k \times number\_of\_tasks}.
 By default, each requested rank runs one ordinary stochastic
 multiplicative-update KL-NMF fit per explicit restart seed. Connected
 discovery uses `init="random"`; passing `connectivity=None` preserves the
-legacy single-fit `init="nndsvda"` path and performs no graph work.
+single-fit seeded `init="random"` path and performs no graph work.
 
 Binary adjacency comes from supported non-self transitions in
 `environment.passive`, symmetrized in physical-state order. For each column
@@ -471,13 +471,33 @@ is retained and states in its secondary components become persistent fixed
 zeros. Equal component masses use a tight numerical comparison and then the
 lowest physical-state index.
 
-The current `D, W` initialize a custom MU refit with the forbidden entries of
-`D` exactly zero. Supports are recomputed after every refit, for at most three
+Before each constrained refit, discovery checks whether any physical state
+with a positive target row is forbidden from every component. Such a mask is
+structurally infeasible and is excluded as
+`fully_forbidden_state`. Otherwise, the current `D, W`
+initialize a custom MU refit with forbidden `D` entries exactly zero. If that
+warm start—or its fitted result—has a positive target with exact-zero
+reconstruction, the mask is still structurally feasible. By default, discovery
+runs three positive fallback candidates. Each candidate seed is deterministically
+derived from the restart seed, zero-based prune round, and attempt index. Every
+allowed `D` entry and every `W` entry is strictly positive, with values sampled
+from moderate fractions of the typical positive magnitude in each profile
+column and weight row rather than machine epsilon. Forbidden `D` entries remain
+exact zero.
+
+All candidates are fitted. Only warning-free candidates with finite strict KL
+are eligible, and the lowest raw-KL candidate continues through later pruning
+and the final connectivity check. If none succeeds, the restart is excluded as
+the optimization failure `positive_fallback_failed`. These initializations are
+not epsilon floors, and every fitted reconstruction is still evaluated with
+strict KL. Restart diagnostics separately flag `zero_locked_warm_start`,
+`positive_fallback_succeeded`, and `positive_fallback_failed`.
+
+Supports are recomputed after every completed refit, for at most three
 prune/refit rounds. Low-valued states below the mass cutoff are not forbidden.
-A restart is excluded if scikit-learn emits `ConvergenceWarning`, if a positive
-entry of `X` has exact-zero reconstruction, if a component becomes empty, or
-if effective support remains disconnected after the final round. No epsilon
-is inserted into the returned factors or reconstruction.
+A restart is also excluded if scikit-learn emits `ConvergenceWarning`, if a
+component becomes empty, or if effective support remains disconnected after
+the final round. No epsilon is inserted into returned factors or reconstruction.
 
 Every completed fit fixes the NMF gauge using the configured profile
 normalization and absorbs the scale into the corresponding row of `W`. Peak
@@ -487,7 +507,9 @@ norm. Reconstruction is unchanged by either rescaling.
 `study.rank_result(k)` retains every seed's original unconstrained `D0, W0`,
 final constrained factors when available, raw KL values, per-restart
 connectivity cost, cumulative forbidden mass measured against `D0`, effective
-support sizes, refit counts, feasibility, and exclusion reasons. Selection
+support sizes, refit counts, fully forbidden state indices, zero-reconstruction
+fallback event, attempt, and successful-candidate counts, feasibility, and
+exclusion reasons. Selection
 uses the lowest final connected raw KL. The rank-level connectivity cost is
 the winning connected KL minus the best finite converged unconstrained KL
 across all restarts. `study.result(k)` returns the selected immutable

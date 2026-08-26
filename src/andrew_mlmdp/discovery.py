@@ -55,6 +55,7 @@ class NMFConnectivityConfig:
 
     support_mass: float = 0.95
     max_prune_refits: int = 3
+    positive_fallback_attempts: int = 3
     restart_seeds: tuple[int, ...] = (0,)
 
     def __post_init__(self) -> None:
@@ -71,6 +72,22 @@ class NMFConnectivityConfig:
             raise ValueError(
                 "Maximum connectivity prune/refit rounds must be positive"
             )
+        if (
+            isinstance(self.positive_fallback_attempts, (bool, np.bool_))
+            or not isinstance(
+                self.positive_fallback_attempts,
+                (int, np.integer),
+            )
+            or self.positive_fallback_attempts < 1
+        ):
+            raise ValueError(
+                "Positive masked fallback attempts must be positive"
+            )
+        object.__setattr__(
+            self,
+            "positive_fallback_attempts",
+            int(self.positive_fallback_attempts),
+        )
         seeds = tuple(self.restart_seeds)
         if not seeds:
             raise ValueError("Connectivity requires at least one restart seed")
@@ -222,6 +239,10 @@ class NMFRestartResult:
     prune_refit_rounds: int
     fit_iterations: tuple[int, ...]
     fit_converged: tuple[bool, ...]
+    fully_forbidden_state_indices: np.ndarray
+    positive_target_zero_reconstruction_counts: tuple[int, ...]
+    positive_fallback_attempt_counts: tuple[int, ...]
+    positive_fallback_success_counts: tuple[int, ...]
     feasible: bool
     eligible: bool
     reason: str | None = None
@@ -295,7 +316,51 @@ class NMFRestartResult:
         ):
             raise ValueError("Discarded masses must be component fractions")
         if support_connected.shape != (n_components,):
-            raise ValueError("Connectivity flags must have one entry per component")
+            raise ValueError(
+                "Connectivity flags must have one entry per component"
+            )
+        fully_forbidden = np.array(
+            self.fully_forbidden_state_indices,
+            dtype=int,
+            copy=True,
+        )
+        if (
+            fully_forbidden.ndim != 1
+            or np.any(fully_forbidden < 0)
+            or np.any(fully_forbidden >= n_states)
+            or len(np.unique(fully_forbidden)) != len(fully_forbidden)
+            or np.any(np.diff(fully_forbidden) <= 0)
+        ):
+            raise ValueError(
+                "Fully forbidden state indices must be sorted and unique"
+            )
+        zero_counts = tuple(
+            int(value)
+            for value in self.positive_target_zero_reconstruction_counts
+        )
+        if any(value < 1 for value in zero_counts):
+            raise ValueError(
+                "Positive-target zero-reconstruction counts must be positive"
+            )
+        fallback_attempts = tuple(
+            int(value) for value in self.positive_fallback_attempt_counts
+        )
+        fallback_successes = tuple(
+            int(value) for value in self.positive_fallback_success_counts
+        )
+        if (
+            len(fallback_attempts) != len(zero_counts)
+            or len(fallback_successes) != len(zero_counts)
+            or any(value < 1 for value in fallback_attempts)
+            or any(
+                not 0 <= successes <= attempts
+                for successes, attempts in zip(
+                    fallback_successes,
+                    fallback_attempts,
+                )
+            )
+        ):
+            raise ValueError("Positive fallback diagnostics must align")
 
         effective_sizes = self.effective_support_sizes
         effective_fractions = self.effective_support_fractions
@@ -327,8 +392,8 @@ class NMFRestartResult:
             raise ValueError("Restart fit diagnostics must align")
         if any(value < 1 for value in iterations):
             raise ValueError("Restart iteration counts must be positive")
-        if self.prune_refit_rounds != len(iterations) - 1:
-            raise ValueError("Prune/refit count must match fit diagnostics")
+        if self.prune_refit_rounds > len(iterations) - 1:
+            raise ValueError("Prune/refit count exceeds fit diagnostics")
         if np.isnan(self.unconstrained_kl) or (
             self.connected_kl is not None and np.isnan(self.connected_kl)
         ):
@@ -349,6 +414,7 @@ class NMFRestartResult:
             forbidden,
             discarded,
             support_connected,
+            fully_forbidden,
             connected_profiles,
             connected_weights,
             effective_sizes,
@@ -363,10 +429,61 @@ class NMFRestartResult:
         object.__setattr__(self, "forbidden_mask", forbidden)
         object.__setattr__(self, "discarded_mass_fractions", discarded)
         object.__setattr__(self, "final_support_connected", support_connected)
+        object.__setattr__(
+            self,
+            "fully_forbidden_state_indices",
+            fully_forbidden,
+        )
+        object.__setattr__(
+            self,
+            "positive_target_zero_reconstruction_counts",
+            zero_counts,
+        )
+        object.__setattr__(
+            self,
+            "positive_fallback_attempt_counts",
+            fallback_attempts,
+        )
+        object.__setattr__(
+            self,
+            "positive_fallback_success_counts",
+            fallback_successes,
+        )
         object.__setattr__(self, "effective_support_sizes", effective_sizes)
         object.__setattr__(self, "effective_support_fractions", effective_fractions)
         object.__setattr__(self, "fit_iterations", iterations)
         object.__setattr__(self, "fit_converged", converged)
+
+    @property
+    def fully_forbidden_state(self) -> bool:
+        return len(self.fully_forbidden_state_indices) > 0
+
+    @property
+    def positive_masked_fallback_event_count(self) -> int:
+        return len(self.positive_target_zero_reconstruction_counts)
+
+    @property
+    def positive_masked_fallback_count(self) -> int:
+        return sum(self.positive_fallback_attempt_counts)
+
+    @property
+    def positive_fallback_success_count(self) -> int:
+        return sum(self.positive_fallback_success_counts)
+
+    @property
+    def zero_locked_warm_start(self) -> bool:
+        return self.positive_masked_fallback_event_count > 0
+
+    @property
+    def positive_fallback_failed(self) -> bool:
+        return self.reason == "positive_fallback_failed"
+
+    @property
+    def positive_fallback_succeeded(self) -> bool:
+        return (
+            self.zero_locked_warm_start
+            and not self.positive_fallback_failed
+        )
 
     @property
     def delta_kl_connectivity(self) -> float | None:
@@ -661,6 +778,43 @@ class _NMFFit:
     converged: bool
 
 
+@dataclass(frozen=True)
+class _MaskedNMFRefitResult:
+    fit: _NMFFit | None
+    reason: str | None
+    fully_forbidden_state_indices: np.ndarray
+    positive_target_zero_reconstruction_count: int
+    used_positive_fallback: bool
+    fit_iterations: tuple[int, ...]
+    fit_converged: tuple[bool, ...]
+    positive_fallback_attempt_count: int = 0
+    positive_fallback_success_count: int = 0
+
+    def __post_init__(self) -> None:
+        indices = np.array(
+            self.fully_forbidden_state_indices,
+            dtype=int,
+            copy=True,
+        )
+        if indices.ndim != 1:
+            raise ValueError("Fully forbidden state indices must be a vector")
+        if self.positive_target_zero_reconstruction_count < 0:
+            raise ValueError("Zero-reconstruction count cannot be negative")
+        if len(self.fit_iterations) != len(self.fit_converged):
+            raise ValueError("Masked refit diagnostics must align")
+        if (
+            self.positive_fallback_attempt_count < 0
+            or not 0
+            <= self.positive_fallback_success_count
+            <= self.positive_fallback_attempt_count
+            or self.used_positive_fallback
+            != (self.positive_fallback_attempt_count > 0)
+        ):
+            raise ValueError("Masked fallback diagnostics are invalid")
+        indices.flags.writeable = False
+        object.__setattr__(self, "fully_forbidden_state_indices", indices)
+
+
 class _EmptyComponentError(RuntimeError):
     pass
 
@@ -676,6 +830,9 @@ def _connectivity_with_seed_shorthand(
         return NMFConnectivityConfig(
             support_mass=connectivity.support_mass,
             max_prune_refits=connectivity.max_prune_refits,
+            positive_fallback_attempts=(
+                connectivity.positive_fallback_attempts
+            ),
             restart_seeds=(seed,),
         )
     if seed not in (None, 0):
@@ -761,7 +918,7 @@ def _factorize_soft_subtasks(
     max_iter: int = 2000,
     tolerance: float = 1e-5,
 ) -> SubtaskDiscovery:
-    """Run the preserved single-fit NNDSVDa KL-NMF path."""
+    """Run a single seeded stochastic KL-NMF fit without connectivity."""
 
     maximum_rank = min(ensemble.desirability.shape)
     _validate_nmf_options(n_subtasks, maximum_rank, max_iter, tolerance)
@@ -769,7 +926,7 @@ def _factorize_soft_subtasks(
     fit = _fit_nmf_factors(
         target,
         n_subtasks,
-        init="nndsvda",
+        init="random",
         profile_normalization=ensemble.parameters.profile_normalization,
         seed=seed,
         max_iter=max_iter,
@@ -818,6 +975,10 @@ def _legacy_rank_result(
         prune_refit_rounds=0,
         fit_iterations=(discovery.n_iter,),
         fit_converged=(discovery.converged,),
+        fully_forbidden_state_indices=np.empty(0, dtype=int),
+        positive_target_zero_reconstruction_counts=(),
+        positive_fallback_attempt_counts=(),
+        positive_fallback_success_counts=(),
         feasible=True,
         eligible=True,
     )
@@ -921,7 +1082,13 @@ def _connectivity_restart(
     forbidden = np.zeros_like(unconstrained.profiles, dtype=bool)
     fit_iterations = [unconstrained.n_iter]
     fit_converged = [unconstrained.converged]
+    fully_forbidden = np.empty(0, dtype=int)
+    zero_reconstruction_counts: list[int] = []
+    fallback_attempt_counts: list[int] = []
+    fallback_success_counts: list[int] = []
+    prune_refit_rounds = 0
     current = unconstrained
+    current_respects_forbidden = True
     feasible = True
     reason = _strict_kl_issue(target, unconstrained.reconstruction)
     if reason is None and not unconstrained.converged:
@@ -930,7 +1097,7 @@ def _connectivity_restart(
         feasible = False
 
     if reason is None:
-        for _ in range(connectivity.max_prune_refits):
+        for prune_round in range(connectivity.max_prune_refits):
             expanded, additions, _ = _expand_forbidden_mask(
                 current.profiles,
                 adjacency,
@@ -940,29 +1107,48 @@ def _connectivity_restart(
             if not np.any(additions):
                 break
             forbidden = expanded
-            refit, refit_reason = _masked_nmf_refit(
+            current_respects_forbidden = False
+            outcome = _masked_nmf_refit(
                 target,
                 current.profiles,
                 current.task_weights,
                 forbidden,
-                profile_normalization=ensemble.parameters.profile_normalization,
+                profile_normalization=(
+                    ensemble.parameters.profile_normalization
+                ),
                 max_iter=max_iter,
                 tolerance=tolerance,
+                fallback_seeds=_derived_positive_fallback_seeds(
+                    seed,
+                    prune_round,
+                    connectivity.positive_fallback_attempts,
+                ),
             )
-            if refit is None:
-                feasible = False
-                reason = refit_reason
+            fully_forbidden = outcome.fully_forbidden_state_indices
+            if outcome.positive_target_zero_reconstruction_count:
+                zero_reconstruction_counts.append(
+                    outcome.positive_target_zero_reconstruction_count
+                )
+                fallback_attempt_counts.append(
+                    outcome.positive_fallback_attempt_count
+                )
+                fallback_success_counts.append(
+                    outcome.positive_fallback_success_count
+                )
+            fit_iterations.extend(outcome.fit_iterations)
+            fit_converged.extend(outcome.fit_converged)
+            if outcome.fit is None:
+                feasible = (
+                    outcome.reason
+                    != "fully_forbidden_state"
+                )
+                reason = outcome.reason
                 break
-            current = refit
-            fit_iterations.append(refit.n_iter)
-            fit_converged.append(refit.converged)
-            if refit_reason is not None:
-                feasible = refit_reason not in {
-                    "positive_target_zero_reconstruction",
-                    "nonfinite_factors_or_kl",
-                    "empty_component",
-                }
-                reason = refit_reason
+            current = outcome.fit
+            current_respects_forbidden = True
+            prune_refit_rounds += 1
+            if outcome.reason is not None:
+                reason = outcome.reason
                 break
 
     final_connected = _component_support_connectivity(
@@ -976,15 +1162,21 @@ def _connectivity_restart(
     connected_profiles = None
     connected_weights = None
     connected_kl = None
-    if reason != "positive_target_zero_reconstruction" or len(fit_iterations) > 1:
+    if current_respects_forbidden:
         issue = _strict_kl_issue(target, current.reconstruction)
         if issue is None:
-            connected_profiles = current.profiles
-            connected_weights = current.task_weights
-            connected_kl = _strict_generalized_kl_divergence(
+            final_kl = _strict_generalized_kl_divergence(
                 target,
                 current.reconstruction,
             )
+            if np.isfinite(final_kl):
+                connected_profiles = current.profiles
+                connected_weights = current.task_weights
+                connected_kl = final_kl
+            elif reason is None:
+                reason = "nonfinite_factors_or_kl"
+        elif reason is None:
+            reason = issue
 
     effective = _effective_support_sizes(current.profiles)
     discarded = np.sum(
@@ -1006,9 +1198,15 @@ def _connectivity_restart(
         effective_support_sizes=effective,
         effective_support_fractions=effective / target.shape[0],
         final_support_connected=final_connected,
-        prune_refit_rounds=len(fit_iterations) - 1,
+        prune_refit_rounds=prune_refit_rounds,
         fit_iterations=tuple(fit_iterations),
         fit_converged=tuple(fit_converged),
+        fully_forbidden_state_indices=fully_forbidden,
+        positive_target_zero_reconstruction_counts=tuple(
+            zero_reconstruction_counts
+        ),
+        positive_fallback_attempt_counts=tuple(fallback_attempt_counts),
+        positive_fallback_success_counts=tuple(fallback_success_counts),
         feasible=feasible,
         eligible=eligible,
         reason=reason,
@@ -1024,38 +1222,285 @@ def _masked_nmf_refit(
     profile_normalization: ProfileNormalization,
     max_iter: int,
     tolerance: float,
-) -> tuple[_NMFFit | None, str | None]:
+    fallback_seeds: tuple[int, ...] = (0,),
+) -> _MaskedNMFRefitResult:
+    fully_forbidden = np.flatnonzero(
+        (target > 0.0).any(axis=1) & np.all(forbidden, axis=1)
+    )
+    if len(fully_forbidden):
+        return _MaskedNMFRefitResult(
+            fit=None,
+            reason="fully_forbidden_state",
+            fully_forbidden_state_indices=fully_forbidden,
+            positive_target_zero_reconstruction_count=0,
+            used_positive_fallback=False,
+            fit_iterations=(),
+            fit_converged=(),
+        )
+
     initial_profiles = np.array(profiles, dtype=np.float64, copy=True)
     initial_weights = np.array(task_weights, dtype=np.float64, copy=True)
     initial_profiles[forbidden] = 0.0
-    issue = _strict_kl_issue(target, initial_profiles @ initial_weights)
-    if issue is not None:
-        return None, issue
+    initial_reconstruction = initial_profiles @ initial_weights
+    issue = _strict_kl_issue(target, initial_reconstruction)
+    attempted_fits: list[_NMFFit] = []
+    zero_count = 0
 
-    try:
-        fit = _fit_nmf_factors(
+    if issue is None:
+        try:
+            warm_fit = _fit_nmf_factors(
+                target,
+                profiles.shape[1],
+                init="custom",
+                profile_normalization=profile_normalization,
+                seed=None,
+                max_iter=max_iter,
+                tolerance=tolerance,
+                initial_profiles=initial_profiles,
+                initial_task_weights=initial_weights,
+            )
+        except _EmptyComponentError:
+            return _MaskedNMFRefitResult(
+                fit=None,
+                reason="empty_component",
+                fully_forbidden_state_indices=fully_forbidden,
+                positive_target_zero_reconstruction_count=0,
+                used_positive_fallback=False,
+                fit_iterations=(),
+                fit_converged=(),
+            )
+        attempted_fits.append(warm_fit)
+        if np.any(warm_fit.profiles[forbidden] != 0.0):
+            raise RuntimeError(
+                "Masked NMF changed a forbidden profile entry"
+            )
+        issue = _strict_kl_issue(target, warm_fit.reconstruction)
+        if issue is None:
+            reason = None if warm_fit.converged else "constrained_not_converged"
+            return _masked_refit_result(
+                warm_fit,
+                reason,
+                fully_forbidden,
+                zero_count=0,
+                used_positive_fallback=False,
+                attempted_fits=attempted_fits,
+            )
+        if issue != "positive_target_zero_reconstruction":
+            return _masked_refit_result(
+                warm_fit,
+                issue,
+                fully_forbidden,
+                zero_count=0,
+                used_positive_fallback=False,
+                attempted_fits=attempted_fits,
+            )
+        zero_count = _positive_target_zero_reconstruction_count(
             target,
-            profiles.shape[1],
-            init="custom",
-            profile_normalization=profile_normalization,
-            seed=None,
-            max_iter=max_iter,
-            tolerance=tolerance,
-            initial_profiles=initial_profiles,
-            initial_task_weights=initial_weights,
+            warm_fit.reconstruction,
         )
-    except _EmptyComponentError:
-        return None, "empty_component"
+    elif issue == "positive_target_zero_reconstruction":
+        zero_count = _positive_target_zero_reconstruction_count(
+            target,
+            initial_reconstruction,
+        )
+    else:
+        return _masked_refit_result(
+            None,
+            issue,
+            fully_forbidden,
+            zero_count=0,
+            used_positive_fallback=False,
+            attempted_fits=attempted_fits,
+        )
 
-    if np.any(fit.profiles[forbidden] != 0.0):
-        raise RuntimeError("Masked NMF changed a forbidden profile entry")
-    issue = _strict_kl_issue(target, fit.reconstruction)
-    if issue is not None:
-        return fit, issue
-    if not fit.converged:
-        return fit, "constrained_not_converged"
-    return fit, None
+    fallback_source_profiles = (
+        attempted_fits[-1].profiles
+        if attempted_fits
+        else initial_profiles
+    )
+    fallback_source_weights = (
+        attempted_fits[-1].task_weights
+        if attempted_fits
+        else initial_weights
+    )
+    fallback_candidates: list[tuple[float, int, _NMFFit]] = []
+    for attempt_index, fallback_seed in enumerate(fallback_seeds):
+        fallback_profiles, fallback_weights = (
+            _positive_masked_initialization(
+                target,
+                fallback_source_profiles,
+                fallback_source_weights,
+                forbidden,
+                seed=fallback_seed,
+            )
+        )
+        try:
+            fallback_fit = _fit_nmf_factors(
+                target,
+                profiles.shape[1],
+                init="custom",
+                profile_normalization=profile_normalization,
+                seed=None,
+                max_iter=max_iter,
+                tolerance=tolerance,
+                initial_profiles=fallback_profiles,
+                initial_task_weights=fallback_weights,
+            )
+        except _EmptyComponentError:
+            continue
+        attempted_fits.append(fallback_fit)
+        if np.any(fallback_fit.profiles[forbidden] != 0.0):
+            raise RuntimeError(
+                "Masked NMF changed a forbidden profile entry"
+            )
+        issue = _strict_kl_issue(target, fallback_fit.reconstruction)
+        if issue is not None or not fallback_fit.converged:
+            continue
+        fallback_kl = _strict_generalized_kl_divergence(
+            target,
+            fallback_fit.reconstruction,
+        )
+        fallback_candidates.append(
+            (fallback_kl, attempt_index, fallback_fit)
+        )
 
+    attempt_count = len(fallback_seeds)
+    success_count = len(fallback_candidates)
+    if not fallback_candidates:
+        return _masked_refit_result(
+            None,
+            "positive_fallback_failed",
+            fully_forbidden,
+            zero_count=zero_count,
+            used_positive_fallback=True,
+            attempted_fits=attempted_fits,
+            fallback_attempt_count=attempt_count,
+            fallback_success_count=0,
+        )
+    _, _, best_fallback = min(
+        fallback_candidates,
+        key=lambda candidate: (candidate[0], candidate[1]),
+    )
+    return _masked_refit_result(
+        best_fallback,
+        None,
+        fully_forbidden,
+        zero_count=zero_count,
+        used_positive_fallback=True,
+        attempted_fits=attempted_fits,
+        fallback_attempt_count=attempt_count,
+        fallback_success_count=success_count,
+    )
+
+
+def _masked_refit_result(
+    fit: _NMFFit | None,
+    reason: str | None,
+    fully_forbidden: np.ndarray,
+    *,
+    zero_count: int,
+    used_positive_fallback: bool,
+    attempted_fits: list[_NMFFit],
+    fallback_attempt_count: int = 0,
+    fallback_success_count: int = 0,
+) -> _MaskedNMFRefitResult:
+    return _MaskedNMFRefitResult(
+        fit=fit,
+        reason=reason,
+        fully_forbidden_state_indices=fully_forbidden,
+        positive_target_zero_reconstruction_count=zero_count,
+        used_positive_fallback=used_positive_fallback,
+        fit_iterations=tuple(item.n_iter for item in attempted_fits),
+        fit_converged=tuple(item.converged for item in attempted_fits),
+        positive_fallback_attempt_count=fallback_attempt_count,
+        positive_fallback_success_count=fallback_success_count,
+    )
+
+
+def _derived_positive_fallback_seeds(
+    restart_seed: int,
+    prune_round: int,
+    attempts: int,
+) -> tuple[int, ...]:
+    return tuple(
+        int(
+            np.random.SeedSequence(
+                [restart_seed, prune_round, attempt]
+            ).generate_state(1, dtype=np.uint32)[0]
+        )
+        for attempt in range(attempts)
+    )
+
+
+def _positive_masked_initialization(
+    target: np.ndarray,
+    profiles: np.ndarray,
+    task_weights: np.ndarray,
+    forbidden: np.ndarray,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    profile_values = np.asarray(profiles, dtype=np.float64)
+    weight_values = np.asarray(task_weights, dtype=np.float64)
+    if profile_values.shape != forbidden.shape:
+        raise ValueError("Fallback profiles and mask must have equal shapes")
+    n_components = profile_values.shape[1]
+    if weight_values.shape != (n_components, target.shape[1]):
+        raise ValueError("Fallback NMF factors have incompatible shapes")
+
+    target_scale = np.sqrt(float(np.mean(target)) / n_components)
+    if not np.isfinite(target_scale) or target_scale <= 0.0:
+        raise ValueError("Positive masked initialization requires positive data")
+    profile_scale = _typical_positive_value(profile_values, target_scale)
+    weight_scale = _typical_positive_value(weight_values, target_scale)
+    random = np.random.RandomState(seed)
+    initial_profiles = np.zeros_like(profile_values)
+    initial_weights = np.empty_like(weight_values)
+
+    for component in range(n_components):
+        allowed = ~forbidden[:, component]
+        component_profile_scale = _typical_positive_value(
+            profile_values[allowed, component],
+            profile_scale,
+        )
+        initial_profiles[allowed, component] = (
+            component_profile_scale
+            * random.uniform(0.1, 1.0, size=np.count_nonzero(allowed))
+        )
+        component_weight_scale = _typical_positive_value(
+            weight_values[component],
+            weight_scale,
+        )
+        initial_weights[component] = (
+            component_weight_scale
+            * random.uniform(0.1, 1.0, size=target.shape[1])
+        )
+
+    if np.any(initial_profiles[~forbidden] <= 0.0):
+        raise RuntimeError("Allowed fallback profile entries must be positive")
+    if np.any(initial_profiles[forbidden] != 0.0):
+        raise RuntimeError("Forbidden fallback entries must remain zero")
+    if np.any(initial_weights <= 0.0):
+        raise RuntimeError("Fallback task weights must be positive")
+    if _strict_kl_issue(target, initial_profiles @ initial_weights) is not None:
+        raise RuntimeError("Positive masked initialization is not KL-feasible")
+    return initial_profiles, initial_weights
+
+
+def _typical_positive_value(values: np.ndarray, fallback: float) -> float:
+    positive = np.asarray(values, dtype=np.float64)
+    positive = positive[positive > 0.0]
+    if not len(positive):
+        return float(fallback)
+    return float(np.median(positive))
+
+def _positive_target_zero_reconstruction_count(
+    target: np.ndarray,
+    reconstruction: np.ndarray,
+) -> int:
+    return int(
+        np.count_nonzero((target > 0.0) & (reconstruction == 0.0))
+    )
 
 def _q_mass_support(
     column: np.ndarray,
@@ -1212,8 +1657,9 @@ def _strict_generalized_kl_divergence(
     reconstruction_values = np.asarray(reconstruction, dtype=np.float64)
     logarithmic_term = np.zeros_like(target_values)
     positive = target_values > 0.0
-    logarithmic_term[positive] = target_values[positive] * np.log(
-        target_values[positive] / reconstruction_values[positive]
+    logarithmic_term[positive] = target_values[positive] * (
+        np.log(target_values[positive])
+        - np.log(reconstruction_values[positive])
     )
     return float(
         np.sum(logarithmic_term - target_values + reconstruction_values)

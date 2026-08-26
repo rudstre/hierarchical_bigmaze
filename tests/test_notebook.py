@@ -134,13 +134,27 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     assert "NMFConnectivityConfig" in notebook_source
     assert "DISCOVERY_SUPPORT_MASS = 0.95" in notebook_source
     assert "DISCOVERY_MAX_PRUNE_REFITS = 3" in notebook_source
+    assert "DISCOVERY_POSITIVE_FALLBACK_ATTEMPTS = 3" in notebook_source
     assert "DISCOVERY_RESTART_SEEDS = tuple(range(5))" in notebook_source
     assert "connectivity=NMFConnectivityConfig(" in notebook_source
     assert "soft_study.rank_result(DISCOVERY_RANK)" in notebook_source
     assert "delta_kl_connectivity" in notebook_source
-    assert "forbidden_mask" in notebook_source
-    assert "final_support_connected" in notebook_source
-    assert "positive_target" in notebook_source
+    assert "nmf_run_table" in notebook_source
+    assert "selected_nmf_summary" in notebook_source
+    assert "selected_component_table" in notebook_source
+    assert "display(nmf_run_table)" in notebook_source
+    assert "display(selected_nmf_summary)" in notebook_source
+    assert "display(selected_component_table)" in notebook_source
+    assert "KL_initial" in notebook_source
+    assert "KL_connected" in notebook_source
+    assert "positive_fallback_attempts" in notebook_source
+    assert "positive_fallback_successes" in notebook_source
+    assert "fully_forbidden_states" in notebook_source
+    assert "RELEASE_DIAGNOSTIC" not in notebook_source
+    assert "FAIRNESS_DIAGNOSTIC" not in notebook_source
+    assert "released_kl" not in notebook_source
+    assert "fairness_" not in notebook_source
+    assert "nmf_discovery" not in notebook_source
     assert "lambda_smooth" not in notebook_source
     assert "parameters=soft_parameters(DISCOVERY_RANK)" in notebook_source
     assert '"lower_control_cost": 1.0' in notebook_source

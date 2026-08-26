@@ -1,4 +1,5 @@
 import warnings
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -138,6 +139,22 @@ def test_connected_discovery_is_reproducible_for_explicit_seed_tuple():
             right.unconstrained_profiles,
         )
         assert np.array_equal(left.forbidden_mask, right.forbidden_mask)
+        assert np.array_equal(
+            left.fully_forbidden_state_indices,
+            right.fully_forbidden_state_indices,
+        )
+        assert (
+            left.positive_target_zero_reconstruction_counts
+            == right.positive_target_zero_reconstruction_counts
+        )
+        assert (
+            left.positive_fallback_attempt_counts
+            == right.positive_fallback_attempt_counts
+        )
+        assert (
+            left.positive_fallback_success_counts
+            == right.positive_fallback_success_counts
+        )
         assert left.reason == right.reason
         if left.connected_profiles is not None:
             assert np.array_equal(left.connected_profiles, right.connected_profiles)
@@ -164,6 +181,8 @@ def test_discovery_validates_ranks(ranks, match):
         ({"support_mass": 0.0}, "support mass"),
         ({"support_mass": np.nan}, "support mass"),
         ({"max_prune_refits": 0}, "rounds"),
+        ({"positive_fallback_attempts": 0}, "fallback attempts"),
+        ({"positive_fallback_attempts": True}, "fallback attempts"),
         ({"restart_seeds": ()}, "at least one"),
         ({"restart_seeds": (1, 1)}, "unique"),
         ({"restart_seeds": (True,)}, "uint32"),
@@ -298,7 +317,7 @@ def test_masked_refit_keeps_exact_zeros_and_recovers_quality(normalization):
         pruned @ weights,
     )
 
-    fit, reason = discovery._masked_nmf_refit(
+    outcome = discovery._masked_nmf_refit(
         target,
         profiles,
         weights,
@@ -307,8 +326,10 @@ def test_masked_refit_keeps_exact_zeros_and_recovers_quality(normalization):
         max_iter=2000,
         tolerance=1e-7,
     )
+    fit = outcome.fit
 
-    assert reason is None
+    assert outcome.reason is None
+    assert not outcome.used_positive_fallback
     assert fit is not None
     assert np.array_equal(fit.profiles[forbidden], np.zeros(1))
     assert discovery._strict_generalized_kl_divergence(
@@ -322,7 +343,7 @@ def test_masked_refit_keeps_exact_zeros_and_recovers_quality(normalization):
     assert scales == pytest.approx(np.ones(2))
 
 
-def test_infeasible_mask_is_detected_without_epsilon_patch():
+def test_fully_forbidden_state_is_structurally_infeasible():
     import andrew_mlmdp.discovery as discovery
 
     target = np.ones((2, 2))
@@ -330,7 +351,7 @@ def test_infeasible_mask_is_detected_without_epsilon_patch():
     weights = np.ones((1, 2))
     forbidden = np.asarray([[True], [False]])
 
-    fit, reason = discovery._masked_nmf_refit(
+    outcome = discovery._masked_nmf_refit(
         target,
         profiles,
         weights,
@@ -339,8 +360,198 @@ def test_infeasible_mask_is_detected_without_epsilon_patch():
         max_iter=100,
         tolerance=1e-5,
     )
-    assert fit is None
-    assert reason == "positive_target_zero_reconstruction"
+
+    assert outcome.fit is None
+    assert outcome.reason == "fully_forbidden_state"
+    assert outcome.fully_forbidden_state_indices.tolist() == [0]
+    assert outcome.positive_target_zero_reconstruction_count == 0
+    assert not outcome.used_positive_fallback
+
+
+def test_zero_locked_warm_start_uses_positive_masked_fallback():
+    import andrew_mlmdp.discovery as discovery
+
+    target = np.ones((2, 2))
+    profiles = np.eye(2)
+    weights = np.eye(2)
+    forbidden = np.eye(2, dtype=bool)
+
+    outcome = discovery._masked_nmf_refit(
+        target,
+        profiles,
+        weights,
+        forbidden,
+        profile_normalization="peak",
+        max_iter=2000,
+        tolerance=1e-7,
+        fallback_seeds=(7, 8, 9),
+    )
+
+    assert outcome.reason is None
+    assert outcome.fit is not None
+    assert outcome.fully_forbidden_state_indices.tolist() == []
+    assert outcome.positive_target_zero_reconstruction_count == 4
+    assert outcome.used_positive_fallback
+    assert outcome.positive_fallback_attempt_count == 3
+    assert outcome.positive_fallback_success_count >= 1
+    assert np.all(outcome.fit.profiles[~forbidden] > 0.0)
+    assert np.all(outcome.fit.profiles[forbidden] == 0.0)
+    assert np.isfinite(
+        discovery._strict_generalized_kl_divergence(
+            target,
+            outcome.fit.reconstruction,
+        )
+    )
+
+
+def test_positive_fallback_derived_seeds_are_stable_and_distinct():
+    import andrew_mlmdp.discovery as discovery
+
+    seeds = discovery._derived_positive_fallback_seeds(2, 1, 3)
+
+    assert seeds == discovery._derived_positive_fallback_seeds(2, 1, 3)
+    assert len(set(seeds)) == 3
+    assert seeds != discovery._derived_positive_fallback_seeds(2, 2, 3)
+
+
+def test_positive_fallback_selects_lowest_kl_success(monkeypatch):
+    import andrew_mlmdp.discovery as discovery
+
+    target = np.ones((2, 2))
+    profiles = np.eye(2)
+    weights = np.eye(2)
+    forbidden = np.eye(2, dtype=bool)
+    fallback_seeds = discovery._derived_positive_fallback_seeds(2, 1, 3)
+    seen_seeds = []
+
+    def fake_initialization(
+        target,
+        profiles,
+        task_weights,
+        forbidden,
+        *,
+        seed,
+    ):
+        seen_seeds.append(seed)
+        marker = (2.0, 1.0, 3.0)[fallback_seeds.index(seed)]
+        initial_profiles = np.zeros_like(profiles)
+        initial_profiles[~forbidden] = marker
+        return initial_profiles, np.ones_like(task_weights)
+
+    def fake_fit(
+        target,
+        n_components,
+        *,
+        initial_profiles,
+        initial_task_weights,
+        **kwargs,
+    ):
+        marker = initial_profiles[0, 1]
+        if marker == 3.0:
+            fitted_profiles = np.zeros_like(initial_profiles)
+        else:
+            fitted_profiles = initial_profiles.copy()
+        reconstruction = fitted_profiles @ initial_task_weights
+        return discovery._NMFFit(
+            profiles=fitted_profiles,
+            task_weights=initial_task_weights.copy(),
+            reconstruction=reconstruction,
+            n_iter=int(marker),
+            converged=True,
+        )
+
+    monkeypatch.setattr(
+        discovery,
+        "_positive_masked_initialization",
+        fake_initialization,
+    )
+    monkeypatch.setattr(discovery, "_fit_nmf_factors", fake_fit)
+
+    outcome = discovery._masked_nmf_refit(
+        target,
+        profiles,
+        weights,
+        forbidden,
+        profile_normalization="peak",
+        max_iter=100,
+        tolerance=1e-5,
+        fallback_seeds=fallback_seeds,
+    )
+
+    assert seen_seeds == list(fallback_seeds)
+    assert outcome.reason is None
+    assert outcome.fit is not None
+    assert outcome.fit.reconstruction == pytest.approx(target)
+    assert outcome.positive_fallback_attempt_count == 3
+    assert outcome.positive_fallback_success_count == 2
+
+
+def test_positive_masked_initialization_is_scale_relative():
+    import andrew_mlmdp.discovery as discovery
+
+    target = np.ones((2, 2))
+    profiles = np.asarray([[2.0, 0.0], [4.0, 8.0]])
+    weights = np.asarray([[10.0, 0.0], [2.0, 4.0]])
+    forbidden = np.asarray([[False, True], [False, False]])
+
+    initial_profiles, initial_weights = (
+        discovery._positive_masked_initialization(
+            target,
+            profiles,
+            weights,
+            forbidden,
+            seed=5,
+        )
+    )
+
+    assert np.all(initial_profiles[~forbidden] > 0.0)
+    assert np.all(initial_profiles[forbidden] == 0.0)
+    assert np.all(initial_weights > 0.0)
+    assert np.all(initial_profiles[:, 0] <= 3.0)
+    assert 0.8 <= initial_profiles[1, 1] <= 8.0
+    assert np.all((1.0 <= initial_weights[0]) & (initial_weights[0] <= 10.0))
+    assert np.all((0.3 <= initial_weights[1]) & (initial_weights[1] <= 3.0))
+
+
+def test_positive_masked_fallback_still_uses_strict_final_kl(monkeypatch):
+    import andrew_mlmdp.discovery as discovery
+
+    target = np.ones((2, 2))
+    profiles = np.eye(2)
+    weights = np.eye(2)
+    forbidden = np.eye(2, dtype=bool)
+    failed_fit = discovery._NMFFit(
+        profiles=np.zeros((2, 2)),
+        task_weights=np.ones((2, 2)),
+        reconstruction=np.zeros((2, 2)),
+        n_iter=3,
+        converged=True,
+    )
+    monkeypatch.setattr(
+        discovery,
+        "_fit_nmf_factors",
+        lambda *args, **kwargs: failed_fit,
+    )
+
+    outcome = discovery._masked_nmf_refit(
+        target,
+        profiles,
+        weights,
+        forbidden,
+        profile_normalization="peak",
+        max_iter=100,
+        tolerance=1e-5,
+    )
+
+    assert outcome.fit is None
+    assert (
+        outcome.reason
+        == "positive_fallback_failed"
+    )
+    assert outcome.used_positive_fallback
+    assert outcome.positive_target_zero_reconstruction_count == 4
+    assert outcome.positive_fallback_attempt_count == 1
+    assert outcome.positive_fallback_success_count == 0
 
 
 def test_strict_kl_does_not_change_legacy_floored_helper():
@@ -355,6 +566,22 @@ def test_strict_kl_does_not_change_legacy_floored_helper():
         discovery._generalized_kl_divergence(target, reconstruction)
     )
     assert reconstruction[0, 0] == 0.0
+
+
+def test_strict_kl_handles_tiny_positive_reconstruction_without_overflow():
+    import andrew_mlmdp.discovery as discovery
+
+    target = np.asarray([[1.0]])
+    reconstruction = np.asarray([[np.nextafter(0.0, 1.0)]])
+    with np.errstate(over="raise"):
+        divergence = discovery._strict_generalized_kl_divergence(
+            target, reconstruction
+        )
+
+    assert np.isfinite(divergence)
+    assert divergence == pytest.approx(
+        -np.log(reconstruction[0, 0]) - 1.0 + reconstruction[0, 0]
+    )
 
 
 def test_convergence_status_comes_from_sklearn_warning(monkeypatch):
@@ -386,7 +613,7 @@ def test_convergence_status_comes_from_sklearn_warning(monkeypatch):
         legacy = discovery._fit_nmf_factors(
             np.ones((2, 2)),
             1,
-            init="nndsvda",
+            init="random",
             profile_normalization="peak",
             seed=1,
             max_iter=100,
@@ -417,10 +644,10 @@ def test_connected_and_disabled_paths_use_expected_initialization(monkeypatch):
         connectivity=None,
         seed=7,
     )
-    assert initializations == ["nndsvda"]
+    assert initializations == ["random"]
 
 
-def test_disabled_connectivity_preserves_exact_legacy_factorization(monkeypatch):
+def test_disabled_connectivity_preserves_exact_seeded_random_factorization(monkeypatch):
     import andrew_mlmdp.discovery as discovery
 
     def unexpected_graph_construction(_passive):
@@ -508,9 +735,50 @@ def _restart_result(seed, unconstrained_kl, connected_kl):
         prune_refit_rounds=0,
         fit_iterations=(10,),
         fit_converged=(True,),
+        fully_forbidden_state_indices=np.empty(0, dtype=int),
+        positive_target_zero_reconstruction_counts=(),
+        positive_fallback_attempt_counts=(),
+        positive_fallback_success_counts=(),
         feasible=True,
         eligible=True,
     )
+
+
+def test_restart_mask_failure_and_fallback_classifications():
+    base = _restart_result(0, unconstrained_kl=1.0, connected_kl=1.1)
+    structural = replace(
+        base,
+        fully_forbidden_state_indices=np.asarray([1]),
+        feasible=False,
+        eligible=False,
+        reason="fully_forbidden_state",
+    )
+    fallback_succeeded = replace(
+        base,
+        positive_target_zero_reconstruction_counts=(2,),
+        positive_fallback_attempt_counts=(3,),
+        positive_fallback_success_counts=(2,),
+    )
+    fallback_failed = replace(
+        base,
+        positive_target_zero_reconstruction_counts=(2,),
+        positive_fallback_attempt_counts=(3,),
+        positive_fallback_success_counts=(0,),
+        eligible=False,
+        reason="positive_fallback_failed",
+    )
+
+    assert structural.fully_forbidden_state
+    assert not structural.zero_locked_warm_start
+    assert fallback_succeeded.zero_locked_warm_start
+    assert fallback_succeeded.positive_masked_fallback_event_count == 1
+    assert fallback_succeeded.positive_masked_fallback_count == 3
+    assert fallback_succeeded.positive_fallback_success_count == 2
+    assert fallback_succeeded.positive_fallback_succeeded
+    assert not fallback_succeeded.positive_fallback_failed
+    assert fallback_failed.zero_locked_warm_start
+    assert not fallback_failed.positive_fallback_succeeded
+    assert fallback_failed.positive_fallback_failed
 
 
 def test_selection_and_rank_delta_use_final_and_cross_restart_losses(monkeypatch):
@@ -583,10 +851,21 @@ def test_persistent_mask_stops_after_three_refits_and_flags_disconnected(
         "_fit_nmf_factors",
         lambda *args, **kwargs: unconstrained,
     )
+    def fake_masked_refit(*args, **kwargs):
+        fit = next(refits)
+        return discovery._masked_refit_result(
+            fit,
+            None,
+            np.empty(0, dtype=int),
+            zero_count=0,
+            used_positive_fallback=False,
+            attempted_fits=[fit],
+        )
+
     monkeypatch.setattr(
         discovery,
         "_masked_nmf_refit",
-        lambda *args, **kwargs: (next(refits), None),
+        fake_masked_refit,
     )
 
     result = discovery._connectivity_restart(
@@ -626,6 +905,7 @@ def test_restart_diagnostics_are_immutable_and_match_formulas():
 
     assert not restart.unconstrained_profiles.flags.writeable
     assert not restart.forbidden_mask.flags.writeable
+    assert not restart.fully_forbidden_state_indices.flags.writeable
     expected_discarded = np.sum(
         np.where(
             restart.forbidden_mask,

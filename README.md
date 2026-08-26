@@ -278,11 +278,17 @@ By default, discovery fits stochastic KL-NMF restarts and requires each
 profile's tie-safe 95%-mass support to be connected on the passive-dynamics
 maze graph. Secondary high-mass islands are persistently forbidden and the
 factors are genuinely refit with those entries fixed at zero. Low-mass tails
-remain free. `study.rank_result(k)` exposes every seed, before/after raw KL,
-forbidden mass, effective support, convergence status, and the selected
-restart. Its rank-level connectivity cost compares the best connected KL with
+remain free. Fully forbidden positive-target state rows are structural mask
+failures; zero-locked warm starts under otherwise feasible masks receive three
+deterministic derived-seed positive fallback attempts by default. Allowed `D`
+and all `W` entries start positive, forbidden `D` entries remain zero, and the
+lowest strict-finite warning-free KL candidate continues. Final KL evaluation
+remains strict. `study.rank_result(k)` exposes every seed, before/after raw KL,
+mask-failure and fallback diagnostics, forbidden mass, effective support,
+convergence status, and the selected restart. Its rank-level connectivity cost
+compares the best connected KL with
 the best unconstrained KL across seeds. Pass `connectivity=None` to retain the
-legacy single-fit NNDSVDa path without graph work.
+single-fit seeded random path without graph work.
 
 ## Doohan edge-list mazes
 
