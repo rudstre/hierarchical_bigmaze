@@ -20,12 +20,14 @@ From the repository root:
 python scripts/run_hierarchy_rank_validation.py \
   --config configs/hierarchy_rank_validation_production.json \
   --k 8 \
-  --output-dir output/hierarchy_rank_validation/production
+  --output-dir output/hierarchy_rank_validation/production_normalized_threshold
 ```
 
 The production configuration uses connected KL-NMF seeds 0 through 49 for
-every rank and one ADAM initialization. A compatible existing shard is reused;
-pass `--force` to recompute and atomically replace it.
+every rank and one ADAM initialization. The configured threshold fraction is
+`0.8`; each worker resolves the physical initial `core_threshold` as `0.8`
+times that rank's structural cap. A compatible existing shard is reused; pass
+`--force` to recompute and atomically replace it.
 
 ## Submit the SLURM array
 
@@ -52,19 +54,28 @@ visible and the current winner is marked provisional:
 ```bash
 python scripts/aggregate_hierarchy_rank_validation.py \
   --config configs/hierarchy_rank_validation_production.json \
-  --shard-dir output/hierarchy_rank_validation/production \
-  --output-dir output/hierarchy_rank_validation/production/aggregate
+  --shard-dir output/hierarchy_rank_validation/production_normalized_threshold \
+  --output-dir output/hierarchy_rank_validation/production_normalized_threshold/aggregate
 ```
 
 `aggregate.json` contains the complete compatible shards. `rank_summary.csv`
 contains the rank scores, NMF selection diagnostics, ADAM convergence fields,
 best parameter values, parameter changes from initialization, and the fitted
-threshold as a fraction of its structural cap. The aggregator also writes
-`held_out_log_likelihood_vs_k.png` and `.svg`, using the pooled held-out log
-likelihood per movement transition as the y-axis.
+threshold as a fraction of its structural cap. The CSV includes initial,
+best, and last thresholds in both physical and cap-normalized units. The
+aggregator also writes `held_out_log_likelihood_vs_k.png` and `.svg`, using the
+pooled held-out log likelihood per movement transition as the y-axis.
 
 Every shard records exact configuration, dataset, maze, dependency, Git HEAD,
 and worker/model working-tree source fingerprints. Aggregation and plotting
 code has a separate fingerprint, so presentation-only changes do not invalidate
 existing shards. Aggregation still rejects mixed worker fingerprints and any
 configuration, data, maze, or runtime mismatch.
+
+
+## Threshold-normalized rerun
+
+This schema-v2 sweep is incompatible with the original physical-threshold
+shards. Keep the original `production` directory unchanged and write all new
+workers to `production_normalized_threshold`. Do not use `--force` to mix one
+schema or worker fingerprint into the other directory.

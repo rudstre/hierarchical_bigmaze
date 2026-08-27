@@ -53,7 +53,7 @@ def _context(config: RankValidationConfig):
     )
 
 
-def _parameter_values():
+def _parameter_values(*, core_threshold=0.7):
     return {
         "interior_reward": -1.0,
         "goal_reward": 0.0,
@@ -61,22 +61,22 @@ def _parameter_values():
         "upper_control_cost": 1.2,
         "alpha": 0.8,
         "beta": 1.3,
-        "core_threshold": 0.7,
+        "core_threshold": core_threshold,
         "core_exponent": 1.4,
     }
 
 
-def _fit_result():
+def _fit_result(*, initial_threshold=0.8, best_threshold=0.7):
     initial = {
         **_parameter_values(),
         "lower_control_cost": 1.0,
         "upper_control_cost": 1.0,
         "alpha": 0.75,
         "beta": 1.0,
-        "core_threshold": 0.8,
+        "core_threshold": initial_threshold,
         "core_exponent": 1.0,
     }
-    best = _parameter_values()
+    best = _parameter_values(core_threshold=best_threshold)
     history = (
         FitStep(
             evaluation=0,
@@ -121,7 +121,10 @@ def _score(total=-4.0, transitions=2):
 
 
 def _successful_shard(config, compatibility, k, score):
-    fit_result = validation._fit_result_payload(_fit_result())
+    fit_result = validation._fit_result_payload(
+        _fit_result(initial_threshold=0.72),
+        threshold_cap=0.9,
+    )
     return {
         "schema_version": validation.SCHEMA_VERSION,
         "k": k,
@@ -135,6 +138,8 @@ def _successful_shard(config, compatibility, k, score):
             "selected_discovery": {"reconstruction_error": 0.2},
         },
         "optimizer": {
+            "initial_core_threshold_fraction": 0.8,
+            "initial_values": fit_result["initial_values"],
             "threshold_domain": {"maximum": 0.9},
             "fit_result": fit_result,
         },
@@ -174,6 +179,14 @@ def test_production_config_requires_all_fifty_nmf_seeds():
     assert config.restart_seeds == tuple(range(50))
 
 
+@pytest.mark.parametrize("fraction", [0.0, 1.0, -0.1, float("nan")])
+def test_initial_core_threshold_fraction_must_be_strictly_between_zero_and_one(
+    fraction,
+):
+    with pytest.raises(ValueError, match="initial_core_threshold_fraction"):
+        validation.AdamValidationConfig(initial_core_threshold_fraction=fraction)
+
+
 def test_source_fingerprint_changes_with_dirty_source(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
@@ -200,16 +213,22 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
         def rank_result(self, k):
             return SimpleNamespace(discovery=object())
 
+    threshold_range = SimpleNamespace(
+        maximum=0.25,
+        limiting_pairs=(((0, 1), 0),),
+    )
+    resolved_initial_values = {
+        **config.adam.initial_values,
+        "core_threshold": 0.2,
+    }
+
     class FakeTemplate:
         task_library = object()
         composition_exponent = 1.0
         composition_mode = "linear"
 
-        def threshold_range(self, goals):
-            return SimpleNamespace(maximum=0.9, limiting_pairs=(((0, 1), 0),))
-
         def fit(self, *args, **kwargs):
-            return _fit_result()
+            return _fit_result(initial_threshold=0.2, best_threshold=0.15)
 
     def fake_discovery(*args, **kwargs):
         discovery_calls.append(kwargs["ranks"])
@@ -227,19 +246,30 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
             "restarts": [{"seed": seed} for seed in range(50)],
         },
     )
-    monkeypatch.setattr(validation, "_initial_template", lambda *args: FakeTemplate())
+    monkeypatch.setattr(
+        validation,
+        "_initial_template",
+        lambda *args: (FakeTemplate(), threshold_range, resolved_initial_values),
+    )
     monkeypatch.setattr(validation, "_fitted_template", lambda *args: FakeTemplate())
     monkeypatch.setattr(validation, "_strict_score", lambda *args: _score())
 
-    result = run_rank_validation(config, 8, tmp_path / "shards")
-    cached = run_rank_validation(config, 8, tmp_path / "shards")
+    result = run_rank_validation(config, 49, tmp_path / "shards")
+    cached = run_rank_validation(config, 49, tmp_path / "shards")
 
     assert result["status"] == "success"
     assert cached == result
-    assert discovery_calls == [(8,)]
+    assert discovery_calls == [(49,)]
     assert len(result["discovery"]["restarts"]) == 50
-    assert result["optimizer"]["fit_result"]["history"][0]["lr"] == 0.15
-    assert (tmp_path / "shards" / "k_08.json").is_file()
+    optimizer = result["optimizer"]
+    assert optimizer["threshold_domain"]["maximum"] == pytest.approx(0.25)
+    assert optimizer["initial_core_threshold_fraction"] == pytest.approx(0.8)
+    assert optimizer["initial_values"]["core_threshold"] == pytest.approx(0.2)
+    fit_result = optimizer["fit_result"]
+    assert fit_result["history"][0]["lr"] == 0.15
+    assert fit_result["history"][0]["core_threshold_fraction"] == pytest.approx(0.8)
+    assert fit_result["best_core_threshold_fraction"] == pytest.approx(0.6)
+    assert (tmp_path / "shards" / "k_49.json").is_file()
 
 
 def test_worker_writes_failure_shard(tmp_path, monkeypatch):
@@ -289,7 +319,15 @@ def test_aggregation_ranks_pooled_scores_and_preserves_parameter_history(
     row = result["summary_rows"][1]
     assert row["best_alpha"] == pytest.approx(0.8)
     assert row["delta_alpha"] == pytest.approx(0.05)
+    assert row["initial_core_threshold"] == pytest.approx(0.72)
+    assert row["last_core_threshold"] == pytest.approx(0.7)
+    assert row["initial_core_threshold_fraction"] == pytest.approx(0.8)
+    assert row["best_core_threshold_fraction"] == pytest.approx(0.7 / 0.9)
+    assert row["last_core_threshold_fraction"] == pytest.approx(0.7 / 0.9)
+    assert row["delta_core_threshold_fraction"] == pytest.approx(0.7 / 0.9 - 0.8)
     assert row["core_threshold_fraction_of_cap"] == pytest.approx(0.7 / 0.9)
+    history = result["shards"][0]["optimizer"]["fit_result"]["history"]
+    assert history[0]["core_threshold_fraction"] == pytest.approx(0.8)
     assert (tmp_path / "aggregate" / "rank_summary.csv").is_file()
 
 

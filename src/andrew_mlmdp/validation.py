@@ -29,11 +29,11 @@ from andrew_mlmdp.discovery import (
 )
 from andrew_mlmdp.doohan_dataset import DoohanDataset
 from andrew_mlmdp.fitting import FitResult
-from andrew_mlmdp.hierarchy.model import SubgoalBasis, Template
+from andrew_mlmdp.hierarchy.model import SubgoalBasis, Template, ThresholdRange
 from andrew_mlmdp.lmdp import Environment, soft_parameters
 from andrew_mlmdp.profiles import ProfileNormalization
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PRODUCTION_RANKS = tuple(range(2, 50))
 PRODUCTION_NMF_RESTART_SEEDS = tuple(range(50))
 FITTED_PARAMETER_NAMES = (
@@ -139,10 +139,10 @@ class AdamValidationConfig:
             "upper_control_cost": 1.0,
             "alpha": 0.75,
             "beta": 1.0,
-            "core_threshold": 0.8,
             "core_exponent": 1.0,
         }
     )
+    initial_core_threshold_fraction: float = 0.8
     learning_rate: float = 0.15
     max_steps: int = 1000
     convergence_tolerance: float = 1e-4
@@ -165,16 +165,24 @@ class AdamValidationConfig:
         required = {
             "interior_reward",
             "goal_reward",
-            *FITTED_PARAMETER_NAMES,
+            "lower_control_cost",
+            "upper_control_cost",
+            "alpha",
+            "beta",
+            "core_exponent",
         }
         if set(self.initial_values) != required:
             raise ValueError(
-                "initial_values must contain exactly the eight hierarchy parameters"
+                "initial_values must contain exactly the seven non-threshold "
+                "hierarchy parameters"
             )
         if not all(
             math.isfinite(float(value)) for value in self.initial_values.values()
         ):
             raise ValueError("initial parameter values must be finite")
+        fraction = self.initial_core_threshold_fraction
+        if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+            raise ValueError("initial_core_threshold_fraction must be in (0, 1)")
         if self.initialization_count != 1:
             raise ValueError("The first rank sweep supports one ADAM initialization")
         if (
@@ -423,21 +431,22 @@ def run_rank_validation(
             raise RankValidationError("Every connected NMF restart was excluded")
 
         stage = "initial_score"
-        initial_template = _initial_template(
+        initial_template, threshold_range, resolved_initial_values = _initial_template(
             context.environment,
             rank_result,
             resolved,
             k,
-        )
-        threshold_range = initial_template.threshold_range(
-            {trial.goal for trial in context.training_trials}
+            {trial.goal for trial in context.training_trials},
         )
         payload["optimizer"] = {
             "initialization_count": 1,
             "initialization_seed": resolved.adam.initialization_seed,
             "future_restart_log_scale": resolved.adam.future_restart_log_scale,
             "fitted_names": list(resolved.adam.fitted_names),
-            "initial_values": dict(resolved.adam.initial_values),
+            "initial_core_threshold_fraction": (
+                resolved.adam.initial_core_threshold_fraction
+            ),
+            "initial_values": resolved_initial_values,
             "threshold_domain": {
                 "maximum": threshold_range.maximum,
                 "limiting_pairs": [
@@ -480,7 +489,10 @@ def run_rank_validation(
         timings["fit"] = time.perf_counter() - fit_started
         optimizer = payload["optimizer"]
         assert isinstance(optimizer, dict)
-        optimizer["fit_result"] = _fit_result_payload(fit_result)
+        optimizer["fit_result"] = _fit_result_payload(
+            fit_result,
+            threshold_cap=threshold_range.maximum,
+        )
         if fit_result.best_values is None:
             raise RankValidationError(
                 f"ADAM found no finite parameter state ({fit_result.reason})"
@@ -697,21 +709,53 @@ def _initial_template(
     result: NMFRankResult,
     config: RankValidationConfig,
     k: int,
-) -> Template:
+    goals: Iterable[tuple[int, int]],
+) -> tuple[Template, ThresholdRange, dict[str, float]]:
     discovery = result.discovery
     assert discovery is not None
-    values = dict(config.adam.initial_values)
+    probe_values = {
+        **config.adam.initial_values,
+        "core_threshold": 0.0,
+    }
+    probe_basis = SubgoalBasis.from_profiles(
+        environment.maze,
+        discovery.profiles,
+        core_threshold=probe_values["core_threshold"],
+        core_exponent=probe_values["core_exponent"],
+        profile_normalization=config.discovery.profile_normalization,
+    )
+    probe_template = environment.hierarchy(
+        probe_basis,
+        parameters=soft_parameters(k, **probe_values),
+    )
+    threshold_range = probe_template.threshold_range(goals)
+    threshold_cap = float(threshold_range.maximum)
+    threshold = config.adam.initial_core_threshold_fraction * threshold_cap
+    interior_upper = np.nextafter(threshold_cap, -np.inf)
+    domain_epsilon = np.finfo(np.float64).eps
+    if not (
+        math.isfinite(threshold_cap) and domain_epsilon < threshold < interior_upper
+    ):
+        raise ValueError(
+            "The structural core-threshold domain has no representable "
+            "initial value at the configured fraction"
+        )
+    values = {
+        **config.adam.initial_values,
+        "core_threshold": threshold,
+    }
     basis = SubgoalBasis.from_profiles(
         environment.maze,
         discovery.profiles,
-        core_threshold=values["core_threshold"],
+        core_threshold=threshold,
         core_exponent=values["core_exponent"],
         profile_normalization=config.discovery.profile_normalization,
     )
-    return environment.hierarchy(
+    template = environment.hierarchy(
         basis,
         parameters=soft_parameters(k, **values),
     )
+    return template, threshold_range, values
 
 
 def _fitted_template(
@@ -774,15 +818,27 @@ def _trial_score_payload(score: TrialScore) -> dict[str, object]:
     }
 
 
-def _fit_result_payload(result: FitResult) -> dict[str, object]:
+def _fit_result_payload(
+    result: FitResult,
+    *,
+    threshold_cap: float | None = None,
+) -> dict[str, object]:
     def values_payload(values) -> dict[str, float] | None:
         return None if values is None else dict(values.as_floats())
+
+    def threshold_fraction(values) -> float | None:
+        if values is None or threshold_cap is None:
+            return None
+        return dict(values.as_floats())["core_threshold"] / threshold_cap
 
     return {
         "names": list(result.names),
         "initial_values": values_payload(result.initial_values),
         "best_values": values_payload(result.best_values),
         "last_values": values_payload(result.last_values),
+        "initial_core_threshold_fraction": threshold_fraction(result.initial_values),
+        "best_core_threshold_fraction": threshold_fraction(result.best_values),
+        "last_core_threshold_fraction": threshold_fraction(result.last_values),
         "history": [
             {
                 "evaluation": step.evaluation,
@@ -794,6 +850,11 @@ def _fit_result_payload(result: FitResult) -> dict[str, object]:
                 "parameter_values": dict(step.parameter_values),
                 "gradients": dict(step.gradients),
                 "gradient_norm": step.gradient_norm,
+                "core_threshold_fraction": (
+                    None
+                    if threshold_cap is None
+                    else step.parameter_values["core_threshold"] / threshold_cap
+                ),
             }
             for step in result.history
         ],
@@ -909,6 +970,12 @@ def _summary_row(k: int, shard: dict[str, object] | None) -> dict[str, object]:
         "adam_converged": None,
         "adam_reason": None,
         "threshold_domain_maximum": None,
+        "initial_core_threshold": None,
+        "last_core_threshold": None,
+        "initial_core_threshold_fraction": None,
+        "best_core_threshold_fraction": None,
+        "last_core_threshold_fraction": None,
+        "delta_core_threshold_fraction": None,
         "core_threshold_fraction_of_cap": None,
     }
     for name in _TREND_PARAMETER_NAMES:
@@ -968,13 +1035,28 @@ def _summary_row(k: int, shard: dict[str, object] | None) -> dict[str, object]:
     )
     best = fit_result["best_values"]
     initial = fit_result["initial_values"]
+    last = fit_result["last_values"]
     assert isinstance(best, dict)
     assert isinstance(initial, dict)
+    assert isinstance(last, dict)
     for name in _TREND_PARAMETER_NAMES:
         row[f"best_{name}"] = best[name]
         row[f"delta_{name}"] = best[name] - initial[name]
     threshold_cap = threshold_domain["maximum"]
-    row["core_threshold_fraction_of_cap"] = best["core_threshold"] / threshold_cap
+    initial_fraction = initial["core_threshold"] / threshold_cap
+    best_fraction = best["core_threshold"] / threshold_cap
+    last_fraction = last["core_threshold"] / threshold_cap
+    row.update(
+        {
+            "initial_core_threshold": initial["core_threshold"],
+            "last_core_threshold": last["core_threshold"],
+            "initial_core_threshold_fraction": initial_fraction,
+            "best_core_threshold_fraction": best_fraction,
+            "last_core_threshold_fraction": last_fraction,
+            "delta_core_threshold_fraction": best_fraction - initial_fraction,
+            "core_threshold_fraction_of_cap": best_fraction,
+        }
+    )
     return row
 
 
