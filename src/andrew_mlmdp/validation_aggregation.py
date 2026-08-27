@@ -67,7 +67,7 @@ def aggregate_rank_results(
             )
         shards_by_rank[k] = payload
 
-    rows = [_summary_row(k, shards_by_rank.get(k)) for k in resolved.ranks]
+    rows = [_aggregation_summary_row(k, shards_by_rank.get(k)) for k in resolved.ranks]
     successful = [
         row
         for row in rows
@@ -106,6 +106,8 @@ def aggregate_rank_results(
     _atomic_write_json(destination / "aggregate.json", aggregate)
     _atomic_write_csv(destination / "rank_summary.csv", rows)
     plot_held_out_log_likelihood(rows, destination, complete=complete)
+    plot_selected_nmf_normalized_kl(rows, destination, complete=complete)
+    plot_fitted_parameters(rows, destination, complete=complete)
     return aggregate
 
 
@@ -123,35 +125,33 @@ def plot_held_out_log_likelihood(
     import matplotlib.pyplot as plt
 
     ranks = np.asarray([int(row["k"]) for row in rows], dtype=int)
-    likelihoods = np.asarray(
-        [
-            (
-                float(row["validation_ll_per_transition"])
-                if row["status"] == "success"
-                and row["validation_ll_per_transition"] is not None
-                else np.nan
-            )
-            for row in rows
-        ],
-        dtype=np.float64,
-    )
-    available = np.isfinite(likelihoods)
-    if not np.any(available):
+    held_out = _numeric_series(rows, "validation_ll_per_transition")
+    training = _numeric_series(rows, "training_fitted_ll_per_transition")
+    if not np.any(np.isfinite(held_out)):
         raise ValueError("No successful held-out likelihoods are available to plot")
 
     figure, axis = plt.subplots(figsize=(9, 5.5))
     axis.plot(
         ranks,
-        likelihoods,
+        held_out,
         color="#2369a1",
         marker="o",
         markersize=4,
         linewidth=1.5,
         label="Held-out pooled LL / transition",
     )
-    best_index = int(np.nanargmax(likelihoods))
+    axis.plot(
+        ranks,
+        training,
+        color="#d9822b",
+        marker="o",
+        markersize=4,
+        linewidth=1.5,
+        label="Fitted training pooled LL / transition",
+    )
+    best_index = int(np.nanargmax(held_out))
     best_k = int(ranks[best_index])
-    best_value = float(likelihoods[best_index])
+    best_value = float(held_out[best_index])
     axis.scatter(
         [best_k],
         [best_value],
@@ -173,9 +173,9 @@ def plot_held_out_log_likelihood(
     )
     axis.set(
         xlabel="Number of discovered subgoals (k)",
-        ylabel="Pooled held-out log likelihood per movement transition",
+        ylabel="Pooled log likelihood per movement transition",
         title=(
-            "Held-out hierarchy likelihood by NMF rank"
+            "Training and held-out hierarchy likelihood by NMF rank"
             + ("" if complete else " (provisional)")
         ),
         xticks=np.arange(2, 50, 2),
@@ -191,6 +191,166 @@ def plot_held_out_log_likelihood(
     figure.savefig(svg_path, bbox_inches="tight")
     plt.close(figure)
     return png_path, svg_path
+
+
+def plot_selected_nmf_normalized_kl(
+    rows: list[dict[str, object]],
+    output_dir: str | Path,
+    *,
+    complete: bool,
+) -> tuple[Path, Path]:
+    """Plot the selected basis's normalized generalized KL by rank."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ranks = np.asarray([int(row["k"]) for row in rows], dtype=int)
+    values = _numeric_series(
+        rows,
+        "nmf_reconstruction_error",
+        require_success=False,
+    )
+    if not np.any(np.isfinite(values)):
+        raise ValueError("No selected NMF normalized KL values are available to plot")
+
+    figure, axis = plt.subplots(figsize=(9, 5.5))
+    axis.plot(
+        ranks,
+        values,
+        color="#2369a1",
+        marker="o",
+        markersize=4,
+        linewidth=1.5,
+    )
+    axis.set(
+        xlabel="Number of discovered subgoals (k)",
+        ylabel="Selected normalized generalized KL divergence",
+        title=(
+            "Selected connected NMF basis fit by rank"
+            + ("" if complete else " (provisional)")
+        ),
+        xticks=np.arange(2, 50, 2),
+    )
+    axis.grid(alpha=0.25)
+    figure.tight_layout()
+
+    destination = Path(output_dir).resolve()
+    png_path = destination / "selected_nmf_normalized_kl_vs_k.png"
+    svg_path = destination / "selected_nmf_normalized_kl_vs_k.svg"
+    figure.savefig(png_path, dpi=200, bbox_inches="tight")
+    figure.savefig(svg_path, bbox_inches="tight")
+    plt.close(figure)
+    return png_path, svg_path
+
+
+def plot_fitted_parameters(
+    rows: list[dict[str, object]],
+    output_dir: str | Path,
+    *,
+    complete: bool,
+) -> tuple[Path, Path]:
+    """Plot the six fitted hierarchy parameters in compact small multiples."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ranks = np.asarray([int(row["k"]) for row in rows], dtype=int)
+    parameters = (
+        ("best_lower_control_cost", "Lower control cost"),
+        ("best_upper_control_cost", "Upper control cost"),
+        ("best_alpha", "Alpha"),
+        ("best_beta", "Beta"),
+        ("best_core_threshold_fraction", "Core threshold / structural cap"),
+        ("best_core_exponent", "Core exponent"),
+    )
+    series = [_numeric_series(rows, field) for field, _ in parameters]
+    if not any(np.any(np.isfinite(values)) for values in series):
+        raise ValueError("No fitted hierarchy parameters are available to plot")
+
+    figure, axes = plt.subplots(3, 2, figsize=(10, 10), sharex=True)
+    for axis, (_, label), values in zip(axes.flat, parameters, series, strict=True):
+        axis.plot(
+            ranks,
+            values,
+            color="#2369a1",
+            marker="o",
+            markersize=3.5,
+            linewidth=1.4,
+        )
+        axis.set_ylabel(label)
+        axis.set_xticks(np.arange(2, 50, 4))
+        axis.grid(alpha=0.25)
+    for axis in axes[-1, :]:
+        axis.set_xlabel("Number of discovered subgoals (k)")
+    figure.suptitle(
+        "Fitted hierarchy parameters by NMF rank"
+        + ("" if complete else " (provisional)")
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+
+    destination = Path(output_dir).resolve()
+    png_path = destination / "fitted_parameters_vs_k.png"
+    svg_path = destination / "fitted_parameters_vs_k.svg"
+    figure.savefig(png_path, dpi=200, bbox_inches="tight")
+    figure.savefig(svg_path, bbox_inches="tight")
+    plt.close(figure)
+    return png_path, svg_path
+
+
+def _aggregation_summary_row(
+    k: int,
+    shard: dict[str, object] | None,
+) -> dict[str, object]:
+    """Build a row and retain NMF evidence after downstream failures."""
+
+    row = _summary_row(k, shard)
+    if shard is None:
+        return row
+    discovery = shard.get("discovery")
+    if not isinstance(discovery, dict):
+        return row
+    row["nmf_selected_restart"] = discovery.get("selected_restart_id")
+    row["nmf_selected_seed"] = discovery.get("selected_seed")
+    selected = discovery.get("selected_discovery")
+    if isinstance(selected, dict):
+        value = selected.get("reconstruction_error")
+        if _finite_number(value):
+            row["nmf_reconstruction_error"] = float(value)
+    return row
+
+
+def _numeric_series(
+    rows: list[dict[str, object]],
+    field: str,
+    *,
+    require_success: bool = True,
+) -> np.ndarray:
+    """Return finite plotted values with missing or invalid entries as gaps."""
+
+    return np.asarray(
+        [
+            (
+                float(row[field])
+                if (not require_success or row["status"] == "success")
+                and _finite_number(row.get(field))
+                else np.nan
+            )
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
+
+
+def _finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and np.isfinite(value)
+    )
 
 
 def _validate_current_non_source_compatibility(
