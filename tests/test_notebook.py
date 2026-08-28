@@ -5,13 +5,9 @@ from nbclient import NotebookClient
 
 PROJECT_ROOT = Path(__file__).parents[1]
 NOTEBOOK = PROJECT_ROOT / "notebooks" / "maze_lmdp_workflows.ipynb"
-DOOHAN_NOTEBOOK = (
-    PROJECT_ROOT / "doohan_data_interaction" / "doohan_trial_lmdp.ipynb"
-)
+DOOHAN_NOTEBOOK = PROJECT_ROOT / "doohan_data_interaction" / "doohan_trial_lmdp.ipynb"
 DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK = (
-    PROJECT_ROOT
-    / "doohan_data_interaction"
-    / "doohan_hierarchy_fit_diagnostics.ipynb"
+    PROJECT_ROOT / "doohan_data_interaction" / "doohan_hierarchy_fit_diagnostics.ipynb"
 )
 
 
@@ -74,6 +70,7 @@ def test_doohan_notebook_compiles_and_fit_cells_are_unexecuted():
         assert cell.execution_count is None
         assert cell.outputs == []
 
+
 def test_doohan_hierarchy_diagnostics_has_flat_sweep_after_section_two():
     notebook = nbformat.read(
         DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK,
@@ -90,10 +87,7 @@ def test_doohan_hierarchy_diagnostics_has_flat_sweep_after_section_two():
     cell = notebook.cells[index]
     assert notebook.cells[index - 1].id == "5f6173e1"
     assert notebook.cells[index + 1].id == "discover-hierarchy"
-    assert all(
-        output.get("output_type") != "error"
-        for output in cell.outputs
-    )
+    assert all(output.get("output_type") != "error" for output in cell.outputs)
     assert "FLAT_CONTROL_COST_SWEEP_VALUES" in cell.source
     assert "flat_solutions" in cell.source
     assert "trajectory_length_moments" in cell.source
@@ -106,7 +100,6 @@ def test_doohan_hierarchy_diagnostics_has_flat_sweep_after_section_two():
         str(DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK),
         "exec",
     )
-
 
 
 def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
@@ -122,11 +115,17 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     assert "start=example_start" in notebook_source
     assert "goal=example_goal" in notebook_source
     assert "sweep_expected_policy_entropy" not in notebook_source
-    assert "N_RESTARTS =" in notebook_source
-    assert "initial_conditions" in notebook_source
+    assert "ADAM_FIT_NAMES =" in notebook_source
+    assert "ADAM_INITIAL_VALUES =" in notebook_source
+    assert "ADAM_DEFAULTS =" in notebook_source
+    assert '"lr": 0.15' in notebook_source
+    assert '"max_steps": 1000' in notebook_source
+    assert "ADAM_RESTART_DEFAULTS = RestartDefaults(" in notebook_source
+    assert "fit_hierarchy_restarts(" in notebook_source
+    assert "optimizer_defaults=ADAM_DEFAULTS" in notebook_source
+    assert "adam_run.initial_conditions" in notebook_source
     assert "Adam initial conditions:" in notebook_source
-    assert "display(initial_condition_table)" in notebook_source
-    assert "restart_results" in notebook_source
+    assert "restart_results" not in notebook_source
     assert "fittable_parameters" in notebook_source
     assert "required_parameters" not in notebook_source
     assert "DISCOVERY_CONTROL_COST =" in notebook_source
@@ -169,23 +168,30 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
         )
 
     fit_cells = {
-        cell.id: cell for cell in code_cells if cell.id == "run-adam-fit"
-    }
-    assert set(fit_cells) == {"run-adam-fit"}
-    fit_cell = fit_cells["run-adam-fit"]
-    assert fit_cell.execution_count is None
-    assert fit_cell.outputs == []
-    assert "FIT_CACHE_PATH.is_file()" in fit_cell.source
-    assert "fit_result_from_payload" in fit_cell.source
-    assert "fit_result_to_payload" in fit_cell.source
-    assert "Loaded cached Adam fit" in fit_cell.source
-    assert "Cached best Adam fit" in fit_cell.source
-    assert "temporary_cache_path.replace(FIT_CACHE_PATH)" in fit_cell.source
-
-    sweep_cells = {
         cell.id: cell
         for cell in code_cells
-        if cell.id == "sweep-pair-diagnostics"
+        if cell.id in {"adam-fit-defaults", "run-adam-fit"}
+    }
+    assert set(fit_cells) == {"adam-fit-defaults", "run-adam-fit"}
+    defaults_cell = fit_cells["adam-fit-defaults"]
+    fit_cell = fit_cells["run-adam-fit"]
+    for cell in fit_cells.values():
+        assert cell.execution_count is None
+        assert cell.outputs == []
+    assert "ADAM_DEFAULTS =" in defaults_cell.source
+    assert "ADAM_INITIAL_VALUES =" in defaults_cell.source
+    assert "ADAM_RESTART_DEFAULTS =" in defaults_cell.source
+    assert "fit_hierarchy_restarts(" in fit_cell.source
+    assert "optimizer_defaults=ADAM_DEFAULTS" in fit_cell.source
+    assert "Loaded cached Adam fit" in fit_cell.source
+    assert "Cached best Adam fit" in fit_cell.source
+    assert "def fit_result_to_payload" not in fit_cell.source
+    assert "def fit_result_from_payload" not in fit_cell.source
+    assert "for restart_index" not in fit_cell.source
+    assert len(fit_cell.source.splitlines()) < 55
+
+    sweep_cells = {
+        cell.id: cell for cell in code_cells if cell.id == "sweep-pair-diagnostics"
     }
     assert set(sweep_cells) == {"sweep-pair-diagnostics"}
     sweep_cell = sweep_cells["sweep-pair-diagnostics"]
