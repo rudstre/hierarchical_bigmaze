@@ -35,18 +35,22 @@ Resource and account choices stay at submission time:
 
 ```bash
 sbatch --partition=PARTITION --time=TIME --mem=MEMORY \
-  slurm/hierarchy_rank_validation.sbatch
+  scripts/slurm/hierarchy_rank_validation.sbatch RUN_IDENTIFIER
 ```
 
-The log-routing wrapper maps `SLURM_ARRAY_TASK_ID` directly to `k`, then
-delegates computation to the fingerprinted worker wrapper under `scripts/`.
-Each task writes its combined standard output and error to
-`slurm_out/rank_val/job_<array-job-id>/slurm-<array-job-id>_<k>.out`. The
-log-routing wrapper creates the job-specific directory safely when the array
-starts.
+`RUN_IDENTIFIER` is an optional name containing letters, numbers, periods,
+underscores, or hyphens. For example, passing `threshold_040` writes every
+array task's combined standard output and error under
+`slurm_out/rank_val/job_threshold_040/`. Log filenames retain the numeric
+array job ID and rank, for example `slurm-3416000_24.out`, so reusing a run
+identifier cannot overwrite logs from another job. If `RUN_IDENTIFIER` is
+omitted, the directory falls back to `job_<array-job-id>`.
+
+The wrapper maps `SLURM_ARRAY_TASK_ID` directly to `k` and creates the shared
+log directory safely when the array starts.
 
 These optional environment variables customize paths without editing the
-wrappers:
+script:
 
 - `HIERARCHY_PROJECT_ROOT`
 - `HIERARCHY_PYTHON`
