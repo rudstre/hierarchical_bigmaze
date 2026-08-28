@@ -142,7 +142,7 @@ class AdamValidationConfig:
             "core_exponent": 1.0,
         }
     )
-    initial_core_threshold_fraction: float = 0.8
+    initial_core_threshold_fraction: float = 0.4
     learning_rate: float = 0.15
     max_steps: int = 1000
     convergence_tolerance: float = 1e-4

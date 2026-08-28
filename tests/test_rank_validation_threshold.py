@@ -60,10 +60,10 @@ def test_initial_template_resolves_fraction_against_small_rank_cap(
     )
 
     assert domain.maximum == pytest.approx(1e-6)
-    assert values["core_threshold"] == pytest.approx(8e-7)
+    assert values["core_threshold"] == pytest.approx(4e-7)
     assert 0.0 < values["core_threshold"] < domain.maximum
     assert environment.calls[0][0].core_threshold == 0.0
-    assert environment.calls[1][0].core_threshold == pytest.approx(8e-7)
+    assert environment.calls[1][0].core_threshold == pytest.approx(4e-7)
     assert template is not None
 
 

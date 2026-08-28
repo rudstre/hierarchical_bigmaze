@@ -52,7 +52,7 @@
       "beta": 1.0,
       "core_exponent": 1.0
     },
-    "initial_core_threshold_fraction": 0.8,
+    "initial_core_threshold_fraction": 0.4,
     "learning_rate": 0.15,
     "max_steps": 1000,
     "convergence_tolerance": 1e-4,

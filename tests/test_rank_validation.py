@@ -219,7 +219,7 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
     )
     resolved_initial_values = {
         **config.adam.initial_values,
-        "core_threshold": 0.2,
+        "core_threshold": 0.1,
     }
 
     class FakeTemplate:
@@ -228,7 +228,7 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
         composition_mode = "linear"
 
         def fit(self, *args, **kwargs):
-            return _fit_result(initial_threshold=0.2, best_threshold=0.15)
+            return _fit_result(initial_threshold=0.1, best_threshold=0.15)
 
     def fake_discovery(*args, **kwargs):
         discovery_calls.append(kwargs["ranks"])
@@ -263,11 +263,11 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
     assert len(result["discovery"]["restarts"]) == 50
     optimizer = result["optimizer"]
     assert optimizer["threshold_domain"]["maximum"] == pytest.approx(0.25)
-    assert optimizer["initial_core_threshold_fraction"] == pytest.approx(0.8)
-    assert optimizer["initial_values"]["core_threshold"] == pytest.approx(0.2)
+    assert optimizer["initial_core_threshold_fraction"] == pytest.approx(0.4)
+    assert optimizer["initial_values"]["core_threshold"] == pytest.approx(0.1)
     fit_result = optimizer["fit_result"]
     assert fit_result["history"][0]["lr"] == 0.15
-    assert fit_result["history"][0]["core_threshold_fraction"] == pytest.approx(0.8)
+    assert fit_result["history"][0]["core_threshold_fraction"] == pytest.approx(0.4)
     assert fit_result["best_core_threshold_fraction"] == pytest.approx(0.6)
     assert (tmp_path / "shards" / "k_49.json").is_file()
 

@@ -20,12 +20,12 @@ From the repository root:
 python scripts/run_hierarchy_rank_validation.py \
   --config configs/hierarchy_rank_validation_production.json \
   --k 8 \
-  --output-dir output/hierarchy_rank_validation/production_normalized_threshold
+  --output-dir output/hierarchy_rank_validation/production_normalized_threshold_040
 ```
 
 The production configuration uses connected KL-NMF seeds 0 through 49 for
 every rank and one ADAM initialization. The configured threshold fraction is
-`0.8`; each worker resolves the physical initial `core_threshold` as `0.8`
+`0.4`; each worker resolves the physical initial `core_threshold` as `0.4`
 times that rank's structural cap. A compatible existing shard is reused; pass
 `--force` to recompute and atomically replace it.
 
@@ -61,8 +61,8 @@ visible and the current winner is marked provisional:
 ```bash
 python scripts/aggregate_hierarchy_rank_validation.py \
   --config configs/hierarchy_rank_validation_production.json \
-  --shard-dir output/hierarchy_rank_validation/production_normalized_threshold \
-  --output-dir output/hierarchy_rank_validation/production_normalized_threshold/aggregate
+  --shard-dir output/hierarchy_rank_validation/production_normalized_threshold_040 \
+  --output-dir output/hierarchy_rank_validation/production_normalized_threshold_040/aggregate
 ```
 
 `aggregate.json` contains the complete compatible shards. `rank_summary.csv`
@@ -93,6 +93,8 @@ configuration, data, maze, or runtime mismatch.
 ## Threshold-normalized rerun
 
 This schema-v2 sweep is incompatible with the original physical-threshold
-shards. Keep the original `production` directory unchanged and write all new
-workers to `production_normalized_threshold`. Do not use `--force` to mix one
-schema or worker fingerprint into the other directory.
+shards. Keep the original `production` directory and the prior `0.8`-fraction
+`production_normalized_threshold` directory unchanged. The current `0.4`-
+fraction sweep writes to `production_normalized_threshold_040`. Do not use
+`--force` to mix configurations, schemas, or worker fingerprints between these
+directories.
