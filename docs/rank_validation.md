@@ -35,11 +35,18 @@ Resource and account choices stay at submission time:
 
 ```bash
 sbatch --partition=PARTITION --time=TIME --mem=MEMORY \
-  scripts/slurm/hierarchy_rank_validation.sbatch
+  slurm/hierarchy_rank_validation.sbatch
 ```
 
-The wrapper maps `SLURM_ARRAY_TASK_ID` directly to `k`. These optional
-environment variables customize paths without editing the script:
+The log-routing wrapper maps `SLURM_ARRAY_TASK_ID` directly to `k`, then
+delegates computation to the fingerprinted worker wrapper under `scripts/`.
+Each task writes its combined standard output and error to
+`slurm_out/rank_val/job_<array-job-id>/slurm-<array-job-id>_<k>.out`. The
+log-routing wrapper creates the job-specific directory safely when the array
+starts.
+
+These optional environment variables customize paths without editing the
+wrappers:
 
 - `HIERARCHY_PROJECT_ROOT`
 - `HIERARCHY_PYTHON`
