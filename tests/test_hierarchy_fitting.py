@@ -117,6 +117,7 @@ def test_fitting_improves_likelihood_restores_aligned_best_and_mutates_nothing()
     after = _registered_values(template)
     assert before.keys() == after.keys()
     assert all(torch.equal(before[name], after[name]) for name in before)
+    assert all(parameter.grad is None for parameter in template.parameters.parameters())
     assert template._task_cache == {}
     assert template._passive_dynamics is None
 

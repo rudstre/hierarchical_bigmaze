@@ -166,7 +166,10 @@ def fit_parameters(
     )
 
     # Prepare reusable trial structure before entering the optimizer loop.
-    initial_values = parameter_values(template)
+    initial_values = {
+        name: value.detach()
+        for name, value in parameter_values(template).items()
+    }
     threshold_max = None
     if "core_threshold" in required_parameters(template):
         goals = tuple(dict.fromkeys(trial.goal for trial in materialized_trials))
