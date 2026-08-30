@@ -64,14 +64,14 @@ def main() -> None:
         for name in diagnostics.stage_seconds
     }
     recursion_fractions = [
-        run.stage_seconds["sequential_trajectory_recursion"] / forward
+        run.stage_seconds["batched_trajectory_recursion"] / forward
         for run, forward in zip(diagnostics_by_run, forward_times, strict=True)
     ]
     print(f"median_forward_seconds={statistics.median(forward_times):.6f}")
     print(f"median_backward_seconds={statistics.median(backward_times):.6f}")
     print(f"median_stage_seconds={median_stages}")
     print(
-        "median_sequential_recursion_fraction="
+        "median_batched_recursion_fraction="
         f"{statistics.median(recursion_fractions):.6f}"
     )
     print(

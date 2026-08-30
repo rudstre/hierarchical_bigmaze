@@ -47,11 +47,18 @@ class _PreparedTrial:
 
 
 @dataclass(frozen=True)
+class _PreparedTrajectoryStep:
+    trial_indices: Tensor
+    operator_indices: Tensor
+
+
+@dataclass(frozen=True)
 class PreparedBatch:
     """Parameter-independent integer metadata reused across optimizer steps."""
 
     goals: tuple[_PreparedGoal, ...]
     trials: tuple[_PreparedTrial, ...]
+    trajectory_steps: tuple[_PreparedTrajectoryStep, ...]
     closure_shared_indices: Tensor
     closure_x_states: Tensor
     operator_closure_indices: Tensor
@@ -186,15 +193,40 @@ def prepare_batch(
         closure_offset += len(closures)
 
     prepared_trials = []
+    trial_operator_indices = []
     for goal, start, departures, impossible in records:
-        indices = (
+        indices = tuple(
             operator_lookup[(closure_lookup[(goal, start, current)], following)]
             for current, following in departures
         )
+        trial_operator_indices.append(indices)
         prepared_trials.append(_PreparedTrial(_long(indices, device), impossible))
+    trajectory_steps = []
+    maximum_steps = max((len(indices) for indices in trial_operator_indices), default=0)
+    for step_index in range(maximum_steps):
+        active_trials = tuple(
+            trial_index
+            for trial_index, (indices, trial) in enumerate(
+                zip(trial_operator_indices, prepared_trials, strict=True)
+            )
+            if not trial.impossible and step_index < len(indices)
+        )
+        trajectory_steps.append(
+            _PreparedTrajectoryStep(
+                trial_indices=_long(active_trials, device),
+                operator_indices=_long(
+                    (
+                        trial_operator_indices[trial_index][step_index]
+                        for trial_index in active_trials
+                    ),
+                    device,
+                ),
+            )
+        )
     return PreparedBatch(
         goals=tuple(goal_metadata),
         trials=tuple(prepared_trials),
+        trajectory_steps=tuple(trajectory_steps),
         closure_shared_indices=_long(global_shared_indices, device),
         closure_x_states=_long(global_x_states, device),
         operator_closure_indices=_long(operator_closure_indices, device),
@@ -217,6 +249,43 @@ def prepared_log_likelihoods(
     diagnostics: BatchTimings | None = None,
 ) -> Tensor:
     """Return ordered trial scores from one prepared differentiable graph."""
+
+    return _prepared_log_likelihoods(
+        template,
+        prepared,
+        parameter_values=parameter_values,
+        diagnostics=diagnostics,
+        use_reference_recursion=False,
+    )
+
+
+def _reference_prepared_log_likelihoods(
+    template: "Template",
+    prepared: PreparedBatch,
+    *,
+    parameter_values: "Mapping[str, Tensor]",
+    diagnostics: BatchTimings | None = None,
+) -> Tensor:
+    """Evaluate the unchanged trial-wise recurrence for parity checks."""
+
+    return _prepared_log_likelihoods(
+        template,
+        prepared,
+        parameter_values=parameter_values,
+        diagnostics=diagnostics,
+        use_reference_recursion=True,
+    )
+
+
+def _prepared_log_likelihoods(
+    template: "Template",
+    prepared: PreparedBatch,
+    *,
+    parameter_values: "Mapping[str, Tensor]",
+    diagnostics: BatchTimings | None,
+    use_reference_recursion: bool,
+) -> Tensor:
+    """Build shared operators and run the selected private recurrence."""
 
     values = _validated_parameter_values(template, parameter_values)
     device = next(iter(values.values())).device
@@ -325,9 +394,44 @@ def prepared_log_likelihoods(
     _require_finite(operators)
     _record(diagnostics, "operator_assembly_and_multiply", started)
 
-    started = perf_counter()
-    scores = []
     n_modes = n_subtasks + 2
+    started = perf_counter()
+    if use_reference_recursion:
+        scores = _reference_trajectory_recursion(
+            operators,
+            prepared,
+            zero=zero,
+            negative_infinity=negative_infinity,
+            n_modes=n_modes,
+            device=device,
+        )
+        timing_name = "reference_trajectory_recursion"
+    else:
+        scores = _batched_trajectory_recursion(
+            operators,
+            prepared,
+            zero=zero,
+            negative_infinity=negative_infinity,
+            n_modes=n_modes,
+            device=device,
+        )
+        timing_name = "batched_trajectory_recursion"
+    _record(diagnostics, timing_name, started)
+    return scores
+
+
+def _reference_trajectory_recursion(
+    operators: Tensor,
+    prepared: PreparedBatch,
+    *,
+    zero: Tensor,
+    negative_infinity: Tensor,
+    n_modes: int,
+    device: torch.device,
+) -> Tensor:
+    """Run the original trial-wise recurrence unchanged as a parity reference."""
+
+    scores = []
     initial_forward = torch.nn.functional.one_hot(
         torch.tensor(0, device=device),
         num_classes=n_modes,
@@ -353,8 +457,93 @@ def prepared_log_likelihoods(
             trial_total = trial_total + torch.log(probability)
             forward = next_forward / probability
         scores.append(trial_total)
-    _record(diagnostics, "sequential_trajectory_recursion", started)
     return torch.stack(scores) if scores else zero.reshape(1)[:0]
+
+
+def _batched_trajectory_recursion(
+    operators: Tensor,
+    prepared: PreparedBatch,
+    *,
+    zero: Tensor,
+    negative_infinity: Tensor,
+    n_modes: int,
+    device: torch.device,
+) -> Tensor:
+    """Run the exact recurrence over packed active trials at each depth."""
+
+    n_trials = len(prepared.trials)
+    if n_trials == 0:
+        return zero.reshape(1)[:0]
+    initial_forward = torch.nn.functional.one_hot(
+        torch.tensor(0, device=device),
+        num_classes=n_modes,
+    ).to(dtype=torch.float64)
+    forwards = initial_forward.expand(n_trials, -1)
+    totals = zero.expand(n_trials)
+    failed = torch.tensor(
+        tuple(trial.impossible for trial in prepared.trials),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    for step in prepared.trajectory_steps:
+        eligible = ~failed[step.trial_indices]
+        trial_indices = step.trial_indices[eligible]
+        if trial_indices.numel() == 0:
+            continue
+
+        # Filter failed trials before indexing their later operators. This is
+        # the packed equivalent of the reference loop's immediate break.
+        operator_indices = step.operator_indices[eligible]
+        active_forwards = forwards[trial_indices]
+        active_operators = operators[operator_indices]
+        next_forwards = torch.bmm(
+            active_operators,
+            active_forwards.unsqueeze(-1),
+        ).squeeze(-1)
+        _require_finite(next_forwards)
+        if bool(torch.any(next_forwards < -1e-12)):
+            raise NumericalError(
+                "First-departure operator produced negative probability mass"
+            )
+        next_forwards = torch.clamp_min(next_forwards, 0.0)
+        probabilities = next_forwards.sum(dim=-1)
+        valid = torch.isfinite(probabilities) & (probabilities > 0.0)
+
+        invalid_trials = trial_indices[~valid]
+        newly_failed = torch.zeros_like(failed).index_fill(
+            0,
+            invalid_trials,
+            True,
+        )
+        failed = failed | newly_failed
+
+        valid_trials = trial_indices[valid]
+        valid_probabilities = probabilities[valid]
+        valid_next_forwards = next_forwards[valid]
+        increments = torch.zeros_like(totals).index_copy(
+            0,
+            valid_trials,
+            torch.log(valid_probabilities),
+        )
+        totals = totals + increments
+        normalized_forwards = valid_next_forwards / valid_probabilities.unsqueeze(-1)
+        forwards = torch.index_copy(
+            forwards,
+            0,
+            valid_trials,
+            normalized_forwards,
+        )
+
+    # Match the reference assembly as well as its values: when every trial
+    # fails, the returned tensor has no spurious autograd edge through
+    # ``totals``. In mixed batches, stacking retains gradients for the
+    # successful trials exactly as the trial-wise reference does.
+    scores = [
+        negative_infinity if bool(failed[index]) else totals[index]
+        for index in range(n_trials)
+    ]
+    return torch.stack(scores)
 
 
 def total_prepared_log_likelihood(

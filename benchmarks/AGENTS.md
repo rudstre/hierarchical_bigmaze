@@ -53,6 +53,36 @@ passes without fitting. It depends on the configured external Doohan dataset.
 
 ## Correctness before timing
 
+The production rank-eight recursion and fitting benchmark is run with:
+
+```bash
+python benchmarks/benchmark_hierarchy_fit.py --repeats 5 --profile
+python benchmarks/benchmark_hierarchy_fit.py --fit-mode fixed \
+  --recursion reference --output /tmp/hierarchy_fixed_reference.json
+python benchmarks/benchmark_hierarchy_fit.py --fit-mode fixed \
+  --recursion batched --output /tmp/hierarchy_fixed_batched.json
+python benchmarks/benchmark_hierarchy_fit.py --compare-fit-results \
+  /tmp/hierarchy_fixed_reference.json /tmp/hierarchy_fixed_batched.json
+```
+
+Run convergence regression separately with `--fit-mode convergence` for each
+recursion. Its wall time is not a speed metric because stopping differences
+could change the amount of work. Use `--fit-mode cold` for cold pipeline
+latency including discovery; this bypasses the basis cache.
+
+This benchmark reads the production validation configuration, uses rank 8,
+the 326-trial training split, and all 50 required NMF restart seeds. Repeated
+runs may reuse the selected basis only when the stored specification,
+configuration, data and source compatibility, restart diagnostics, profile
+digest, and selected restart match. An incompatible cache is an error rather
+than a reason to reuse or silently recompute it.
+
+Eight Torch intra-op threads are the validated setting for the current
+benchmark host and workload. They are not a library default or a general
+recommendation for other machines. Value and all six fitted-parameter
+gradients must pass `rtol=1e-10, atol=1e-11` before timing. Do not relax those
+tolerances without investigating and explaining the discrepancy.
+
 Before comparing performance, verify that baseline and candidate perform the
 same scientific computation.
 
