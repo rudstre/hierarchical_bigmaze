@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+task_cpus="${SLURM_CPUS_PER_TASK:-1}"
+export OMP_NUM_THREADS="${task_cpus}"
+export MKL_NUM_THREADS="${task_cpus}"
+export OPENBLAS_NUM_THREADS="${task_cpus}"
+
 project_root="${HIERARCHY_PROJECT_ROOT:-${SLURM_SUBMIT_DIR}}"
 python_executable="${HIERARCHY_PYTHON:-/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python}"
 config_path="${HIERARCHY_SWEEP_CONFIG:-${project_root}/configs/hierarchy_rank_validation_production.json}"
