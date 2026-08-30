@@ -16,7 +16,7 @@ from andrew_mlmdp.fitting import (
     fit_adam,
     validate_adam_config,
 )
-from andrew_mlmdp.flat_autodiff import (
+from andrew_mlmdp.flat_likelihood import (
     parameter_values,
     prepare_batch,
     total_prepared_log_likelihood,

@@ -13,10 +13,19 @@ from andrew_mlmdp import (
     required_parameters,
     soft_parameters,
 )
-from andrew_mlmdp.hierarchy.model import (
-    _goal_only_plan,
-    _shape_weights,
+from andrew_mlmdp.hierarchy.equations import (
+    _shape_weights as _tensor_shape_weights,
 )
+from andrew_mlmdp.hierarchy.model import _goal_only_plan
+
+
+def _shape_weights(weights, *, exponent, mode):
+    tensor = torch.as_tensor(weights, dtype=torch.float64)
+    return _tensor_shape_weights(
+        tensor,
+        exponent=exponent,
+        mode=mode,
+    ).detach().numpy()
 
 
 def _parameter_values(parameters: Parameters) -> dict[str, float]:
@@ -463,7 +472,6 @@ def test_power_composition_preserves_zeros_subgoal_mass_and_goal_weight(exponent
     assert sharpened[-1] == weights[-1]
     assert np.array_equal(sharpened[[0, 3]], np.zeros(2))
     if exponent == 1.0:
-        assert sharpened is weights
         assert np.array_equal(sharpened, weights)
 
 

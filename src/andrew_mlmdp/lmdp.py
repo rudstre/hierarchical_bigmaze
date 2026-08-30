@@ -5,13 +5,13 @@ All transition matrices use the convention
 distributions over the next state.
 """
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from andrew_mlmdp.maze import COMMAND_DELTAS, Coordinate, Maze
 
@@ -76,9 +76,7 @@ class Parameters(nn.Module):
             or not np.isfinite(core_threshold)
             or not 0.0 <= core_threshold < 1.0
         ):
-            raise ValueError(
-                "Core threshold must be finite and in [0, 1), or None"
-            )
+            raise ValueError("Core threshold must be finite and in [0, 1), or None")
 
         self.interior_reward = _scalar_parameter(interior_reward)
         self.goal_reward = _scalar_parameter(goal_reward)
@@ -96,9 +94,7 @@ class Parameters(nn.Module):
         """Retain the former dataclass's concise value-oriented display."""
 
         threshold = (
-            "None"
-            if self.core_threshold is None
-            else f"{self.core_threshold.item():g}"
+            "None" if self.core_threshold is None else f"{self.core_threshold.item():g}"
         )
         return (
             f"interior_reward={self.interior_reward.item():g}, "
@@ -169,11 +165,7 @@ def soft_parameters(
     Any explicitly supplied parameter replaces its default value.
     """
 
-    if (
-        isinstance(k, (bool, np.bool_))
-        or not isinstance(k, (int, np.integer))
-        or k < 1
-    ):
+    if isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer)) or k < 1:
         raise ValueError("Soft hierarchy rank k must be a positive integer")
 
     reference = point_parameters()
@@ -196,11 +188,7 @@ def soft_parameters(
         "beta": beta,
     }
     derived.update(
-        {
-            name: value
-            for name, value in overrides.items()
-            if value is not None
-        }
+        {name: value for name, value in overrides.items() if value is not None}
     )
     return Parameters(**derived)
 
@@ -224,8 +212,7 @@ class Dynamics:
             raise ValueError("Interior passive dynamics must be square")
         if boundary.ndim != 2 or boundary.shape[1] != interior.shape[1]:
             raise ValueError(
-                "Boundary passive dynamics must have one column per "
-                "interior state"
+                "Boundary passive dynamics must have one column per interior state"
             )
         if np.any(interior < 0.0) or np.any(boundary < 0.0):
             raise ValueError("Passive dynamics cannot contain negative values")
@@ -279,46 +266,18 @@ class Solution:
         self,
         trajectory: list[Coordinate] | tuple[Coordinate, ...],
     ) -> float:
-        """Score state entries, conditional on leaving each distinct state.
+        """Score discrete movement through the single Torch likelihood."""
 
-        This likelihood describes discrete movement observations rather than
-        frame-by-frame tracking data. Runs of consecutive repeats are collapsed
-        to one state before scoring.
-        """
+        from andrew_mlmdp.flat_likelihood import log_likelihood
 
-        if not trajectory:
-            raise ValueError("Trajectory must contain at least one coordinate")
-
-        maze = self.environment.maze
-        states = [maze.state_index(coordinate) for coordinate in trajectory]
-        observations = list(zip(trajectory, states))
-        collapsed_observations = [observations[0]]
-        for observation in observations[1:]:
-            if observation[0] != collapsed_observations[-1][0]:
-                collapsed_observations.append(observation)
-
-        log_likelihood = 0.0
-        for current_observation, next_observation in zip(
-            collapsed_observations,
-            collapsed_observations[1:],
-        ):
-            current_coordinate, current_state = current_observation
-            _, next_state = next_observation
-            if current_coordinate == self.goal:
-                return -np.inf
-
-            leaving_probability = 1.0 - self.controlled[
-                current_state,
-                current_state,
-            ]
-            transition_probability = self.controlled[next_state, current_state]
-            if leaving_probability <= 0.0 or transition_probability <= 0.0:
-                return -np.inf
-            log_likelihood += np.log(
-                transition_probability / leaving_probability
+        with torch.no_grad():
+            score = log_likelihood(
+                self.environment,
+                self.goal,
+                trajectory,
+                parameters=self.parameters,
             )
-
-        return float(log_likelihood)
+        return float(score.detach().cpu())
 
     def rollout(
         self,
@@ -380,9 +339,7 @@ class Solution:
         reachable_states = [start_state]
         reached = {start_state}
         for current_state in reachable_states:
-            for next_state in np.flatnonzero(
-                departure[:, current_state] > 0.0
-            ):
+            for next_state in np.flatnonzero(departure[:, current_state] > 0.0):
                 next_index = int(next_state)
                 if next_index != goal_state and next_index not in reached:
                     reached.add(next_index)
@@ -441,12 +398,8 @@ class Solution:
             if degree > 1:
                 normalized = entropy / float(np.log(degree))
                 if normalized < -1e-10 or normalized > 1.0 + 1e-10:
-                    raise RuntimeError(
-                        "Normalized physical entropy is outside [0, 1]"
-                    )
-                normalized_entropy[entropy_index] = float(
-                    np.clip(normalized, 0.0, 1.0)
-                )
+                    raise RuntimeError("Normalized physical entropy is outside [0, 1]")
+                normalized_entropy[entropy_index] = float(np.clip(normalized, 0.0, 1.0))
 
         expected_decisions = float(occupancy.sum())
         if not np.isfinite(expected_decisions) or expected_decisions <= 0.0:
@@ -483,9 +436,7 @@ class Solution:
         reachable_states = [start_state]
         reached = {start_state}
         for current_state in reachable_states:
-            for next_state in np.flatnonzero(
-                self.controlled[:, current_state] > 0.0
-            ):
+            for next_state in np.flatnonzero(self.controlled[:, current_state] > 0.0):
                 next_index = int(next_state)
                 if next_index != goal_state and next_index not in reached:
                     reached.add(next_index)
@@ -574,25 +525,30 @@ class Environment:
 
         if parameters is None:
             parameters = Parameters()
-        desirability = _solve_desirability_from_passive(
-            self.maze,
-            self.passive,
-            goal,
-            parameters,
-        )
-        unnormalized = self.passive * desirability[:, np.newaxis]
-        normalizers = unnormalized.sum(axis=0)
-        controlled = self.passive.copy()
-        usable = np.isfinite(normalizers) & (normalizers > 0.0)
-        controlled[:, usable] = (
-            unnormalized[:, usable] / normalizers[usable]
-        )
+        goal_state = self.maze.state_index(goal)
+        values = {
+            name: getattr(parameters, name)
+            for name in (
+                "interior_reward",
+                "goal_reward",
+                "lower_control_cost",
+            )
+        }
+        with torch.no_grad():
+            desirability, controlled = _flat_goal_policy(
+                torch.tensor(
+                    self.passive,
+                    device=parameters.lower_control_cost.device,
+                ),
+                goal_state,
+                values,
+            )
         return Solution(
             environment=self,
             goal=goal,
             parameters=parameters,
-            desirability=desirability,
-            controlled=controlled,
+            desirability=_numpy(desirability),
+            controlled=_numpy(controlled),
         )
 
     def fit(
@@ -669,6 +625,121 @@ class Environment:
         )
 
 
+def _numpy(value: Tensor) -> np.ndarray:
+    """Detach one public research result as a CPU NumPy array."""
+
+    return value.detach().cpu().numpy()
+
+
+def _solve_first_exit_tensor(
+    interior_passive: Tensor,
+    boundary_passive: Tensor,
+    boundary_desirability: Tensor,
+    q_interior: Tensor,
+) -> Tensor:
+    """Solve Equation 4 for one or more boundary tasks."""
+
+    n_states = interior_passive.shape[0]
+    if q_interior.ndim == 0:
+        q_interior = q_interior.expand(n_states)
+    coefficient = torch.eye(
+        n_states,
+        dtype=interior_passive.dtype,
+        device=interior_passive.device,
+    )
+    coefficient = coefficient - q_interior.unsqueeze(1) * interior_passive.T
+    right_hand_side = q_interior.unsqueeze(1) * (
+        boundary_passive.T @ boundary_desirability
+    )
+    result = torch.linalg.solve(coefficient, right_hand_side)
+    return result.squeeze(1) if boundary_desirability.shape[1] == 1 else result
+
+
+def _desirability_step_tensor(
+    interior_passive: Tensor,
+    boundary_passive: Tensor,
+    interior_desirability: Tensor,
+    boundary_desirability: Tensor,
+    q_interior: Tensor,
+) -> Tensor:
+    """Apply one Equation 5 fixed-point update."""
+
+    if q_interior.ndim == 0:
+        q_interior = q_interior.expand(interior_passive.shape[0])
+    return q_interior * (
+        interior_passive.T @ interior_desirability
+        + boundary_passive.T @ boundary_desirability
+    )
+
+
+def _controlled_dynamics_tensor(
+    passive: Tensor,
+    desirability: Tensor,
+    *,
+    zero_columns: Literal["error", "passive", "zero"] = "error",
+) -> Tensor:
+    """Apply Equation 6 with an explicit policy for undefined columns."""
+
+    unnormalized = passive * desirability.unsqueeze(-1)
+    normalizers = unnormalized.sum(dim=-2)
+    usable = torch.isfinite(normalizers) & (normalizers > 0.0)
+    if zero_columns == "error" and not bool(torch.all(usable)):
+        raise ValueError("Controlled dynamics contain a zero-mass column")
+    safe = torch.where(usable, normalizers, torch.ones_like(normalizers))
+    normalized = unnormalized / safe.unsqueeze(-2)
+    if zero_columns == "error":
+        return normalized
+    fallback = passive if zero_columns == "passive" else torch.zeros_like(passive)
+    return torch.where(usable.unsqueeze(-2), normalized, fallback)
+
+
+def _flat_goal_policy(
+    passive: Tensor,
+    goal_state: int,
+    values: Mapping[str, Tensor],
+) -> tuple[Tensor, Tensor]:
+    """Return the flat goal desirability and controlled physical policy."""
+
+    n_states = passive.shape[0]
+    interior = torch.tensor(
+        [state for state in range(n_states) if state != goal_state],
+        dtype=torch.long,
+        device=passive.device,
+    )
+    cost = values["lower_control_cost"]
+    q_interior = torch.exp(values["interior_reward"] / cost)
+    goal_desirability = torch.exp(values["goal_reward"] / cost)
+    interior_passive = passive[interior[:, None], interior[None, :]]
+    boundary_passive = passive[goal_state, interior].unsqueeze(0)
+    solved = _solve_first_exit_tensor(
+        interior_passive,
+        boundary_passive,
+        goal_desirability.reshape(1, 1),
+        q_interior,
+    )
+    desirability = torch.zeros(
+        n_states,
+        dtype=passive.dtype,
+        device=passive.device,
+    )
+    desirability = desirability.index_copy(0, interior, solved)
+    goal_index = torch.tensor(
+        [goal_state],
+        dtype=torch.long,
+        device=passive.device,
+    )
+    desirability = desirability.index_copy(
+        0,
+        goal_index,
+        goal_desirability.reshape(1),
+    )
+    return desirability, _controlled_dynamics_tensor(
+        passive,
+        desirability,
+        zero_columns="passive",
+    )
+
+
 def solve_first_exit(
     dynamics: Dynamics,
     boundary_desirability: np.ndarray,
@@ -701,15 +772,14 @@ def solve_first_exit(
     if np.any(q_interior < 0.0) or not np.all(np.isfinite(q_interior)):
         raise ValueError("Exponentiated rewards must be finite and non-negative")
 
-    # (I - diag(q_i) P_II^T) z_i = diag(q_i) P_BI^T z_b.
-    coefficient_matrix = np.eye(n_states)
-    coefficient_matrix -= q_interior[:, np.newaxis] * (
-        dynamics.interior_passive.T
-    )
-    right_hand_side = q_interior * (
-        dynamics.boundary_passive.T @ boundary
-    )
-    return np.linalg.solve(coefficient_matrix, right_hand_side)
+    with torch.no_grad():
+        result = _solve_first_exit_tensor(
+            torch.tensor(dynamics.interior_passive),
+            torch.tensor(dynamics.boundary_passive),
+            torch.tensor(boundary).reshape(-1, 1),
+            torch.tensor(q_interior),
+        )
+    return _numpy(result)
 
 
 def desirability_step(
@@ -761,10 +831,15 @@ def desirability_step(
     if np.any(q_interior < 0.0) or not np.all(np.isfinite(q_interior)):
         raise ValueError("Exponentiated rewards must be finite and non-negative")
 
-    return q_interior * (
-        dynamics.interior_passive.T @ interior
-        + dynamics.boundary_passive.T @ boundary
-    )
+    with torch.no_grad():
+        result = _desirability_step_tensor(
+            torch.tensor(dynamics.interior_passive),
+            torch.tensor(dynamics.boundary_passive),
+            torch.tensor(interior),
+            torch.tensor(boundary),
+            torch.tensor(q_interior),
+        )
+    return _numpy(result)
 
 
 def controlled_dynamics(
@@ -789,11 +864,12 @@ def controlled_dynamics(
     if np.any(passive_values < 0.0):
         raise ValueError("Passive dynamics cannot contain negative values")
 
-    unnormalized = passive_values * desirability_values[:, np.newaxis]
-    column_normalizers = unnormalized.sum(axis=0)
-    if np.any(column_normalizers == 0.0):
-        raise ValueError("Controlled dynamics contain a zero-mass column")
-    return unnormalized / column_normalizers[np.newaxis, :]
+    with torch.no_grad():
+        result = _controlled_dynamics_tensor(
+            torch.tensor(passive_values),
+            torch.tensor(desirability_values),
+        )
+    return _numpy(result)
 
 
 def passive_dynamics(
@@ -846,55 +922,6 @@ def passive_dynamics(
     return passive_dynamics
 
 
-def _solve_desirability_from_passive(
-    maze: Maze,
-    passive: np.ndarray,
-    goal: Coordinate,
-    parameters: Parameters,
-) -> np.ndarray:
-    """Solve a goal task from a validated, reusable physical matrix."""
-
-    goal_state = maze.state_index(goal)
-    passive_values = np.asarray(passive, dtype=np.float64)
-    expected_shape = (len(maze.free_cells), len(maze.free_cells))
-    if passive_values.shape != expected_shape:
-        raise ValueError(
-            f"Passive dynamics must have shape {expected_shape}, "
-            f"got {passive_values.shape}"
-        )
-    interior_states = np.asarray(
-        [state for state in range(len(maze.free_cells)) if state != goal_state],
-        dtype=int,
-    )
-
-    desirability = np.empty(len(maze.free_cells), dtype=np.float64)
-    goal_desirability = np.exp(
-        parameters.goal_reward.item() / parameters.lower_control_cost.item()
-    )
-    desirability[goal_state] = goal_desirability
-    if len(interior_states) == 0:
-        return desirability
-
-    dynamics = Dynamics(
-        interior_passive=passive_values[
-            np.ix_(interior_states, interior_states)
-        ],
-        boundary_passive=passive_values[
-            goal_state, interior_states
-        ][np.newaxis, :],
-    )
-    q_interior = np.exp(
-        parameters.interior_reward.item()
-        / parameters.lower_control_cost.item()
-    )
-    desirability[interior_states] = solve_first_exit(
-        dynamics,
-        np.asarray([goal_desirability]),
-        q_interior,
-    )
-    return desirability
-
-
 def sample_rollout(
     maze: Maze,
     controlled: np.ndarray,
@@ -915,8 +942,7 @@ def sample_rollout(
     expected_shape = (n_states, n_states)
     if values.shape != expected_shape:
         raise ValueError(
-            f"Controlled dynamics must have shape {expected_shape}, "
-            f"got {values.shape}"
+            f"Controlled dynamics must have shape {expected_shape}, got {values.shape}"
         )
     if max_steps < 0:
         raise ValueError("Maximum steps must be non-negative")

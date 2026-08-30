@@ -11,10 +11,19 @@ def _reference():
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_canonical_matrices_and_initial_plan(four_room_template):
+def test_canonical_matrices_and_initial_plan(
+    four_room_environment,
+    four_room_template,
+    regression_parameters,
+):
     reference = _reference()
     task = four_room_template.task(FOUR_ROOM_GOAL)
-    plan = task.plan((1, 0))
+    initial = (1, 0)
+    plan = task.plan(initial)
+    flat = four_room_environment.solve(
+        FOUR_ROOM_GOAL,
+        parameters=regression_parameters,
+    )
 
     assert four_room_template.upper_passive == pytest.approx(
         np.asarray(reference["subgoal_passive"]),
@@ -36,6 +45,29 @@ def test_canonical_matrices_and_initial_plan(four_room_template):
         reference["initial_inpainted_rewards"],
         abs=1e-11,
     )
+    assert task.first_hit[:, task.interior_index[initial]] == pytest.approx(
+        reference["initial_first_hit"],
+        abs=1e-11,
+    )
+    assert plan.desirability == pytest.approx(
+        reference["initial_plan_desirability"],
+        abs=1e-11,
+    )
+    assert flat.desirability == pytest.approx(
+        reference["flat_desirability"],
+        abs=1e-11,
+    )
+
+    flat_trajectory = tuple(map(tuple, reference["flat_trajectory"]))
+    hierarchical_trajectory = tuple(map(tuple, reference["hierarchical_trajectory"]))
+    assert flat.log_likelihood(flat_trajectory) == pytest.approx(
+        reference["flat_log_likelihood"],
+        abs=1e-11,
+    )
+    assert task.log_likelihood(hierarchical_trajectory) == pytest.approx(
+        reference["hierarchical_log_likelihood"],
+        abs=1e-11,
+    )
 
 
 def test_canonical_seeded_rollouts(
@@ -54,12 +86,10 @@ def test_canonical_seeded_rollouts(
     assert hierarchical.status == reference["hierarchical_status"]
     assert hierarchical.physical_steps == reference["hierarchical_steps"]
     assert hierarchical.trajectory == tuple(
-        tuple(coordinate)
-        for coordinate in reference["hierarchical_trajectory"]
+        tuple(coordinate) for coordinate in reference["hierarchical_trajectory"]
     )
     assert [access.coordinate for access in hierarchical.accesses] == [
-        tuple(coordinate)
-        for coordinate in reference["hierarchical_subgoal_accesses"]
+        tuple(coordinate) for coordinate in reference["hierarchical_subgoal_accesses"]
     ]
     assert [
         {
@@ -70,9 +100,7 @@ def test_canonical_seeded_rollouts(
         }
         for access in hierarchical.accesses
     ] == reference["hierarchical_upper_transitions"]
-    assert flat == [
-        tuple(coordinate) for coordinate in reference["flat_trajectory"]
-    ]
+    assert flat == [tuple(coordinate) for coordinate in reference["flat_trajectory"]]
 
 
 def test_canonical_arrays_are_finite_and_stochastic(four_room_template):

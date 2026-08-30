@@ -87,21 +87,29 @@ def score_flat_dataset(
     *,
     parameters: "Parameters | None" = None,
 ) -> DatasetScore:
-    """Score independent trials under flat policies cached by trial goal."""
+    """Score independent trials together through the prepared flat engine."""
 
-    solutions = {}
+    from andrew_mlmdp.flat_likelihood import trial_log_likelihoods
+    from andrew_mlmdp.lmdp import Parameters
 
-    def score(trial: Trial) -> float:
-        solution = solutions.get(trial.goal)
-        if solution is None:
-            solution = environment.solve(
-                trial.goal,
-                parameters=parameters,
-            )
-            solutions[trial.goal] = solution
-        return solution.log_likelihood(trial.trajectory)
-
-    return _score_movement_dataset("flat", trials, score)
+    materialized = tuple(trials)
+    valid, exclusions = _validated_trials(
+        materialized,
+        validate=lambda trial: _validate_trial(environment.maze, trial),
+    )
+    if parameters is None:
+        parameters = Parameters()
+    scores = trial_log_likelihoods(
+        environment,
+        valid,
+        parameters=parameters,
+    )
+    return _dataset_score(
+        "flat",
+        valid,
+        scores.detach().cpu().tolist(),
+        exclusions,
+    )
 
 
 def score_hierarchy_dataset(
@@ -110,30 +118,53 @@ def score_hierarchy_dataset(
     *,
     beta: float | None = None,
 ) -> DatasetScore:
-    """Score independent trials with hierarchy tasks cached by trial goal."""
+    """Score independent trials together through the prepared hierarchy."""
 
-    tasks = {}
+    from andrew_mlmdp.hierarchy.likelihood import trial_log_likelihoods
 
-    def score(trial: Trial) -> float:
-        task = tasks.get(trial.goal)
-        if task is None:
-            task = template.task(trial.goal)
-            tasks[trial.goal] = task
-        return task.log_likelihood(trial.trajectory, beta=beta)
+    materialized = tuple(trials)
 
-    return _score_movement_dataset("hierarchical", trials, score)
+    def validate(trial: Trial) -> None:
+        _validate_trial(template.maze, trial)
+        if (
+            template.basis.locations is not None
+            and trial.goal in template.basis.locations
+        ):
+            raise ValueError("The goal and point subgoals must be disjoint")
+        if template.basis.core_threshold is not None:
+            template.validate_threshold(
+                template.basis.core_threshold,
+                (trial.goal,),
+            )
+
+    valid, exclusions = _validated_trials(materialized, validate=validate)
+    overrides = None
+    if beta is not None:
+        overrides = {"beta": template.parameters.beta.new_tensor(beta)}
+    values = template.parameter_values(overrides=overrides)
+    scores = trial_log_likelihoods(
+        template,
+        valid,
+        parameter_values=values,
+    )
+    return _dataset_score(
+        "hierarchical",
+        valid,
+        scores.detach().cpu().tolist(),
+        exclusions,
+    )
 
 
-def _score_movement_dataset(
-    model: Literal["flat", "hierarchical"],
-    trials: Iterable[Trial],
-    score: Callable[[Trial], float],
-) -> DatasetScore:
-    likelihoods = []
+def _validated_trials(
+    trials: tuple[Trial, ...],
+    *,
+    validate: Callable[[Trial], None],
+) -> tuple[tuple[Trial, ...], tuple[ExcludedTrial, ...]]:
+    valid = []
     exclusions = []
     for trial in trials:
         try:
-            log_likelihood = score(trial)
+            validate(trial)
         except ValueError as error:
             exclusions.append(
                 ExcludedTrial(
@@ -143,25 +174,41 @@ def _score_movement_dataset(
                     reason=str(error),
                 )
             )
-            continue
+        else:
+            valid.append(trial)
+    return tuple(valid), tuple(exclusions)
 
-        likelihoods.append(
-            TrialScore(
-                session_id=trial.session_id,
-                trial_id=trial.trial_id,
-                goal=trial.goal,
-                n_transitions=_movement_count(
-                    trial.trajectory
-                ),
-                log_likelihood=float(log_likelihood),
-            )
+
+def _validate_trial(maze, trial: Trial) -> None:
+    if not trial.trajectory:
+        raise ValueError("Trajectory must contain at least one coordinate")
+    maze.state_index(trial.goal)
+    for coordinate in trial.trajectory:
+        maze.state_index(coordinate)
+
+
+def _dataset_score(
+    model: Literal["flat", "hierarchical"],
+    trials: tuple[Trial, ...],
+    values: list[float],
+    exclusions: tuple[ExcludedTrial, ...],
+) -> DatasetScore:
+    likelihoods = tuple(
+        TrialScore(
+            session_id=trial.session_id,
+            trial_id=trial.trial_id,
+            goal=trial.goal,
+            n_transitions=_movement_count(trial.trajectory),
+            log_likelihood=float(value),
         )
-
+        for trial, value in zip(trials, values, strict=True)
+    )
     return DatasetScore(
         model=model,
-        trial_likelihoods=tuple(likelihoods),
-        exclusions=tuple(exclusions),
+        trial_likelihoods=likelihoods,
+        exclusions=exclusions,
     )
+
 
 
 def _movement_count(

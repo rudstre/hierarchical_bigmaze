@@ -19,13 +19,13 @@ from andrew_mlmdp.fitting import (
 from andrew_mlmdp.fitting import (
     ParameterValues as ParameterValues,
 )
-from andrew_mlmdp.hierarchy.autodiff import (
+from andrew_mlmdp.hierarchy.equations import (
     NumericalError,
     fittable_parameters,
     parameter_values,
     required_parameters,
 )
-from andrew_mlmdp.hierarchy.batch import (
+from andrew_mlmdp.hierarchy.likelihood import (
     prepare_batch,
     total_prepared_log_likelihood,
 )

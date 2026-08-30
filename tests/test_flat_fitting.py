@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from andrew_mlmdp import Environment, Maze, Parameters, Trial
-from andrew_mlmdp.flat_autodiff import (
+from andrew_mlmdp.flat_likelihood import (
     parameter_values,
     prepare_batch,
     total_prepared_log_likelihood,

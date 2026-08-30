@@ -30,7 +30,7 @@ def _hierarchy_template():
     return environment.hierarchy(basis, parameters=parameters)
 
 
-def test_flat_dataset_matches_trial_sum_and_caches_unique_goals(monkeypatch):
+def test_flat_dataset_matches_trial_sum_without_public_solves(monkeypatch):
     environment = Environment(Maze.from_ascii("...."))
     trials = (
         Trial(
@@ -77,10 +77,10 @@ def test_flat_dataset_matches_trial_sum_and_caches_unique_goals(monkeypatch):
     assert result.n_scored == 3
     assert result.n_excluded == 0
     assert [trial.trial_id for trial in result.trial_likelihoods] == [1, 2, 3]
-    assert solved_goals == [(0, 3), (0, 0)]
+    assert solved_goals == []
 
 
-def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks(
+def test_hierarchical_dataset_matches_fresh_scores_without_public_tasks(
     monkeypatch,
 ):
     template = _hierarchy_template()
@@ -125,8 +125,8 @@ def test_hierarchical_dataset_matches_fresh_trial_scores_and_reuses_tasks(
     assert result.total_log_likelihood == pytest.approx(sum(expected_scores))
     assert result.total_transitions == 9
     assert result.n_excluded == 0
-    assert requested_goals == [(0, 4), (0, 0)]
-    assert set(template._task_cache) == {(0, 0), (0, 4)}
+    assert requested_goals == []
+    assert template._task_cache == {}
     assert result.trial_likelihoods[0].log_likelihood == pytest.approx(
         result.trial_likelihoods[2].log_likelihood
     )

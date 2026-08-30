@@ -12,7 +12,7 @@ from andrew_mlmdp import (
     parameter_values,
     total_log_likelihood,
 )
-from andrew_mlmdp.hierarchy.autodiff import (
+from andrew_mlmdp.hierarchy.equations import (
     PINV_RCOND,
     _build_hierarchy,
     _first_departure_forward,
@@ -21,10 +21,6 @@ from andrew_mlmdp.hierarchy.autodiff import (
     _plan,
     _shape_weights,
 )
-from andrew_mlmdp.hierarchy.likelihood import (
-    _step_kernel as _numpy_step_kernel,
-)
-from andrew_mlmdp.hierarchy.model import _goal_only_plan as _numpy_goal_only_plan
 
 
 def _parameters(**overrides):
@@ -60,7 +56,7 @@ def _gated_template(profile_normalization="peak"):
         profile_normalization=profile_normalization,
     )
     # These inactive gate fields deliberately disagree with the basis.  The
-    # differentiable path must follow the basis to match the NumPy oracle.
+    # differentiable path must follow the basis definition exactly.
     parameters = _parameters(core_threshold=0.75, core_exponent=2.0)
     return Environment(maze).hierarchy(basis, parameters=parameters)
 
@@ -70,18 +66,6 @@ def _tensor_values(template, *, requires_grad=False):
         name: value.detach().clone().requires_grad_(requires_grad)
         for name, value in parameter_values(template).items()
     }
-
-
-def _numpy_plans(task, start):
-    return (
-        task.plan(start),
-        *(task.plan(start, upper_state=j) for j in range(task.n_subtasks)),
-        _numpy_goal_only_plan(
-            task,
-            start,
-            goal_desirability=None,
-        ),
-    )
 
 
 def _torch_plans(model, start):
@@ -168,7 +152,7 @@ def test_finite_composition_full_likelihood_has_finite_behavioral_gradients(
     "kind",
     ["point", "ungated", "gated_peak", "gated_l2"],
 )
-def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
+def test_public_arrays_and_likelihood_match_tensor_equations(kind):
     if kind.startswith("gated"):
         template = _gated_template(
             profile_normalization="l2" if kind == "gated_l2" else "peak"
@@ -198,7 +182,7 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
     values = parameter_values(template)
     torch_model = _build_hierarchy(template, goal, values)
     torch_plan = _plan(torch_model, trajectory[0])
-    numpy_plan = task.plan(trajectory[0])
+    public_plan = task.plan(trajectory[0])
 
     assert torch_model.access_profiles.detach().numpy() == pytest.approx(
         task.subtask_profiles
@@ -231,25 +215,13 @@ def test_torch_and_numpy_hierarchies_and_likelihoods_agree(kind):
         pytest.approx(task.task_basis.interior_desirability, abs=1e-11)
     )
     assert torch_plan.weights.detach().numpy() == pytest.approx(
-        numpy_plan.weights,
+        public_plan.weights,
         abs=1e-11,
     )
     assert torch_plan.lower_policy.detach().numpy() == pytest.approx(
-        numpy_plan.lower_policy,
+        public_plan.lower_policy,
         abs=1e-11,
     )
-
-    torch_kernel = _physical_step_kernel(
-        torch_model,
-        trajectory[0],
-        _torch_plans(torch_model, trajectory[0]),
-    )
-    numpy_kernel = _numpy_step_kernel(
-        task,
-        trajectory[0],
-        _numpy_plans(task, trajectory[0]),
-    )
-    assert torch_kernel.detach().numpy() == pytest.approx(numpy_kernel, abs=1e-11)
 
     torch_ll = log_likelihood(
         template,
@@ -508,7 +480,7 @@ def test_parameter_mapping_is_strict_and_basis_owns_gate_defaults():
 
 
 def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypatch):
-    from andrew_mlmdp.hierarchy import batch as batch_module
+    from andrew_mlmdp.hierarchy import likelihood as batch_module
 
     template = _gated_template()
     trials = (
@@ -547,15 +519,17 @@ def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypa
     cached.backward()
     assert calls == {"pinv": 1, "closure": 1}
 
+    monkeypatch.setattr(torch.linalg, "pinv", original_pinv)
+    monkeypatch.setattr(
+        batch_module,
+        "_batched_departure_closures",
+        original_closure,
+    )
     reference_values = _tensor_values(template, requires_grad=True)
-    reference = sum(
-        log_likelihood(
-            template,
-            trial.goal,
-            trial.trajectory,
-            parameter_values=reference_values,
-        )
-        for trial in trials
+    reference = total_log_likelihood(
+        template,
+        trials,
+        parameter_values=reference_values,
     )
     reference.backward()
     assert cached.detach() == pytest.approx(reference.detach(), abs=1e-11)
@@ -566,7 +540,7 @@ def test_prepared_batch_reuses_structure_and_matches_uncached_gradients(monkeypa
 
 
 def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
-    from andrew_mlmdp.hierarchy import batch as batch_module
+    from andrew_mlmdp.hierarchy import likelihood as batch_module
 
     template = _gated_template()
     trials = (
@@ -595,7 +569,7 @@ def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
 
 
 def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts():
-    from andrew_mlmdp.hierarchy import batch as batch_module
+    from andrew_mlmdp.hierarchy import likelihood as batch_module
 
     template = _gated_template()
     goal = (0, 5)

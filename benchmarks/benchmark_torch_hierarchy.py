@@ -24,7 +24,7 @@ from andrew_mlmdp import (  # noqa: E402
     parameter_values,
     soft_parameters,
 )
-from andrew_mlmdp.hierarchy.batch import (  # noqa: E402
+from andrew_mlmdp.hierarchy.likelihood import (  # noqa: E402
     BatchTimings,
     prepare_batch,
     total_prepared_log_likelihood,

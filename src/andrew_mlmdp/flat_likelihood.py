@@ -1,4 +1,4 @@
-"""Differentiable exact likelihoods for flat first-exit LMDPs."""
+"""Exact prepared movement likelihoods for flat first-exit LMDPs."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from andrew_mlmdp.dataset import Trial
+from andrew_mlmdp.lmdp import _flat_goal_policy
 
 if TYPE_CHECKING:
     from andrew_mlmdp.lmdp import Environment, Parameters
@@ -23,20 +24,19 @@ _PARAMETER_NAMES = (
 
 
 @dataclass(frozen=True)
-class _PreparedGoal:
+class _PreparedTrial:
     goal_state: int
-    interior_states: Tensor
     current_states: Tensor
     next_states: Tensor
+    impossible: bool
 
 
 @dataclass(frozen=True)
 class PreparedFlatBatch:
-    """Parameter-independent flat dynamics and movement indices."""
+    """Parameter-independent dynamics and ordered movement trials."""
 
     passive: Tensor
-    goals: tuple[_PreparedGoal, ...]
-    has_impossible_trial: bool
+    trials: tuple[_PreparedTrial, ...]
 
 
 def parameter_values(
@@ -67,11 +67,10 @@ def prepare_batch(
     *,
     device: torch.device,
 ) -> PreparedFlatBatch:
-    """Collapse repeats and group reusable movement indices by goal."""
+    """Collapse repeats and retain each trial's movement observations."""
 
-    grouped: dict[int, list[tuple[int, int]]] = {}
-    impossible = False
     maze = environment.maze
+    prepared = []
     for trial in trials:
         if not trial.trajectory:
             raise ValueError("Trajectory must contain at least one coordinate")
@@ -81,26 +80,16 @@ def prepare_batch(
             if state != collapsed[-1]:
                 collapsed.append(state)
         goal_state = maze.state_index(trial.goal)
-        if len(collapsed) > 1 and goal_state in collapsed[:-1]:
-            impossible = True
-            continue
-        departures = tuple(zip(collapsed, collapsed[1:]))
-        if departures:
-            grouped.setdefault(goal_state, []).extend(departures)
-
-    n_states = len(maze.free_cells)
-    goals = []
-    for goal_state, departures in grouped.items():
-        interior_states = tuple(
-            state for state in range(n_states) if state != goal_state
-        )
-        current, following = zip(*departures)
-        goals.append(
-            _PreparedGoal(
+        impossible = len(collapsed) > 1 and goal_state in collapsed[:-1]
+        departures = () if impossible else tuple(zip(collapsed, collapsed[1:]))
+        current = (departure[0] for departure in departures)
+        following = (departure[1] for departure in departures)
+        prepared.append(
+            _PreparedTrial(
                 goal_state=goal_state,
-                interior_states=_long(interior_states, device),
                 current_states=_long(current, device),
                 next_states=_long(following, device),
+                impossible=impossible,
             )
         )
     return PreparedFlatBatch(
@@ -109,17 +98,16 @@ def prepare_batch(
             dtype=torch.float64,
             device=device,
         ),
-        goals=tuple(goals),
-        has_impossible_trial=impossible,
+        trials=tuple(prepared),
     )
 
 
-def total_prepared_log_likelihood(
+def prepared_log_likelihoods(
     prepared: PreparedFlatBatch,
     *,
     parameter_values: Mapping[str, Tensor],
 ) -> Tensor:
-    """Evaluate an exact prepared flat movement log likelihood."""
+    """Return ordered trial scores while solving each distinct goal once."""
 
     values = _validated_parameter_values(parameter_values)
     device = values["lower_control_cost"].device
@@ -132,54 +120,82 @@ def total_prepared_log_likelihood(
     negative_infinity = torch.full(
         (), -torch.inf, dtype=torch.float64, device=device
     )
-    if prepared.has_impossible_trial:
-        return negative_infinity
-
-    total = zero
-    for goal in prepared.goals:
-        controlled = _controlled_for_goal(prepared.passive, goal, values)
-        transitions = controlled[goal.next_states, goal.current_states]
+    policies: dict[int, Tensor] = {}
+    scores = []
+    for trial in prepared.trials:
+        if trial.impossible:
+            scores.append(negative_infinity)
+            continue
+        if trial.current_states.numel() == 0:
+            scores.append(zero)
+            continue
+        controlled = policies.get(trial.goal_state)
+        if controlled is None:
+            _, controlled = _flat_goal_policy(
+                prepared.passive,
+                trial.goal_state,
+                values,
+            )
+            policies[trial.goal_state] = controlled
+        transitions = controlled[trial.next_states, trial.current_states]
         leaving = 1.0 - controlled[
-            goal.current_states, goal.current_states
+            trial.current_states,
+            trial.current_states,
         ]
         if not bool(torch.all((transitions > 0.0) & (leaving > 0.0))):
-            return negative_infinity
-        total = total + torch.sum(torch.log(transitions) - torch.log(leaving))
-    return total
+            scores.append(negative_infinity)
+            continue
+        scores.append(
+            torch.sum(torch.log(transitions) - torch.log(leaving))
+        )
+    return torch.stack(scores) if scores else zero.reshape(1)[:0]
 
 
-def _controlled_for_goal(
-    passive: Tensor,
-    goal: _PreparedGoal,
-    values: Mapping[str, Tensor],
+def total_prepared_log_likelihood(
+    prepared: PreparedFlatBatch,
+    *,
+    parameter_values: Mapping[str, Tensor],
 ) -> Tensor:
-    cost = values["lower_control_cost"]
-    q_interior = torch.exp(values["interior_reward"] / cost)
-    goal_desirability = torch.exp(values["goal_reward"] / cost)
-    interior = goal.interior_states
-    interior_passive = passive[interior[:, None], interior[None, :]]
-    boundary_passive = passive[goal.goal_state, interior]
-    coefficient = torch.eye(
-        len(interior), dtype=torch.float64, device=passive.device
-    ) - q_interior * interior_passive.T
-    right_hand_side = q_interior * boundary_passive * goal_desirability
-    interior_desirability = torch.linalg.solve(coefficient, right_hand_side)
-    desirability = torch.zeros_like(passive[:, 0]).index_copy(
-        0, interior, interior_desirability
-    )
-    goal_index = torch.tensor(
-        [goal.goal_state], dtype=torch.long, device=passive.device
-    )
-    desirability = desirability.index_copy(
-        0, goal_index, goal_desirability.unsqueeze(0)
+    """Sum scores from one prepared flat likelihood graph."""
+
+    return prepared_log_likelihoods(
+        prepared,
+        parameter_values=parameter_values,
+    ).sum()
+
+
+def trial_log_likelihoods(
+    environment: "Environment",
+    trials: Iterable[Trial],
+    *,
+    parameters: "Parameters",
+) -> Tensor:
+    """Score independent flat trials in their input order."""
+
+    values = parameter_values(parameters)
+    device = values["lower_control_cost"].device
+    prepared = prepare_batch(environment, trials, device=device)
+    return prepared_log_likelihoods(
+        prepared,
+        parameter_values=values,
     )
 
-    unnormalized = passive * desirability[:, None]
-    normalizers = unnormalized.sum(dim=0)
-    usable = torch.isfinite(normalizers) & (normalizers > 0.0)
-    safe_normalizers = torch.where(usable, normalizers, torch.ones_like(normalizers))
-    normalized = unnormalized / safe_normalizers.unsqueeze(0)
-    return torch.where(usable.unsqueeze(0), normalized, passive)
+
+def log_likelihood(
+    environment: "Environment",
+    goal,
+    trajectory,
+    *,
+    parameters: "Parameters",
+) -> Tensor:
+    """Score one flat trajectory through the prepared likelihood engine."""
+
+    trial = Trial("", 0, goal, tuple(trajectory))
+    return trial_log_likelihoods(
+        environment,
+        (trial,),
+        parameters=parameters,
+    )[0]
 
 
 def _validated_parameter_values(

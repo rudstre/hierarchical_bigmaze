@@ -1,0 +1,55 @@
+{
+  "ungated_trajectory": [
+    [
+      0,
+      1
+    ],
+    [
+      0,
+      2
+    ],
+    [
+      0,
+      3
+    ]
+  ],
+  "ungated_log_likelihood": -0.132092683203,
+  "latent_direct_and_access_route": [
+    [
+      0,
+      1
+    ],
+    [
+      0,
+      2
+    ]
+  ],
+  "latent_direct_and_access_log_likelihood": -0.124168193017,
+  "gated_trajectory": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      1
+    ],
+    [
+      0,
+      2
+    ],
+    [
+      0,
+      3
+    ],
+    [
+      0,
+      4
+    ],
+    [
+      0,
+      5
+    ]
+  ],
+  "gated_log_likelihood": -1.491659647755
+}

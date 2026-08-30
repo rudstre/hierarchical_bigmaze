@@ -89,9 +89,9 @@ structure is retained while goals and current abstract commands change.
 | How is the passive maze random walk built? | [`passive_dynamics`](src/andrew_mlmdp/lmdp.py) |
 | How is a flat first-exit LMDP solved? | [`solve_first_exit` and `Environment.solve`](src/andrew_mlmdp/lmdp.py) |
 | How are point and distributed subgoals represented? | [`SubgoalBasis`](src/andrew_mlmdp/hierarchy/model.py) |
-| How is a goal-conditioned hierarchy constructed? | [`_build_task`](src/andrew_mlmdp/hierarchy/model.py) |
-| How are the lower and upper passive dynamics derived? | [`_lower_dynamics` and `_upper_dynamics`](src/andrew_mlmdp/hierarchy/model.py) |
-| How does an upper policy become a physical policy? | [`compute_plan`, `_compose_plan`, and `_compose_policy`](src/andrew_mlmdp/hierarchy/model.py) |
+| How is a goal-conditioned hierarchy constructed? | [`_build_hierarchy`](src/andrew_mlmdp/hierarchy/equations.py) |
+| How are the lower and upper passive dynamics derived? | [`_build_hierarchy`](src/andrew_mlmdp/hierarchy/equations.py) |
+| How does an upper policy become a physical policy? | [`compute_plan`](src/andrew_mlmdp/hierarchy/model.py), then [`_plan` and `_compose_policy`](src/andrew_mlmdp/hierarchy/equations.py) |
 | What exactly happens during a rollout? | [`_run_rollout`](src/andrew_mlmdp/hierarchy/rollout.py) |
 | How are distributed subgoals discovered? | [`discover_subgoals`](src/andrew_mlmdp/discovery.py) |
 

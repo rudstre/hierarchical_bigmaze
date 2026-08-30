@@ -121,9 +121,9 @@ fitted_cost = result.best_values["lower_control_cost"]
 ```
 
 The supplied `interior_reward` and `goal_reward` define the fixed reward gauge.
-Only `lower_control_cost` is optimized. Fitting uses a differentiable float64
-Torch version of the same first-exit solve and movement likelihood as
-`Environment.solve`, and does not mutate the environment or `parameters`.
+Only `lower_control_cost` is optimized. Fitting and `Environment.solve` use the
+same differentiable float64 Torch first-exit equations and movement likelihood,
+and fitting does not mutate the environment or `parameters`.
 
 ## 3. One representation for point and distributed subgoals
 
@@ -171,7 +171,7 @@ subgoal leaves the current physical coordinate unchanged.
 `template.task(g)` builds and caches one
 [`Task`](../src/andrew_mlmdp/hierarchy/model.py).
 
-For that goal, [`_build_task`](../src/andrew_mlmdp/hierarchy/model.py)
+For that goal, [`_build_hierarchy`](../src/andrew_mlmdp/hierarchy/equations.py)
 does the following:
 
 1. Remove `g` from the physical interior, leaving `m` states.
@@ -202,8 +202,8 @@ the goal-conditioned execution-access transition probabilities after the full
 augmented passive matrix has been normalized. The last quantity is not `D`,
 `D_hat`, or an NMF profile.
 
-The implementation is
-[`_lower_dynamics`](../src/andrew_mlmdp/hierarchy/model.py).
+This construction is part of
+[`_build_hierarchy`](../src/andrew_mlmdp/hierarchy/equations.py).
 The stacked matrix is column-stochastic after normalization.
 
 ## 5. Convert physical first hits into upper passive dynamics
@@ -238,7 +238,7 @@ P_g^2 = P_g^1 F P_t^{1T}.
 After column normalization, `P_i^2` describes passive transitions among the
 `k` subgoals and `P_g^2` describes passive termination at the one physical
 goal boundary. See
-[`_upper_dynamics`](../src/andrew_mlmdp/hierarchy/model.py).
+[`_build_hierarchy`](../src/andrew_mlmdp/hierarchy/equations.py).
 
 This is the bridge between layers: long physical paths through the maze are
 summarized as one small abstract transition matrix.
@@ -251,7 +251,7 @@ The upper layer is another first-exit LMDP:
 - its one boundary state is the physical goal; and
 - it uses `upper_control_cost` rather than `lower_control_cost`.
 
-[`_solve_upper`](../src/andrew_mlmdp/hierarchy/model.py) solves for
+[`_solve_upper`](../src/andrew_mlmdp/hierarchy/equations.py) solves for
 `task.upper_desirability` and then reweights the passive upper dynamics to
 obtain `task.upper_controlled`.
 
@@ -279,7 +279,7 @@ uses the matching columns of `upper_dynamics.passive` and
 Layer 1 needs a way to realize many abstract commands without solving a new
 physical LMDP every time. It therefore pre-solves `k + 1` component tasks.
 
-[`_task_basis`](../src/andrew_mlmdp/hierarchy/model.py) constructs the
+[`_task_basis`](../src/andrew_mlmdp/hierarchy/equations.py) constructs the
 interior basis `Z_i` from the fixed boundary matrix `Q_b` stored by
 `TaskLibrary`. The matrix is not constructed from behavioral rewards
 or control costs. The standard canonical library has:
@@ -320,7 +320,7 @@ combination of these columns is also a valid desirability solution.
 ## 8. Turn the current upper policy into one physical policy
 
 [`Task.plan`](../src/andrew_mlmdp/hierarchy/model.py) delegates to
-[`_compose_plan`](../src/andrew_mlmdp/hierarchy/model.py).
+[`_plan`](../src/andrew_mlmdp/hierarchy/equations.py).
 Planning performs four transformations.
 
 First, reward inpainting converts the change requested by abstract control
@@ -383,7 +383,7 @@ z_b^1 = Q_b w.
 
 Finally, the standard LMDP reweighting formula converts this desirability into
 `plan.lower_policy`. The complete implementation is in
-[`_compose_policy`](../src/andrew_mlmdp/hierarchy/model.py).
+[`_compose_policy`](../src/andrew_mlmdp/hierarchy/equations.py).
 
 The most useful debugging fields on `Plan` are
 `upper_passive`, `upper_policy`, `rewards`, `raw_weights`,
@@ -527,11 +527,11 @@ normalization, pass the same mode to discovery and basis construction.
 | Physical passive dynamics | `environment.passive` | `lmdp.passive_dynamics` |
 | Flat goal solution | `Solution` | `Environment.solve` |
 | Reusable subgoal representation | `SubgoalBasis` | `SubgoalBasis.from_locations` / `from_profiles` |
-| Goal-conditioned construction | `Task` | `Template.task` -> `_build_task` |
-| First-hit abstraction | `first_hit` | `_fundamental_matrix`, `_upper_dynamics` |
+| Goal-conditioned construction | `Task` | `Template.task` -> `_build_hierarchy` |
+| First-hit abstraction | `first_hit` | `_build_hierarchy` |
 | Upper LMDP | `upper_desirability`, `upper_controlled` | `_solve_upper` |
 | Reusable lower solutions | `task_basis` | `_task_basis` |
-| Top-down composition | `Plan` | `compute_plan` -> `_compose_plan` |
+| Top-down composition | `Plan` | `compute_plan` -> `_plan` |
 | Coupled execution | `Rollout` | `_run_rollout` |
 | Distributed discovery | `NMFStudy` | `discover_subgoals` |
 
@@ -597,21 +597,24 @@ Repeated physical coordinates still count as sampled physical transitions.
 Successful-route statistics exclude censored or failed outcomes while status
 counts retain every rollout.
 
-The NumPy object supplied to diagnostics must already contain the desired
-fitted parameter values. `FitResult` snapshots are not applied to
-templates implicitly.
+The template supplied to diagnostics must already contain the desired fitted
+parameter values. `FitResult` snapshots are not applied to templates
+implicitly.
 
 ## Differentiable hierarchical likelihood and fitting
 
-The NumPy hierarchy remains the rollout and regression implementation. The
-Torch likelihood rebuilds every parameter-dependent quantity in float64 for
-each forward graph, while retaining the `P[next_state, current_state]`
-orientation and exact latent controller-mode semantics. Only topology,
-indices, physical passive dynamics, fixed normalized subgoal profiles, and
-their normalization mode are safe to retain across optimizer steps. Gated
-access profiles, lower and upper
-dynamics, task bases, plans, policies, latent kernels, and first-departure
-occupancies must be recomputed.
+The hierarchy equations and likelihood have one float64 Torch implementation.
+Public `Task` and `Plan` fields are detached CPU NumPy snapshots so they remain
+easy to inspect, plot, and compare in a notebook. Rollout deliberately keeps
+NumPy RNG sampling so seeded trajectories are stable. The differentiable path
+retains the `P[next_state, current_state]` orientation and exact latent
+controller-mode semantics.
+
+For each forward graph, parameter-dependent gated access profiles, lower and
+upper dynamics, task bases, plans, policies, latent kernels, and
+first-departure occupancies are rebuilt. Only topology, indices, physical
+passive dynamics, fixed normalized subgoal profiles, and their normalization
+mode are safe to prepare once across optimizer steps.
 
 For full datasets, parameter-independent collapsed trajectories and integer context
 indices are prepared once. Each forward graph then constructs a shared boundary
@@ -650,8 +653,8 @@ neither the public physical threshold nor the hard-gate equation.
 log-likelihood using a private constrained parameterization. It never mutates
 `Parameters`, `SubgoalBasis`, `Template`, or NumPy caches. Its
 `best_values` snapshot can be passed explicitly to
-`total_log_likelihood`. NumPy rollout from fitted
-values requires separately constructing a fresh basis and template.
+`total_log_likelihood`. Rollout from fitted values requires separately
+constructing a fresh basis and template with those values.
 
 The fixed task library and `composition_exponent` are not Adam variables.
 Adam fitting currently fixes `composition_exponent = c = 1.0` and rejects a

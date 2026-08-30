@@ -1,21 +1,24 @@
-"""Differentiable hierarchical movement likelihoods.
+"""The hierarchical MLMDP equations, implemented once in ``torch.float64``.
 
-The reference hierarchy and likelihood remain implemented in NumPy.  This
-module mirrors that mathematics in ``torch.float64`` while rebuilding every
-parameter-dependent quantity for each forward graph.  Transition matrices use
-the project convention ``P[next_state, current_state]``.
+Transition matrices use the project convention
+``P[next_state, current_state]``. Public research objects expose detached
+NumPy arrays, while fitting and likelihood retain these tensor calculations
+inside their differentiable graphs.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
-from andrew_mlmdp.dataset import Trial
+from andrew_mlmdp.lmdp import (
+    _controlled_dynamics_tensor,
+    _solve_first_exit_tensor,
+)
 from andrew_mlmdp.maze import Coordinate
 
 if TYPE_CHECKING:
@@ -70,10 +73,21 @@ class _Plan:
     rewards: Tensor
     target_boundary: Tensor
     raw_weights: Tensor
+    clipped_weights: Tensor
     weights: Tensor
     boundary_desirability: Tensor
     desirability: Tensor
     lower_policy: Tensor
+
+
+@dataclass(frozen=True)
+class _Composition:
+    rewards: Tensor
+    target_boundary: Tensor
+    raw_weights: Tensor
+    clipped_weights: Tensor
+    weights: Tensor
+    boundary_desirability: Tensor
 
 
 @dataclass(frozen=True)
@@ -145,7 +159,7 @@ def parameter_values(
     The complete execution parameters come from ``template.parameters``. For a
     gated soft basis, gate defaults come exclusively from
     ``template.basis.core_threshold`` and ``core_exponent`` so unused gate fields on
-    ``Parameters`` cannot silently change the NumPy oracle's structure.
+    ``Parameters`` cannot silently change the basis structure.
     Overrides may replace required values but may not introduce inactive or
     unknown names.
     """
@@ -175,53 +189,6 @@ def parameter_values(
             raise ValueError(f"Inactive or unknown parameter overrides: {names}")
         values.update(overrides)
     return _validated_parameter_values(template, values)
-
-
-def log_likelihood(
-    template: "Template",
-    goal: Coordinate,
-    trajectory: list[Coordinate] | tuple[Coordinate, ...],
-    *,
-    parameter_values: Mapping[str, Tensor],
-) -> Tensor:
-    """Return one exact hierarchical movement log-likelihood tensor.
-
-    ``parameter_values`` must contain exactly the physical scalar tensors
-    returned by :func:`required_parameters`.  Every tensor
-    must be scalar, ``torch.float64``, and on one common device.  Frozen values
-    are ordinary tensors with ``requires_grad=False``.  Gate keys are required
-    only for an already-gated soft basis and are rejected for point or ungated
-    bases.
-    """
-
-    values = _validated_parameter_values(template, parameter_values)
-    model = _build_hierarchy(template, goal, values)
-    return _score_trajectory(model, trajectory)
-
-
-def total_log_likelihood(
-    template: "Template",
-    trials: Iterable[Trial],
-    *,
-    parameter_values: Mapping[str, Tensor],
-) -> Tensor:
-    """Return an exact sum using prepared metadata and graph-local tensor banks."""
-
-    from andrew_mlmdp.hierarchy.batch import (
-        prepare_batch,
-        total_prepared_log_likelihood,
-    )
-
-    values = _validated_parameter_values(template, parameter_values)
-    device = next(iter(values.values())).device
-    prepared = prepare_batch(
-        template, trials, device=device
-    )
-    return total_prepared_log_likelihood(
-        template,
-        prepared,
-        parameter_values=values,
-    )
 
 
 def _basis_is_gated(template: "Template") -> bool:
@@ -307,6 +274,33 @@ def _dynamic_access_profiles(
     return gated / scales
 
 
+def _template_upper_passive(
+    template: "Template",
+    values: Mapping[str, Tensor],
+) -> Tensor:
+    """Return the task-independent passive process between basis states."""
+
+    device = next(iter(values.values())).device
+    passive = torch.tensor(
+        template.environment.passive,
+        dtype=torch.float64,
+        device=device,
+    )
+    access = values["alpha"] * _dynamic_access_profiles(template, values).T
+    interior, boundary = _normalize_columns(passive, access)
+    identity = torch.eye(
+        interior.shape[0],
+        dtype=interior.dtype,
+        device=interior.device,
+    )
+    fundamental = _solve_checked(identity - interior, identity)
+    upper = boundary @ fundamental @ boundary.T
+    normalizers = upper.sum(dim=0)
+    if not bool(torch.all(torch.isfinite(normalizers) & (normalizers > 0.0))):
+        raise ValueError("A subgoal has no reachable abstract target")
+    return upper / normalizers.unsqueeze(0)
+
+
 def _build_hierarchy(
     template: "Template",
     goal: Coordinate,
@@ -326,9 +320,7 @@ def _build_hierarchy(
 
     device = next(iter(values.values())).device
     n_states = len(maze.free_cells)
-    interior_states = tuple(
-        state for state in range(n_states) if state != goal_state
-    )
+    interior_states = tuple(state for state in range(n_states) if state != goal_state)
     interior_by_coordinate = {
         maze.coordinate(state): index for index, state in enumerate(interior_states)
     }
@@ -421,20 +413,21 @@ def _solve_first_exit(
     boundary_desirability: Tensor,
     q_interior: Tensor,
 ) -> Tensor:
-    n_states = dynamics.interior_passive.shape[0]
-    identity = torch.eye(
-        n_states,
-        dtype=dynamics.interior_passive.dtype,
-        device=dynamics.interior_passive.device,
+    boundary = (
+        boundary_desirability.unsqueeze(1)
+        if boundary_desirability.ndim == 1
+        else boundary_desirability
     )
-    coefficient = identity - q_interior * dynamics.interior_passive.T
-    right_hand_side = q_interior * (dynamics.boundary_passive.T @ boundary_desirability)
-    return _solve_checked(coefficient, right_hand_side)
+    return _solve_first_exit_tensor(
+        dynamics.interior_passive,
+        dynamics.boundary_passive,
+        boundary,
+        q_interior,
+    )
 
 
 def _controlled_dynamics(passive: Tensor, desirability: Tensor) -> Tensor:
-    unnormalized = passive * desirability.unsqueeze(1)
-    return unnormalized / unnormalized.sum(dim=0, keepdim=True)
+    return _controlled_dynamics_tensor(passive, desirability)
 
 
 def _solve_upper(
@@ -470,12 +463,58 @@ def _task_basis(
     return _TaskBasis(boundary, interior)
 
 
+def _plan_composition(
+    model: _Hierarchy,
+    passive: Tensor,
+    controlled: Tensor,
+    *,
+    boundary_pinv: Tensor | None = None,
+    beta: float | Tensor | None = None,
+) -> _Composition:
+    """Inpaint and compose one plan or a bank along the final axis."""
+
+    inpainting_scale = (
+        model.parameter_values["beta"]
+        if beta is None
+        else torch.as_tensor(beta, dtype=model.dtype, device=model.device)
+    )
+    if not bool(torch.isfinite(inpainting_scale) & (inpainting_scale > 0.0)):
+        raise ValueError("Beta must be finite and positive")
+    rewards = inpainting_scale * (controlled - passive)
+    target = torch.exp(rewards / model.parameter_values["lower_control_cost"])
+    if boundary_pinv is None:
+        boundary_pinv = torch.linalg.pinv(
+            model.task_basis.boundary_desirability,
+            rtol=PINV_RCOND,
+        )
+    raw_weights = target @ boundary_pinv.T
+    clipped_weights = torch.clamp_min(raw_weights, 0.0)
+    weights = _shape_weights(
+        clipped_weights,
+        exponent=model.template.composition_exponent,
+        mode=model.template.composition_mode,
+    )
+    reconstructed = weights @ model.task_basis.boundary_desirability.T
+    return _Composition(
+        rewards=rewards,
+        target_boundary=target,
+        raw_weights=raw_weights,
+        clipped_weights=clipped_weights,
+        weights=weights,
+        boundary_desirability=reconstructed,
+    )
+
+
 def _plan(
     model: _Hierarchy,
     current: Coordinate,
     *,
     upper_state: int | None = None,
+    beta: float | Tensor | None = None,
+    goal_desirability: Tensor | None = None,
 ) -> _Plan:
+    """Compose the physical policy for one current controller context."""
+
     maze = model.template.maze
     maze.state_index(current)
     if current == model.goal:
@@ -499,49 +538,46 @@ def _plan(
         unnormalized = passive * model.upper_desirability
         controlled = unnormalized / unnormalized.sum()
 
-    inpainted = model.parameter_values["beta"] * (controlled - passive)
-    target = torch.exp(inpainted / model.parameter_values["lower_control_cost"])
-    raw_weights = (
-        torch.linalg.pinv(
-            model.task_basis.boundary_desirability,
-            rtol=PINV_RCOND,
-        )
-        @ target
+    composition = _plan_composition(
+        model,
+        passive,
+        controlled,
+        beta=beta,
     )
-    weights = _shape_weights(
-        torch.clamp_min(raw_weights, 0.0),
-        exponent=model.template.composition_exponent,
-        mode=model.template.composition_mode,
-    )
-    reconstructed = model.task_basis.boundary_desirability @ weights
     physical, lower_controlled = _compose_policy(
         model,
-        weights,
-        reconstructed,
+        composition.weights,
+        composition.boundary_desirability,
+        goal_desirability=goal_desirability,
     )
     return _Plan(
         upper_passive=passive,
         upper_policy=controlled,
-        rewards=inpainted,
-        target_boundary=target,
-        raw_weights=raw_weights,
-        weights=weights,
-        boundary_desirability=reconstructed,
+        rewards=composition.rewards,
+        target_boundary=composition.target_boundary,
+        raw_weights=composition.raw_weights,
+        clipped_weights=composition.clipped_weights,
+        weights=composition.weights,
+        boundary_desirability=composition.boundary_desirability,
         desirability=physical,
         lower_policy=lower_controlled,
     )
 
 
-def _goal_only_plan(model: _Hierarchy) -> _Plan:
+def _goal_only_plan(
+    model: _Hierarchy,
+    *,
+    goal_desirability: Tensor | None = None,
+    tolerate_unreachable: bool = False,
+) -> _Plan:
+    """Construct the permanent physical-goal policy after upper termination."""
+
     n_boundaries = model.lower_dynamics.boundary_passive.shape[0]
     weights = torch.nn.functional.one_hot(
-        torch.tensor(
-            n_boundaries - 1,
-            device=model.device,
-        ),
+        torch.tensor(n_boundaries - 1, device=model.device),
         num_classes=n_boundaries,
     ).to(dtype=model.dtype)
-    goal_desirability = torch.exp(
+    exact_goal = torch.exp(
         model.parameter_values["goal_reward"]
         / model.parameter_values["lower_control_cost"]
     )
@@ -561,18 +597,24 @@ def _goal_only_plan(model: _Hierarchy) -> _Plan:
                 dtype=model.dtype,
                 device=model.device,
             ),
-            goal_desirability.reshape(1),
+            exact_goal.reshape(1),
         )
     )
-    q_interior = torch.exp(
-        model.parameter_values["interior_reward"]
-        / model.parameter_values["lower_control_cost"]
-    )
-    interior = _solve_first_exit(model.lower_dynamics, target, q_interior)
+    if goal_desirability is None:
+        q_interior = torch.exp(
+            model.parameter_values["interior_reward"]
+            / model.parameter_values["lower_control_cost"]
+        )
+        interior = _solve_first_exit(model.lower_dynamics, target, q_interior)
+    else:
+        interior = _validate_goal_desirability(model, goal_desirability)
     physical, controlled = _lower_policy(
         model,
         interior,
         target,
+        zero_columns=(
+            "zero" if goal_desirability is not None or tolerate_unreachable else "error"
+        ),
     )
     zeros = torch.zeros_like(weights)
     return _Plan(
@@ -581,6 +623,7 @@ def _goal_only_plan(model: _Hierarchy) -> _Plan:
         rewards=inpainted,
         target_boundary=target,
         raw_weights=weights,
+        clipped_weights=weights,
         weights=weights,
         boundary_desirability=target,
         desirability=physical,
@@ -588,46 +631,54 @@ def _goal_only_plan(model: _Hierarchy) -> _Plan:
     )
 
 
+def _validate_goal_desirability(
+    model: _Hierarchy,
+    values: Tensor,
+) -> Tensor:
+    expected = (len(model.interior_states),)
+    if values.shape != expected:
+        raise ValueError(
+            "Initial goal desirability must have shape "
+            f"{expected}, got {tuple(values.shape)}"
+        )
+    if not bool(torch.all(torch.isfinite(values) & (values >= 0.0))):
+        raise ValueError("Initial goal desirability must be finite and non-negative")
+    return values
+
+
 def _compose_policy(
     model: _Hierarchy,
     weights: Tensor,
     reconstructed_boundary: Tensor,
+    *,
+    goal_desirability: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    interior = model.task_basis.interior_desirability @ weights
-    n_states = len(model.template.maze.free_cells)
-    physical = torch.zeros(
-        n_states,
-        dtype=model.dtype,
-        device=model.device,
+    if goal_desirability is None:
+        interior = weights @ model.task_basis.interior_desirability.T
+    else:
+        learned = _validate_goal_desirability(model, goal_desirability)
+        interior = (
+            weights[..., :-1] @ model.task_basis.interior_desirability[:, :-1].T
+            + weights[..., -1:] * learned
+        )
+    return _lower_policy(
+        model,
+        interior,
+        reconstructed_boundary,
+        zero_columns="zero" if goal_desirability is not None else "error",
     )
-    interior_index = torch.tensor(
-        model.interior_states,
-        dtype=torch.long,
-        device=model.device,
-    )
-    physical = physical.index_copy(0, interior_index, interior)
-    goal_index = torch.tensor(
-        [model.template.maze.state_index(model.goal)],
-        dtype=torch.long,
-        device=model.device,
-    )
-    physical = physical.index_copy(0, goal_index, reconstructed_boundary[-1:])
-    complete = torch.cat((interior, reconstructed_boundary))
-    controlled = _controlled_dynamics(
-        model.lower_dynamics.passive,
-        complete,
-    )
-    return physical, controlled
 
 
 def _lower_policy(
     model: _Hierarchy,
     interior: Tensor,
     boundary: Tensor,
+    *,
+    zero_columns: str = "error",
 ) -> tuple[Tensor, Tensor]:
     n_states = len(model.template.maze.free_cells)
     physical = torch.zeros(
-        n_states,
+        (*interior.shape[:-1], n_states),
         dtype=model.dtype,
         device=model.device,
     )
@@ -636,17 +687,18 @@ def _lower_policy(
         dtype=torch.long,
         device=model.device,
     )
-    physical = physical.index_copy(0, interior_index, interior)
+    physical = physical.index_copy(-1, interior_index, interior)
     goal_index = torch.tensor(
         [model.template.maze.state_index(model.goal)],
         dtype=torch.long,
         device=model.device,
     )
-    physical = physical.index_copy(0, goal_index, boundary[-1:])
-    complete = torch.cat((interior, boundary))
-    return physical, _controlled_dynamics(
+    physical = physical.index_copy(-1, goal_index, boundary[..., -1:])
+    complete = torch.cat((interior, boundary), dim=-1)
+    return physical, _controlled_dynamics_tensor(
         model.lower_dynamics.passive,
         complete,
+        zero_columns=zero_columns,
     )
 
 
@@ -698,77 +750,6 @@ def _shape_weights(
             subgoal,
         )
     return torch.cat((sharpened, clipped_weights[..., -1:]), dim=-1)
-
-
-def _score_trajectory(
-    model: _Hierarchy,
-    trajectory: list[Coordinate] | tuple[Coordinate, ...],
-) -> Tensor:
-    if not trajectory:
-        raise ValueError("Trajectory must contain at least one coordinate")
-    maze = model.template.maze
-    observations = [
-        (coordinate, maze.state_index(coordinate)) for coordinate in trajectory
-    ]
-    collapsed = [observations[0]]
-    for observation in observations[1:]:
-        if observation[0] != collapsed[-1][0]:
-            collapsed.append(observation)
-
-    if len(collapsed) == 1:
-        # Probability one, tied to parameters so fitting receives zero rather
-        # than missing gradients for singleton/all-repeat trajectories.
-        return sum(
-            (value * 0.0 for value in model.parameter_values.values()),
-            torch.zeros((), dtype=model.dtype, device=model.device),
-        )
-    if collapsed[0][0] == model.goal:
-        return torch.full((), -torch.inf, dtype=model.dtype, device=model.device)
-
-    initial = collapsed[0][0]
-    plans = (
-        _plan(model, initial),
-        *(
-            _plan(model, initial, upper_state=state)
-            for state in range(model.n_subtasks)
-        ),
-        _goal_only_plan(model),
-    )
-    forward = torch.nn.functional.one_hot(
-        torch.tensor(0, device=model.device),
-        num_classes=len(plans),
-    ).to(dtype=model.dtype)
-    total_log_likelihood = torch.zeros(
-        (),
-        dtype=model.dtype,
-        device=model.device,
-    )
-    for (current, current_state), (_, next_state) in zip(collapsed, collapsed[1:]):
-        if current == model.goal:
-            return torch.full(
-                (),
-                -torch.inf,
-                dtype=model.dtype,
-                device=model.device,
-            )
-        kernel = _physical_step_kernel(model, current, plans)
-        next_forward = _first_departure_forward(
-            kernel,
-            current_state,
-            next_state,
-            forward,
-        )
-        probability = next_forward.sum()
-        if not bool(torch.isfinite(probability) & (probability > 0.0)):
-            return torch.full(
-                (),
-                -torch.inf,
-                dtype=model.dtype,
-                device=model.device,
-            )
-        total_log_likelihood = total_log_likelihood + torch.log(probability)
-        forward = next_forward / probability
-    return total_log_likelihood
 
 
 def _physical_step_kernel(
@@ -895,28 +876,61 @@ def _physical_outcomes(model: _Hierarchy, probabilities: Tensor) -> Tensor:
     return result.index_copy(0, goal_index, probabilities[-1:])
 
 
+def _first_departure_kernel(
+    kernel: Tensor,
+    current_state: int,
+) -> Tensor:
+    """Collapse same-location transitions for every controller mode."""
+
+    self_kernel = kernel[current_state]
+    other_states = (
+        torch.arange(
+            kernel.shape[0],
+            device=kernel.device,
+        )
+        != current_state
+    )
+    exit_mass = kernel[other_states].sum(dim=(0, 1))
+    can_exit = exit_mass > 0.0
+    while True:
+        predecessors = torch.any(self_kernel[can_exit, :] > 0.0, dim=0)
+        expanded = can_exit | predecessors
+        if bool(torch.equal(expanded, can_exit)):
+            break
+        can_exit = expanded
+
+    result = torch.zeros_like(kernel)
+    if not bool(torch.any(can_exit)):
+        return result
+    transient = torch.nonzero(can_exit, as_tuple=False).flatten()
+    restricted = self_kernel[transient[:, None], transient[None, :]]
+    identity = torch.eye(
+        len(transient),
+        dtype=kernel.dtype,
+        device=kernel.device,
+    )
+    try:
+        closure = torch.linalg.solve(identity - restricted, identity)
+    except RuntimeError:
+        return result
+    selected = kernel[:, :, transient] @ closure
+    result[:, :, transient] = selected
+    result[current_state] = 0.0
+    if not bool(torch.all(torch.isfinite(result))) or bool(torch.any(result < -1e-12)):
+        return torch.zeros_like(kernel)
+    return torch.clamp_min(result, 0.0)
+
+
 def _first_departure_forward(
     kernel: Tensor,
     current_state: int,
     next_state: int,
     forward: Tensor,
 ) -> Tensor:
-    """Propagate through all structural modes to the first physical exit."""
+    """Propagate through the shared first-departure closure."""
 
-    self_kernel = kernel[current_state]
-    identity = torch.eye(
-        self_kernel.shape[0],
-        dtype=self_kernel.dtype,
-        device=self_kernel.device,
-    )
-    occupancy = _solve_checked(identity - self_kernel, forward)
-    result = kernel[next_state] @ occupancy
-    _require_finite(result)
-    if bool(torch.any(result < -1e-12)):
-        raise NumericalError(
-            "First-departure solve produced negative probability mass"
-        )
-    return torch.clamp_min(result, 0.0)
+    departure = _first_departure_kernel(kernel, current_state)
+    return departure[next_state] @ forward
 
 
 def _solve_checked(coefficient: Tensor, right_hand_side: Tensor) -> Tensor:
@@ -932,6 +946,4 @@ def _solve_checked(coefficient: Tensor, right_hand_side: Tensor) -> Tensor:
 
 def _require_finite(*values: Tensor) -> None:
     if not all(bool(torch.all(torch.isfinite(value))) for value in values):
-        raise NumericalError(
-            "Hierarchy calculation produced nonfinite values"
-        )
+        raise NumericalError("Hierarchy calculation produced nonfinite values")

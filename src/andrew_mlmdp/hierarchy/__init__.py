@@ -4,14 +4,6 @@ The public API is re-exported here while construction, rollout execution, and
 movement likelihoods live in focused modules.
 """
 
-from andrew_mlmdp.hierarchy.autodiff import (
-    NumericalError,
-    fittable_parameters,
-    log_likelihood,
-    parameter_values,
-    required_parameters,
-    total_log_likelihood,
-)
 from andrew_mlmdp.hierarchy.diagnostics import (
     CompositionTrace,
     ContinuationPolicy,
@@ -33,11 +25,21 @@ from andrew_mlmdp.hierarchy.diagnostics import (
     sweep_diagnostics,
     upper_graph,
 )
+from andrew_mlmdp.hierarchy.equations import (
+    NumericalError,
+    fittable_parameters,
+    parameter_values,
+    required_parameters,
+)
 from andrew_mlmdp.hierarchy.fitting import (
     FitResult,
     FitStep,
     ParameterValues,
     fit_parameters,
+)
+from andrew_mlmdp.hierarchy.likelihood import (
+    log_likelihood,
+    total_log_likelihood,
 )
 from andrew_mlmdp.hierarchy.model import (
     Plan,

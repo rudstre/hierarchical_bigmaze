@@ -20,16 +20,22 @@ import numpy as np
 import torch
 
 from andrew_mlmdp.dataset import Trial
-from andrew_mlmdp.hierarchy.autodiff import (
-    parameter_values as _autodiff_parameter_values,
+from andrew_mlmdp.hierarchy.equations import (
+    _first_departure_kernel,
+    _physical_step_kernel,
 )
-from andrew_mlmdp.hierarchy.batch import (
-    prepare_batch,
-    total_prepared_log_likelihood,
+from andrew_mlmdp.hierarchy.equations import (
+    _goal_only_plan as _tensor_goal_only_plan,
+)
+from andrew_mlmdp.hierarchy.equations import (
+    _plan as _tensor_plan,
+)
+from andrew_mlmdp.hierarchy.equations import (
+    parameter_values as _tensor_parameter_values,
 )
 from andrew_mlmdp.hierarchy.likelihood import (
-    _first_departure_kernel,
-    _step_kernel,
+    prepare_batch,
+    total_prepared_log_likelihood,
 )
 from andrew_mlmdp.hierarchy.model import (
     Plan,
@@ -37,7 +43,6 @@ from andrew_mlmdp.hierarchy.model import (
     Task,
     Template,
     _build_task,
-    _goal_only_plan,
 )
 from andrew_mlmdp.hierarchy.rollout import Rollout, _rollout_column
 from andrew_mlmdp.lmdp import PairEntropy, Parameters
@@ -417,25 +422,27 @@ class DiagnosticSweep:
 def _pair_plans(
     task: Task,
     start: Coordinate,
-) -> tuple[Plan, ...]:
-    """Return the initial, continuation, and goal-only plans for one pair."""
+) -> tuple:
+    """Return tensor plans for every controller mode in one pair."""
 
     task.maze.state_index(start)
     if start == task.goal:
         raise ValueError("start must differ from the physical goal")
+    model = task._tensor_model
     return (
-        task.plan(start),
+        _tensor_plan(model, start),
         *(
-            task.plan(start, upper_state=upper_state)
+            _tensor_plan(model, start, upper_state=upper_state)
             for upper_state in range(task.n_subtasks)
         ),
-        _goal_only_plan(
-            task,
-            start,
-            goal_desirability=None,
-            tolerate_unreachable=True,
-        ),
+        _tensor_goal_only_plan(model, tolerate_unreachable=True),
     )
+
+
+def _step_kernel(task: Task, current: Coordinate, plans) -> torch.Tensor:
+    """Expose one diagnostic seam around the shared tensor equation."""
+
+    return _physical_step_kernel(task._tensor_model, current, plans)
 
 
 def _step_dynamics(
@@ -444,25 +451,31 @@ def _step_dynamics(
 ) -> np.ndarray:
     """Return one-step controller dynamics for a selected navigation pair."""
 
+    model = task._tensor_model
     plans = _pair_plans(task, start)
     n_physical = len(task.maze.free_cells)
     n_modes = task.n_subtasks + 2
-    result = np.zeros(
+    result = torch.zeros(
         (
             n_physical,
             n_modes,
             n_physical,
             n_modes,
         ),
-        dtype=np.float64,
+        dtype=model.dtype,
+        device=model.device,
     )
     goal_state = task.maze.state_index(task.goal)
-    for current_state, current in enumerate(task.maze.free_cells):
-        if current_state != goal_state:
-            result[:, :, current_state, :] = _step_kernel(
-                task, current, plans
-            )
-    return result
+    with torch.no_grad():
+        for current_state, current in enumerate(task.maze.free_cells):
+            if current_state != goal_state:
+                kernel = _step_kernel(task, current, plans)
+                result[:, :, current_state, :] = torch.as_tensor(
+                    kernel,
+                    dtype=model.dtype,
+                    device=model.device,
+                )
+    return result.detach().cpu().numpy()
 
 
 def _departure_dynamics(
@@ -471,15 +484,22 @@ def _departure_dynamics(
 ) -> np.ndarray:
     """Collapse same-location steps into first physical departures."""
 
-    result = np.zeros_like(physical_steps)
+    model = task._tensor_model
+    steps = torch.as_tensor(
+        physical_steps,
+        dtype=model.dtype,
+        device=model.device,
+    )
+    result = torch.zeros_like(steps)
     goal_state = task.maze.state_index(task.goal)
-    for current_state in range(len(task.maze.free_cells)):
-        if current_state != goal_state:
-            result[:, :, current_state, :] = _first_departure_kernel(
-                physical_steps[:, :, current_state, :],
-                current_state,
-            )
-    return result
+    with torch.no_grad():
+        for current_state in range(len(task.maze.free_cells)):
+            if current_state != goal_state:
+                result[:, :, current_state, :] = _first_departure_kernel(
+                    steps[:, :, current_state, :],
+                    current_state,
+                )
+    return result.detach().cpu().numpy()
 
 
 def _first_departure_dynamics(
@@ -1310,7 +1330,7 @@ def sweep_diagnostics(
                 total_log_likelihood = total_prepared_log_likelihood(
                     candidate,
                     prepared_trials,
-                    parameter_values=_autodiff_parameter_values(candidate),
+                    parameter_values=_tensor_parameter_values(candidate),
                 )
             log_likelihoods.append(float(total_log_likelihood.detach()))
             likelihood_seconds = perf_counter() - likelihood_started
