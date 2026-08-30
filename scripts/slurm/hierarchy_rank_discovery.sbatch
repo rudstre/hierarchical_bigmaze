@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=hierarchy-loso
-#SBATCH --array=0-287
+#SBATCH --job-name=hierarchy-nmf
+#SBATCH --array=2-49
 #SBATCH --mem=12G
 #SBATCH --partition=cpu
 #SBATCH --time=08:00:00
@@ -33,7 +33,7 @@ else
 fi
 
 slurm_log_dir="${project_root}/slurm_out/rank_val/job_${run_identifier}"
-slurm_log_path="${slurm_log_dir}/slurm-${array_job_id}_${array_task_id}.out"
+slurm_log_path="${slurm_log_dir}/nmf-${array_job_id}_${array_task_id}.out"
 
 mkdir -p "${slurm_log_dir}"
 exec >"${slurm_log_path}" 2>&1
@@ -44,9 +44,8 @@ if [[ -n "${identifier_error}" ]]; then
 fi
 
 cd "${project_root}"
-"${python_executable}" scripts/run_hierarchy_rank_validation.py \
+"${python_executable}" scripts/run_hierarchy_rank_discovery.py \
   --config "${config_path}" \
-  --array-task-id "${array_task_id}" \
+  --k "${array_task_id}" \
   --max-rank "${max_rank}" \
-  --output-dir "${output_dir}" \
-  --discovery-dir "${discovery_dir}"
+  --output-dir "${discovery_dir}"

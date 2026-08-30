@@ -1,104 +1,119 @@
 # Hierarchical rank validation sweep
 
-The production sweep fits one hierarchical model for every integer NMF rank
-from 2 through 49. Each worker trains ADAM on the first five selected sessions
-and scores the fitted model on the sixth session. The primary validation metric
-is pooled over observed movement transitions:
+The production workflow compares every integer NMF rank from 2 through a
+configurable inclusive maximum (49 by default). Its default validation mode is
+leave-one-session-out (LOSO): each chronologically ordered session is held out
+once while ADAM fits the other sessions.
+
+For the current six-session dataset, ranks 2–49 produce:
+
+- 48 split-independent NMF discovery tasks; and
+- 48 × 6 = 288 rank/fold fitting and scoring tasks.
+
+NMF is fitted only once per rank because discovery uses the flat maze model and
+does not depend on the behavioral training split. Every fold records its exact
+training and validation sessions and trials.
+
+The held-out metric within a fold remains:
 
 ```text
 sum(trial log likelihood) / sum(trial movement-transition count)
 ```
 
-This is not the unweighted mean of per-trial normalized likelihoods. Every
-validation trial must receive a finite score for a rank to enter the ranking.
+Across LOSO folds, reports use the unweighted session mean. One standard error
+is the sample standard deviation across sessions divided by the square root of
+the number of sessions. A rank is eligible for ranking only when every expected
+fold succeeds.
 
-## Run one rank locally
+## Submit the two-stage SLURM sweep
 
 From the repository root:
 
 ```bash
-python scripts/run_hierarchy_rank_validation.py \
-  --config configs/hierarchy_rank_validation_production.json \
-  --k 8 \
-  --output-dir output/hierarchy_rank_validation/production_normalized_threshold_040
+scripts/slurm/submit_hierarchy_rank_validation.sh --run-id production_loso
 ```
 
-The production configuration uses connected KL-NMF seeds 0 through 49 for
-every rank and one ADAM initialization. The configured threshold fraction is
-`0.4`; each worker resolves the physical initial `core_threshold` as `0.4`
-times that rank's structural cap. A compatible existing shard is reused; pass
-`--force` to recompute and atomically replace it.
-
-## Submit the SLURM array
-
-Resource and account choices stay at submission time:
+The wrapper first submits the NMF rank array, then submits the dependent
+rank/fold array after every discovery task finishes. Both stages request 12 GB
+per task, the `cpu` partition, and an eight-hour (`08:00:00`) time limit by
+default. Submission-time options include:
 
 ```bash
-sbatch --partition=PARTITION --time=TIME --mem=MEMORY \
-  scripts/slurm/hierarchy_rank_validation.sbatch RUN_IDENTIFIER
+scripts/slurm/submit_hierarchy_rank_validation.sh \
+  --run-id production_loso \
+  --max-rank 49 \
+  --max-concurrent 48 \
+  --mem 12G \
+  --partition PARTITION \
+  --time TIME \
+  --account ACCOUNT
 ```
 
-`RUN_IDENTIFIER` is an optional name containing letters, numbers, periods,
-underscores, or hyphens. For example, passing `threshold_040` writes every
-array task's combined standard output and error under
-`slurm_out/rank_val/job_threshold_040/`. Log filenames retain the numeric
-array job ID and rank, for example `slurm-3416000_24.out`, so reusing a run
-identifier cannot overwrite logs from another job. If `RUN_IDENTIFIER` is
-omitted, the directory falls back to `job_<array-job-id>`.
+`--max-rank` is inclusive, accepts 2 through 49, and defaults to 49. It
+reduces both arrays and the expected aggregation grid. `--max-concurrent`
+keeps every requested task but adds SLURM's `%N` concurrency cap. If omitted,
+all requested array elements are eligible to run concurrently.
 
-The wrapper maps `SLURM_ARRAY_TASK_ID` directly to `k` and creates the shared
-log directory safely when the array starts.
+The default configuration is
+`configs/hierarchy_rank_validation_loso.json`, and the default result root is
+`output/hierarchy_rank_validation/production_loso`. The established
+`HIERARCHY_PROJECT_ROOT`, `HIERARCHY_PYTHON`,
+`HIERARCHY_SWEEP_CONFIG`, and `HIERARCHY_SWEEP_OUTPUT` environment
+overrides remain available.
 
-These optional environment variables customize paths without editing the
-script:
+## Run individual stages locally
 
-- `HIERARCHY_PROJECT_ROOT`
-- `HIERARCHY_PYTHON`
-- `HIERARCHY_SWEEP_CONFIG`
-- `HIERARCHY_SWEEP_OUTPUT`
+Fit or reuse one NMF artifact:
 
-## Aggregate completed shards
+```bash
+python scripts/run_hierarchy_rank_discovery.py \
+  --config configs/hierarchy_rank_validation_loso.json \
+  --k 8 \
+  --output-dir output/hierarchy_rank_validation/production_loso/discovery
+```
 
-Aggregation can be run before the array finishes. Missing and failed ranks stay
-visible and the current winner is marked provisional:
+Fit one rank/fold from that artifact:
+
+```bash
+python scripts/run_hierarchy_rank_validation.py \
+  --config configs/hierarchy_rank_validation_loso.json \
+  --k 8 \
+  --fold-index 0 \
+  --output-dir output/hierarchy_rank_validation/production_loso
+```
+
+Compatible artifacts and fold shards are reused. Use `--force` on the
+relevant stage to atomically replace that stage's existing result.
+
+## Preserve the chronological holdout option
+
+`configs/hierarchy_rank_validation_production.json` retains the original
+first-five-session training and last-session validation split through
+`validation_mode: "chronological_holdout"`. It uses one fold per rank but the
+same two-stage discovery/fitting machinery.
+
+## Aggregate results
 
 ```bash
 python scripts/aggregate_hierarchy_rank_validation.py \
-  --config configs/hierarchy_rank_validation_production.json \
-  --shard-dir output/hierarchy_rank_validation/production_normalized_threshold_040 \
-  --output-dir output/hierarchy_rank_validation/production_normalized_threshold_040/aggregate
+  --config configs/hierarchy_rank_validation_loso.json \
+  --shard-dir output/hierarchy_rank_validation/production_loso \
+  --output-dir output/hierarchy_rank_validation/production_loso/aggregate \
+  --max-rank 49
 ```
 
-`aggregate.json` contains the complete compatible shards. `rank_summary.csv`
-contains the rank scores, NMF selection diagnostics, ADAM convergence fields,
-best parameter values, parameter changes from initialization, and the fitted
-threshold as a fraction of its structural cap. The CSV includes initial,
-best, and last thresholds in both physical and cap-normalized units. The
-aggregator writes three figures in both PNG and SVG formats:
+Aggregation preserves the expected rank/fold grid and explicitly reports
+missing, failed, incompatible, and nonfinite results. Outputs include:
 
-- `held_out_log_likelihood_vs_k` compares the pooled held-out and fitted
-  training log likelihoods per movement transition. Missing and failed ranks
-  remain visible as gaps, and the best available held-out rank is marked.
-- `selected_nmf_normalized_kl_vs_k` shows the selected basis's normalized
-  generalized KL value. It retains ranks whose NMF discovery succeeded even
-  when a later fitting or scoring stage failed.
-- `fitted_parameters_vs_k` shows the six best fitted parameters in a 3-by-2
-  panel, with `core_threshold` reported as a fraction of its structural cap.
+- `aggregate.json` with the complete provenance and ranking;
+- `fold_summary.csv` with one row per expected rank/fold;
+- `rank_summary.csv` with fold counts, eligibility, means, and standard
+  errors;
+- held-out and fitted-training likelihood versus rank with mean ±1 SE;
+- all six fitted parameters versus rank with mean ±1 SE, including core
+  threshold as a fraction of its fold-specific structural cap; and
+- the selected once-per-rank NMF normalized generalized KL diagnostic.
 
-Every plotted value is also present in `rank_summary.csv`.
-
-Every shard records exact configuration, dataset, maze, dependency, Git HEAD,
-and worker/model working-tree source fingerprints. Aggregation and plotting
-code has a separate fingerprint, so presentation-only changes do not invalidate
-existing shards. Aggregation still rejects mixed worker fingerprints and any
-configuration, data, maze, or runtime mismatch.
-
-
-## Threshold-normalized rerun
-
-This schema-v2 sweep is incompatible with the original physical-threshold
-shards. Keep the original `production` directory and the prior `0.8`-fraction
-`production_normalized_threshold` directory unchanged. The current `0.4`-
-fraction sweep writes to `production_normalized_threshold_040`. Do not use
-`--force` to mix configurations, schemas, or worker fingerprints between these
-directories.
+Figures are written as PNG and SVG. Aggregation may run while jobs are still
+active, but incomplete ranks remain ineligible for ranking. Existing schema-v2
+result directories are not modified or mixed with the schema-v3 workflow.

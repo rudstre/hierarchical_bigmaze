@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import andrew_mlmdp.validation as validation
+import andrew_mlmdp.validation_aggregation as aggregation
 from andrew_mlmdp import FitResult, FitStep, ParameterValues, Trial
 from andrew_mlmdp.validation import (
     DatasetValidationConfig,
@@ -13,6 +15,7 @@ from andrew_mlmdp.validation import (
     RankValidationError,
     aggregate_rank_results,
     pooled_log_likelihood_per_transition,
+    run_rank_discovery,
     run_rank_validation,
     source_code_fingerprint,
 )
@@ -207,11 +210,6 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
 ):
     config = _config(tmp_path)
     context = _context(config)
-    discovery_calls = []
-
-    class FakeStudy:
-        def rank_result(self, k):
-            return SimpleNamespace(discovery=object())
 
     threshold_range = SimpleNamespace(
         maximum=0.25,
@@ -230,21 +228,26 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
         def fit(self, *args, **kwargs):
             return _fit_result(initial_threshold=0.1, best_threshold=0.15)
 
-    def fake_discovery(*args, **kwargs):
-        discovery_calls.append(kwargs["ranks"])
-        return FakeStudy()
-
-    monkeypatch.setattr(validation, "_load_problem_context", lambda _: context)
-    monkeypatch.setattr(validation, "discover_subgoals", fake_discovery)
-    monkeypatch.setattr(
-        validation,
-        "_rank_result_payload",
-        lambda _: {
+    artifact = {
+        "discovery": {
             "selected_restart_id": 11,
             "selected_seed": 11,
-            "selected_discovery": {"reconstruction_error": 0.2},
-            "restarts": [{"seed": seed} for seed in range(50)],
-        },
+            "selected_discovery": {
+                "reconstruction_error": 0.2,
+                "profile_sha256": "profiles",
+                "task_weights_sha256": "weights",
+            },
+        }
+    }
+    monkeypatch.setattr(
+        validation,
+        "_load_problem_context",
+        lambda _, fold_index=0: context,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_load_discovery_artifact",
+        lambda *args: (artifact, np.ones((2, 49)), "artifact-digest"),
     )
     monkeypatch.setattr(
         validation,
@@ -259,8 +262,8 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
 
     assert result["status"] == "success"
     assert cached == result
-    assert discovery_calls == [(49,)]
-    assert len(result["discovery"]["restarts"]) == 50
+    assert result["discovery"]["artifact_sha256"] == "artifact-digest"
+    assert result["fold_index"] == 0
     optimizer = result["optimizer"]
     assert optimizer["threshold_domain"]["maximum"] == pytest.approx(0.25)
     assert optimizer["initial_core_threshold_fraction"] == pytest.approx(0.4)
@@ -269,18 +272,23 @@ def test_worker_writes_complete_diagnostics_and_reuses_compatible_shard(
     assert fit_result["history"][0]["lr"] == 0.15
     assert fit_result["history"][0]["core_threshold_fraction"] == pytest.approx(0.4)
     assert fit_result["best_core_threshold_fraction"] == pytest.approx(0.6)
-    assert (tmp_path / "shards" / "k_49.json").is_file()
+    assert (tmp_path / "shards" / "folds" / "k_49_fold_00.json").is_file()
 
 
 def test_worker_writes_failure_shard(tmp_path, monkeypatch):
     config = _config(tmp_path)
-    context = _context(config)
+    dataset_context = SimpleNamespace(environment=object())
 
     class FakeStudy:
         def rank_result(self, k):
             return SimpleNamespace(discovery=None)
 
-    monkeypatch.setattr(validation, "_load_problem_context", lambda _: context)
+    monkeypatch.setattr(
+        validation,
+        "_load_dataset_context",
+        lambda _: dataset_context,
+    )
+    monkeypatch.setattr(validation, "_discovery_compatibility", lambda *a: {})
     monkeypatch.setattr(validation, "discover_subgoals", lambda *a, **k: FakeStudy())
     monkeypatch.setattr(
         validation,
@@ -289,9 +297,9 @@ def test_worker_writes_failure_shard(tmp_path, monkeypatch):
     )
 
     with pytest.raises(RankValidationError, match="Every connected"):
-        run_rank_validation(config, 9, tmp_path / "shards")
+        run_rank_discovery(config, 9, tmp_path / "discovery")
 
-    payload = json.loads((tmp_path / "shards" / "k_09.json").read_text())
+    payload = json.loads((tmp_path / "discovery" / "k_09.json").read_text())
     assert payload["status"] == "failure"
     assert payload["stage"] == "discover_subgoals"
 
@@ -302,7 +310,7 @@ def test_aggregation_ranks_pooled_scores_and_preserves_parameter_history(
 ):
     config = _config(tmp_path)
     context = _context(config)
-    monkeypatch.setattr(validation, "_load_problem_context", lambda _: context)
+    monkeypatch.setattr(aggregation, "_load_problem_context", lambda _: context)
     shards = tmp_path / "shards"
     shards.mkdir()
     first = _successful_shard(config, context.compatibility, 2, -4.0)
@@ -331,13 +339,13 @@ def test_aggregation_ranks_pooled_scores_and_preserves_parameter_history(
     assert (tmp_path / "aggregate" / "rank_summary.csv").is_file()
 
 
-def test_aggregation_rejects_a_different_source_fingerprint(
+def test_presentation_aggregation_accepts_a_stored_source_fingerprint(
     tmp_path,
     monkeypatch,
 ):
     config = _config(tmp_path)
     context = _context(config)
-    monkeypatch.setattr(validation, "_load_problem_context", lambda _: context)
+    monkeypatch.setattr(aggregation, "_load_problem_context", lambda _: context)
     shards = tmp_path / "shards"
     shards.mkdir()
     incompatible = dict(context.compatibility)
@@ -348,5 +356,5 @@ def test_aggregation_rejects_a_different_source_fingerprint(
     shard = _successful_shard(config, incompatible, 2, -4.0)
     (shards / "k_02.json").write_text(json.dumps(shard))
 
-    with pytest.raises(ValueError, match="incompatible"):
-        aggregate_rank_results(config, shards, tmp_path / "aggregate")
+    result = aggregate_rank_results(config, shards, tmp_path / "aggregate")
+    assert result["worker_compatibility"]["source"] == incompatible["source"]

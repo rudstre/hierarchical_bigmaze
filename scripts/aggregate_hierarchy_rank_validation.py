@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--shard-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--max-rank", type=int, default=49)
     return parser
 
 
@@ -28,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             args.shard_dir,
             args.output_dir,
+            max_rank=args.max_rank,
         )
     except (OSError, ValueError) as error:
         print(f"rank aggregation failed: {error}", file=sys.stderr, flush=True)

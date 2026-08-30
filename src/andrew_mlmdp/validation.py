@@ -15,7 +15,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -33,7 +33,7 @@ from andrew_mlmdp.hierarchy.model import SubgoalBasis, Template, ThresholdRange
 from andrew_mlmdp.lmdp import Environment, soft_parameters
 from andrew_mlmdp.profiles import ProfileNormalization
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PRODUCTION_RANKS = tuple(range(2, 50))
 PRODUCTION_NMF_RESTART_SEEDS = tuple(range(50))
 FITTED_PARAMETER_NAMES = (
@@ -45,6 +45,7 @@ FITTED_PARAMETER_NAMES = (
     "core_exponent",
 )
 _TREND_PARAMETER_NAMES = FITTED_PARAMETER_NAMES
+ValidationMode = Literal["chronological_holdout", "leave_one_session_out"]
 
 
 class RankValidationError(RuntimeError):
@@ -53,26 +54,41 @@ class RankValidationError(RuntimeError):
 
 @dataclass(frozen=True)
 class DatasetValidationConfig:
-    """Dataset selection and chronological holdout definition."""
+    """Dataset selection and session-level validation definition."""
 
     data_root: str
     subject_ids: tuple[str, ...]
     maze_name: str
     start_date: str
     end_date: str
+    validation_mode: ValidationMode = "chronological_holdout"
     training_session_count: int = 5
     validation_session_count: int = 1
     expected_training_trials: int | None = None
     expected_validation_trials: int | None = None
+    expected_session_trial_counts: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "subject_ids", tuple(self.subject_ids))
+        object.__setattr__(
+            self,
+            "expected_session_trial_counts",
+            dict(self.expected_session_trial_counts),
+        )
         if not self.data_root:
             raise ValueError("data_root cannot be empty")
         if not self.subject_ids or any(not value for value in self.subject_ids):
             raise ValueError("subject_ids must contain non-empty identifiers")
         if not self.maze_name:
             raise ValueError("maze_name cannot be empty")
+        if self.validation_mode not in {
+            "chronological_holdout",
+            "leave_one_session_out",
+        }:
+            raise ValueError(
+                "validation_mode must be 'chronological_holdout' or "
+                "'leave_one_session_out'"
+            )
         for name in ("training_session_count", "validation_session_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -84,6 +100,17 @@ class DatasetValidationConfig:
             ):
                 raise ValueError(f"{name} must be a positive integer or null")
 
+        for session_id, count in self.expected_session_trial_counts.items():
+            if (
+                not session_id
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 1
+            ):
+                raise ValueError(
+                    "expected_session_trial_counts must map non-empty session IDs "
+                    "to positive integers"
+                )
 
 @dataclass(frozen=True)
 class DiscoveryValidationConfig:
@@ -277,6 +304,16 @@ class _ProblemContext:
     validation_trials: tuple[Trial, ...]
     split_payload: dict[str, object]
     compatibility: dict[str, object]
+    fold_index: int
+
+
+@dataclass(frozen=True)
+class _DatasetContext:
+    dataset: DoohanDataset
+    environment: Environment
+    data_sha256: str
+    maze_sha256: str
+    runtime: dict[str, str]
 
 
 def load_validation_config(path: str | Path) -> RankValidationConfig:
@@ -360,13 +397,253 @@ def source_code_fingerprint(
     }
 
 
-def run_rank_validation(
+
+
+
+
+def _coerce_config(
+    config: RankValidationConfig | str | Path,
+) -> RankValidationConfig:
+    if isinstance(config, RankValidationConfig):
+        return config
+    return load_validation_config(config)
+
+
+
+
+def _check_expected_count(name: str, actual: int, expected: int | None) -> None:
+    if expected is not None and actual != expected:
+        raise ValueError(f"Expected {expected} {name} trials, found {actual}")
+
+
+def validate_max_rank(max_rank: int) -> int:
+    """Validate and return an inclusive production rank upper bound."""
+
+    if (
+        isinstance(max_rank, bool)
+        or not isinstance(max_rank, int)
+        or not 2 <= max_rank <= PRODUCTION_RANKS[-1]
+    ):
+        raise ValueError("max_rank must be an integer in the inclusive range 2..49")
+    return max_rank
+
+
+def rank_fold_from_array_task(
+    task_id: int,
+    fold_count: int,
+    *,
+    max_rank: int = PRODUCTION_RANKS[-1],
+) -> tuple[int, int]:
+    """Map a zero-based SLURM task to its deterministic rank and fold."""
+
+    validate_max_rank(max_rank)
+    if (
+        isinstance(fold_count, bool)
+        or not isinstance(fold_count, int)
+        or fold_count < 1
+    ):
+        raise ValueError("fold_count must be a positive integer")
+    task_count = (max_rank - 1) * fold_count
+    if isinstance(task_id, bool) or not isinstance(task_id, int):
+        raise ValueError("task_id must be an integer")
+    if not 0 <= task_id < task_count:
+        raise ValueError(f"task_id must be in the inclusive range 0..{task_count - 1}")
+    return 2 + task_id // fold_count, task_id % fold_count
+
+
+def validation_fold_count(config: RankValidationConfig | str | Path) -> int:
+    """Return the number of configured session-level validation folds."""
+
+    resolved = _coerce_config(config)
+    dataset = _load_dataset_context(resolved).dataset
+    if resolved.dataset.validation_mode == "leave_one_session_out":
+        return len(dataset.sessions)
+    return 1
+
+
+def _load_dataset_context(config: RankValidationConfig) -> _DatasetContext:
+    dataset_config = config.dataset
+    data_root = Path(dataset_config.data_root)
+    if not data_root.is_absolute():
+        data_root = config.project_root / data_root
+    dataset = DoohanDataset.from_data_root(
+        data_root,
+        subject_ids=dataset_config.subject_ids,
+        start_date=dataset_config.start_date,
+        end_date=dataset_config.end_date,
+        maze_name=dataset_config.maze_name,
+    )
+    if len(dataset.sessions) < 2:
+        raise ValueError("Session-level validation requires at least two sessions")
+
+    actual_session_counts = {
+        session.session_id: sum(
+            trial.session_id == session.session_id for trial in dataset.trials
+        )
+        for session in dataset.sessions
+    }
+    expected_session_counts = dict(dataset_config.expected_session_trial_counts)
+    if expected_session_counts and actual_session_counts != expected_session_counts:
+        raise ValueError(
+            "Per-session trial counts do not match the configured expectation; "
+            f"expected={expected_session_counts}, actual={actual_session_counts}"
+        )
+
+    if dataset_config.validation_mode == "chronological_holdout":
+        expected_sessions = (
+            dataset_config.training_session_count
+            + dataset_config.validation_session_count
+        )
+        if len(dataset.sessions) != expected_sessions:
+            raise ValueError(
+                f"Expected exactly {expected_sessions} ordered sessions, "
+                f"found {len(dataset.sessions)}"
+            )
+
+    return _DatasetContext(
+        dataset=dataset,
+        environment=Environment(dataset.definition.maze),
+        data_sha256=_data_fingerprint(dataset),
+        maze_sha256=_maze_fingerprint(dataset),
+        runtime=_runtime_versions(),
+    )
+
+
+def _fold_session_ids(
+    config: RankValidationConfig,
+    dataset: DoohanDataset,
+    fold_index: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    sessions = tuple(session.session_id for session in dataset.sessions)
+    if config.dataset.validation_mode == "leave_one_session_out":
+        fold_count = len(sessions)
+        if isinstance(fold_index, bool) or not isinstance(fold_index, int):
+            raise ValueError("fold_index must be an integer")
+        if not 0 <= fold_index < fold_count:
+            raise ValueError(
+                f"fold_index must be in the inclusive range 0..{fold_count - 1}"
+            )
+        validation = (sessions[fold_index],)
+        training = tuple(
+            session_id
+            for index, session_id in enumerate(sessions)
+            if index != fold_index
+        )
+        return training, validation
+
+    if fold_index != 0:
+        raise ValueError("chronological_holdout has exactly one fold with index 0")
+    split = config.dataset.training_session_count
+    return sessions[:split], sessions[split:]
+
+
+def _load_problem_context(
+    config: RankValidationConfig,
+    fold_index: int = 0,
+    *,
+    dataset_context: _DatasetContext | None = None,
+) -> _ProblemContext:
+    dataset_context = dataset_context or _load_dataset_context(config)
+    dataset = dataset_context.dataset
+    training_sessions, validation_sessions = _fold_session_ids(
+        config,
+        dataset,
+        fold_index,
+    )
+    training_ids = set(training_sessions)
+    validation_ids = set(validation_sessions)
+    training_trials = tuple(
+        trial for trial in dataset.trials if trial.session_id in training_ids
+    )
+    validation_trials = tuple(
+        trial for trial in dataset.trials if trial.session_id in validation_ids
+    )
+    if not training_trials or not validation_trials:
+        raise ValueError("Both training and validation splits require valid trials")
+
+    if config.dataset.validation_mode == "chronological_holdout":
+        _check_expected_count(
+            "training",
+            len(training_trials),
+            config.dataset.expected_training_trials,
+        )
+        _check_expected_count(
+            "validation",
+            len(validation_trials),
+            config.dataset.expected_validation_trials,
+        )
+
+    split_payload = {
+        "validation_mode": config.dataset.validation_mode,
+        "fold_index": fold_index,
+        "training_sessions": list(training_sessions),
+        "validation_sessions": list(validation_sessions),
+        "training_trial_count": len(training_trials),
+        "validation_trial_count": len(validation_trials),
+        "training_trial_keys": [_trial_key(trial) for trial in training_trials],
+        "validation_trial_keys": [_trial_key(trial) for trial in validation_trials],
+        "data_exclusions": [
+            {
+                "session_id": exclusion.session_id,
+                "trial_id": exclusion.trial_id,
+                "goal_label": exclusion.goal_label,
+                "reason": exclusion.reason,
+            }
+            for exclusion in dataset.exclusions
+        ],
+    }
+    compatibility = {
+        "sweep_signature": config.sweep_signature,
+        "data_sha256": dataset_context.data_sha256,
+        "maze_sha256": dataset_context.maze_sha256,
+        "source": source_code_fingerprint(
+            config.project_root,
+            config_path=config.source_path,
+        ),
+        "runtime": dataset_context.runtime,
+        "validation_mode": config.dataset.validation_mode,
+        "fold_index": fold_index,
+        "training_session_ids": split_payload["training_sessions"],
+        "validation_session_ids": split_payload["validation_sessions"],
+        "training_trial_keys": split_payload["training_trial_keys"],
+        "validation_trial_keys": split_payload["validation_trial_keys"],
+    }
+    return _ProblemContext(
+        dataset=dataset,
+        environment=dataset_context.environment,
+        training_trials=training_trials,
+        validation_trials=validation_trials,
+        split_payload=split_payload,
+        compatibility=compatibility,
+        fold_index=fold_index,
+    )
+
+
+def _discovery_compatibility(
+    config: RankValidationConfig,
+    dataset: _DatasetContext,
+) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "discovery_signature": _payload_digest(
+            {
+                "discovery": asdict(config.discovery),
+                "maze_sha256": dataset.maze_sha256,
+            }
+        ),
+        "maze_sha256": dataset.maze_sha256,
+        "source": source_code_fingerprint(config.project_root),
+        "runtime": dataset.runtime,
+    }
+
+
+def run_rank_discovery(
     config: RankValidationConfig | str | Path,
     k: int,
     output_dir: str | Path,
     force: bool = False,
 ) -> dict[str, object]:
-    """Discover, fit, validate, and atomically write one rank shard."""
+    """Fit and atomically store the split-independent NMF result for one rank."""
 
     resolved = _coerce_config(config)
     if isinstance(k, bool) or not isinstance(k, int) or k not in resolved.ranks:
@@ -374,37 +651,34 @@ def run_rank_validation(
     shard_path = Path(output_dir).resolve() / f"k_{k:02d}.json"
     started = time.perf_counter()
     stage = "load_data"
-    context: _ProblemContext | None = None
     payload: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
+        "artifact_type": "rank_discovery",
         "k": k,
         "status": "running",
-        "configuration": resolved.normalized_payload(),
+        "configuration": {"discovery": _json_value(asdict(resolved.discovery))},
     }
     try:
-        context = _load_problem_context(resolved)
-        payload.update(
-            {
-                "compatibility": context.compatibility,
-                "split": context.split_payload,
-            }
-        )
+        dataset = _load_dataset_context(resolved)
+        compatibility = _discovery_compatibility(resolved, dataset)
+        payload["compatibility"] = compatibility
         if shard_path.is_file() and not force:
             existing = _read_json(shard_path)
             if (
-                existing.get("k") == k
-                and existing.get("compatibility") == context.compatibility
+                existing.get("artifact_type") == "rank_discovery"
+                and existing.get("k") == k
+                and existing.get("compatibility") == compatibility
             ):
                 return existing
             raise ValueError(
-                f"Refusing to overwrite incompatible shard {shard_path}; use force=True"
+                f"Refusing to overwrite incompatible discovery artifact "
+                f"{shard_path}; use force=True"
             )
 
         stage = "discover_subgoals"
-        discovery_started = time.perf_counter()
         discovery_config = resolved.discovery
         rank_result = discover_subgoals(
-            context.environment,
+            dataset.environment,
             ranks=(k,),
             parameters=NMFConfig(
                 interior_reward=discovery_config.interior_reward,
@@ -424,16 +698,145 @@ def run_rank_validation(
             tolerance=discovery_config.tolerance,
         ).rank_result(k)
         payload["discovery"] = _rank_result_payload(rank_result)
-        payload["timings_seconds"] = {
-            "discovery": time.perf_counter() - discovery_started
-        }
         if rank_result.discovery is None:
             raise RankValidationError("Every connected NMF restart was excluded")
+        payload["status"] = "success"
+        payload["stage"] = "complete"
+        payload["timings_seconds"] = {"total": time.perf_counter() - started}
+        _atomic_write_json(shard_path, payload)
+        return _json_value(payload)
+    except Exception as error:
+        payload["status"] = "failure"
+        payload["stage"] = stage
+        payload["failure"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+        payload["timings_seconds"] = {"total": time.perf_counter() - started}
+        _atomic_write_json(shard_path, payload)
+        if isinstance(error, RankValidationError):
+            raise
+        raise RankValidationError(
+            f"Rank {k} discovery failed during {stage}: {error}"
+        ) from error
+
+
+def _load_discovery_artifact(
+    config: RankValidationConfig,
+    k: int,
+    discovery_dir: Path,
+) -> tuple[dict[str, object], np.ndarray, str]:
+    path = discovery_dir / f"k_{k:02d}.json"
+    artifact = _read_json(path)
+    dataset = _load_dataset_context(config)
+    expected_compatibility = _discovery_compatibility(config, dataset)
+    if artifact.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"Discovery artifact {path} has an incompatible schema")
+    if artifact.get("artifact_type") != "rank_discovery" or artifact.get("k") != k:
+        raise ValueError(f"Discovery artifact {path} has an invalid identity")
+    if artifact.get("compatibility") != expected_compatibility:
+        raise ValueError(f"Discovery artifact {path} is incompatible")
+    if artifact.get("status") != "success":
+        raise RankValidationError(f"Discovery artifact {path} did not succeed")
+    discovery = artifact.get("discovery")
+    if not isinstance(discovery, dict):
+        raise ValueError(f"Discovery artifact {path} has no discovery payload")
+    selected = discovery.get("selected_discovery")
+    if not isinstance(selected, dict):
+        raise ValueError(f"Discovery artifact {path} has no selected basis")
+    profiles = np.asarray(selected.get("profiles"), dtype=np.float64)
+    if profiles.ndim != 2 or profiles.shape[1] != k:
+        raise ValueError(f"Discovery artifact {path} has invalid profile dimensions")
+    if not np.all(np.isfinite(profiles)) or np.any(profiles < 0.0):
+        raise ValueError(f"Discovery artifact {path} has invalid profile values")
+    return artifact, profiles, _payload_digest(artifact)
+
+
+def _discovery_reference(
+    artifact: Mapping[str, object],
+    artifact_sha256: str,
+) -> dict[str, object]:
+    discovery = artifact["discovery"]
+    assert isinstance(discovery, dict)
+    selected = discovery["selected_discovery"]
+    assert isinstance(selected, dict)
+    return {
+        "artifact_sha256": artifact_sha256,
+        "selected_restart_id": discovery["selected_restart_id"],
+        "selected_seed": discovery["selected_seed"],
+        "selected_discovery": {
+            "reconstruction_error": selected["reconstruction_error"],
+            "profile_sha256": selected["profile_sha256"],
+            "task_weights_sha256": selected["task_weights_sha256"],
+        },
+    }
+
+
+def run_rank_validation(
+    config: RankValidationConfig | str | Path,
+    k: int,
+    output_dir: str | Path,
+    *,
+    fold_index: int = 0,
+    discovery_dir: str | Path | None = None,
+    force: bool = False,
+) -> dict[str, object]:
+    """Fit and score one rank/fold using a precomputed NMF artifact."""
+
+    resolved = _coerce_config(config)
+    if isinstance(k, bool) or not isinstance(k, int) or k not in resolved.ranks:
+        raise ValueError("k must be an integer in the configured range 2..49")
+    destination = Path(output_dir).resolve()
+    shard_path = destination / "folds" / f"k_{k:02d}_fold_{fold_index:02d}.json"
+    resolved_discovery_dir = (
+        destination / "discovery"
+        if discovery_dir is None
+        else Path(discovery_dir).resolve()
+    )
+    started = time.perf_counter()
+    stage = "load_data"
+    payload: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "rank_fold",
+        "k": k,
+        "fold_index": fold_index,
+        "status": "running",
+        "configuration": resolved.normalized_payload(),
+    }
+    try:
+        context = _load_problem_context(resolved, fold_index)
+        payload["split"] = context.split_payload
+        payload["compatibility"] = context.compatibility
+        stage = "load_discovery"
+        artifact, profiles, artifact_sha256 = _load_discovery_artifact(
+            resolved,
+            k,
+            resolved_discovery_dir,
+        )
+        compatibility = {
+            **context.compatibility,
+            "discovery_artifact_sha256": artifact_sha256,
+        }
+        payload["compatibility"] = compatibility
+        payload["discovery"] = _discovery_reference(artifact, artifact_sha256)
+        if shard_path.is_file() and not force:
+            existing = _read_json(shard_path)
+            if (
+                existing.get("artifact_type") == "rank_fold"
+                and existing.get("k") == k
+                and existing.get("fold_index") == fold_index
+                and existing.get("compatibility") == compatibility
+            ):
+                return existing
+            raise ValueError(
+                f"Refusing to overwrite incompatible fold shard {shard_path}; "
+                "use force=True"
+            )
 
         stage = "initial_score"
         initial_template, threshold_range, resolved_initial_values = _initial_template(
             context.environment,
-            rank_result,
+            profiles,
             resolved,
             k,
             {trial.goal for trial in context.training_trials},
@@ -464,7 +867,8 @@ def run_rank_validation(
         def progress(evaluation) -> None:
             if evaluation.evaluation == 0 or evaluation.evaluation % 10 == 0:
                 print(
-                    f"k={k} update={evaluation.updates}/{resolved.adam.max_steps} "
+                    f"k={k} fold={fold_index} "
+                    f"update={evaluation.updates}/{resolved.adam.max_steps} "
                     f"loss={evaluation.loss:.6f} lr={evaluation.lr:.3e} "
                     f"gradient_norm={evaluation.gradient_norm:.3e}",
                     flush=True,
@@ -484,9 +888,10 @@ def run_rank_validation(
             min_lr=resolved.adam.min_lr,
             callback=progress,
         )
-        timings = payload["timings_seconds"]
-        assert isinstance(timings, dict)
-        timings["fit"] = time.perf_counter() - fit_started
+        timings: dict[str, float] = {
+            "fit": time.perf_counter() - fit_started,
+        }
+        payload["timings_seconds"] = timings
         optimizer = payload["optimizer"]
         assert isinstance(optimizer, dict)
         optimizer["fit_result"] = _fit_result_payload(
@@ -502,7 +907,7 @@ def run_rank_validation(
         best_values = dict(fit_result.best_values.as_floats())
         fitted_template = _fitted_template(
             context.environment,
-            rank_result,
+            profiles,
             resolved,
             k,
             best_values,
@@ -539,187 +944,34 @@ def run_rank_validation(
         if isinstance(error, RankValidationError):
             raise
         raise RankValidationError(
-            f"Rank {k} validation failed during {stage}: {error}"
+            f"Rank {k} fold {fold_index} validation failed during {stage}: {error}"
         ) from error
 
+def _selected_profiles(result: NMFRankResult | np.ndarray) -> np.ndarray:
+    if isinstance(result, np.ndarray):
+        return result
+    discovery = result.discovery
+    if discovery is None:
+        raise ValueError("The NMF rank result has no selected discovery")
+    return discovery.profiles
 
-def aggregate_rank_results(
-    config: RankValidationConfig | str | Path,
-    shard_dir: str | Path,
-    output_dir: str | Path,
-) -> dict[str, object]:
-    """Verify, combine, and summarize all compatible rank shards."""
-
-    resolved = _coerce_config(config)
-    context = _load_problem_context(resolved)
-    shards_by_rank: dict[int, dict[str, object]] = {}
-    for path in sorted(Path(shard_dir).resolve().glob("k_*.json")):
-        payload = _read_json(path)
-        k = payload.get("k")
-        if isinstance(k, bool) or not isinstance(k, int) or k not in resolved.ranks:
-            raise ValueError(f"Shard {path} contains an invalid rank {k!r}")
-        if k in shards_by_rank:
-            raise ValueError(f"Duplicate result shards found for k={k}")
-        if payload.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError(f"Shard {path} has an incompatible schema")
-        if payload.get("compatibility") != context.compatibility:
-            raise ValueError(
-                f"Shard {path} has incompatible configuration, data, or source"
-            )
-        shards_by_rank[k] = payload
-
-    rows = [_summary_row(k, shards_by_rank.get(k)) for k in resolved.ranks]
-    successful = [
-        row
-        for row in rows
-        if row["status"] == "success"
-        and isinstance(row["validation_ll_per_transition"], float)
-    ]
-    ranked = sorted(
-        successful,
-        key=lambda row: (-row["validation_ll_per_transition"], row["k"]),
-    )
-    missing = [k for k in resolved.ranks if k not in shards_by_rank]
-    failed = [
-        k for k, shard in shards_by_rank.items() if shard.get("status") != "success"
-    ]
-    complete = not missing and not failed
-    aggregate = {
-        "schema_version": SCHEMA_VERSION,
-        "configuration": resolved.normalized_payload(),
-        "compatibility": context.compatibility,
-        "complete": complete,
-        "best_k": None if not ranked else ranked[0]["k"],
-        "best_k_provisional": not complete,
-        "primary_metric": (
-            "sum(trial_log_likelihood) / sum(trial_movement_transition_count)"
-        ),
-        "missing_ranks": missing,
-        "failed_ranks": sorted(failed),
-        "ranking": [row["k"] for row in ranked],
-        "summary_rows": rows,
-        "shards": [shards_by_rank[k] for k in sorted(shards_by_rank)],
-    }
-    destination = Path(output_dir).resolve()
-    destination.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(destination / "aggregate.json", aggregate)
-    _atomic_write_csv(destination / "rank_summary.csv", rows)
-    return _json_value(aggregate)
-
-
-def _coerce_config(
-    config: RankValidationConfig | str | Path,
-) -> RankValidationConfig:
-    if isinstance(config, RankValidationConfig):
-        return config
-    return load_validation_config(config)
-
-
-def _load_problem_context(config: RankValidationConfig) -> _ProblemContext:
-    dataset_config = config.dataset
-    data_root = Path(dataset_config.data_root)
-    if not data_root.is_absolute():
-        data_root = config.project_root / data_root
-    dataset = DoohanDataset.from_data_root(
-        data_root,
-        subject_ids=dataset_config.subject_ids,
-        start_date=dataset_config.start_date,
-        end_date=dataset_config.end_date,
-        maze_name=dataset_config.maze_name,
-    )
-    expected_sessions = (
-        dataset_config.training_session_count + dataset_config.validation_session_count
-    )
-    if len(dataset.sessions) != expected_sessions:
-        raise ValueError(
-            f"Expected exactly {expected_sessions} ordered sessions, "
-            f"found {len(dataset.sessions)}"
-        )
-    training_sessions = dataset.sessions[: dataset_config.training_session_count]
-    validation_sessions = dataset.sessions[dataset_config.training_session_count :]
-    training_ids = {session.session_id for session in training_sessions}
-    validation_ids = {session.session_id for session in validation_sessions}
-    training_trials = tuple(
-        trial for trial in dataset.trials if trial.session_id in training_ids
-    )
-    validation_trials = tuple(
-        trial for trial in dataset.trials if trial.session_id in validation_ids
-    )
-    if not training_trials or not validation_trials:
-        raise ValueError("Both training and validation splits require valid trials")
-    _check_expected_count(
-        "training",
-        len(training_trials),
-        dataset_config.expected_training_trials,
-    )
-    _check_expected_count(
-        "validation",
-        len(validation_trials),
-        dataset_config.expected_validation_trials,
-    )
-    split_payload = {
-        "training_sessions": [session.session_id for session in training_sessions],
-        "validation_sessions": [session.session_id for session in validation_sessions],
-        "training_trial_count": len(training_trials),
-        "validation_trial_count": len(validation_trials),
-        "training_trial_keys": [_trial_key(trial) for trial in training_trials],
-        "validation_trial_keys": [_trial_key(trial) for trial in validation_trials],
-        "data_exclusions": [
-            {
-                "session_id": exclusion.session_id,
-                "trial_id": exclusion.trial_id,
-                "goal_label": exclusion.goal_label,
-                "reason": exclusion.reason,
-            }
-            for exclusion in dataset.exclusions
-        ],
-    }
-    source = source_code_fingerprint(
-        config.project_root,
-        config_path=config.source_path,
-    )
-    compatibility = {
-        "sweep_signature": config.sweep_signature,
-        "data_sha256": _data_fingerprint(dataset),
-        "maze_sha256": _maze_fingerprint(dataset),
-        "source": source,
-        "runtime": _runtime_versions(),
-        "training_session_ids": split_payload["training_sessions"],
-        "validation_session_ids": split_payload["validation_sessions"],
-        "training_trial_keys": split_payload["training_trial_keys"],
-        "validation_trial_keys": split_payload["validation_trial_keys"],
-    }
-    return _ProblemContext(
-        dataset=dataset,
-        environment=Environment(dataset.definition.maze),
-        training_trials=training_trials,
-        validation_trials=validation_trials,
-        split_payload=split_payload,
-        compatibility=compatibility,
-    )
-
-
-def _check_expected_count(name: str, actual: int, expected: int | None) -> None:
-    if expected is not None and actual != expected:
-        raise ValueError(f"Expected {expected} {name} trials, found {actual}")
 
 
 def _initial_template(
     environment: Environment,
-    result: NMFRankResult,
+    result: NMFRankResult | np.ndarray,
     config: RankValidationConfig,
     k: int,
     goals: Iterable[tuple[int, int]],
 ) -> tuple[Template, ThresholdRange, dict[str, float]]:
-    discovery = result.discovery
-    assert discovery is not None
+    profiles = _selected_profiles(result)
     probe_values = {
         **config.adam.initial_values,
         "core_threshold": 0.0,
     }
     probe_basis = SubgoalBasis.from_profiles(
         environment.maze,
-        discovery.profiles,
+        profiles,
         core_threshold=probe_values["core_threshold"],
         core_exponent=probe_values["core_exponent"],
         profile_normalization=config.discovery.profile_normalization,
@@ -746,7 +998,7 @@ def _initial_template(
     }
     basis = SubgoalBasis.from_profiles(
         environment.maze,
-        discovery.profiles,
+        profiles,
         core_threshold=threshold,
         core_exponent=values["core_exponent"],
         profile_normalization=config.discovery.profile_normalization,
@@ -760,17 +1012,16 @@ def _initial_template(
 
 def _fitted_template(
     environment: Environment,
-    result: NMFRankResult,
+    result: NMFRankResult | np.ndarray,
     config: RankValidationConfig,
     k: int,
     best_values: Mapping[str, float],
     initial_template: Template,
 ) -> Template:
-    discovery = result.discovery
-    assert discovery is not None
+    profiles = _selected_profiles(result)
     basis = SubgoalBasis.from_profiles(
         environment.maze,
-        discovery.profiles,
+        profiles,
         core_threshold=best_values["core_threshold"],
         core_exponent=best_values["core_exponent"],
         profile_normalization=config.discovery.profile_normalization,
@@ -1243,3 +1494,24 @@ def _atomic_write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def aggregate_rank_results(
+    config: RankValidationConfig | str | Path,
+    shard_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    max_rank: int = 49,
+) -> dict[str, object]:
+    """Aggregate schema-v3 rank/fold shards via the presentation module."""
+
+    from andrew_mlmdp.validation_aggregation import (
+        aggregate_rank_results as aggregate,
+    )
+
+    return aggregate(
+        config,
+        shard_dir,
+        output_dir,
+        max_rank=max_rank,
+    )
