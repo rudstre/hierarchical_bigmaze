@@ -921,18 +921,6 @@ def _first_departure_kernel(
     return torch.clamp_min(result, 0.0)
 
 
-def _first_departure_forward(
-    kernel: Tensor,
-    current_state: int,
-    next_state: int,
-    forward: Tensor,
-) -> Tensor:
-    """Propagate through the shared first-departure closure."""
-
-    departure = _first_departure_kernel(kernel, current_state)
-    return departure[next_state] @ forward
-
-
 def _solve_checked(coefficient: Tensor, right_hand_side: Tensor) -> Tensor:
     try:
         result = torch.linalg.solve(coefficient, right_hand_side)

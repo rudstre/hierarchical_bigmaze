@@ -8,7 +8,6 @@ import torch
 
 from andrew_mlmdp import Environment, Maze, Parameters, SubgoalBasis
 from andrew_mlmdp.hierarchy.equations import (
-    _first_departure_forward,
     _first_departure_kernel,
     _goal_only_plan,
     _physical_step_kernel,
@@ -119,12 +118,11 @@ def test_likelihood_sums_direct_and_latent_access_routes():
         num_classes=len(plans),
     ).to(torch.float64)
 
-    enumerated = _first_departure_forward(
+    departure = _first_departure_kernel(
         kernel,
         task.maze.state_index(current),
-        task.maze.state_index(following),
-        forward,
-    ).sum()
+    )
+    enumerated = (departure[task.maze.state_index(following)] @ forward).sum()
     likelihood = np.exp(task.log_likelihood([current, following]))
 
     assert likelihood == pytest.approx(float(enumerated.detach()))
@@ -167,12 +165,11 @@ def test_likelihood_propagates_controller_modes_across_movements():
 
     for current, following in zip(trajectory, trajectory[1:]):
         kernel = _physical_step_kernel(model, current, plans)
-        next_forward = _first_departure_forward(
+        departure = _first_departure_kernel(
             kernel,
             task.maze.state_index(current),
-            task.maze.state_index(following),
-            forward,
         )
+        next_forward = departure[task.maze.state_index(following)] @ forward
         probability = next_forward.sum()
         expected += float(torch.log(probability).detach())
         forward = next_forward / probability
@@ -258,12 +255,11 @@ def test_zero_access_special_case_reduces_to_flat_departures():
         for following in task.maze.free_cells:
             if following == current:
                 continue
-            probability = _first_departure_forward(
+            departure = _first_departure_kernel(
                 kernel,
                 task.maze.state_index(current),
-                task.maze.state_index(following),
-                forward,
-            ).sum()
+            )
+            probability = (departure[task.maze.state_index(following)] @ forward).sum()
             assert float(probability) == pytest.approx(
                 np.exp(flat.log_likelihood([current, following])),
                 abs=1e-14,
@@ -291,9 +287,4 @@ def test_first_departure_closure_matches_analytical_solution():
     assert departure[1] == pytest.approx(expected)
     assert departure.sum(dim=(0, 1)) == pytest.approx(torch.ones(2))
     forward = torch.tensor([0.7, 0.3], dtype=torch.float64)
-    assert _first_departure_forward(
-        kernel,
-        current_state=0,
-        next_state=1,
-        forward=forward,
-    ) == pytest.approx(departure[1] @ forward)
+    assert departure[1] @ forward == pytest.approx(expected @ forward)

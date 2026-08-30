@@ -15,7 +15,7 @@ from andrew_mlmdp import (
 from andrew_mlmdp.hierarchy.equations import (
     PINV_RCOND,
     _build_hierarchy,
-    _first_departure_forward,
+    _first_departure_kernel,
     _goal_only_plan,
     _physical_step_kernel,
     _plan,
@@ -275,7 +275,7 @@ def test_probability_orientation_and_likelihood_invariants():
         torch.tensor(0),
         num_classes=kernel.shape[1],
     ).to(torch.float64)
-    departure = _first_departure_forward(kernel, 1, 2, forward).sum()
+    departure = (_first_departure_kernel(kernel, 1)[2] @ forward).sum()
     assert 0.0 <= departure <= 1.0
 
     assert template.log_likelihood(goal, [(0, 1)]) == 0.0
@@ -303,7 +303,7 @@ def test_complete_mode_first_departure_uses_full_occupancy_system():
         forward,
     )
     expected = exit_kernel @ expected_occupancy
-    actual = _first_departure_forward(kernel, 0, 1, forward)
+    actual = _first_departure_kernel(kernel, 0)[1] @ forward
     assert actual == pytest.approx(expected, abs=1e-14)
     assert actual[1] > 0.0
     assert actual[2] > 0.0
