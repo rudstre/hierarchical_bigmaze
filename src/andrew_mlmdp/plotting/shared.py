@@ -1,11 +1,9 @@
-"""Shared types and small utilities for plotting modules."""
+"""Shared data structures and Plotly utilities for plotting modules."""
 
 from dataclasses import dataclass
-from typing import Callable, cast
 
-import matplotlib
 import numpy as np
-from matplotlib.colors import Colormap
+from plotly.colors import get_colorscale, qualitative, sample_colorscale
 
 from andrew_mlmdp.hierarchy import Plan
 from andrew_mlmdp.maze import Coordinate
@@ -49,30 +47,43 @@ class _ProfileFrame:
     status: str | None = None
 
 
-
-def _colormap(name: str, *, bad: str | None = None) -> Colormap:
-    """Return a configured copy from Matplotlib's modern registry API."""
-
-    registry = getattr(matplotlib, "colormaps")
-    color_map = cast(Colormap, registry[name])
-    if bad is None:
-        return color_map
-    with_extremes = cast(Callable[..., Colormap], color_map.with_extremes)
-    return with_extremes(bad=bad)
+_TRAJECTORY_ARROW_COLORS = tuple(qualitative.Plotly[:10])
 
 
-_TRAJECTORY_ARROW_COLORS = (
-    "#1f77b4",
-    "#ff7f0e",
-    "#2ca02c",
-    "#d62728",
-    "#9467bd",
-    "#8c564b",
-    "#e377c2",
-    "#7f7f7f",
-    "#bcbd22",
-    "#17becf",
-)
+def _colorscale(name: str) -> list[list[object]]:
+    """Return a Plotly colorscale using familiar case-insensitive names."""
+
+    aliases = {
+        "viridis": "Viridis",
+        "ylorrd": "YlOrRd",
+        "coolwarm": "RdBu",
+        "blues": "Blues",
+    }
+    return get_colorscale(aliases.get(name.lower(), name))
+
+
+def _sample_color(name: str, value: float) -> str:
+    """Sample a named Plotly colorscale at a clipped unit interval value."""
+
+    clipped = min(1.0, max(0.0, float(value)))
+    return str(sample_colorscale(_colorscale(name), [clipped])[0])
+
+
+def _plotly_color(color: str) -> str:
+    """Translate Matplotlib-style numeric gray strings to CSS colors."""
+
+    try:
+        gray = float(color)
+    except (TypeError, ValueError):
+        return color
+    channel = round(255 * min(1.0, max(0.0, gray)))
+    return f"rgb({channel},{channel},{channel})"
+
+
+def _figure_size(figsize: tuple[float, float]) -> tuple[int, int]:
+    """Convert the project's historical inch-based sizes to CSS pixels."""
+
+    return round(100 * figsize[0]), round(100 * figsize[1])
 
 
 def _format_probability(value: float | None) -> str:
@@ -91,5 +102,3 @@ def _event_title(event: str) -> str:
         "terminal": "terminal",
     }
     return titles[event]
-
-

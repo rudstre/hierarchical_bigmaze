@@ -111,6 +111,22 @@ def aggregate_rank_results(
     return aggregate
 
 
+def _write_plotly_outputs(
+    figure,
+    output_dir: str | Path,
+    stem: str,
+) -> tuple[Path, Path]:
+    """Write a Plotly figure to the report's established PNG and SVG paths."""
+
+    destination = Path(output_dir).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    png_path = destination / f"{stem}.png"
+    svg_path = destination / f"{stem}.svg"
+    figure.write_image(png_path, width=900, height=550, scale=2)
+    figure.write_image(svg_path, width=900, height=550)
+    return png_path, svg_path
+
+
 def plot_held_out_log_likelihood(
     rows: list[dict[str, object]],
     output_dir: str | Path,
@@ -119,78 +135,62 @@ def plot_held_out_log_likelihood(
 ) -> tuple[Path, Path]:
     """Plot pooled held-out log likelihood per transition against rank."""
 
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
 
     ranks = np.asarray([int(row["k"]) for row in rows], dtype=int)
     held_out = _numeric_series(rows, "validation_ll_per_transition")
     training = _numeric_series(rows, "training_fitted_ll_per_transition")
     if not np.any(np.isfinite(held_out)):
         raise ValueError("No successful held-out likelihoods are available to plot")
-
-    figure, axis = plt.subplots(figsize=(9, 5.5))
-    axis.plot(
-        ranks,
-        held_out,
-        color="#2369a1",
-        marker="o",
-        markersize=4,
-        linewidth=1.5,
-        label="Held-out pooled LL / transition",
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=ranks,
+            y=held_out,
+            mode="lines+markers",
+            line={"color": "#2369a1", "width": 1.5},
+            marker={"size": 6},
+            name="Held-out pooled LL / transition",
+        )
     )
-    axis.plot(
-        ranks,
-        training,
-        color="#d9822b",
-        marker="o",
-        markersize=4,
-        linewidth=1.5,
-        label="Fitted training pooled LL / transition",
+    figure.add_trace(
+        go.Scatter(
+            x=ranks,
+            y=training,
+            mode="lines+markers",
+            line={"color": "#d9822b", "width": 1.5},
+            marker={"size": 6},
+            name="Fitted training pooled LL / transition",
+        )
     )
     best_index = int(np.nanargmax(held_out))
     best_k = int(ranks[best_index])
     best_value = float(held_out[best_index])
-    axis.scatter(
-        [best_k],
-        [best_value],
-        color="#d1495b",
-        edgecolor="white",
-        linewidth=0.8,
-        s=70,
-        zorder=4,
-        label=f"Best available: k={best_k}",
+    figure.add_trace(
+        go.Scatter(
+            x=[best_k],
+            y=[best_value],
+            mode="markers+text",
+            text=[f"k={best_k}<br>{best_value:.4f}"],
+            textposition="bottom right",
+            marker={
+                "size": 11,
+                "color": "#d1495b",
+                "line": {"color": "white", "width": 1},
+            },
+            name=f"Best available: k={best_k}",
+        )
     )
-    axis.annotate(
-        f"k={best_k}\n{best_value:.4f}",
-        xy=(best_k, best_value),
-        xytext=(8, -10),
-        textcoords="offset points",
-        fontsize=9,
-        horizontalalignment="left",
-        verticalalignment="top",
+    figure.update_layout(
+        title="Training and held-out hierarchy likelihood by NMF rank"
+        + ("" if complete else " (provisional)"),
+        xaxis_title="Number of discovered subgoals (k)",
+        yaxis_title="Pooled log likelihood per movement transition",
+        template="plotly_white",
+        legend={"orientation": "h", "y": 1.12},
     )
-    axis.set(
-        xlabel="Number of discovered subgoals (k)",
-        ylabel="Pooled log likelihood per movement transition",
-        title=(
-            "Training and held-out hierarchy likelihood by NMF rank"
-            + ("" if complete else " (provisional)")
-        ),
-        xticks=np.arange(2, 50, 2),
-    )
-    axis.grid(alpha=0.25)
-    axis.legend(frameon=False)
-    figure.tight_layout()
-
-    destination = Path(output_dir).resolve()
-    png_path = destination / "held_out_log_likelihood_vs_k.png"
-    svg_path = destination / "held_out_log_likelihood_vs_k.svg"
-    figure.savefig(png_path, dpi=200, bbox_inches="tight")
-    figure.savefig(svg_path, bbox_inches="tight")
-    plt.close(figure)
-    return png_path, svg_path
+    figure.update_xaxes(tickmode="array", tickvals=np.arange(2, 50, 2))
+    return _write_plotly_outputs(figure, output_dir, "held_out_log_likelihood_vs_k")
 
 
 def plot_selected_nmf_normalized_kl(
@@ -201,48 +201,30 @@ def plot_selected_nmf_normalized_kl(
 ) -> tuple[Path, Path]:
     """Plot the selected basis's normalized generalized KL by rank."""
 
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
 
     ranks = np.asarray([int(row["k"]) for row in rows], dtype=int)
-    values = _numeric_series(
-        rows,
-        "nmf_reconstruction_error",
-        require_success=False,
-    )
+    values = _numeric_series(rows, "nmf_reconstruction_error", require_success=False)
     if not np.any(np.isfinite(values)):
         raise ValueError("No selected NMF normalized KL values are available to plot")
-
-    figure, axis = plt.subplots(figsize=(9, 5.5))
-    axis.plot(
-        ranks,
-        values,
-        color="#2369a1",
-        marker="o",
-        markersize=4,
-        linewidth=1.5,
+    figure = go.Figure(
+        go.Scatter(
+            x=ranks,
+            y=values,
+            mode="lines+markers",
+            line={"color": "#2369a1", "width": 1.5},
+            marker={"size": 6},
+        )
     )
-    axis.set(
-        xlabel="Number of discovered subgoals (k)",
-        ylabel="Selected normalized generalized KL divergence",
-        title=(
-            "Selected connected NMF basis fit by rank"
-            + ("" if complete else " (provisional)")
-        ),
-        xticks=np.arange(2, 50, 2),
+    figure.update_layout(
+        title="Selected connected NMF basis fit by rank"
+        + ("" if complete else " (provisional)"),
+        xaxis_title="Number of discovered subgoals (k)",
+        yaxis_title="Selected normalized generalized KL divergence",
+        template="plotly_white",
     )
-    axis.grid(alpha=0.25)
-    figure.tight_layout()
-
-    destination = Path(output_dir).resolve()
-    png_path = destination / "selected_nmf_normalized_kl_vs_k.png"
-    svg_path = destination / "selected_nmf_normalized_kl_vs_k.svg"
-    figure.savefig(png_path, dpi=200, bbox_inches="tight")
-    figure.savefig(svg_path, bbox_inches="tight")
-    plt.close(figure)
-    return png_path, svg_path
+    figure.update_xaxes(tickmode="array", tickvals=np.arange(2, 50, 2))
+    return _write_plotly_outputs(figure, output_dir, "selected_nmf_normalized_kl_vs_k")
 
 
 def plot_fitted_parameters(
@@ -253,10 +235,8 @@ def plot_fitted_parameters(
 ) -> tuple[Path, Path]:
     """Plot the six fitted hierarchy parameters in compact small multiples."""
 
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     ranks = np.asarray([int(row["k"]) for row in rows], dtype=int)
     parameters = (
@@ -270,35 +250,37 @@ def plot_fitted_parameters(
     series = [_numeric_series(rows, field) for field, _ in parameters]
     if not any(np.any(np.isfinite(values)) for values in series):
         raise ValueError("No fitted hierarchy parameters are available to plot")
-
-    figure, axes = plt.subplots(3, 2, figsize=(10, 10), sharex=True)
-    for axis, (_, label), values in zip(axes.flat, parameters, series, strict=True):
-        axis.plot(
-            ranks,
-            values,
-            color="#2369a1",
-            marker="o",
-            markersize=3.5,
-            linewidth=1.4,
-        )
-        axis.set_ylabel(label)
-        axis.set_xticks(np.arange(2, 50, 4))
-        axis.grid(alpha=0.25)
-    for axis in axes[-1, :]:
-        axis.set_xlabel("Number of discovered subgoals (k)")
-    figure.suptitle(
-        "Fitted hierarchy parameters by NMF rank"
-        + ("" if complete else " (provisional)")
+    figure = make_subplots(
+        rows=3, cols=2, subplot_titles=[label for _, label in parameters]
     )
-    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
-
-    destination = Path(output_dir).resolve()
-    png_path = destination / "fitted_parameters_vs_k.png"
-    svg_path = destination / "fitted_parameters_vs_k.svg"
-    figure.savefig(png_path, dpi=200, bbox_inches="tight")
-    figure.savefig(svg_path, bbox_inches="tight")
-    plt.close(figure)
-    return png_path, svg_path
+    for index, ((_, label), values) in enumerate(zip(parameters, series, strict=True)):
+        row, col = divmod(index, 2)
+        figure.add_trace(
+            go.Scatter(
+                x=ranks,
+                y=values,
+                mode="lines+markers",
+                line={"color": "#2369a1", "width": 1.4},
+                marker={"size": 5},
+                showlegend=False,
+            ),
+            row=row + 1,
+            col=col + 1,
+        )
+        figure.update_yaxes(title_text=label, row=row + 1, col=col + 1)
+        figure.update_xaxes(
+            tickmode="array", tickvals=np.arange(2, 50, 4), row=row + 1, col=col + 1
+        )
+    figure.update_xaxes(title_text="Number of discovered subgoals (k)", row=3, col=1)
+    figure.update_xaxes(title_text="Number of discovered subgoals (k)", row=3, col=2)
+    figure.update_layout(
+        title="Fitted hierarchy parameters by NMF rank"
+        + ("" if complete else " (provisional)"),
+        template="plotly_white",
+        width=1000,
+        height=1000,
+    )
+    return _write_plotly_outputs(figure, output_dir, "fitted_parameters_vs_k")
 
 
 def _aggregation_summary_row(

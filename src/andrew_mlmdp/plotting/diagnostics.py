@@ -1,4 +1,4 @@
-"""Static Matplotlib diagnostics for goal-conditioned hierarchies."""
+"""Plotly diagnostics for goal-conditioned hierarchies."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from math import ceil, sqrt
 from typing import Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import Normalize, TwoSlopeNorm
-from matplotlib.patches import FancyArrowPatch
+import plotly.graph_objects as go
+from plotly.colors import qualitative
+from plotly.subplots import make_subplots
 
 from andrew_mlmdp.hierarchy.diagnostics import (
     ContinuationPolicy,
@@ -29,380 +29,338 @@ from andrew_mlmdp.hierarchy.diagnostics import (
 )
 from andrew_mlmdp.maze import Coordinate, Maze
 from andrew_mlmdp.plotting.maze import plot_maze
-from andrew_mlmdp.plotting.shared import _colormap
+from andrew_mlmdp.plotting.shared import _colorscale, _figure_size
 
 
 def plot_diagnostic_sweep(
     sweep_data: DiagnosticSweep,
     *,
     axes=None,
-):
+) -> go.Figure:
     """Plot pair diagnostics and an optional full-dataset likelihood."""
 
     if not isinstance(sweep_data, DiagnosticSweep):
-        raise TypeError("sweep_data must be an DiagnosticSweep")
+        raise TypeError("sweep_data must be a DiagnosticSweep")
     has_likelihood = sweep_data.total_log_likelihood is not None
-    expected_axes = 3 if has_likelihood else 2
-    expected_axes_text = "three" if has_likelihood else "two"
+    rows = 3 if has_likelihood else 2
     if axes is None:
-        height_ratios = [1.0, 1.15, 1.0] if has_likelihood else [1.0, 1.15]
-        figure, created_axes = plt.subplots(
-            expected_axes,
-            1,
-            figsize=(10.0, 2.9 * expected_axes),
-            sharex=True,
-            layout="constrained",
-            gridspec_kw={"height_ratios": height_ratios},
+        figure = make_subplots(
+            rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.1
         )
-        resolved_axes = tuple(created_axes)
+    elif isinstance(axes, go.Figure):
+        figure = axes
     else:
-        try:
-            resolved_axes = tuple(axes)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                f"axes must contain exactly {expected_axes_text} axes"
-            ) from error
-        if len(resolved_axes) != expected_axes:
-            raise ValueError(
-                f"axes must contain exactly {expected_axes_text} axes"
-            )
-        entropy_ax, length_ax = resolved_axes[:2]
-        figure = entropy_ax.figure
-        if any(ax.figure is not figure for ax in resolved_axes[1:]):
-            raise ValueError("axes must belong to the same figure")
+        raise TypeError("axes must be a Plotly Figure or None")
 
-    entropy_ax, length_ax = resolved_axes[:2]
-
-    parameter_values = sweep_data.parameter_values
-    entropy_ax.plot(
-        parameter_values,
-        sweep_data.normalized_entropy,
-        marker="o",
-        label="Policy entropy",
+    x = sweep_data.parameter_values
+    figure.add_trace(
+        go.Scatter(
+            x=x,
+            y=sweep_data.normalized_entropy,
+            mode="lines+markers",
+            name="Policy entropy",
+        ),
+        row=1,
+        col=1,
     )
-    entropy_ax.set_ylabel("Expected policy entropy (normalized)")
-    _style_sweep_axis(entropy_ax)
-    _place_sweep_legend(entropy_ax)
+    figure.update_yaxes(title_text="Expected policy entropy (normalized)", row=1, col=1)
 
     mean = sweep_data.mean_steps
-    standard_deviation = sweep_data.step_sd
-    length_ax.plot(
-        parameter_values,
-        mean,
-        marker="o",
-        label="Mean physical steps",
+    sd = sweep_data.step_sd
+    figure.add_trace(
+        go.Scatter(
+            x=np.concatenate((x, x[::-1])),
+            y=np.concatenate((mean - sd, (mean + sd)[::-1])),
+            fill="toself",
+            fillcolor="rgba(31,119,180,0.18)",
+            line={"color": "rgba(0,0,0,0)"},
+            name="±1 SD",
+        ),
+        row=2,
+        col=1,
     )
-    length_ax.fill_between(
-        parameter_values,
-        mean - standard_deviation,
-        mean + standard_deviation,
-        alpha=0.2,
-        label="±1 SD",
+    figure.add_trace(
+        go.Scatter(x=x, y=mean, mode="lines+markers", name="Mean physical steps"),
+        row=2,
+        col=1,
     )
-    length_ax.axhline(
-        sweep_data.shortest_steps,
-        color="black",
-        linestyle="--",
-        label=(f"Shortest path = {sweep_data.shortest_steps} steps"),
+    figure.add_hline(
+        y=sweep_data.shortest_steps,
+        line_dash="dash",
+        line_color="black",
+        annotation_text=f"Shortest path = {sweep_data.shortest_steps} steps",
+        row=2,
+        col=1,
     )
-    length_ax.set_ylabel("Trajectory length (physical steps)")
-    _style_sweep_axis(length_ax)
-    _place_sweep_legend(length_ax)
-
+    figure.update_yaxes(title_text="Trajectory length (physical steps)", row=2, col=1)
     if has_likelihood:
-        likelihood_ax = resolved_axes[2]
-        likelihood_ax.plot(
-            parameter_values,
-            sweep_data.total_log_likelihood,
-            marker="o",
-            label="All observed trials",
+        figure.add_trace(
+            go.Scatter(
+                x=x,
+                y=sweep_data.total_log_likelihood,
+                mode="lines+markers",
+                name="All observed trials",
+            ),
+            row=3,
+            col=1,
         )
-        likelihood_ax.set_ylabel("Total log likelihood")
-        _style_sweep_axis(likelihood_ax)
-        _place_sweep_legend(likelihood_ax)
-
-    resolved_axes[-1].set_xlabel(
-        sweep_data.parameter_name.replace("_", " ").capitalize()
+        figure.update_yaxes(title_text="Total log likelihood", row=3, col=1)
+    figure.update_xaxes(
+        title_text=sweep_data.parameter_name.replace("_", " ").capitalize(),
+        row=rows,
+        col=1,
     )
-    for ax in resolved_axes:
-        ax.margins(x=0.02)
-        ax.yaxis.labelpad = 12
-    figure.align_ylabels(resolved_axes)
-    return figure, resolved_axes
-
-
-def _style_sweep_axis(ax) -> None:
-    """Apply a quiet, comparison-friendly style to one sweep panel."""
-
-    ax.set_axisbelow(True)
-    ax.grid(axis="y", color="0.88", linewidth=0.8)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.tick_params(axis="both", direction="out")
-
-
-def _place_sweep_legend(ax) -> None:
-    """Keep legends above the data and distribute entries across the panel."""
-
-    handles, labels = ax.get_legend_handles_labels()
-    ax.legend(
-        handles,
-        labels,
-        loc="lower left",
-        bbox_to_anchor=(0.0, 1.02, 1.0, 0.2),
-        mode="expand",
-        ncols=len(handles),
-        borderaxespad=0.0,
-        frameon=False,
-        handlelength=2.4,
-        columnspacing=1.4,
+    width, height = _figure_size((10.0, 2.9 * rows))
+    figure.update_layout(
+        width=width,
+        height=height,
+        template="plotly_white",
+        hovermode="x unified",
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0,
+        },
     )
+    figure.update_yaxes(showgrid=True, gridcolor="rgb(225,225,225)")
+    return figure
 
 
-def _subgoal_colors(n_subgoals: int) -> tuple[tuple[float, ...], ...]:
-    color_map = _colormap("tab20" if n_subgoals <= 20 else "hsv")
-    denominator = max(1, n_subgoals)
-    return tuple(color_map(index / denominator) for index in range(n_subgoals))
-
-
-def _profile_rgba(
-    maze: Maze,
-    profiles: np.ndarray,
-    colors: Sequence[tuple[float, ...]],
-) -> np.ndarray:
-    values = np.asarray(profiles, dtype=np.float64)
-    rgba = np.zeros((*maze.shape, 4), dtype=np.float64)
-    largest = float(values.max(initial=0.0))
-    for state, (row, column) in enumerate(maze.free_cells):
-        state_values = values[state]
-        mass = float(state_values.sum())
-        if mass <= 0.0 or largest <= 0.0:
-            continue
-        mixture = (
-            sum(
-                state_values[index] * np.asarray(colors[index][:3])
-                for index in range(len(colors))
-            )
-            / mass
-        )
-        rgba[row, column, :3] = mixture
-        rgba[row, column, 3] = min(0.92, 0.12 + 0.80 * state_values.max() / largest)
-    return rgba
-
-
-def _draw_profile_panel(
-    ax,
-    maze: Maze,
-    profiles: np.ndarray,
-    colors: Sequence[tuple[float, ...]],
-    *,
-    title: str,
-) -> None:
-    ax.imshow(_profile_rgba(maze, profiles, colors), origin="upper", zorder=-1)
-    plot_maze(maze, show_grid=False, title=title, ax=ax)
+def _subgoal_colors(n_subgoals: int) -> tuple[str, ...]:
+    palette = qualitative.Plotly if n_subgoals <= 10 else qualitative.Light24
+    return tuple(palette[index % len(palette)] for index in range(n_subgoals))
 
 
 def _arrow_width(probability: float, maximum: float) -> float:
-    if maximum <= 0.0:
-        return 0.0
-    return 0.45 + 4.0 * probability / maximum
+    return 0.0 if maximum <= 0.0 else 0.75 + 4.0 * probability / maximum
 
 
-def _curved_arrow(
-    ax,
+def _add_arrow(
+    fig: go.Figure,
     source: tuple[float, float],
     destination: tuple[float, float],
     *,
     width: float,
-    color,
-    rad: float = 0.0,
-    alpha: float = 0.8,
-    zorder: int = 5,
+    color: str,
+    row: int,
+    col: int,
+    name: str | None = None,
 ) -> None:
     source_row, source_column = source
     destination_row, destination_column = destination
-    arrow = FancyArrowPatch(
-        (source_column, source_row),
-        (destination_column, destination_row),
-        arrowstyle="-|>",
-        mutation_scale=8.0 + 1.5 * width,
-        linewidth=width,
-        color=color,
-        alpha=alpha,
-        connectionstyle=f"arc3,rad={rad}",
-        shrinkA=8,
-        shrinkB=9,
-        zorder=zorder,
+    angle = float(
+        np.degrees(
+            np.arctan2(destination_row - source_row, destination_column - source_column)
+        )
     )
-    ax.add_patch(arrow)
+    fig.add_trace(
+        go.Scatter(
+            x=[source_column, destination_column],
+            y=[source_row, destination_row],
+            mode="lines+markers",
+            line={"color": color, "width": width},
+            marker={"size": [0, 8], "symbol": ["circle", "arrow"], "angle": [0, angle]},
+            name=name,
+            showlegend=name is not None,
+            hoverinfo="skip",
+        ),
+        row=row,
+        col=col,
+    )
 
 
-def _draw_loop(
-    ax,
-    coordinate: tuple[float, float],
+def _add_profile_panel(
+    fig: go.Figure,
+    maze: Maze,
+    profiles: np.ndarray,
     *,
-    width: float,
-    color,
+    title: str,
+    row: int,
+    col: int,
 ) -> None:
-    row, column = coordinate
-    loop = FancyArrowPatch(
-        (column - 0.12, row - 0.05),
-        (column + 0.12, row - 0.05),
-        arrowstyle="-|>",
-        mutation_scale=8.0 + width,
-        linewidth=width,
-        color=color,
-        connectionstyle="arc3,rad=-1.6",
-        shrinkA=2,
-        shrinkB=2,
-        zorder=5,
+    values = np.asarray(profiles, dtype=np.float64)
+    intensity = values.max(axis=1) if values.ndim == 2 else values
+    fig.add_trace(
+        go.Heatmap(
+            z=_state_grid(maze, intensity),
+            colorscale=_colorscale("Viridis"),
+            zmin=0.0,
+            zmax=float(np.max(intensity, initial=1.0)),
+            showscale=False,
+            hovertemplate="profile: %{z:.4f}<extra></extra>",
+        ),
+        row=row,
+        col=col,
     )
-    ax.add_patch(loop)
+    plot_maze(maze, show_grid=False, title=None, fig=fig, row=row, col=col)
+    fig.update_xaxes(title_text=title, row=row, col=col)
 
 
 def _draw_upper_edges(
-    ax,
+    fig: go.Figure,
     data: UpperGraph,
     dynamics: np.ndarray,
-    colors: Sequence[tuple[float, ...]],
+    colors: Sequence[str],
     *,
     probability_threshold: float,
     common_maximum: float,
+    row: int,
+    col: int,
     show_goal: bool = True,
 ) -> None:
-    n_subgoals = len(data.positions)
-    for source in range(n_subgoals):
-        for destination in range(n_subgoals):
+    for source, coordinate in enumerate(data.positions):
+        for destination, destination_coordinate in enumerate(data.positions):
             probability = float(dynamics[destination, source])
             if probability <= probability_threshold:
                 continue
-            width = _arrow_width(probability, common_maximum)
             if source == destination:
-                _draw_loop(
-                    ax,
-                    data.positions[source],
-                    width=width,
-                    color=colors[source],
+                node_row, node_col = coordinate
+                theta = np.linspace(0, 2 * np.pi, 30)
+                fig.add_trace(
+                    go.Scatter(
+                        x=node_col + 0.18 * np.cos(theta),
+                        y=node_row - 0.28 + 0.14 * np.sin(theta),
+                        mode="lines",
+                        line={
+                            "color": colors[source],
+                            "width": _arrow_width(probability, common_maximum),
+                        },
+                        showlegend=False,
+                        hovertemplate=f"p={probability:.4f}<extra></extra>",
+                    ),
+                    row=row,
+                    col=col,
                 )
             else:
-                rad = 0.13 if source < destination else -0.13
-                _curved_arrow(
-                    ax,
-                    data.positions[source],
-                    data.positions[destination],
-                    width=width,
+                _add_arrow(
+                    fig,
+                    coordinate,
+                    destination_coordinate,
+                    width=_arrow_width(probability, common_maximum),
                     color=colors[source],
-                    rad=rad,
+                    row=row,
+                    col=col,
                 )
-        goal_probability = float(dynamics[-1, source]) if show_goal else 0.0
-        if goal_probability > probability_threshold:
-            _curved_arrow(
-                ax,
-                data.positions[source],
-                (float(data.goal[0]), float(data.goal[1])),
-                width=_arrow_width(goal_probability, common_maximum),
-                color=colors[source],
-                rad=0.08,
-            )
+        if show_goal:
+            probability = float(dynamics[-1, source])
+            if probability > probability_threshold:
+                _add_arrow(
+                    fig,
+                    coordinate,
+                    data.goal,
+                    width=_arrow_width(probability, common_maximum),
+                    color=colors[source],
+                    row=row,
+                    col=col,
+                )
 
 
 def _draw_upper_nodes(
-    ax,
+    fig: go.Figure,
     data: UpperGraph,
-    colors: Sequence[tuple[float, ...]],
+    colors: Sequence[str],
     *,
+    row: int,
+    col: int,
     show_goal: bool = True,
 ) -> None:
-    for label, coordinate, color in zip(
-        data.labels,
-        data.positions,
-        colors,
-    ):
-        row, column = coordinate
-        ax.scatter(
-            [column],
-            [row],
-            s=100,
-            facecolor=color,
-            edgecolor="white",
-            linewidth=1.0,
-            zorder=7,
-        )
-        ax.text(
-            column,
-            row,
-            label,
-            color="black",
-            fontsize=7,
-            fontweight="bold",
-            ha="center",
-            va="center",
-            zorder=8,
-        )
+    fig.add_trace(
+        go.Scatter(
+            x=[coordinate[1] for coordinate in data.positions],
+            y=[coordinate[0] for coordinate in data.positions],
+            mode="markers+text",
+            text=list(data.labels),
+            textposition="middle center",
+            marker={
+                "size": 17,
+                "color": list(colors),
+                "line": {"color": "white", "width": 1},
+            },
+            textfont={"size": 9, "color": "black"},
+            name="subgoals",
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
+    )
     if show_goal:
-        goal_row, goal_column = data.goal
-        ax.plot(
-            goal_column,
-            goal_row,
-            marker="*",
-            markersize=14,
-            markerfacecolor="#ffd92f",
-            markeredgecolor="black",
-            zorder=8,
+        fig.add_trace(
+            go.Scatter(
+                x=[data.goal[1]],
+                y=[data.goal[0]],
+                mode="markers",
+                marker={
+                    "symbol": "star",
+                    "size": 19,
+                    "color": "#ffd92f",
+                    "line": {"color": "black", "width": 1},
+                },
+                name="goal",
+                showlegend=False,
+            ),
+            row=row,
+            col=col,
         )
 
 
 def _draw_initial_edges(
-    ax,
+    fig: go.Figure,
     data: UpperGraph,
     values: np.ndarray,
     *,
     maximum: float,
     probability_threshold: float,
+    row: int,
+    col: int,
 ) -> None:
     if data.start_state is None:
         return
-    start = (float(data.start_state[0]), float(data.start_state[1]))
     for destination, coordinate in enumerate(data.positions):
         probability = float(values[destination])
         if probability > probability_threshold:
-            _curved_arrow(
-                ax,
-                start,
+            _add_arrow(
+                fig,
+                data.start_state,
                 coordinate,
                 width=_arrow_width(probability, maximum),
                 color="#222222",
-                rad=-0.18,
-                alpha=0.75,
-                zorder=6,
+                row=row,
+                col=col,
             )
-    goal_probability = float(values[-1])
-    if goal_probability > probability_threshold:
-        _curved_arrow(
-            ax,
-            start,
-            (float(data.goal[0]), float(data.goal[1])),
-            width=_arrow_width(goal_probability, maximum),
+    if float(values[-1]) > probability_threshold:
+        _add_arrow(
+            fig,
+            data.start_state,
+            data.goal,
+            width=_arrow_width(float(values[-1]), maximum),
             color="#222222",
-            rad=-0.18,
-            alpha=0.75,
-            zorder=6,
+            row=row,
+            col=col,
         )
-    start_row, start_column = start
-    ax.scatter(
-        [start_column],
-        [start_row],
-        marker="s",
-        s=70,
-        facecolor="white",
-        edgecolor="black",
-        zorder=9,
+    label = (
+        "START (entered)"
+        if data.start_interpretation == "entered_upper_state"
+        else "START"
     )
-    label = "START"
-    if data.start_interpretation == "entered_upper_state":
-        label = "START\n(entered)"
-    ax.annotate(
-        label, (start_column, start_row), xytext=(4, 4), textcoords="offset points"
+    fig.add_trace(
+        go.Scatter(
+            x=[data.start_state[1]],
+            y=[data.start_state[0]],
+            mode="markers+text",
+            text=[label],
+            textposition="top right",
+            marker={
+                "symbol": "square",
+                "size": 11,
+                "color": "white",
+                "line": {"color": "black", "width": 1},
+            },
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
     )
 
 
@@ -415,45 +373,44 @@ def plot_upper_graph(
     representative: Literal["peak", "centroid"] = "peak",
     show_goal: bool = True,
     probability_threshold: float = 0.0,
-):
+) -> go.Figure:
     """Plot task-level execution access and passive upper dynamics."""
 
     data = upper_graph(model, goal, representative=representative)
-    panels: list[tuple[str, np.ndarray]] = []
+    panels = []
     if show_original_profiles:
         panels.append(("Original NMF profiles", data.source_profiles))
     if show_gated_profiles:
         panels.append(("Gated basis profiles", data.gated_profiles))
     panels.append(
-        (
-            "Goal-conditioned execution-access probabilities",
-            data.access_probabilities,
-        )
+        ("Goal-conditioned execution-access probabilities", data.access_probabilities)
     )
-    figure, axes = plt.subplots(
-        1,
-        len(panels),
-        figsize=(6.0 * len(panels), 6.0),
-        squeeze=False,
+    figure = make_subplots(
+        rows=1, cols=len(panels), subplot_titles=[p[0] for p in panels]
     )
     colors = _subgoal_colors(len(data.labels))
     maximum = float(data.upper_passive.max(initial=0.0))
-    for panel_index, (title, profiles) in enumerate(panels):
-        ax = axes[0, panel_index]
-        _draw_profile_panel(ax, data.maze, profiles, colors, title=title)
-        if panel_index == len(panels) - 1:
+    for panel_index, (title, profiles) in enumerate(panels, 1):
+        _add_profile_panel(
+            figure, data.maze, profiles, title=title, row=1, col=panel_index
+        )
+        if panel_index == len(panels):
             _draw_upper_edges(
-                ax,
+                figure,
                 data,
                 data.upper_passive,
                 colors,
                 probability_threshold=probability_threshold,
                 common_maximum=maximum,
+                row=1,
+                col=panel_index,
                 show_goal=show_goal,
             )
-        _draw_upper_nodes(ax, data, colors, show_goal=show_goal)
-    figure.tight_layout()
-    return figure, axes
+        _draw_upper_nodes(
+            figure, data, colors, row=1, col=panel_index, show_goal=show_goal
+        )
+    figure.update_layout(width=600 * len(panels), height=600, template="plotly_white")
+    return figure
 
 
 def plot_upper_policy(
@@ -464,61 +421,61 @@ def plot_upper_policy(
     compare_passive: bool = True,
     representative: Literal["peak", "centroid"] = "peak",
     probability_threshold: float = 0.0,
-):
+) -> go.Figure:
     """Plot controlled continuation and optional initial/passive dynamics."""
 
     data = upper_graph(
-        model,
-        goal,
-        start_state=start_state,
-        representative=representative,
+        model, goal, start_state=start_state, representative=representative
     )
-    matrices = (
-        [("Passive upper dynamics", data.upper_passive)] if compare_passive else []
-    )
+    matrices = []
+    if compare_passive:
+        matrices.append(
+            ("Passive upper dynamics", data.upper_passive, data.initial_passive)
+        )
     matrices.append(
-        ("Goal-conditioned controlled upper dynamics", data.upper_controlled)
+        (
+            "Goal-conditioned controlled upper dynamics",
+            data.upper_controlled,
+            data.initial_controlled,
+        )
     )
-    figure, axes = plt.subplots(
-        1,
-        len(matrices),
-        figsize=(6.0 * len(matrices), 6.0),
-        squeeze=False,
+    figure = make_subplots(
+        rows=1, cols=len(matrices), subplot_titles=[item[0] for item in matrices]
     )
     colors = _subgoal_colors(len(data.labels))
-    maxima = [float(matrix.max(initial=0.0)) for _, matrix in matrices]
-    if data.initial_passive is not None:
-        maxima.append(float(data.initial_passive.max(initial=0.0)))
-    if data.initial_controlled is not None:
-        maxima.append(float(data.initial_controlled.max(initial=0.0)))
+    maxima = [float(item[1].max(initial=0.0)) for item in matrices]
+    maxima.extend(
+        float(item.max(initial=0.0))
+        for item in (data.initial_passive, data.initial_controlled)
+        if item is not None
+    )
     common_maximum = max(maxima, default=0.0)
-    for panel_index, (title, matrix) in enumerate(matrices):
-        ax = axes[0, panel_index]
-        plot_maze(data.maze, show_grid=False, title=title, ax=ax)
+    for index, (title, matrix, initial) in enumerate(matrices, 1):
+        plot_maze(data.maze, show_grid=False, title=None, fig=figure, row=1, col=index)
         _draw_upper_edges(
-            ax,
+            figure,
             data,
             matrix,
             colors,
             probability_threshold=probability_threshold,
             common_maximum=common_maximum,
-        )
-        initial = (
-            data.initial_passive
-            if title.startswith("Passive")
-            else data.initial_controlled
+            row=1,
+            col=index,
         )
         if initial is not None:
             _draw_initial_edges(
-                ax,
+                figure,
                 data,
                 initial,
                 maximum=common_maximum,
                 probability_threshold=probability_threshold,
+                row=1,
+                col=index,
             )
-        _draw_upper_nodes(ax, data, colors)
-    figure.tight_layout()
-    return figure, axes
+        _draw_upper_nodes(figure, data, colors, row=1, col=index)
+        figure.update_xaxes(title_text=title, row=1, col=index)
+    figure.update_layout(width=600 * len(matrices), height=600, template="plotly_white")
+    return figure
 
 
 def _quantity_values(
@@ -542,7 +499,7 @@ def _state_grid(maze: Maze, values: np.ndarray) -> np.ndarray:
 
 
 def _physical_edges(maze: Maze) -> tuple[tuple[int, int], ...]:
-    edges: list[tuple[int, int]] = []
+    edges = []
     for source, coordinate in enumerate(maze.free_cells):
         destinations = {
             maze.command_outcome(coordinate, command)
@@ -556,12 +513,14 @@ def _physical_edges(maze: Maze) -> tuple[tuple[int, int], ...]:
 
 
 def _draw_physical_policy_arrows(
-    ax,
+    fig: go.Figure,
     maze: Maze,
     matrix: np.ndarray,
     *,
     signed: bool,
     maximum: float,
+    row: int,
+    col: int,
     source_filter: set[int] | None = None,
     excluded_sources: set[int] | None = None,
     color: str = "#286f9b",
@@ -575,26 +534,19 @@ def _draw_physical_policy_arrows(
         magnitude = abs(value) if signed else value
         if magnitude <= 0.0 or maximum <= 0.0:
             continue
-        source_row, source_column = maze.coordinate(source)
-        destination_row, destination_column = maze.coordinate(destination)
-        delta_row = destination_row - source_row
-        delta_column = destination_column - source_column
-        length = 0.38 * magnitude / maximum
-        arrow_color = color
-        if signed:
-            arrow_color = "#2166ac" if value > 0.0 else "#b2182b"
-        ax.arrow(
-            source_column,
-            source_row,
-            delta_column * length,
-            delta_row * length,
-            width=0.009,
-            head_width=min(0.10, 0.5 * length),
-            head_length=min(0.08, 0.4 * length),
-            length_includes_head=True,
-            color=arrow_color,
-            alpha=0.8,
-            zorder=4,
+        source_coordinate = maze.coordinate(source)
+        destination_coordinate = maze.coordinate(destination)
+        delta = np.subtract(destination_coordinate, source_coordinate)
+        end = tuple(np.asarray(source_coordinate) + 0.4 * magnitude / maximum * delta)
+        arrow_color = "#2166ac" if not signed or value > 0 else "#b2182b"
+        _add_arrow(
+            fig,
+            source_coordinate,
+            end,
+            width=1.2,
+            color=arrow_color if color == "#286f9b" else color,
+            row=row,
+            col=col,
         )
 
 
@@ -602,14 +554,12 @@ def plot_continuation_policies(
     model: HierarchyModel,
     goal: Coordinate | None = None,
     *,
-    quantity: Literal["desirability", "log_desirability", "value"] = (
-        "log_desirability"
-    ),
+    quantity: Literal["desirability", "log_desirability", "value"] = "log_desirability",
     show_controlled_arrows: bool = True,
     show_control_delta: bool = False,
     entry_coordinates: Mapping[int, Coordinate] | None = None,
     show_refractory: bool = False,
-):
+) -> go.Figure:
     """Plot stationary continuation landscapes and optional refractory exits."""
 
     task = _resolve_task(model, goal)
@@ -629,109 +579,115 @@ def plot_continuation_policies(
                 "for the selected subgoal"
             )
     values = [_quantity_values(policy, quantity) for policy in policies]
-    finite_values = np.concatenate([value[np.isfinite(value)] for value in values])
-    if finite_values.size:
-        color_norm = Normalize(
-            vmin=float(finite_values.min()),
-            vmax=float(finite_values.max()),
-        )
-    else:
-        color_norm = Normalize(vmin=0.0, vmax=1.0)
-    n_panels = len(policies)
-    columns = max(1, ceil(sqrt(n_panels)))
-    rows = ceil(n_panels / columns)
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=(5.2 * columns, 5.0 * rows),
-        squeeze=False,
-    )
-    color_map = _colormap("viridis", bad="white")
+    finite = np.concatenate([value[np.isfinite(value)] for value in values])
+    zmin = float(finite.min()) if finite.size else 0.0
+    zmax = float(finite.max()) if finite.size else 1.0
+    columns = max(1, ceil(sqrt(len(policies))))
+    rows = ceil(len(policies) / columns)
+    titles = [f"Continuation after {policy.label}" for policy in policies]
+    figure = make_subplots(rows=rows, cols=columns, subplot_titles=titles)
     matrices = (
         [policy.policy_delta for policy in policies]
         if show_control_delta
         else [policy.physical_controlled for policy in policies]
     )
-    arrow_maximum = max(
-        (float(np.abs(matrix).max(initial=0.0)) for matrix in matrices),
-        default=0.0,
+    maximum = max(
+        (float(np.abs(matrix).max(initial=0.0)) for matrix in matrices), default=0.0
     )
     display = upper_graph(task)
-    for panel_index, policy in enumerate(policies):
-        ax = axes.flat[panel_index]
-        image = ax.imshow(
-            _state_grid(task.maze, values[panel_index]),
-            origin="upper",
-            cmap=color_map,
-            norm=color_norm,
-            zorder=-1,
+    for index, policy in enumerate(policies):
+        panel_row, panel_col = divmod(index, columns)
+        panel_row += 1
+        panel_col += 1
+        figure.add_trace(
+            go.Heatmap(
+                z=_state_grid(task.maze, values[index]),
+                colorscale=_colorscale("Viridis"),
+                zmin=zmin,
+                zmax=zmax,
+                coloraxis="coloraxis",
+                hovertemplate=f"{quantity}: %{{z:.4g}}<extra></extra>",
+            ),
+            row=panel_row,
+            col=panel_col,
         )
         plot_maze(
             task.maze,
             show_grid=False,
-            title=f"Continuation after {policy.label}",
-            ax=ax,
+            title=None,
+            fig=figure,
+            row=panel_row,
+            col=panel_col,
         )
-        entry_sources: set[int] = set()
+        entry_sources = set()
         if show_refractory and policy.upper_state in entries:
-            coordinate = entries[policy.upper_state]
-            source = task.maze.state_index(coordinate)
-            entry_sources.add(source)
+            entry_sources.add(task.maze.state_index(entries[policy.upper_state]))
         if show_control_delta or show_controlled_arrows:
             _draw_physical_policy_arrows(
-                ax,
+                figure,
                 task.maze,
-                matrices[panel_index],
+                matrices[index],
                 signed=show_control_delta,
-                maximum=arrow_maximum,
+                maximum=maximum,
                 excluded_sources=entry_sources,
+                row=panel_row,
+                col=panel_col,
             )
         if entry_sources:
-            current_interior = task.interior_index[
-                entries[policy.upper_state]
-            ]
+            current_interior = task.interior_index[entries[policy.upper_state]]
             if not policy.valid_refractory_sources[current_interior]:
                 raise ValueError("refractory-adjusted outgoing policy is undefined")
             _draw_physical_policy_arrows(
-                ax,
+                figure,
                 task.maze,
                 policy.refractory_physical,
                 signed=False,
                 maximum=float(policy.refractory_physical.max(initial=0.0)),
                 source_filter=entry_sources,
                 color="#7b3294",
+                row=panel_row,
+                col=panel_col,
             )
-            entry_row, entry_column = entries[policy.upper_state]
-            ax.scatter(
-                [entry_column],
-                [entry_row],
-                marker="X",
-                s=90,
-                facecolor="#7b3294",
-                edgecolor="white",
-                zorder=7,
-                label="explicit entry / refractory",
+            entry_row, entry_col = entries[policy.upper_state]
+            figure.add_trace(
+                go.Scatter(
+                    x=[entry_col],
+                    y=[entry_row],
+                    mode="markers",
+                    marker={"symbol": "x", "size": 13, "color": "#7b3294"},
+                    name="explicit entry / refractory",
+                ),
+                row=panel_row,
+                col=panel_col,
             )
-            ax.legend(loc="upper right", fontsize=7)
-        display_row, display_column = display.positions[policy.upper_state]
-        ax.scatter(
-            [display_column],
-            [display_row],
-            s=65,
-            facecolor="none",
-            edgecolor="black",
-            linewidth=1.2,
-            zorder=6,
+        display_row, display_col = display.positions[policy.upper_state]
+        figure.add_trace(
+            go.Scatter(
+                x=[display_col],
+                y=[display_row],
+                mode="markers",
+                marker={
+                    "size": 11,
+                    "color": "rgba(0,0,0,0)",
+                    "line": {"color": "black", "width": 2},
+                },
+                showlegend=False,
+            ),
+            row=panel_row,
+            col=panel_col,
         )
-        goal_row, goal_column = task.goal
-        ax.plot(goal_column, goal_row, marker="*", markersize=12, color="#ffd92f")
-    for unused in range(n_panels, rows * columns):
-        axes.flat[unused].set_visible(False)
-    figure.colorbar(
-        image, ax=list(axes.flat[:n_panels]), shrink=0.75, label=quantity
+    figure.update_layout(
+        width=520 * columns,
+        height=500 * rows,
+        template="plotly_white",
+        coloraxis={
+            "colorscale": _colorscale("Viridis"),
+            "cmin": zmin,
+            "cmax": zmax,
+            "colorbar": {"title": quantity},
+        },
     )
-    figure.subplots_adjust(wspace=0.25, hspace=0.28)
-    return figure, axes
+    return figure
 
 
 def plot_composition_weights(
@@ -740,7 +696,7 @@ def plot_composition_weights(
     *,
     start_state: Coordinate | None = None,
     continuation_subgoal: int | None = None,
-):
+) -> go.Figure:
     """Plot the exact raw, composition-input, and final weight stages."""
 
     data = composition_trace(
@@ -754,25 +710,26 @@ def plot_composition_weights(
         ("Composition-input weights", data.clipped_weights),
         ("Final weights", data.weights),
     )
-    figure, axes = plt.subplots(1, 3, figsize=(15, 4.8), squeeze=False, sharey=True)
-    colors = [*_subgoal_colors(len(data.labels) - 1), (0.2, 0.2, 0.2, 1.0)]
-    positions = np.arange(len(data.labels), dtype=np.float64)
-    positions[-1] += 0.45
-    for index, (title, values) in enumerate(stages):
-        ax = axes[0, index]
-        ax.bar(positions, values, color=colors)
-        ax.axhline(0.0, color="0.35", linewidth=0.8)
-        ax.set_xticks(positions, data.labels, rotation=45, ha="right")
-        ax.set_title(title)
-        ax.set_ylabel("composition weight")
+    figure = make_subplots(rows=1, cols=3, subplot_titles=[item[0] for item in stages])
+    colors = [*_subgoal_colors(len(data.labels) - 1), "#333333"]
+    for index, (_, values) in enumerate(stages, 1):
+        figure.add_trace(
+            go.Bar(
+                x=list(data.labels),
+                y=values,
+                marker_color=colors,
+                name=stages[index - 1][0],
+                showlegend=False,
+            ),
+            row=1,
+            col=index,
+        )
+        figure.add_hline(y=0.0, line_color="#666666", row=1, col=index)
+        figure.update_yaxes(title_text="composition weight", row=1, col=index)
     metrics = [
         f"subgoal mass: {data.subgoal_mass:.4g}",
         "subgoal fraction: "
-        + (
-            "n/a"
-            if data.subgoal_share is None
-            else f"{data.subgoal_share:.3f}"
-        ),
+        + ("n/a" if data.subgoal_share is None else f"{data.subgoal_share:.3f}"),
         "effective count: "
         + (
             "no subgoal mass"
@@ -783,97 +740,101 @@ def plot_composition_weights(
         + ("n/a" if data.subgoal_entropy is None else f"{data.subgoal_entropy:.3f}"),
         "maximum share: "
         + (
-            "n/a"
-            if data.max_subgoal_share is None
-            else f"{data.max_subgoal_share:.3f}"
+            "n/a" if data.max_subgoal_share is None else f"{data.max_subgoal_share:.3f}"
         ),
     ]
-    axes[0, -1].text(
-        1.02,
-        0.98,
-        "\n".join(metrics),
-        transform=axes[0, -1].transAxes,
-        va="top",
-        fontsize=9,
+    figure.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=1.0,
+        y=1.0,
+        text="<br>".join(metrics),
+        showarrow=False,
+        xanchor="right",
+        yanchor="top",
+        align="left",
     )
-    figure.suptitle(f"{data.plan_kind.capitalize()} composition pipeline")
-    figure.tight_layout()
-    return figure, axes
+    figure.update_layout(
+        title=f"{data.plan_kind.capitalize()} composition pipeline",
+        width=1500,
+        height=480,
+        template="plotly_white",
+    )
+    return figure
 
 
-def _draw_route_edges(
-    ax,
-    maze: Maze,
-    edge_values: np.ndarray,
-    *,
-    signed: bool,
-) -> None:
-    maximum = float(np.abs(edge_values).max(initial=0.0))
-    if maximum <= 0.0:
-        return
-    for source, destination in _physical_edges(maze):
-        value = float(edge_values[destination, source])
-        magnitude = abs(value) if signed else value
-        if magnitude <= 0.0:
-            continue
-        source_row, source_column = maze.coordinate(source)
-        destination_row, destination_column = maze.coordinate(destination)
-        color = "#2166ac" if not signed or value > 0.0 else "#b2182b"
-        arrow = FancyArrowPatch(
-            (source_column, source_row),
-            (destination_column, destination_row),
-            arrowstyle="-|>",
-            mutation_scale=8.0,
-            linewidth=_arrow_width(magnitude, maximum),
-            color=color,
-            alpha=0.75,
-            shrinkA=7,
-            shrinkB=7,
-            zorder=3,
-        )
-        ax.add_patch(arrow)
-
-
-def _draw_route_map(
-    ax,
+def _add_route_map(
+    fig: go.Figure,
     data: RolloutSummary,
     *,
     edge_values: np.ndarray,
     occupancy_values: np.ndarray,
     title: str,
+    row: int,
+    col: int,
     example_trajectories: Sequence[Sequence[Coordinate]] = (),
     signed: bool = False,
 ) -> None:
-    maze = data.maze
-    if signed:
-        maximum = float(np.abs(occupancy_values).max(initial=0.0))
-        norm = (
-            TwoSlopeNorm(vmin=-maximum, vcenter=0.0, vmax=maximum) if maximum else None
-        )
-        color_map = _colormap("coolwarm", bad="white")
-    else:
-        norm = Normalize(vmin=0.0, vmax=float(occupancy_values.max(initial=1.0)))
-        color_map = _colormap("YlOrRd", bad="white")
-    ax.imshow(
-        _state_grid(maze, occupancy_values),
-        origin="upper",
-        cmap=color_map,
-        norm=norm,
-        alpha=0.75,
-        zorder=-2,
+    maximum = float(np.abs(occupancy_values).max(initial=0.0))
+    colorscale = _colorscale("RdBu" if signed else "YlOrRd")
+    fig.add_trace(
+        go.Heatmap(
+            z=_state_grid(data.maze, occupancy_values),
+            colorscale=colorscale,
+            zmin=-maximum if signed else 0.0,
+            zmax=maximum or 1.0,
+            showscale=False,
+            opacity=0.8,
+        ),
+        row=row,
+        col=col,
     )
-    plot_maze(maze, show_grid=False, title=title, ax=ax)
+    plot_maze(data.maze, show_grid=False, title=None, fig=fig, row=row, col=col)
     for trajectory in example_trajectories:
-        rows = [coordinate[0] for coordinate in trajectory]
-        columns = [coordinate[1] for coordinate in trajectory]
-        ax.plot(columns, rows, color="#377eb8", alpha=0.10, linewidth=0.8, zorder=1)
-    _draw_route_edges(ax, maze, edge_values, signed=signed)
-    start_row, start_column = data.start
-    goal_row, goal_column = data.goal
-    ax.scatter(
-        [start_column], [start_row], marker="s", s=70, color="white", edgecolor="black"
+        fig.add_trace(
+            go.Scatter(
+                x=[coordinate[1] for coordinate in trajectory],
+                y=[coordinate[0] for coordinate in trajectory],
+                mode="lines",
+                line={"color": "rgba(55,126,184,0.1)", "width": 1},
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=row,
+            col=col,
+        )
+    edge_maximum = float(np.abs(edge_values).max(initial=0.0))
+    for source, destination in _physical_edges(data.maze):
+        value = float(edge_values[destination, source])
+        magnitude = abs(value) if signed else value
+        if magnitude <= 0.0:
+            continue
+        _add_arrow(
+            fig,
+            data.maze.coordinate(source),
+            data.maze.coordinate(destination),
+            width=_arrow_width(magnitude, edge_maximum),
+            color="#2166ac" if not signed or value > 0 else "#b2182b",
+            row=row,
+            col=col,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=[data.start[1], data.goal[1]],
+            y=[data.start[0], data.goal[0]],
+            mode="markers",
+            marker={
+                "symbol": ["square", "star"],
+                "size": [11, 17],
+                "color": ["white", "#ffd92f"],
+                "line": {"color": "black", "width": 1},
+            },
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
     )
-    ax.plot(goal_column, goal_row, marker="*", markersize=13, color="#ffd92f")
+    fig.update_xaxes(title_text=title, row=row, col=col)
 
 
 def _rollout_ensemble_for_plot(
@@ -911,114 +872,90 @@ def plot_rollout_distribution(
     ensemble: RolloutEnsemble | None = None,
     observed_trajectories: Iterable[Sequence[Coordinate]] | None = None,
     n_example_trajectories: int = 30,
-):
+) -> go.Figure:
     """Plot physical route use and successful trajectory lengths in steps."""
 
     selected = _rollout_ensemble_for_plot(
-        model,
-        start,
-        goal,
-        ensemble=ensemble,
-        n_rollouts=n_rollouts,
-        seed=seed,
+        model, start, goal, ensemble=ensemble, n_rollouts=n_rollouts, seed=seed
     )
     observed = None if observed_trajectories is None else tuple(observed_trajectories)
     data = summarize_rollouts(selected, observed_trajectories=observed)
     example_count = max(0, min(int(n_example_trajectories), len(selected.rollouts)))
     examples = [rollout.trajectory for rollout in selected.rollouts[:example_count]]
-    if observed is None:
-        figure, axes = plt.subplots(1, 2, figsize=(13, 5.5), squeeze=False)
-        _draw_route_map(
-            axes[0, 0],
-            data,
-            edge_values=data.directed_edge_mean,
-            occupancy_values=data.occupancy_mean,
-            title="Model mean occupancy and directed edge use",
-            example_trajectories=examples,
-        )
-        histogram_ax = axes[0, 1]
-    else:
-        figure, axes = plt.subplots(2, 2, figsize=(13, 11), squeeze=False)
+    rows = 1 if observed is None else 2
+    figure = make_subplots(rows=rows, cols=2)
+    _add_route_map(
+        figure,
+        data,
+        edge_values=data.directed_edge_mean,
+        occupancy_values=data.occupancy_mean,
+        title="Model mean occupancy and directed edge use",
+        row=1,
+        col=1,
+        example_trajectories=examples,
+    )
+    histogram_row, histogram_col = 1, 2
+    if observed is not None:
         assert data.observed_directed_edge_mean is not None
         assert data.observed_occupancy_mean is not None
-        _draw_route_map(
-            axes[0, 0],
-            data,
-            edge_values=data.directed_edge_mean,
-            occupancy_values=data.occupancy_mean,
-            title="Model mean occupancy and directed edge use",
-            example_trajectories=examples,
-        )
-        _draw_route_map(
-            axes[0, 1],
+        _add_route_map(
+            figure,
             data,
             edge_values=data.observed_directed_edge_mean,
             occupancy_values=data.observed_occupancy_mean,
             title="Observed mean occupancy and directed edge use",
+            row=1,
+            col=2,
         )
-        _draw_route_map(
-            axes[1, 0],
+        _add_route_map(
+            figure,
             data,
             edge_values=data.directed_edge_mean - data.observed_directed_edge_mean,
             occupancy_values=data.occupancy_mean - data.observed_occupancy_mean,
             title="Model minus observed",
+            row=2,
+            col=1,
             signed=True,
         )
-        histogram_ax = axes[1, 1]
+        histogram_row, histogram_col = 2, 2
     if data.successful_steps.size:
-        histogram_ax.hist(
-            data.successful_steps,
-            bins="auto",
-            alpha=0.6,
-            label="model successful rollouts",
+        figure.add_trace(
+            go.Histogram(
+                x=data.successful_steps, opacity=0.65, name="model successful rollouts"
+            ),
+            row=histogram_row,
+            col=histogram_col,
         )
     if data.observed_steps is not None:
-        histogram_ax.hist(
-            data.observed_steps,
-            bins="auto",
-            alpha=0.5,
-            label="observed",
+        figure.add_trace(
+            go.Histogram(x=data.observed_steps, opacity=0.55, name="observed"),
+            row=histogram_row,
+            col=histogram_col,
         )
-    histogram_ax.axvline(
-        data.shortest_steps,
-        color="black",
-        linestyle="--",
-        label="shortest physical steps",
+    figure.add_vline(
+        x=data.shortest_steps,
+        line_dash="dash",
+        line_color="black",
+        annotation_text="shortest physical steps",
+        row=histogram_row,
+        col=histogram_col,
     )
-    histogram_ax.set_xlabel("trajectory length (physical steps)")
-    histogram_ax.set_ylabel("number of trajectories")
-    histogram_ax.set_title("Successful trajectory lengths")
-    histogram_ax.legend()
-    has_successes = bool(data.successful_steps.size)
-    mean_steps = (
-        float(data.successful_steps.mean()) if has_successes else float("nan")
+    figure.update_xaxes(
+        title_text="trajectory length (physical steps)",
+        row=histogram_row,
+        col=histogram_col,
     )
-    median_steps = data.step_quantiles.get(0.5, float("nan"))
-    lower_quantile = data.step_quantiles.get(0.05, float("nan"))
-    upper_quantile = data.step_quantiles.get(0.95, float("nan"))
-    mean_excess = (
-        float(data.excess_steps.mean()) if has_successes else float("nan")
+    figure.update_yaxes(
+        title_text="number of trajectories", row=histogram_row, col=histogram_col
     )
-    statuses = ", ".join(
-        f"{status}={count}" for status, count in sorted(data.status_counts.items())
+    figure.update_layout(
+        width=1300,
+        height=550 * rows,
+        template="plotly_white",
+        barmode="overlay",
+        title="Successful trajectory lengths",
     )
-    histogram_ax.text(
-        0.98,
-        0.98,
-        f"completion: {data.completion_rate:.1%}\n"
-        f"mean physical steps: {mean_steps:.2f}\n"
-        f"median [5%, 95%]: {median_steps:.1f} "
-        f"[{lower_quantile:.1f}, {upper_quantile:.1f}]\n"
-        f"mean excess steps: {mean_excess:.2f}\n"
-        f"mean self-transitions: {data.mean_self_transitions:.2f}\n"
-        f"statuses: {statuses}",
-        transform=histogram_ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=9,
-    )
-    figure.tight_layout()
-    return figure, axes
+    return figure
 
 
 def _latent_positions(tokens: Sequence[str]) -> dict[str, tuple[float, float]]:
@@ -1028,10 +965,9 @@ def _latent_positions(tokens: Sequence[str]) -> dict[str, tuple[float, float]]:
         for token in tokens
         if token not in {"START", "TERMINATE", "GOAL"} and token not in subgoals
     ]
-    positions: dict[str, tuple[float, float]] = {"START": (0.0, 0.5)}
+    positions = {"START": (0.0, 0.5)}
     for index, token in enumerate(subgoals):
-        y = (index + 1) / (len(subgoals) + 1)
-        positions[token] = (1.0, y)
+        positions[token] = (1.0, (index + 1) / (len(subgoals) + 1))
     if "TERMINATE" in tokens:
         positions["TERMINATE"] = (2.0, 0.65)
     if "GOAL" in tokens:
@@ -1041,40 +977,46 @@ def _latent_positions(tokens: Sequence[str]) -> dict[str, tuple[float, float]]:
     return positions
 
 
-def _draw_latent_graph(ax, data: RouteSummary) -> None:
+def _draw_latent_graph(
+    fig: go.Figure, data: RouteSummary, *, row: int, col: int
+) -> None:
     positions = _latent_positions(data.tokens)
     maximum = float(data.transition_counts.max(initial=0))
     for source_index, source in enumerate(data.tokens):
         for destination_index, destination in enumerate(data.tokens):
             count = float(data.transition_counts[destination_index, source_index])
-            if count <= 0.0:
-                continue
-            arrow = FancyArrowPatch(
-                positions[source],
-                positions[destination],
-                arrowstyle="-|>",
-                connectionstyle="arc3,rad=0.10",
-                linewidth=_arrow_width(count, maximum),
-                color="#4c78a8",
-                alpha=0.65,
-                shrinkA=18,
-                shrinkB=18,
-            )
-            ax.add_patch(arrow)
-    for token, (x, y) in positions.items():
-        ax.scatter(
-            [x],
-            [y],
-            s=500,
-            facecolor="white",
-            edgecolor="black",
-            zorder=3,
-        )
-        ax.text(x, y, token, ha="center", va="center", fontsize=8, zorder=4)
-    ax.set_xlim(-0.35, 3.45)
-    ax.set_ylim(-0.2, 1.15)
-    ax.set_axis_off()
-    ax.set_title("Latent transition frequencies")
+            if count > 0.0:
+                source_xy = positions[source]
+                destination_xy = positions[destination]
+                _add_arrow(
+                    fig,
+                    (source_xy[1], source_xy[0]),
+                    (destination_xy[1], destination_xy[0]),
+                    width=_arrow_width(count, maximum),
+                    color="#4c78a8",
+                    row=row,
+                    col=col,
+                )
+    fig.add_trace(
+        go.Scatter(
+            x=[positions[token][0] for token in data.tokens],
+            y=[positions[token][1] for token in data.tokens],
+            mode="markers+text",
+            text=list(data.tokens),
+            textposition="middle center",
+            marker={
+                "size": 35,
+                "color": "white",
+                "line": {"color": "black", "width": 1},
+            },
+            textfont={"size": 9},
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
+    )
+    fig.update_xaxes(visible=False, range=[-0.35, 3.45], row=row, col=col)
+    fig.update_yaxes(visible=False, range=[-0.2, 1.15], row=row, col=col)
 
 
 def plot_routes(
@@ -1086,52 +1028,55 @@ def plot_routes(
     seed: int | None = None,
     ensemble: RolloutEnsemble | None = None,
     top_n: int = 10,
-):
+) -> go.Figure:
     """Plot latent subgoal sequences from one rollout ensemble."""
 
     selected = _rollout_ensemble_for_plot(
-        model,
-        start,
-        goal,
-        ensemble=ensemble,
-        n_rollouts=n_rollouts,
-        seed=seed,
+        model, start, goal, ensemble=ensemble, n_rollouts=n_rollouts, seed=seed
     )
     data = summarize_routes(selected, top_n=top_n)
-    figure, axes = plt.subplots(1, 3, figsize=(18, 5.5), squeeze=False)
-    _draw_latent_graph(axes[0, 0], data)
-    matrix_ax = axes[0, 1]
-    image = matrix_ax.imshow(
-        data.transition_probabilities,
-        cmap="Blues",
-        vmin=0.0,
-        vmax=1.0,
+    figure = make_subplots(
+        rows=1,
+        cols=3,
+        subplot_titles=(
+            "Latent transition frequencies",
+            "Latent transition probabilities",
+            f"Top {len(data.top_sequences)} latent sequences",
+        ),
+        specs=[[{"type": "xy"}, {"type": "heatmap"}, {"type": "domain"}]],
     )
-    matrix_ax.set_xticks(
-        np.arange(len(data.tokens)),
-        data.tokens,
-        rotation=45,
-        ha="right",
+    _draw_latent_graph(figure, data, row=1, col=1)
+    figure.add_trace(
+        go.Heatmap(
+            z=data.transition_probabilities,
+            x=list(data.tokens),
+            y=list(data.tokens),
+            colorscale=_colorscale("Blues"),
+            zmin=0.0,
+            zmax=1.0,
+            colorbar={"title": "probability"},
+            hovertemplate="%{y} ← %{x}: %{z:.3f}<extra></extra>",
+        ),
+        row=1,
+        col=2,
     )
-    matrix_ax.set_yticks(np.arange(len(data.tokens)), data.tokens)
-    matrix_ax.set_xlabel("source")
-    matrix_ax.set_ylabel("destination")
-    matrix_ax.set_title("Latent transition probabilities")
-    figure.colorbar(image, ax=matrix_ax, shrink=0.75)
-    table_ax = axes[0, 2]
-    table_ax.set_axis_off()
     lines = [
         f"{probability:6.2%}  {' → '.join(sequence)}"
         for sequence, _, probability in data.top_sequences
     ]
-    table_ax.text(
-        0.0,
-        1.0,
-        "\n".join(lines),
-        va="top",
-        family="monospace",
-        fontsize=9,
+    figure.add_trace(
+        go.Table(
+            header={"values": ["Probability and sequence"]},
+            cells={
+                "values": [lines],
+                "align": "left",
+                "font": {"family": "monospace", "size": 11},
+            },
+        ),
+        row=1,
+        col=3,
     )
-    table_ax.set_title(f"Top {len(data.top_sequences)} latent sequences")
-    figure.tight_layout()
-    return figure, axes
+    figure.update_xaxes(title_text="source", row=1, col=2)
+    figure.update_yaxes(title_text="destination", row=1, col=2)
+    figure.update_layout(width=1800, height=550, template="plotly_white")
+    return figure

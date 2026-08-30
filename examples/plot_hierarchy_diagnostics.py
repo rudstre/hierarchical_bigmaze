@@ -1,6 +1,5 @@
 """Render all six hierarchy-diagnostic figure families."""
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from andrew_mlmdp import Environment, Maze, Parameters, SubgoalBasis, plotting
@@ -49,12 +48,14 @@ start = (3, 0)
 goal = (0, 3)
 task = template.task(goal)
 
-plotting.plot_upper_graph(
-    task,
-    show_original_profiles=True,
-    show_gated_profiles=True,
-)
-plotting.plot_upper_policy(task, start_state=start)
+figures = [
+    plotting.plot_upper_graph(
+        task,
+        show_original_profiles=True,
+        show_gated_profiles=True,
+    ),
+    plotting.plot_upper_policy(task, start_state=start),
+]
 
 entry_coordinates = {}
 for upper_state in range(task.n_subtasks):
@@ -62,28 +63,24 @@ for upper_state in range(task.n_subtasks):
     physical_state = int(task.interior_states[int(support[0])])
     entry_coordinates[upper_state] = task.maze.coordinate(physical_state)
 
-plotting.plot_continuation_policies(
-    task,
-    entry_coordinates=entry_coordinates,
-    show_refractory=True,
-)
-plotting.plot_composition_weights(task, start_state=start)
-
-ensemble = sample_rollouts(
-    task,
-    start,
-    n_rollouts=250,
-    seed=7,
-)
-plotting.plot_rollout_distribution(
-    task,
-    start,
-    ensemble=ensemble,
-)
-plotting.plot_routes(
-    task,
-    start,
-    ensemble=ensemble,
+figures.extend(
+    [
+        plotting.plot_continuation_policies(
+            task,
+            entry_coordinates=entry_coordinates,
+            show_refractory=True,
+        ),
+        plotting.plot_composition_weights(task, start_state=start),
+    ]
 )
 
-plt.show()
+ensemble = sample_rollouts(task, start, n_rollouts=250, seed=7)
+figures.extend(
+    [
+        plotting.plot_rollout_distribution(task, start, ensemble=ensemble),
+        plotting.plot_routes(task, start, ensemble=ensemble),
+    ]
+)
+
+for figure in figures:
+    figure.show()

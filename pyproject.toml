@@ -9,7 +9,8 @@ description = "Readable research code for multitask LMDP maze navigation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "matplotlib>=3.8",
+    "plotly>=6.0,<7",
+    "kaleido>=0.2.1,<1",
     "numpy>=1.26",
     "scikit-learn>=1.5",
     "torch>=2.2",
@@ -17,7 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 notebook = [
-    "ipympl>=0.9",
     "ipywidgets>=8.1",
     "jupyterlab>=4",
     "nbclient>=0.10",

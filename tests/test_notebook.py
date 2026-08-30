@@ -93,8 +93,8 @@ def test_doohan_hierarchy_diagnostics_has_flat_sweep_after_section_two():
     assert "trajectory_length_moments" in cell.source
     assert "policy_entropy" in cell.source
     assert ".normalized_entropy" in cell.source
-    assert "flat_entropy_ax" in cell.source
-    assert "sharex=True" in cell.source
+    assert "flat_sweep_figure" in cell.source
+    assert "shared_xaxes=True" in cell.source
     compile(
         cell.source,
         str(DOOHAN_HIERARCHY_DIAGNOSTICS_NOTEBOOK),
@@ -202,6 +202,8 @@ def test_doohan_hierarchy_diagnostics_notebook_compiles_combined_sweep():
     assert "values=SWEEP_VALUES" in sweep_cell.source
     assert "fitted_parameter_value" in sweep_cell.source
     assert "parameter_values()[" in sweep_cell.source
-    assert "axis.set_xlim(sweep_min, sweep_max)" in sweep_cell.source
+    assert (
+        "sweep_figure.update_xaxes(range=[sweep_min, sweep_max])" in sweep_cell.source
+    )
     assert "fitted_lower_control_cost" not in sweep_cell.source
     assert "lower_control_cost_pair_sweep" not in sweep_cell.source

@@ -1,12 +1,12 @@
 # Core library
-matplotlib>=3.8
+plotly>=6.0,<7
+kaleido>=0.2.1,<1
 numpy>=1.26
 scikit-learn>=1.5
 torch>=2.2
 
 # Notebook and interactive plotting workflow
 ipykernel>=6
-ipympl>=0.9
 ipython>=8
 ipywidgets>=8.1
 jupyterlab>=4
