@@ -67,6 +67,32 @@ The default configuration is
 `HIERARCHY_SWEEP_CONFIG`, and `HIERARCHY_SWEEP_OUTPUT` environment
 overrides remain available.
 
+Each new submission writes an atomic manifest under
+`OUTPUT_DIR/slurm_runs/RUN_ID.json`. If node launch failures leave array
+elements in `JobHeldAdmin`, preview recovery with:
+
+```bash
+./scripts/slurm/submit_hierarchy_rank_validation.sh \
+  --run-id loso_test1 \
+  --retry-missing --cancel-held --dry-run
+```
+
+Then perform the recovery without `--dry-run`. Retry inherits the original
+resources, cancels only administrator-held elements owned by that manifest,
+and leaves ordinary pending, configuring, and running elements alone:
+
+```bash
+./scripts/slurm/submit_hierarchy_rank_validation.sh \
+  --run-id loso_test1 \
+  --retry-missing --cancel-held
+```
+
+Successful compatible shards are never resubmitted. Missing work is grouped
+into replacement fold arrays. Missing discovery ranks are resubmitted first
+and linked to their replacement fits with `aftercorr`. Failed or incompatible
+shards are reported and never overwritten. Runs created before manifest
+support still require manual recovery.
+
 ## Run individual stages locally
 
 Fit or reuse one NMF artifact:
@@ -104,9 +130,12 @@ same two-stage discovery/fitting machinery.
 python scripts/aggregate_hierarchy_rank_validation.py \
   --config configs/hierarchy_rank_validation_loso.json \
   --shard-dir output/hierarchy_rank_validation/production_loso \
-  --output-dir output/hierarchy_rank_validation/production_loso/aggregate \
-  --max-rank 49
+  --output-dir output/hierarchy_rank_validation/production_loso/aggregate
 ```
+
+When the shard directory contains exactly one matching SLURM submission
+manifest, aggregation uses its submitted maximum rank. Pass `--max-rank K` to
+override that value; without a matching manifest, the production default is 49.
 
 Aggregation preserves the expected rank/fold grid and explicitly reports
 missing, failed, incompatible, and nonfinite results. Outputs include:

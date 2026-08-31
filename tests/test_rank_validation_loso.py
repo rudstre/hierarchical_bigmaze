@@ -342,6 +342,9 @@ def test_slurm_defaults_and_submission_controls_are_explicit():
     submit = (
         root / "scripts" / "slurm" / "submit_hierarchy_rank_validation.sh"
     ).read_text()
+    manager = (
+        root / "scripts" / "slurm" / "manage_hierarchy_rank_validation.py"
+    ).read_text()
 
     assert "#SBATCH --array=2-49" in validation_batch
     assert "#SBATCH --array=2-49" in discovery_batch
@@ -351,16 +354,19 @@ def test_slurm_defaults_and_submission_controls_are_explicit():
     assert "#SBATCH --time=08:00:00" in discovery_batch
     assert "#SBATCH --mem=12G" in validation_batch
     assert "#SBATCH --mem=12G" in discovery_batch
-    assert "--max-rank" in submit
-    assert "--max-concurrent" in submit
-    assert "aftercorr:" in submit
-    assert "afterany:" not in submit
-    assert "HIERARCHY_FOLD_INDEX" in submit
-    assert "--kill-on-invalid-dep=yes" in submit
+    assert "--max-rank" in manager
+    assert "--max-concurrent" in manager
+    assert "aftercorr:" in manager
+    assert "afterany:" not in manager
+    assert "HIERARCHY_FOLD_INDEX" in manager
+    assert "--kill-on-invalid-dep=yes" in manager
+    assert "--retry-missing" in manager
+    assert "--cancel-held" in manager
+    assert "--dry-run" in manager
     assert 'BASH_SOURCE[0]' in submit
     assert "SLURM_SUBMIT_DIR" not in submit
-    assert "expected_session_trial_counts" in submit
-    assert "without importing the model stack" in submit
+    assert "expected_session_trial_counts" in manager
+    assert "manage_hierarchy_rank_validation.py" in submit
     assert '--fold-index "${fold_index}"' in validation_batch
 
 

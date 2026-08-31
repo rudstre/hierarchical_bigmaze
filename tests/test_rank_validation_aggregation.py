@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,15 @@ from test_rank_validation import _config, _successful_shard
 
 import andrew_mlmdp.validation as validation
 import andrew_mlmdp.validation_aggregation as aggregation
+
+ROOT = Path(__file__).parents[1]
+AGGREGATE_SCRIPT = ROOT / "scripts" / "aggregate_hierarchy_rank_validation.py"
+AGGREGATE_SPEC = importlib.util.spec_from_file_location(
+    "aggregate_rank_validation", AGGREGATE_SCRIPT
+)
+assert AGGREGATE_SPEC is not None and AGGREGATE_SPEC.loader is not None
+aggregate_cli = importlib.util.module_from_spec(AGGREGATE_SPEC)
+AGGREGATE_SPEC.loader.exec_module(aggregate_cli)
 
 
 def _context(config, *, source_sha: str):
@@ -95,3 +105,42 @@ def test_worker_fingerprint_excludes_only_aggregation_sources(tmp_path: Path):
     assert first["scope"] == "worker_and_model_source"
     assert first["content_sha256"] == presentation_edit["content_sha256"]
     assert presentation_edit["content_sha256"] != worker_edit["content_sha256"]
+
+
+
+def test_aggregate_cli_uses_matching_submission_manifest(tmp_path: Path):
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    output = tmp_path / "output"
+    manifest_dir = output / "slurm_runs"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "short_sweep.json").write_text(
+        json.dumps(
+            {
+                "config_path": str(config.resolve()),
+                "output_dir": str(output.resolve()),
+                "max_rank": 7,
+            }
+        )
+    )
+
+    assert aggregate_cli._manifest_max_rank(output, config) == 7
+
+
+def test_aggregate_cli_ignores_nonmatching_submission_manifests(tmp_path: Path):
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    output = tmp_path / "output"
+    manifest_dir = output / "slurm_runs"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "other.json").write_text(
+        json.dumps(
+            {
+                "config_path": str((tmp_path / "other.json").resolve()),
+                "output_dir": str(output.resolve()),
+                "max_rank": 7,
+            }
+        )
+    )
+
+    assert aggregate_cli._manifest_max_rank(output, config) is None
