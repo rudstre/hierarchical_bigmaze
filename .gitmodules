@@ -1,3 +1,6 @@
 [submodule "external/GridMaze-mFC-ephys-DATA"]
 	path = external/GridMaze-mFC-ephys-DATA
 	url = https://github.com/rudstre/GridMaze-mFC-ephys-DATA.git
+[submodule "external/qin_route_model"]
+	path = external/qin_route_model
+	url = git@github.com:rudstre/qin_route_model.git
