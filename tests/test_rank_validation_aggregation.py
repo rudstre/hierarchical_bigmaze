@@ -144,3 +144,27 @@ def test_aggregate_cli_ignores_nonmatching_submission_manifests(tmp_path: Path):
     )
 
     assert aggregate_cli._manifest_max_rank(output, config) is None
+
+def test_aggregate_cli_show_plot_switches():
+    assert aggregate_cli.build_parser().parse_args(
+        [
+            "--config",
+            "config.json",
+            "--shard-dir",
+            "shards",
+            "--output-dir",
+            "aggregate",
+            "--show-plots",
+        ]
+    ).show_plots is True
+    assert aggregate_cli.build_parser().parse_args(
+        [
+            "--config",
+            "config.json",
+            "--shard-dir",
+            "shards",
+            "--output-dir",
+            "aggregate",
+            "--no-show-plots",
+        ]
+    ).show_plots is False

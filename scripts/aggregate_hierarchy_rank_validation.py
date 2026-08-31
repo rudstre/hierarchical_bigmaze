@@ -24,6 +24,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Inclusive maximum rank; overrides the matching SLURM manifest.",
     )
+    parser.add_argument(
+        "--show-plots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Open interactive Plotly figures when aggregation finishes "
+            "(default: enabled in an interactive terminal)."
+        ),
+    )
     return parser
 
 
@@ -70,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
             args.shard_dir,
             args.output_dir,
             max_rank=49 if max_rank is None else max_rank,
+            show_plots=(
+                sys.stdout.isatty() if args.show_plots is None else args.show_plots
+            ),
         )
     except (OSError, ValueError) as error:
         print(f"rank aggregation failed: {error}", file=sys.stderr, flush=True)

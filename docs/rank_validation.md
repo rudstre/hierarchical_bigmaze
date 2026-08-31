@@ -136,6 +136,10 @@ python scripts/aggregate_hierarchy_rank_validation.py \
 When the shard directory contains exactly one matching SLURM submission
 manifest, aggregation uses its submitted maximum rank. Pass `--max-rank K` to
 override that value; without a matching manifest, the production default is 49.
+When run from an interactive terminal, the command also opens the live Plotly
+figures in the default browser as soon as aggregation finishes. Use
+`--no-show-plots` to suppress this, or `--show-plots` to request it explicitly
+when output is redirected.
 
 Aggregation preserves the expected rank/fold grid and explicitly reports
 missing, failed, incompatible, and nonfinite results. Outputs include:

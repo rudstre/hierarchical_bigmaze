@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -76,6 +77,9 @@ def test_aggregate_writes_auditable_diagnostic_plots(
     for stem in expected:
         assert (output / f"{stem}.png").is_file()
         assert (output / f"{stem}.svg").is_file()
+        interactive_plot = output / f"{stem}.html"
+        assert interactive_plot.is_file()
+        assert "plotly.js" in interactive_plot.read_text()
 
     parameter_svg = (output / "fitted_parameters_vs_k.svg").read_text()
     assert "Lower control cost" in parameter_svg
@@ -84,6 +88,67 @@ def test_aggregate_writes_auditable_diagnostic_plots(
     assert "Beta" in parameter_svg
     assert "Core threshold / structural cap" in parameter_svg
     assert "Core exponent" in parameter_svg
+
+
+def test_plotly_writer_can_open_the_live_figure_after_writing_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("BROWSER", raising=False)
+    monkeypatch.delenv("VSCODE_IPC_HOOK_CLI", raising=False)
+    calls = []
+
+    class Figure:
+        def write_image(self, path, **kwargs):
+            calls.append(("write_image", Path(path).suffix, kwargs))
+
+        def write_html(self, path, **kwargs):
+            calls.append(("write_html", Path(path).suffix, kwargs))
+
+        def show(self, **kwargs):
+            calls.append(("show", kwargs))
+
+    aggregation._write_plotly_outputs(Figure(), tmp_path, "diagnostic", show=True)
+
+    assert calls[-1] == ("show", {"renderer": "browser"})
+    assert calls[-2] == (
+        "write_html",
+        ".html",
+        {
+            "include_plotlyjs": True,
+            "full_html": True,
+            "config": {"displaylogo": False, "responsive": True},
+        },
+    )
+
+
+def test_plotly_writer_does_not_hang_on_a_missing_vscode_ipc_socket(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("BROWSER", "/remote/.vscode/server/bin/helpers/browser.sh")
+    monkeypatch.setenv(
+        "VSCODE_IPC_HOOK_CLI",
+        str(tmp_path / "missing-vscode-ipc.sock"),
+    )
+
+    class Figure:
+        def write_image(self, path, **kwargs):
+            pass
+
+        def write_html(self, path, **kwargs):
+            pass
+
+        def show(self, **kwargs):
+            raise AssertionError("The unavailable browser must not be opened")
+
+    with pytest.warns(RuntimeWarning, match="browser IPC socket is unavailable"):
+        aggregation._write_plotly_outputs(
+            Figure(),
+            tmp_path,
+            "diagnostic",
+            show=True,
+        )
 
 
 def test_numeric_series_turns_missing_nonfinite_and_failed_values_into_gaps():

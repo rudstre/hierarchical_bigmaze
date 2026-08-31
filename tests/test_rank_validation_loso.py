@@ -240,8 +240,9 @@ def test_loso_plots_include_one_se_error_arrays(tmp_path, monkeypatch):
 
     captured = {}
 
-    def capture(figure, output_dir, stem):
+    def capture(figure, output_dir, stem, *, show=False):
         captured[stem] = figure
+        assert not show
         return tmp_path / f"{stem}.png", tmp_path / f"{stem}.svg"
 
     monkeypatch.setattr(aggregation, "_write_plotly_outputs", capture)
@@ -249,11 +250,17 @@ def test_loso_plots_include_one_se_error_arrays(tmp_path, monkeypatch):
     aggregation.plot_fitted_parameters([row], tmp_path, complete=True)
 
     likelihood = captured["held_out_log_likelihood_vs_k"]
+    assert likelihood.layout.legend.orientation == "v"
+    assert likelihood.layout.margin.r == 290
     assert list(likelihood.data[0].error_y.array) == [0.1]
     assert list(likelihood.data[1].error_y.array) == [0.2]
     assert likelihood.data[2].name == "One-SE selection: k=2"
     parameters = captured["fitted_parameters_vs_k"]
     assert all(list(trace.error_y.array) == [0.25] for trace in parameters.data)
+    assert all(
+        getattr(parameters.layout, f"xaxis{index}").matches == "x"
+        for index in range(2, 7)
+    )
 
 
 def test_one_se_rule_selects_smallest_rank_above_best_rank_threshold():

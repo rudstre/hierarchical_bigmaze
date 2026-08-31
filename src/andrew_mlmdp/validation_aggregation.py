@@ -9,6 +9,8 @@ stored worker fingerprint.
 from __future__ import annotations
 
 import hashlib
+import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +36,8 @@ def _aggregate_rank_results_v2(
     config: RankValidationConfig | str | Path,
     shard_dir: str | Path,
     output_dir: str | Path,
+    *,
+    show_plots: bool = False,
 ) -> dict[str, object]:
     """Combine mutually compatible shards and generate summary plots.
 
@@ -110,9 +114,13 @@ def _aggregate_rank_results_v2(
     destination.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(destination / "aggregate.json", aggregate)
     _atomic_write_csv(destination / "rank_summary.csv", rows)
-    _plot_held_out_log_likelihood_v2(rows, destination, complete=complete)
-    plot_selected_nmf_normalized_kl(rows, destination, complete=complete)
-    _plot_fitted_parameters_v2(rows, destination, complete=complete)
+    _plot_held_out_log_likelihood_v2(
+        rows, destination, complete=complete, show=show_plots
+    )
+    plot_selected_nmf_normalized_kl(
+        rows, destination, complete=complete, show=show_plots
+    )
+    _plot_fitted_parameters_v2(rows, destination, complete=complete, show=show_plots)
     return aggregate
 
 
@@ -120,16 +128,58 @@ def _write_plotly_outputs(
     figure,
     output_dir: str | Path,
     stem: str,
+    *,
+    show: bool = False,
 ) -> tuple[Path, Path]:
-    """Write a Plotly figure to the report's established PNG and SVG paths."""
+    """Write static report images and a self-contained interactive Plotly report.
+
+    The HTML file embeds Plotly's JavaScript so it can be opened locally, with
+    no web server or network connection required.
+    """
 
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     png_path = destination / f"{stem}.png"
     svg_path = destination / f"{stem}.svg"
+    html_path = destination / f"{stem}.html"
     figure.write_image(png_path, width=900, height=550, scale=2)
     figure.write_image(svg_path, width=900, height=550)
+    figure.write_html(
+        html_path,
+        include_plotlyjs=True,
+        full_html=True,
+        config={"displaylogo": False, "responsive": True},
+    )
+    if show:
+        _show_plotly_figure(figure)
     return png_path, svg_path
+
+
+def _show_plotly_figure(figure) -> None:
+    """Open a figure unless a remote VS Code browser socket is unavailable."""
+
+    browser = os.environ.get("BROWSER", "")
+    vscode_ipc = os.environ.get("VSCODE_IPC_HOOK_CLI")
+    missing_vscode_ipc = ".vscode" in browser and (
+        not vscode_ipc or not Path(vscode_ipc).exists()
+    )
+    if missing_vscode_ipc:
+        warnings.warn(
+            "Cannot auto-open Plotly figures because VS Code's browser IPC "
+            "socket is unavailable on this node; the interactive HTML plots "
+            "were still written.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    try:
+        figure.show(renderer="browser")
+    except Exception as error:  # Plotly delegates to platform browser tooling.
+        warnings.warn(
+            f"Could not open interactive Plotly figure: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _plot_held_out_log_likelihood_v2(
@@ -137,6 +187,7 @@ def _plot_held_out_log_likelihood_v2(
     output_dir: str | Path,
     *,
     complete: bool,
+    show: bool = False,
 ) -> tuple[Path, Path]:
     """Plot pooled held-out log likelihood per transition against rank."""
 
@@ -192,10 +243,19 @@ def _plot_held_out_log_likelihood_v2(
         xaxis_title="Number of discovered subgoals (k)",
         yaxis_title="Pooled log likelihood per movement transition",
         template="plotly_white",
-        legend={"orientation": "h", "y": 1.12},
+        legend={
+            "orientation": "v",
+            "x": 1.02,
+            "xanchor": "left",
+            "y": 1.0,
+            "yanchor": "top",
+        },
+        margin={"t": 90, "r": 290},
     )
     figure.update_xaxes(tickmode="array", tickvals=np.arange(2, 50, 2))
-    return _write_plotly_outputs(figure, output_dir, "held_out_log_likelihood_vs_k")
+    return _write_plotly_outputs(
+        figure, output_dir, "held_out_log_likelihood_vs_k", show=show
+    )
 
 
 def plot_selected_nmf_normalized_kl(
@@ -203,6 +263,7 @@ def plot_selected_nmf_normalized_kl(
     output_dir: str | Path,
     *,
     complete: bool,
+    show: bool = False,
 ) -> tuple[Path, Path]:
     """Plot the selected basis's normalized generalized KL by rank."""
 
@@ -229,7 +290,9 @@ def plot_selected_nmf_normalized_kl(
         template="plotly_white",
     )
     figure.update_xaxes(tickmode="array", tickvals=np.arange(2, 50, 2))
-    return _write_plotly_outputs(figure, output_dir, "selected_nmf_normalized_kl_vs_k")
+    return _write_plotly_outputs(
+        figure, output_dir, "selected_nmf_normalized_kl_vs_k", show=show
+    )
 
 
 def _plot_fitted_parameters_v2(
@@ -237,6 +300,7 @@ def _plot_fitted_parameters_v2(
     output_dir: str | Path,
     *,
     complete: bool,
+    show: bool = False,
 ) -> tuple[Path, Path]:
     """Plot the six fitted hierarchy parameters in compact small multiples."""
 
@@ -278,6 +342,10 @@ def _plot_fitted_parameters_v2(
         )
     figure.update_xaxes(title_text="Number of discovered subgoals (k)", row=3, col=1)
     figure.update_xaxes(title_text="Number of discovered subgoals (k)", row=3, col=2)
+    # All parameter estimates are indexed by the same NMF rank, so panning or
+    # zooming any subplot must apply the identical rank range everywhere.
+    for row_index, col_index in ((1, 2), (2, 1), (2, 2), (3, 1), (3, 2)):
+        figure.update_xaxes(matches="x", row=row_index, col=col_index)
     figure.update_layout(
         title="Fitted hierarchy parameters by NMF rank"
         + ("" if complete else " (provisional)"),
@@ -285,7 +353,9 @@ def _plot_fitted_parameters_v2(
         width=1000,
         height=1000,
     )
-    return _write_plotly_outputs(figure, output_dir, "fitted_parameters_vs_k")
+    return _write_plotly_outputs(
+        figure, output_dir, "fitted_parameters_vs_k", show=show
+    )
 
 
 def _aggregation_summary_row(
@@ -458,6 +528,7 @@ def aggregate_rank_results(
     output_dir: str | Path,
     *,
     max_rank: int = 49,
+    show_plots: bool = False,
 ) -> dict[str, object]:
     """Aggregate the complete expected rank/fold grid with session-level SEs."""
 
@@ -468,6 +539,7 @@ def aggregate_rank_results(
             config,
             shard_dir,
             output_dir,
+            show_plots=show_plots,
         )
     validate_max_rank(max_rank)
     expected_ranks = tuple(rank for rank in resolved.ranks if rank <= max_rank)
@@ -645,10 +717,14 @@ def aggregate_rank_results(
     _atomic_write_csv(destination / "fold_summary.csv", fold_rows)
     _atomic_write_csv(destination / "rank_summary.csv", rows)
     if eligible:
-        plot_held_out_log_likelihood(rows, destination, complete=complete)
-        plot_fitted_parameters(rows, destination, complete=complete)
+        plot_held_out_log_likelihood(
+            rows, destination, complete=complete, show=show_plots
+        )
+        plot_fitted_parameters(rows, destination, complete=complete, show=show_plots)
     if any(_finite_number(row["nmf_reconstruction_error"]) for row in rows):
-        plot_selected_nmf_normalized_kl(rows, destination, complete=complete)
+        plot_selected_nmf_normalized_kl(
+            rows, destination, complete=complete, show=show_plots
+        )
     return aggregate
 
 
@@ -766,6 +842,7 @@ def plot_held_out_log_likelihood(
     output_dir: str | Path,
     *,
     complete: bool,
+    show: bool = False,
 ) -> tuple[Path, Path]:
     """Plot session-mean training and held-out LL with one-SE error bars."""
 
@@ -844,10 +921,19 @@ def plot_held_out_log_likelihood(
         xaxis_title="Number of discovered subgoals (k)",
         yaxis_title="Session mean pooled log likelihood per movement transition",
         template="plotly_white",
-        legend={"orientation": "h", "y": 1.12},
+        legend={
+            "orientation": "v",
+            "x": 1.02,
+            "xanchor": "left",
+            "y": 1.0,
+            "yanchor": "top",
+        },
+        margin={"t": 90, "r": 290},
     )
     figure.update_xaxes(tickmode="array", tickvals=np.arange(2, 50, 2))
-    return _write_plotly_outputs(figure, output_dir, "held_out_log_likelihood_vs_k")
+    return _write_plotly_outputs(
+        figure, output_dir, "held_out_log_likelihood_vs_k", show=show
+    )
 
 
 def plot_fitted_parameters(
@@ -855,6 +941,7 @@ def plot_fitted_parameters(
     output_dir: str | Path,
     *,
     complete: bool,
+    show: bool = False,
 ) -> tuple[Path, Path]:
     """Plot fold-mean fitted parameters with one-SE error bars."""
 
@@ -909,6 +996,10 @@ def plot_fitted_parameters(
         )
     figure.update_xaxes(title_text="Number of discovered subgoals (k)", row=3, col=1)
     figure.update_xaxes(title_text="Number of discovered subgoals (k)", row=3, col=2)
+    # All parameter estimates are indexed by the same NMF rank, so panning or
+    # zooming any subplot must apply the identical rank range everywhere.
+    for row_index, col_index in ((1, 2), (2, 1), (2, 2), (3, 1), (3, 2)):
+        figure.update_xaxes(matches="x", row=row_index, col=col_index)
     figure.update_layout(
         title="Fold-mean fitted hierarchy parameters by NMF rank"
         + ("" if complete else " (provisional)"),
@@ -916,4 +1007,6 @@ def plot_fitted_parameters(
         width=1000,
         height=1000,
     )
-    return _write_plotly_outputs(figure, output_dir, "fitted_parameters_vs_k")
+    return _write_plotly_outputs(
+        figure, output_dir, "fitted_parameters_vs_k", show=show
+    )
