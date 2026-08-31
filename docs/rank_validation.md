@@ -120,6 +120,14 @@ missing, failed, incompatible, and nonfinite results. Outputs include:
   threshold as a fraction of its fold-specific structural cap; and
 - the selected once-per-rank NMF normalized generalized KL diagnostic.
 
+`best_k` uses the one-standard-error rule: find the eligible rank with the
+largest mean held-out log likelihood, subtract that rank's held-out standard
+error, and select the smallest eligible rank whose mean is at least that
+threshold. `aggregate.json` also records the best-mean rank, its standard
+error, and the resulting threshold. For one-fold chronological validation,
+where a cross-fold standard error is unavailable, this reduces to selecting
+the maximum held-out mean.
+
 Figures are written as PNG and SVG. Aggregation may run while jobs are still
 active, but incomplete ranks remain ineligible for ranking. Existing schema-v2
 result directories are not modified or mixed with the schema-v3 workflow.

@@ -545,7 +545,9 @@ def aggregate_rank_results(
                     and k not in discoveries
                 )
                 if (
-                    shard.get("compatibility") != expected_compatibility
+                    not _worker_compatibility_matches(
+                        shard.get("compatibility"), expected_compatibility
+                    )
                     and not discovery_load_failure
                 ):
                     raise ValueError(f"Fold shard {path} is incompatible")
@@ -601,6 +603,7 @@ def aggregate_rank_results(
             int(row["k"]),
         ),
     )
+    selection = _one_standard_error_selection(rows)
     complete = all(row["eligible"] for row in rows)
     aggregate = {
         "schema_version": SCHEMA_VERSION,
@@ -608,7 +611,15 @@ def aggregate_rank_results(
         "max_rank": max_rank,
         "fold_count": fold_count,
         "complete": complete,
-        "best_k": None if not ranked else ranked[0]["k"],
+        "best_k": selection["selected_k"],
+        "best_mean_k": selection["best_mean_k"],
+        "best_mean_validation_ll_per_transition": selection["best_mean"],
+        "best_mean_standard_error": selection["best_mean_standard_error"],
+        "one_standard_error_threshold": selection["threshold"],
+        "selection_rule": (
+            "smallest eligible rank with mean held-out log likelihood at least "
+            "the best mean minus the standard error at the best-mean rank"
+        ),
         "best_k_provisional": not complete,
         "primary_metric": (
             "unweighted mean across held-out sessions of each session's "
@@ -658,6 +669,95 @@ def _rank_numeric_series(
             for row in rows
         ],
         dtype=np.float64,
+    )
+
+
+def _one_standard_error_selection(
+    rows: list[dict[str, object]],
+) -> dict[str, int | float | None]:
+    """Select the smallest rank within one SE of the best held-out mean.
+
+    The threshold uses the standard error at the rank with the largest mean,
+    as in the conventional one-standard-error rule. A one-fold chronological
+    validation has no estimable cross-fold SE, so its missing SE is treated as
+    zero and the rule reduces to selecting the maximum mean.
+    """
+
+    eligible = [
+        row
+        for row in rows
+        if row.get("eligible")
+        and _finite_number(row.get("validation_ll_per_transition_mean"))
+    ]
+    if not eligible:
+        return {
+            "selected_k": None,
+            "best_mean_k": None,
+            "best_mean": None,
+            "best_mean_standard_error": None,
+            "threshold": None,
+        }
+
+    best = min(
+        eligible,
+        key=lambda row: (
+            -float(row["validation_ll_per_transition_mean"]),
+            int(row["k"]),
+        ),
+    )
+    best_mean = float(best["validation_ll_per_transition_mean"])
+    stored_standard_error = best.get("validation_ll_per_transition_se")
+    standard_error = (
+        float(stored_standard_error)
+        if _finite_number(stored_standard_error)
+        else 0.0
+    )
+    threshold = best_mean - standard_error
+    selected = min(
+        (
+            row
+            for row in eligible
+            if float(row["validation_ll_per_transition_mean"]) >= threshold
+        ),
+        key=lambda row: int(row["k"]),
+    )
+    return {
+        "selected_k": int(selected["k"]),
+        "best_mean_k": int(best["k"]),
+        "best_mean": best_mean,
+        "best_mean_standard_error": (
+            standard_error if _finite_number(stored_standard_error) else None
+        ),
+        "threshold": threshold,
+    }
+
+
+def _worker_compatibility_matches(
+    stored: object,
+    current: dict[str, object],
+) -> bool:
+    """Compare worker provenance by content rather than the Git ref label."""
+
+    if not isinstance(stored, dict):
+        return False
+    stored_without_source = {
+        key: value for key, value in stored.items() if key != "source"
+    }
+    current_without_source = {
+        key: value for key, value in current.items() if key != "source"
+    }
+    if stored_without_source != current_without_source:
+        return False
+    stored_source = stored.get("source")
+    current_source = current.get("source")
+    if not isinstance(stored_source, dict) or not isinstance(current_source, dict):
+        return stored_source == current_source
+    stored_digest = stored_source.get("content_sha256")
+    current_digest = current_source.get("content_sha256")
+    return (
+        isinstance(stored_digest, str)
+        and isinstance(current_digest, str)
+        and stored_digest == current_digest
     )
 
 
@@ -718,22 +818,24 @@ def plot_held_out_log_likelihood(
                 name=name,
             )
         )
-    best_index = int(np.nanargmax(held_out))
-    best_k = int(ranks[best_index])
-    best_value = float(held_out[best_index])
+    selection = _one_standard_error_selection(rows)
+    selected_k = selection["selected_k"]
+    assert selected_k is not None
+    selected_index = int(np.flatnonzero(ranks == selected_k)[0])
+    selected_value = float(held_out[selected_index])
     figure.add_trace(
         go.Scatter(
-            x=[best_k],
-            y=[best_value],
+            x=[selected_k],
+            y=[selected_value],
             mode="markers+text",
-            text=[f"k={best_k}<br>{best_value:.4f}"],
+            text=[f"k={selected_k}<br>{selected_value:.4f}"],
             textposition="bottom right",
             marker={
                 "size": 11,
                 "color": "#d1495b",
                 "line": {"color": "white", "width": 1},
             },
-            name=f"Best available: k={best_k}",
+            name=f"One-SE selection: k={selected_k}",
         )
     )
     figure.update_layout(

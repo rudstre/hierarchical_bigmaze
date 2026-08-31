@@ -251,8 +251,83 @@ def test_loso_plots_include_one_se_error_arrays(tmp_path, monkeypatch):
     likelihood = captured["held_out_log_likelihood_vs_k"]
     assert list(likelihood.data[0].error_y.array) == [0.1]
     assert list(likelihood.data[1].error_y.array) == [0.2]
+    assert likelihood.data[2].name == "One-SE selection: k=2"
     parameters = captured["fitted_parameters_vs_k"]
     assert all(list(trace.error_y.array) == [0.25] for trace in parameters.data)
+
+
+def test_one_se_rule_selects_smallest_rank_above_best_rank_threshold():
+    rows = [
+        {
+            "k": k,
+            "eligible": True,
+            "validation_ll_per_transition_mean": mean,
+            "validation_ll_per_transition_se": standard_error,
+        }
+        for k, mean, standard_error in (
+            (2, -0.60178, 0.01784),
+            (3, -0.58650, 0.01415),
+            (4, -0.57143, 0.01251),
+            (8, -0.56674, 0.01555),
+            (9, -0.56658, 0.01396),
+        )
+    ]
+
+    selection = aggregation._one_standard_error_selection(rows)
+
+    assert selection["best_mean_k"] == 9
+    assert selection["threshold"] == pytest.approx(-0.58054)
+    assert selection["selected_k"] == 4
+
+
+def test_one_se_rule_ignores_ineligible_ranks():
+    rows = [
+        {
+            "k": 2,
+            "eligible": False,
+            "validation_ll_per_transition_mean": -0.1,
+            "validation_ll_per_transition_se": 0.5,
+        },
+        {
+            "k": 3,
+            "eligible": True,
+            "validation_ll_per_transition_mean": -0.5,
+            "validation_ll_per_transition_se": 0.1,
+        },
+    ]
+
+    selection = aggregation._one_standard_error_selection(rows)
+
+    assert selection["best_mean_k"] == 3
+    assert selection["selected_k"] == 3
+
+
+def test_worker_compatibility_uses_content_hash_not_git_head():
+    stored = {
+        "fold": 0,
+        "source": {
+            "git_head": "old-commit",
+            "content_sha256": "same-content",
+        },
+    }
+    current = {
+        "fold": 0,
+        "source": {
+            "git_head": "new-commit",
+            "content_sha256": "same-content",
+        },
+    }
+
+    assert aggregation._worker_compatibility_matches(stored, current)
+
+    changed_source = {
+        **current,
+        "source": {**current["source"], "content_sha256": "changed-content"},
+    }
+    assert not aggregation._worker_compatibility_matches(stored, changed_source)
+    assert not aggregation._worker_compatibility_matches(
+        stored, {**current, "fold": 1}
+    )
 
 
 
@@ -389,6 +464,8 @@ def test_fold_aggregation_limits_grid_and_computes_mean_se(
 
     assert result["complete"]
     assert result["best_k"] == 2
+    assert result["best_mean_k"] == 2
+    assert result["selection_rule"].startswith("smallest eligible rank")
     assert result["missing_ranks"] == []
     row = result["summary_rows"][0]
     assert row["successful_fold_count"] == 2
