@@ -33,10 +33,12 @@ From the repository root:
 scripts/slurm/submit_hierarchy_rank_validation.sh --run-id production_loso
 ```
 
-The wrapper first submits the NMF rank array, then submits the dependent
-rank/fold array after every discovery task finishes. Both stages request 12 GB
-per task, the `cpu` partition, and an eight-hour (`08:00:00`) time limit by
-default. Submission-time options include:
+The wrapper first submits the NMF rank array, then one rank-indexed array for
+each validation fold. Each fold array uses SLURM's `aftercorr` dependency, so
+the fits for rank `k` become eligible as soon as NMF task `k` succeeds; they do
+not wait for slower higher-rank NMF tasks. Both stages request 12 GB per task,
+the `cpu` partition, and an eight-hour (`08:00:00`) time limit by default.
+Submission-time options include:
 
 ```bash
 scripts/slurm/submit_hierarchy_rank_validation.sh \
@@ -51,8 +53,12 @@ scripts/slurm/submit_hierarchy_rank_validation.sh \
 
 `--max-rank` is inclusive, accepts 2 through 49, and defaults to 49. It
 reduces both arrays and the expected aggregation grid. `--max-concurrent`
-keeps every requested task but adds SLURM's `%N` concurrency cap. If omitted,
-all requested array elements are eligible to run concurrently.
+keeps every requested task and bounds aggregate fit concurrency by dividing
+the cap evenly across the fold arrays; it must therefore be at least the
+number of folds (six for production LOSO). If omitted, all requested array
+elements are eligible to run concurrently. If an NMF task fails, its
+corresponding fit tasks are cancelled by SLURM and remain visibly missing from
+aggregation alongside the failed discovery artifact.
 
 The default configuration is
 `configs/hierarchy_rank_validation_loso.json`, and the default result root is

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=hierarchy-loso
-#SBATCH --array=0-287
+#SBATCH --array=2-49
 #SBATCH --mem=12G
 #SBATCH --partition=cpu
 #SBATCH --time=08:00:00
@@ -22,6 +22,7 @@ discovery_dir="${HIERARCHY_DISCOVERY_OUTPUT:-${output_dir}/discovery}"
 max_rank="${HIERARCHY_MAX_RANK:-49}"
 array_job_id="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
 array_task_id="${SLURM_ARRAY_TASK_ID}"
+fold_index="${HIERARCHY_FOLD_INDEX:-0}"
 requested_run_identifier="${HIERARCHY_RUN_IDENTIFIER:-${1:-${array_job_id}}}"
 identifier_error=""
 
@@ -46,7 +47,8 @@ fi
 cd "${project_root}"
 "${python_executable}" scripts/run_hierarchy_rank_validation.py \
   --config "${config_path}" \
-  --array-task-id "${array_task_id}" \
+  --k "${array_task_id}" \
+  --fold-index "${fold_index}" \
   --max-rank "${max_rank}" \
   --output-dir "${output_dir}" \
   --discovery-dir "${discovery_dir}"

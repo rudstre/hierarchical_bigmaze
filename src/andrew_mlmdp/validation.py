@@ -371,6 +371,7 @@ def source_code_fingerprint(
             if path.is_file()
             and path.suffix in {".py", ".sh", ".sbatch"}
             and path not in aggregation_only
+            and scripts_root / "slurm" not in path.parents
         )
     if config_path is not None:
         candidates.append(Path(config_path).resolve())
@@ -395,6 +396,55 @@ def source_code_fingerprint(
         "content_sha256": digest.hexdigest(),
         "files": file_records,
     }
+
+def _discovery_compatibility_matches(
+    stored: object,
+    current: Mapping[str, object],
+) -> bool:
+    """Compare discovery provenance, migrating the former broad source scope."""
+
+    if stored == current:
+        return True
+    if not isinstance(stored, dict):
+        return False
+    stored_non_source = {key: value for key, value in stored.items() if key != "source"}
+    current_non_source = {
+        key: value for key, value in current.items() if key != "source"
+    }
+    if stored_non_source != current_non_source:
+        return False
+
+    def file_map(source: object) -> dict[str, object] | None:
+        if not isinstance(source, dict) or not isinstance(source.get("files"), list):
+            return None
+        records = source["files"]
+        if not all(
+            isinstance(record, dict)
+            and isinstance(record.get("path"), str)
+            and isinstance(record.get("sha256"), str)
+            for record in records
+        ):
+            return None
+        return {record["path"]: record["sha256"] for record in records}
+
+    stored_files = file_map(stored.get("source"))
+    current_files = file_map(current.get("source"))
+    if stored_files is None or current_files is None:
+        return False
+    legacy_broad_scope = any(
+        path.startswith("scripts/slurm/") for path in stored_files
+    )
+    ignored = {"src/andrew_mlmdp/validation.py"} if legacy_broad_scope else set()
+    return {
+        path: digest
+        for path, digest in stored_files.items()
+        if not path.startswith("scripts/slurm/") and path not in ignored
+    } == {
+        path: digest
+        for path, digest in current_files.items()
+        if not path.startswith("scripts/slurm/") and path not in ignored
+    }
+
 
 
 
@@ -452,13 +502,17 @@ def rank_fold_from_array_task(
 
 
 def validation_fold_count(config: RankValidationConfig | str | Path) -> int:
-    """Return the number of configured session-level validation folds."""
+    """Return the fold count without loading trials when config provenance suffices."""
 
     resolved = _coerce_config(config)
-    dataset = _load_dataset_context(resolved).dataset
-    if resolved.dataset.validation_mode == "leave_one_session_out":
-        return len(dataset.sessions)
-    return 1
+    if resolved.dataset.validation_mode == "chronological_holdout":
+        return 1
+    expected_counts = resolved.dataset.expected_session_trial_counts
+    if expected_counts:
+        return len(expected_counts)
+    # Exploratory configs may omit audited session counts. Only those configs
+    # need the slower data load to determine how many LOSO folds exist.
+    return len(_load_dataset_context(resolved).dataset.sessions)
 
 
 def _load_dataset_context(config: RankValidationConfig) -> _DatasetContext:
@@ -667,7 +721,10 @@ def run_rank_discovery(
             if (
                 existing.get("artifact_type") == "rank_discovery"
                 and existing.get("k") == k
-                and existing.get("compatibility") == compatibility
+                and _discovery_compatibility_matches(
+                    existing.get("compatibility"),
+                    compatibility,
+                )
             ):
                 return existing
             raise ValueError(
@@ -734,7 +791,10 @@ def _load_discovery_artifact(
         raise ValueError(f"Discovery artifact {path} has an incompatible schema")
     if artifact.get("artifact_type") != "rank_discovery" or artifact.get("k") != k:
         raise ValueError(f"Discovery artifact {path} has an invalid identity")
-    if artifact.get("compatibility") != expected_compatibility:
+    if not _discovery_compatibility_matches(
+        artifact.get("compatibility"),
+        expected_compatibility,
+    ):
         raise ValueError(f"Discovery artifact {path} is incompatible")
     if artifact.get("status") != "success":
         raise RankValidationError(f"Discovery artifact {path} did not succeed")

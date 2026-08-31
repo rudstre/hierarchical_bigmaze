@@ -20,6 +20,7 @@ from andrew_mlmdp.validation import (
     _atomic_write_json,
     _coerce_config,
     _discovery_compatibility,
+    _discovery_compatibility_matches,
     _load_dataset_context,
     _load_problem_context,
     _payload_digest,
@@ -500,7 +501,10 @@ def aggregate_rank_results(
             or artifact.get("k") != k
         ):
             raise ValueError(f"Discovery artifact {path} has an invalid identity")
-        if artifact.get("compatibility") != current_discovery_compatibility:
+        if not _discovery_compatibility_matches(
+            artifact.get("compatibility"),
+            current_discovery_compatibility,
+        ):
             raise ValueError(f"Discovery artifact {path} is incompatible")
         discovery_digests[k] = _payload_digest(artifact)
         if artifact.get("status") == "success":

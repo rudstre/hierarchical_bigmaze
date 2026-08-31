@@ -90,6 +90,17 @@ def test_loso_folds_hold_out_every_session_exactly_once(tmp_path, monkeypatch):
         assert context.split_payload["validation_trial_count"] == 1
 
 
+def test_audited_loso_fold_count_does_not_load_trial_data(tmp_path, monkeypatch):
+    config = _loso_config(tmp_path, session_count=3)
+
+    def unexpected_load(_):
+        raise AssertionError("fold counting must not load trial TSVs")
+
+    monkeypatch.setattr(validation, "_load_dataset_context", unexpected_load)
+
+    assert validation.validation_fold_count(config) == 3
+
+
 @pytest.mark.parametrize(
     ("task_id", "expected"),
     [
@@ -112,6 +123,51 @@ def test_max_rank_validation_rejects_out_of_range_values(max_rank):
     with pytest.raises(ValueError, match="max_rank"):
         validation.validate_max_rank(max_rank)
 
+
+
+
+def test_legacy_discovery_artifact_ignores_only_scheduler_scope_changes():
+    stored = {
+        "discovery_signature": "science",
+        "maze_sha256": "maze",
+        "source": {
+            "files": [
+                {
+                    "path": "src/andrew_mlmdp/discovery.py",
+                    "sha256": "core",
+                },
+                {
+                    "path": "src/andrew_mlmdp/validation.py",
+                    "sha256": "legacy-wrapper",
+                },
+                {
+                    "path": "scripts/slurm/hierarchy_rank_validation.sbatch",
+                    "sha256": "old-scheduler",
+                },
+            ]
+        },
+    }
+    current = {
+        "discovery_signature": "science",
+        "maze_sha256": "maze",
+        "source": {
+            "files": [
+                {
+                    "path": "src/andrew_mlmdp/discovery.py",
+                    "sha256": "core",
+                },
+                {
+                    "path": "src/andrew_mlmdp/validation.py",
+                    "sha256": "new-wrapper",
+                },
+            ]
+        },
+    }
+
+    assert validation._discovery_compatibility_matches(stored, current)
+
+    current["source"]["files"][0]["sha256"] = "changed-science"
+    assert not validation._discovery_compatibility_matches(stored, current)
 
 def _successful_fold_row(value):
     return {
@@ -212,7 +268,7 @@ def test_slurm_defaults_and_submission_controls_are_explicit():
         root / "scripts" / "slurm" / "submit_hierarchy_rank_validation.sh"
     ).read_text()
 
-    assert "#SBATCH --array=0-287" in validation_batch
+    assert "#SBATCH --array=2-49" in validation_batch
     assert "#SBATCH --array=2-49" in discovery_batch
     assert "#SBATCH --partition=cpu" in validation_batch
     assert "#SBATCH --partition=cpu" in discovery_batch
@@ -222,7 +278,15 @@ def test_slurm_defaults_and_submission_controls_are_explicit():
     assert "#SBATCH --mem=12G" in discovery_batch
     assert "--max-rank" in submit
     assert "--max-concurrent" in submit
-    assert "afterany:" in submit
+    assert "aftercorr:" in submit
+    assert "afterany:" not in submit
+    assert "HIERARCHY_FOLD_INDEX" in submit
+    assert "--kill-on-invalid-dep=yes" in submit
+    assert 'BASH_SOURCE[0]' in submit
+    assert "SLURM_SUBMIT_DIR" not in submit
+    assert "expected_session_trial_counts" in submit
+    assert "without importing the model stack" in submit
+    assert '--fold-index "${fold_index}"' in validation_batch
 
 
 def test_fold_aggregation_limits_grid_and_computes_mean_se(

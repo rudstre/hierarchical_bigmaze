@@ -3,7 +3,8 @@
 
 set -euo pipefail
 
-project_root="${HIERARCHY_PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project_root="${HIERARCHY_PROJECT_ROOT:-$(cd -- "${script_dir}/../.." && pwd)}"
 python_executable="${HIERARCHY_PYTHON:-/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python}"
 config_path="${HIERARCHY_SWEEP_CONFIG:-${project_root}/configs/hierarchy_rank_validation_loso.json}"
 output_dir="${HIERARCHY_SWEEP_OUTPUT:-${project_root}/output/hierarchy_rank_validation/production_loso}"
@@ -78,27 +79,52 @@ if [[ -n "${max_concurrent}" ]] && {
 fi
 
 cd "${project_root}"
-fold_count="$("${python_executable}" scripts/run_hierarchy_rank_validation.py \
-  --config "${config_path}" \
-  --max-rank "${max_rank}" \
-  --print-fold-count)"
+# Production configs record the audited sessions, so submission can determine
+# the array size without importing the model stack or reading behavioral TSVs.
+if ! fold_count="$("${python_executable}" -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    dataset = json.load(config_file)["dataset"]
+mode = dataset.get("validation_mode", "chronological_holdout")
+expected_counts = dataset.get("expected_session_trial_counts", {})
+if mode == "chronological_holdout":
+    print(1)
+elif expected_counts:
+    print(len(expected_counts))
+else:
+    raise SystemExit(1)
+' "${config_path}")"; then
+  fold_count="$("${python_executable}" scripts/run_hierarchy_rank_validation.py \
+    --config "${config_path}" \
+    --max-rank "${max_rank}" \
+    --print-fold-count)"
+fi
 if [[ ! "${fold_count}" =~ ^[0-9]+$ ]] || (( fold_count < 1 )); then
   printf 'worker returned invalid fold count: %s\n' "${fold_count}" >&2
   exit 2
 fi
 
 rank_count=$((max_rank - 1))
-validation_task_count=$((rank_count * fold_count))
-validation_last_task=$((validation_task_count - 1))
 discovery_array="2-${max_rank}"
-validation_array="0-${validation_last_task}"
+validation_array="2-${max_rank}"
 if [[ -n "${max_concurrent}" ]]; then
+  if (( max_concurrent < fold_count )); then
+    printf 'max concurrent must be at least the fold count (%s)\n' \
+      "${fold_count}" >&2
+    exit 2
+  fi
   discovery_limit="${max_concurrent}"
   if (( discovery_limit > rank_count )); then
     discovery_limit="${rank_count}"
   fi
+  per_fold_limit=$((max_concurrent / fold_count))
+  if (( per_fold_limit > rank_count )); then
+    per_fold_limit="${rank_count}"
+  fi
   discovery_array+="%${discovery_limit}"
-  validation_array+="%${max_concurrent}"
+  validation_array+="%${per_fold_limit}"
 fi
 
 export_values="ALL,HIERARCHY_PROJECT_ROOT=${project_root},HIERARCHY_PYTHON=${python_executable},HIERARCHY_SWEEP_CONFIG=${config_path},HIERARCHY_SWEEP_OUTPUT=${output_dir},HIERARCHY_DISCOVERY_OUTPUT=${output_dir}/discovery,HIERARCHY_RUN_IDENTIFIER=${run_identifier},HIERARCHY_MAX_RANK=${max_rank}"
@@ -111,14 +137,18 @@ discovery_submission="$(sbatch --parsable \
   scripts/slurm/hierarchy_rank_discovery.sbatch)"
 discovery_job_id="${discovery_submission%%;*}"
 
-validation_submission="$(sbatch --parsable \
-  "${scheduler_arguments[@]}" \
-  --mem="${memory}" \
-  --array="${validation_array}" \
-  --dependency="afterany:${discovery_job_id}" \
-  --export="${export_values}" \
-  scripts/slurm/hierarchy_rank_validation.sbatch)"
-
 printf 'discovery_job=%s array=%s\n' "${discovery_submission}" "${discovery_array}"
-printf 'validation_job=%s array=%s folds=%s\n' \
-  "${validation_submission}" "${validation_array}" "${fold_count}"
+for ((fold_index = 0; fold_index < fold_count; fold_index++)); do
+  fold_export_values="${export_values},HIERARCHY_FOLD_INDEX=${fold_index}"
+  validation_submission="$(sbatch --parsable \
+    "${scheduler_arguments[@]}" \
+    --mem="${memory}" \
+    --array="${validation_array}" \
+    --dependency="aftercorr:${discovery_job_id}" \
+    --kill-on-invalid-dep=yes \
+    --export="${fold_export_values}" \
+    scripts/slurm/hierarchy_rank_validation.sbatch)"
+  printf 'validation_fold=%s job=%s array=%s dependency=aftercorr:%s\n' \
+    "${fold_index}" "${validation_submission}" "${validation_array}" \
+    "${discovery_job_id}"
+done
