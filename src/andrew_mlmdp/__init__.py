@@ -20,6 +20,7 @@ from andrew_mlmdp.discovery import (
     SubtaskDiscovery,
     discover_subgoals,
 )
+from andrew_mlmdp.doohan_canonical import doohan_to_canonical_decisions
 from andrew_mlmdp.doohan_dataset import (
     DoohanDataset,
     Exclusion,
@@ -112,6 +113,7 @@ __all__ = [
     "Trial",
     "TrialScore",
     "controlled_dynamics",
+    "doohan_to_canonical_decisions",
     "desirability_grid",
     "desirability_step",
     "discover_subgoals",

@@ -228,6 +228,48 @@ assumption. Pandas is only required while loading the processed TSV files and
 is available
 through the `notebook` optional dependency.
 
+## Reproduce the Figure 2.19 or 2.20 behavioral panels
+
+The dedicated analysis command runs Qin's seven-policy full/reduced regression
+from processed Doohan decisions for one animal, any animal subset, or all
+available animals. Figure 2.19 uses PCA routes; Figure 2.20 uses Qin's fitted
+low-rank LMDP/HMM routes:
+
+```bash
+python doohan_data_interaction/reproduce_figure_2_19_behavior.py \
+    --data-root external/GridMaze-mFC-ephys-DATA/data \
+    --output-dir results/figure_2_19 \
+    --figure-number 2.19 \
+    --subject-id m2 \
+    --subject-id m3
+```
+
+For Figure 2.20, pass `--figure-number 2.20`; the HMM fit defaults reproduce
+the settings in Qin's original regressor construction and are exposed as
+`--hmm-*` options. Each fold fits routes only on its explicit route-training
+sessions and records the fitted state and likelihood trace.
+
+`--fold-scheme` selects the cross-validation split. The default `adjacent`
+trains regression coefficients on session k and evaluates on k+1, with routes
+fitted on the other sessions. `leave_one_out` trains on every other session and
+evaluates on the held-out one; routes are then fitted on the same training
+sessions, so route predictors are in-sample on the training rows (the held-out
+session is still fully excluded from both fits). Leave-one-out gives one
+validation point per session and uses far more data per fold, so its numbers
+are not directly comparable to the adjacent scheme.
+
+Omit `--subject-id` to select every animal for the requested maze. The command
+writes the raw regression result (`.pt`), a fold-by-policy CSV grid, a
+per-policy across-animal summary CSV, a JSON provenance record, and PNG/PDF
+figures. Held-out Δ mean NLL is averaged within each animal before the
+across-animal mean ± SEM shown in the left panel; the right panel groups the
+same fold grid by validation-session order. Failed and unavailable folds
+remain explicit in the fold grid and provenance rather than being dropped.
+Subjects may have unequal numbers of sessions and folds. Use `--overwrite`
+only when intentionally replacing an existing output set. This command
+reproduces only the behavioral panels; the theoretical-agent panels and
+thesis significance annotations are not included.
+
 ## Distributed subgoals discovered with NMF
 
 Point subgoals are one-hot profiles. Distributed subgoals use the same
