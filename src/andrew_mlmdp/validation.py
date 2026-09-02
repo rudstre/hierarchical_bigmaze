@@ -112,6 +112,7 @@ class DatasetValidationConfig:
                     "to positive integers"
                 )
 
+
 @dataclass(frozen=True)
 class DiscoveryValidationConfig:
     """Production connected-NMF settings shared by every rank."""
@@ -397,6 +398,39 @@ def source_code_fingerprint(
         "files": file_records,
     }
 
+
+def discovery_source_fingerprint(project_root: str | Path) -> dict[str, object]:
+    """Fingerprint only code that can change split-independent NMF discovery."""
+
+    root = Path(project_root).resolve()
+    relative_paths = (
+        "pyproject.toml",
+        "src/andrew_mlmdp/discovery.py",
+        "src/andrew_mlmdp/lmdp.py",
+        "src/andrew_mlmdp/maze.py",
+        "src/andrew_mlmdp/profiles.py",
+    )
+    digest = hashlib.sha256()
+    records = []
+    for relative in relative_paths:
+        path = root / relative
+        if not path.is_file():
+            raise FileNotFoundError(f"Discovery source dependency is missing: {path}")
+        content = path.read_bytes()
+        content_digest = hashlib.sha256(content).hexdigest()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+        records.append({"path": relative, "sha256": content_digest})
+    return {
+        "scope": "nmf_discovery_source_v1",
+        "git_head": _git_head(root),
+        "content_sha256": digest.hexdigest(),
+        "files": records,
+    }
+
+
 def _discovery_compatibility_matches(
     stored: object,
     current: Mapping[str, object],
@@ -431,9 +465,15 @@ def _discovery_compatibility_matches(
     current_files = file_map(current.get("source"))
     if stored_files is None or current_files is None:
         return False
-    legacy_broad_scope = any(
-        path.startswith("scripts/slurm/") for path in stored_files
-    )
+    current_source = current.get("source")
+    if (
+        isinstance(current_source, dict)
+        and current_source.get("scope") == "nmf_discovery_source_v1"
+    ):
+        return all(
+            stored_files.get(path) == digest for path, digest in current_files.items()
+        )
+    legacy_broad_scope = any(path.startswith("scripts/slurm/") for path in stored_files)
     ignored = {"src/andrew_mlmdp/validation.py"} if legacy_broad_scope else set()
     return {
         path: digest
@@ -446,19 +486,12 @@ def _discovery_compatibility_matches(
     }
 
 
-
-
-
-
-
 def _coerce_config(
     config: RankValidationConfig | str | Path,
 ) -> RankValidationConfig:
     if isinstance(config, RankValidationConfig):
         return config
     return load_validation_config(config)
-
-
 
 
 def _check_expected_count(name: str, actual: int, expected: int | None) -> None:
@@ -686,7 +719,7 @@ def _discovery_compatibility(
             }
         ),
         "maze_sha256": dataset.maze_sha256,
-        "source": source_code_fingerprint(config.project_root),
+        "source": discovery_source_fingerprint(config.project_root),
         "runtime": dataset.runtime,
     }
 
@@ -1007,6 +1040,7 @@ def run_rank_validation(
             f"Rank {k} fold {fold_index} validation failed during {stage}: {error}"
         ) from error
 
+
 def _selected_profiles(result: NMFRankResult | np.ndarray) -> np.ndarray:
     if isinstance(result, np.ndarray):
         return result
@@ -1014,7 +1048,6 @@ def _selected_profiles(result: NMFRankResult | np.ndarray) -> np.ndarray:
     if discovery is None:
         raise ValueError("The NMF rank result has no selected discovery")
     return discovery.profiles
-
 
 
 def _initial_template(

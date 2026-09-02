@@ -20,7 +20,10 @@ from andrew_mlmdp.discovery import (
     SubtaskDiscovery,
     discover_subgoals,
 )
-from andrew_mlmdp.doohan_canonical import doohan_to_canonical_decisions
+from andrew_mlmdp.doohan_canonical import (
+    doohan_to_canonical_decisions,
+    hierarchy_to_canonical_action_predictions,
+)
 from andrew_mlmdp.doohan_dataset import (
     DoohanDataset,
     Exclusion,
@@ -30,6 +33,7 @@ from andrew_mlmdp.doohan_dataset import (
 from andrew_mlmdp.hierarchy import (
     FitResult,
     FitStep,
+    MovementPredictions,
     NumericalError,
     ParameterValues,
     Plan,
@@ -84,6 +88,7 @@ __all__ = [
     "GoalTasks",
     "LabeledMaze",
     "Maze",
+    "MovementPredictions",
     "NMFConfig",
     "NMFConnectivityConfig",
     "NMFRankResult",
@@ -114,6 +119,7 @@ __all__ = [
     "TrialScore",
     "controlled_dynamics",
     "doohan_to_canonical_decisions",
+    "hierarchy_to_canonical_action_predictions",
     "desirability_grid",
     "desirability_step",
     "discover_subgoals",

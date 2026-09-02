@@ -260,3 +260,27 @@ def test_cli_accepts_figure_2_20_hmm_fit_options():
     assert args.figure_number == "2.20"
     assert args.hmm_n_routes == 5
     assert args.hmm_epochs == 12
+
+
+def test_hierarchical_mlmdp_opt_in_has_distinct_outputs_and_cli():
+    default = figure_2_19.output_files("2.19")
+    augmented = figure_2_19.output_files(
+        "2.19",
+        include_hierarchical_mlmdp=True,
+    )
+    args = figure_2_19.build_arg_parser().parse_args(
+        [
+            "--data-root",
+            "/data",
+            "--output-dir",
+            "/out",
+            "--include-hierarchical-mlmdp",
+            "--hierarchical-mlmdp-run-dir",
+            "/artifacts",
+        ]
+    )
+
+    assert default["png"] == "figure_2_19_behavior.png"
+    assert augmented["png"] == ("figure_2_19_behavior_with_hierarchical_mlmdp.png")
+    assert args.include_hierarchical_mlmdp is True
+    assert args.hierarchical_mlmdp_run_dir == Path("/artifacts")

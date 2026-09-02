@@ -51,6 +51,7 @@ from andrew_mlmdp.hierarchy.model import (
     ThresholdRange,
     compute_plan,
 )
+from andrew_mlmdp.hierarchy.prediction import MovementPredictions
 from andrew_mlmdp.hierarchy.rollout import (
     Rollout,
     RolloutEvent,
@@ -64,6 +65,7 @@ __all__ = [
     "FitResult",
     "FitStep",
     "NumericalError",
+    "MovementPredictions",
     "PairDiagnostics",
     "PairEntropy",
     "ParameterValues",

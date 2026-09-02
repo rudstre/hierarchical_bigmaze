@@ -36,6 +36,7 @@ PREDICTOR_STYLE = {
     "vector": ("spatial", "#EE220C"),
     "optimal": ("optimal", "#0076BA"),
     "pca_route": ("route", "#1DB100"),
+    "hierarchical_mlmdp": ("hierarchical MLMDP", "#E69F00"),
     "pca_route_planning": ("route plan", "#64389F"),
     "hmm_route": ("route", "#1DB100"),
     "hmm_route_planning": ("route plan", "#64389F"),
@@ -76,10 +77,12 @@ OUTPUT_SUFFIXES = {
 }
 
 
-def output_files(figure_number):
+def output_files(figure_number, *, include_hierarchical_mlmdp=False):
     if figure_number not in FIGURE_REGRESSORS_BY_NUMBER:
         raise ValueError(f"Unknown figure number: {figure_number!r}")
     stem = f"figure_{figure_number.replace('.', '_')}_behavior"
+    if include_hierarchical_mlmdp:
+        stem += "_with_hierarchical_mlmdp"
     return {name: f"{stem}{suffix}" for name, suffix in OUTPUT_SUFFIXES.items()}
 
 
@@ -338,6 +341,7 @@ def write_outputs(
     provenance: dict,
     figure_number: str = "2.19",
     overwrite: bool = False,
+    include_hierarchical_mlmdp: bool = False,
     dpi: int = 200,
 ) -> dict:
     """Render the figure, then publish every output atomically.
@@ -346,8 +350,16 @@ def write_outputs(
     no partial output set behind.
     """
     output_dir = Path(output_dir).resolve()
-    _refuse_existing(output_dir, figure_number=figure_number, overwrite=overwrite)
-    files = output_files(figure_number)
+    _refuse_existing(
+        output_dir,
+        figure_number=figure_number,
+        include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        overwrite=overwrite,
+    )
+    files = output_files(
+        figure_number,
+        include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+    )
     paths = {name: output_dir / filename for name, filename in files.items()}
     record = {
         **provenance,
@@ -459,6 +471,9 @@ def build_provenance(
             "random_seed": regression_result["random_seed"],
             "pca_configuration": regression_result["pca_configuration"],
             "hmm_configuration": regression_result.get("hmm_configuration"),
+            "hierarchical_mlmdp_run_dir": regression_result.get(
+                "hierarchical_mlmdp_run_dir"
+            ),
             "folds": [
                 {key: record.get(key) for key in fold_keys}
                 for record in regression_result["fold_results"]
@@ -489,6 +504,8 @@ def run_reproduction(
     random_seed=0,
     figure_number="2.19",
     fold_scheme="adjacent",
+    include_hierarchical_mlmdp=False,
+    hierarchical_mlmdp_run_dir=None,
     pca_alpha=0.1,
     pca_components=3,
     hmm_n_routes=7,
@@ -512,10 +529,17 @@ def run_reproduction(
         else Path(project_root).resolve()
     )
     _configure_import_paths(project_root)
-    from datahelper.canonical import canonical_decision_table
+    from datahelper.canonical import (
+        canonical_data_signature,
+        canonical_decision_table,
+        discover_folds,
+    )
     from regressionhelper.regression_pipeline import run_regression_pipeline
 
     from andrew_mlmdp import DoohanDataset, doohan_to_canonical_decisions
+    from andrew_mlmdp.adjacent_regression import (
+        load_external_fold_predictors,
+    )
 
     if maze_name not in _MAZE_IDS:
         raise ValueError(
@@ -529,7 +553,18 @@ def run_reproduction(
             )
         if len(set(requested)) != len(requested):
             raise ValueError("--subject-id values must be unique")
-    _refuse_existing(output_dir, figure_number=figure_number, overwrite=overwrite)
+    if include_hierarchical_mlmdp and fold_scheme != "adjacent":
+        raise ValueError("The hierarchical MLMDP artifacts require adjacent folds")
+    if include_hierarchical_mlmdp and hierarchical_mlmdp_run_dir is None:
+        raise ValueError(
+            "--hierarchical-mlmdp-run-dir is required when the predictor is enabled"
+        )
+    _refuse_existing(
+        output_dir,
+        figure_number=figure_number,
+        include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        overwrite=overwrite,
+    )
 
     _status(quiet, f"Loading Doohan sessions for {maze_name}...")
     dataset = DoohanDataset.from_data_root(
@@ -547,7 +582,19 @@ def run_reproduction(
     _status(quiet, "Converting to canonical decision rows...")
     canonical = canonical_decision_table(doohan_to_canonical_decisions(dataset))
     selected = _subjects_present(canonical, requested)
-    regressors = FIGURE_REGRESSORS_BY_NUMBER[figure_number]
+    regressors = list(FIGURE_REGRESSORS_BY_NUMBER[figure_number])
+    external_fold_predictors = None
+    if include_hierarchical_mlmdp:
+        regressors.insert(regressors.index("optimal") + 1, "hierarchical_mlmdp")
+        folds, unavailable = discover_folds(canonical, selected, scheme="adjacent")
+        if unavailable:
+            raise ValueError(f"Cannot load MLMDP artifacts: {unavailable}")
+        external_fold_predictors = load_external_fold_predictors(
+            hierarchical_mlmdp_run_dir,
+            folds=folds,
+            maze_id=_MAZE_IDS[maze_name],
+            canonical_signature=canonical_data_signature(canonical),
+        )
     _status(
         quiet,
         f"Figure {figure_number} regression ({fold_scheme} folds): "
@@ -563,10 +610,11 @@ def run_reproduction(
     regression_result = run_regression_pipeline(
         canonical,
         maze_id=_MAZE_IDS[maze_name],
-        regressors=list(regressors),
+        regressors=regressors,
         subject_ids=selected,
         random_seed=random_seed,
         fold_scheme=fold_scheme,
+        external_fold_predictors=external_fold_predictors,
         pca_configuration={"alpha": pca_alpha, "n_components": pca_components},
         hmm_configuration={
             "n_routes": hmm_n_routes,
@@ -579,6 +627,11 @@ def run_reproduction(
         verbose=not quiet,
     )
     regression_result["figure_number"] = figure_number
+    regression_result["hierarchical_mlmdp_run_dir"] = (
+        None
+        if hierarchical_mlmdp_run_dir is None
+        else str(Path(hierarchical_mlmdp_run_dir).resolve())
+    )
     _status(quiet, "Summarising folds and rendering the figure...")
     fold_table = build_fold_table(regression_result, _session_order_map(canonical))
     group_summary = summarise_predictability(fold_table, selected)
@@ -603,6 +656,7 @@ def run_reproduction(
         provenance=provenance,
         figure_number=figure_number,
         overwrite=overwrite,
+        include_hierarchical_mlmdp=include_hierarchical_mlmdp,
         dpi=dpi,
     )
     _status(quiet, f"Done. Wrote {len(paths)} files to {Path(output_dir).resolve()}")
@@ -640,6 +694,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--pca-alpha", type=float, default=0.1)
+    parser.add_argument(
+        "--include-hierarchical-mlmdp",
+        action="store_true",
+        help="Add the precomputed nested-CV hierarchical MLMDP predictor.",
+    )
+    parser.add_argument(
+        "--hierarchical-mlmdp-run-dir",
+        type=Path,
+    )
     parser.add_argument("--pca-components", type=int, default=3)
     parser.add_argument("--hmm-n-routes", type=int, default=7)
     parser.add_argument("--hmm-cognitive-constant", type=float, default=20.0)
@@ -699,12 +762,19 @@ def _subjects_present(canonical: pd.DataFrame, requested) -> list:
 
 
 def _refuse_existing(
-    output_dir, *, figure_number: str = "2.19", overwrite: bool
+    output_dir,
+    *,
+    figure_number: str = "2.19",
+    include_hierarchical_mlmdp: bool = False,
+    overwrite: bool,
 ) -> None:
     if overwrite:
         return
     output_dir = Path(output_dir).resolve()
-    files = output_files(figure_number)
+    files = output_files(
+        figure_number,
+        include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+    )
     existing = [name for name in files.values() if (output_dir / name).exists()]
     if existing:
         raise FileExistsError(

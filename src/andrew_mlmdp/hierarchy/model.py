@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         FitResult,
         FitStep,
     )
+    from andrew_mlmdp.hierarchy.prediction import MovementPredictions
     from andrew_mlmdp.hierarchy.rollout import Rollout
 
 
@@ -611,6 +612,16 @@ class Task:
                 parameter_overrides=overrides,
             )
         return float(score.detach().cpu())
+
+    def movement_predictions(
+        self,
+        trajectory: Sequence[Coordinate],
+    ) -> "MovementPredictions":
+        """Predict each departure before conditioning on that movement."""
+
+        from andrew_mlmdp.hierarchy.prediction import movement_predictions
+
+        return movement_predictions(self, trajectory)
 
     def rollout(
         self,

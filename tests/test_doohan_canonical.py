@@ -4,8 +4,11 @@ import numpy as np
 
 from andrew_mlmdp import (
     DoohanDataset,
+    Environment,
     SessionRecord,
+    SubgoalBasis,
     doohan_to_canonical_decisions,
+    hierarchy_to_canonical_action_predictions,
 )
 from andrew_mlmdp.dataset import Trial
 from andrew_mlmdp.labeled_maze import maze_from_labeled_edges
@@ -105,3 +108,64 @@ def test_doohan_adapter_emits_canonical_coordinates_actions_and_timestamps(tmp_p
         frame[["reward_cos_angle", "reward_sin_angle"]],
         [[1, 0], [0, 1], [-1, 0], [0, -1]],
     )
+
+
+def test_hierarchy_predictions_use_canonical_decision_keys(tmp_path):
+    definition = _definition()
+    session = SessionRecord(
+        "m2/2022-01-01.maze",
+        "m2",
+        "2022-01-01.maze",
+        "maze",
+        date(2022, 1, 1),
+        1,
+        "maze_1",
+        (),
+        3,
+        "all",
+        (),
+        "",
+        0.0,
+        "",
+    )
+    trial = Trial(
+        session.session_id,
+        7,
+        definition.coordinate_for("C1"),
+        tuple(definition.coordinate_for(label) for label in ("A1", "B1", "C1")),
+    )
+    dataset = DoohanDataset(
+        tmp_path,
+        "maze_1",
+        definition,
+        (session,),
+        (trial,),
+        (),
+    )
+    profiles = np.linspace(1.0, 0.1, len(definition.maze.free_cells))[:, None]
+    template = Environment(definition.maze).hierarchy(
+        SubgoalBasis.from_profiles(definition.maze, profiles)
+    )
+
+    frame = hierarchy_to_canonical_action_predictions(
+        dataset,
+        template,
+        session_ids=(session.session_id,),
+    )
+
+    assert frame[["subject_id", "session_id", "trial_id", "decision_order"]].to_dict(
+        "records"
+    ) == [
+        {
+            "subject_id": "m2",
+            "session_id": session.session_id,
+            "trial_id": 7,
+            "decision_order": 0,
+        },
+        {
+            "subject_id": "m2",
+            "session_id": session.session_id,
+            "trial_id": 7,
+            "decision_order": 1,
+        },
+    ]

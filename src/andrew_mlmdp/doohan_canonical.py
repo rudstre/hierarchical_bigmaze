@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 from andrew_mlmdp.doohan_dataset import DoohanDataset, _read_hierarchical_tsv
 
+if TYPE_CHECKING:
+    from andrew_mlmdp.hierarchy.model import Template
+
 _QIN_MAZE_NUMBERS = {"maze_1": 1, "maze_2": 2}
+_QIN_ACTION_COMMANDS = ("east", "north", "west", "south")
 
 
 def doohan_to_canonical_decisions(dataset: DoohanDataset):
@@ -100,6 +107,97 @@ def doohan_to_canonical_decisions(dataset: DoohanDataset):
         "trial_phase",
         "reward_cos_angle",
         "reward_sin_angle",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def hierarchy_to_canonical_action_predictions(
+    dataset: DoohanDataset,
+    template: "Template",
+    *,
+    session_ids: Iterable[str],
+):
+    """Return keyed four-action MLMDP predictions for selected sessions."""
+
+    try:
+        import pandas as pd
+    except ImportError as error:
+        raise ImportError(
+            "hierarchy_to_canonical_action_predictions requires pandas; install "
+            "andrew-mlmdp[notebook]"
+        ) from error
+    if template.maze != dataset.definition.maze:
+        raise ValueError("Hierarchy template and Doohan dataset use different mazes")
+
+    selected_sessions = tuple(str(session_id) for session_id in session_ids)
+    if not selected_sessions or len(set(selected_sessions)) != len(selected_sessions):
+        raise ValueError("session_ids must be non-empty and unique")
+    sessions = {session.session_id: session for session in dataset.sessions}
+    unknown = sorted(set(selected_sessions) - set(sessions))
+    if unknown:
+        raise ValueError(f"Unknown prediction session IDs: {unknown}")
+
+    selected = set(selected_sessions)
+    trials = tuple(trial for trial in dataset.trials if trial.session_id in selected)
+    if not trials:
+        raise ValueError("Selected prediction sessions contain no valid trials")
+
+    rows = []
+    for trial in trials:
+        task = template.task(trial.goal)
+        prediction = task.movement_predictions(trial.trajectory)
+        if prediction.trajectory != trial.trajectory:
+            raise ValueError(
+                "MLMDP prediction collapsed repeated states in a Doohan trial: "
+                f"{(trial.session_id, trial.trial_id)}"
+            )
+        if len(prediction.next_state_probabilities) != len(trial.trajectory) - 1:
+            raise ValueError(
+                "MLMDP prediction count does not match Doohan movement count for "
+                f"{(trial.session_id, trial.trial_id)}"
+            )
+        session = sessions[trial.session_id]
+        for decision_order, (current, probabilities) in enumerate(
+            zip(
+                trial.trajectory[:-1],
+                prediction.next_state_probabilities,
+                strict=True,
+            )
+        ):
+            action_values = np.zeros(4, dtype=np.float64)
+            for action, command in enumerate(_QIN_ACTION_COMMANDS):
+                following = template.maze.command_outcome(current, command)
+                if following != current:
+                    action_values[action] = probabilities[
+                        template.maze.state_index(following)
+                    ]
+            if not np.isclose(action_values.sum(), 1.0, atol=1e-10, rtol=0.0):
+                raise ValueError(
+                    "MLMDP predictive mass does not map to valid cardinal actions for "
+                    f"{(trial.session_id, trial.trial_id, decision_order)}"
+                )
+            rows.append(
+                {
+                    "subject_id": session.subject_id,
+                    "session_id": trial.session_id,
+                    "trial_id": trial.trial_id,
+                    "decision_order": decision_order,
+                    **{
+                        f"action_{action}": float(action_values[action])
+                        for action in range(4)
+                    },
+                }
+            )
+
+    columns = [
+        "subject_id",
+        "session_id",
+        "trial_id",
+        "decision_order",
+        "action_0",
+        "action_1",
+        "action_2",
+        "action_3",
     ]
     return pd.DataFrame(rows, columns=columns)
 

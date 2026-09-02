@@ -692,9 +692,36 @@ patience at the minimum learning rate. Omitting either option falls back to `tol
 to use a scientifically interpretable likelihood scale.
 
 
-## Naming conventions
+## Causal movement prediction
+
+Task.movement_predictions(trajectory) uses the same forward controller-mode
+filter and first-departure kernels as trajectory likelihood. At movement t it
+forms the joint probability of every candidate next physical state and next
+controller mode given observations strictly before t, then marginalizes the
+next mode. For next state y and mode n,
+
+~~~math
+p(y_t=y,n_t=n\mid y_{<t})
+  = \sum_o K_t(y,n,o)\,p(n_{t-1}=o\mid y_{<t}).
+~~~
+
+The returned next-state row must be finite, nonnegative, and sum to one to
+absolute tolerance 1e-10; the implementation does not repair or renormalize a
+failed row. Conditioning that joint distribution on the observed destination
+advances the filter. Consequently, the sum of log returned observed
+probabilities equals Task.log_likelihood for the same collapsed trajectory.
+
+Prediction currently requires distributed profiles. Point-subgoal execution
+has relocation semantics that do not define an ordinary physical movement
+distribution and is rejected. MovementPredictions retains the collapsed
+trajectory, pre-movement controller probabilities, next-state probabilities,
+and observed probabilities as read-only float64 arrays.
+
+
 
 Names use the nearest module as context. Inside `andrew_mlmdp.hierarchy`, prefer
+## Naming conventions
+
 `Template`, `Task`, `Plan`, and `TaskLibrary`; repeating `Hierarchy` or
 `LayerOne` does not add information there. Result records name the concept they
 contain (`PairDiagnostics`, `UpperGraph`, `RolloutSummary`) rather than ending

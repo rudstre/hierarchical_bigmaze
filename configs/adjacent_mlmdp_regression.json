@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "dataset": {
+    "data_root": "external/GridMaze-mFC-ephys-DATA/data",
+    "subject_ids": ["m2", "m3", "m4", "m6", "m7", "m8"],
+    "maze_name": "maze_1",
+    "start_date": null,
+    "end_date": null
+  },
+  "base_validation_config": "configs/hierarchy_rank_validation_loso.json",
+  "discovery_dir": "output/hierarchy_rank_validation/production_loso/discovery",
+  "rank_min": 2,
+  "rank_max": 49
+}
+
