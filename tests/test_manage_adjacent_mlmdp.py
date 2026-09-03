@@ -17,6 +17,11 @@ assert SPEC is not None and SPEC.loader is not None
 manager = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(manager)
 
+# Captured before the autouse fixture below patches manager._finalize_resource_usage
+# to a no-op, so tests exercising the real function can still call it directly.
+_REAL_FINALIZE_RESOURCE_USAGE = manager._finalize_resource_usage
+_REAL_WRITE_RESOURCE_USAGE_REPORT = manager._write_resource_usage_report
+
 
 class _FakeDataset:
     def __init__(self):
@@ -218,7 +223,7 @@ def test_figure_command_defaults_to_pca_routes(tmp_path):
     manifest = {"output_dir": str(tmp_path / "output")}
     command = manager._figure_command(config, manifest)
     assert "--figure-number 2.19" in command
-    assert "--output-dir results/figure_2_19" in command
+    assert str(Path(manifest["output_dir"]) / "figure_2_19") in command
 
 
 def test_figure_command_hmm_routes_uses_2_20(tmp_path):
@@ -226,7 +231,18 @@ def test_figure_command_hmm_routes_uses_2_20(tmp_path):
     manifest = {"output_dir": str(tmp_path / "output")}
     command = manager._figure_command(config, manifest, "2.20")
     assert "--figure-number 2.20" in command
-    assert "--output-dir results/figure_2_20" in command
+    assert str(Path(manifest["output_dir"]) / "figure_2_20") in command
+
+
+def test_figure_marker_path_matches_final_output_file(tmp_path):
+    manifest = {"output_dir": str(tmp_path / "output")}
+    marker = manager._figure_marker_path(manifest, "2.19")
+    assert marker == (
+        tmp_path
+        / "output"
+        / "figure_2_19"
+        / "figure_2_19_behavior_with_hierarchical_mlmdp.pdf"
+    )
 
 
 def test_prompt_figure_number_explicit_flag_wins(tmp_path):
@@ -348,6 +364,14 @@ def test_bootstrap_manifest_rejects_band_conflict_on_rerun(tmp_path):
 
 def _prepare_calls(calls: list[list[str]]) -> list[list[str]]:
     return [command for command in calls if "prepare" in command]
+
+
+def _figure_calls(calls: list[list[str]]) -> list[list[str]]:
+    return [
+        command
+        for command in calls
+        if any("reproduce_figure_2_19_behavior.py" in part for part in command)
+    ]
 
 
 def test_advance_skips_prepare_when_config_content_unchanged(monkeypatch, tmp_path):
@@ -560,6 +584,136 @@ def test_advance_does_not_resubmit_within_grace_period_despite_squeue_silence(
     discovery_line = next(line for line in out.splitlines() if "NMF discovery" in line)
     assert "[not started]" not in discovery_line
     assert "%" in discovery_line
+
+
+# --------------------------------------------------------------------------
+# Resource-usage reporting
+# --------------------------------------------------------------------------
+
+
+def test_write_resource_usage_report_returns_none_under_dry_run(tmp_path):
+    submission = {"job_id": "1", "kind": "inner", "task_list": None}
+    result = _REAL_WRITE_RESOURCE_USAGE_REPORT({}, tmp_path, submission, dry_run=True)
+    assert result is None
+    assert not (tmp_path / "resource_usage").exists()
+
+
+def test_write_resource_usage_report_parses_sacct_and_writes_files(
+    monkeypatch, tmp_path
+):
+    band = {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"}
+    tasks = [
+        {
+            "index": 0,
+            "fold_identity_digest": "fold-a",
+            "k": 2,
+            "validation_session_id": "s1",
+        },
+        {
+            "index": 1,
+            "fold_identity_digest": "fold-b",
+            "k": 2,
+            "validation_session_id": "s2",
+        },
+    ]
+    task_list_path = manager._write_task_list(
+        tmp_path, "inner", 1, band, tasks, run_id="test", config_signature="sig"
+    )
+    submission = {
+        "job_id": "42",
+        "kind": "inner",
+        "band": band,
+        "task_list": str(task_list_path),
+    }
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "sacct"
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "42_0|00:01:00|512024K|COMPLETED|0:0\n42_1|00:02:00||COMPLETED|0:0\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(manager.subprocess, "run", fake_run)
+    result = _REAL_WRITE_RESOURCE_USAGE_REPORT({}, tmp_path, submission, dry_run=False)
+
+    assert result["task_count"] == 2
+    assert result["elapsed_seconds"] == [60.0, 120.0]
+    assert result["max_rss_bytes"] == [512024.0 * 1024]
+    assert (tmp_path / "resource_usage" / "inner_42.csv").is_file()
+    assert (tmp_path / "resource_usage" / "inner_42.summary.json").is_file()
+
+
+def test_finalize_resource_usage_prints_one_aggregated_line_not_per_job(
+    monkeypatch, tmp_path, capsys
+):
+    manifest = {
+        "project_root": str(tmp_path),
+        "submissions": [
+            {"job_id": "1", "kind": "inner", "resource_usage_recorded": False},
+            {"job_id": "2", "kind": "inner", "resource_usage_recorded": False},
+        ],
+    }
+    monkeypatch.setattr(
+        manager.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout="", stderr=""
+        ),
+    )
+    reports = iter(
+        [
+            {"task_count": 3, "elapsed_seconds": [10.0, 20.0], "max_rss_bytes": []},
+            {"task_count": 2, "elapsed_seconds": [30.0], "max_rss_bytes": [2048.0]},
+        ]
+    )
+    monkeypatch.setattr(
+        manager, "_write_resource_usage_report", lambda *a, **k: next(reports)
+    )
+
+    manifest_path = tmp_path / "manifest.json"
+    _REAL_FINALIZE_RESOURCE_USAGE(manifest, manifest_path, tmp_path, dry_run=False)
+
+    out = capsys.readouterr().out.strip().splitlines()
+    resource_lines = [line for line in out if line.startswith("resource usage:")]
+    assert len(resource_lines) == 1
+    assert "2 job(s) / 5 task(s) recorded" in resource_lines[0]
+    assert "sacct" not in out  # no raw command echoed
+    assert all(item["resource_usage_recorded"] for item in manifest["submissions"])
+
+
+def test_finalize_resource_usage_skips_active_and_already_recorded(
+    monkeypatch, tmp_path, capsys
+):
+    manifest = {
+        "project_root": str(tmp_path),
+        "submissions": [
+            {"job_id": "1", "kind": "inner", "resource_usage_recorded": True},
+            {"job_id": "2", "kind": "inner", "resource_usage_recorded": False},
+        ],
+    }
+    monkeypatch.setattr(
+        manager.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout="2\n", stderr=""
+        ),
+    )
+    called = []
+    monkeypatch.setattr(
+        manager, "_write_resource_usage_report", lambda *a, **k: called.append(1)
+    )
+
+    _REAL_FINALIZE_RESOURCE_USAGE(
+        manifest, tmp_path / "manifest.json", tmp_path, dry_run=False
+    )
+
+    assert called == []
+    out = capsys.readouterr().out
+    assert "resource usage:" not in out
 
 
 # --------------------------------------------------------------------------
@@ -813,13 +967,8 @@ def test_advance_submits_refit_once_selected(monkeypatch, tmp_path, capsys):
     assert "succeeded: 0   scientifically unavailable: 0   outstanding: 1" in out
 
 
-def test_advance_prints_figure_command_when_complete(monkeypatch, tmp_path, capsys):
-    _patch_config(monkeypatch, tmp_path, ranks=(2,))
-    _patch_prepare(monkeypatch)
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
+def _patch_completion_common(monkeypatch, tmp_path, output_dir):
     _write_science_manifest(output_dir, [_fold("fold-a", ["s1"])])
-
     monkeypatch.setattr(manager, "_active_identities", lambda *_: {})
     monkeypatch.setattr(
         manager, "_discovery_states", lambda *_: {2: {"state": "success"}}
@@ -836,6 +985,17 @@ def test_advance_prints_figure_command_when_complete(monkeypatch, tmp_path, caps
     )
     monkeypatch.setattr(
         manager, "_predictor_states", lambda *a, **k: {"fold-a": {"state": "success"}}
+    )
+
+
+def test_advance_runs_figure_regression_when_complete(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _patch_completion_common(monkeypatch, tmp_path, output_dir)
+    calls = []
+    monkeypatch.setattr(
+        manager, "_run", lambda command, *, dry_run=False: calls.append(command) or ""
     )
 
     args = _args(tmp_path, output_dir)
@@ -843,43 +1003,81 @@ def test_advance_prints_figure_command_when_complete(monkeypatch, tmp_path, caps
 
     out = capsys.readouterr().out
     assert "predictors succeeded: 1" in out
-    assert "doohan_data_interaction/reproduce_figure_2_19_behavior.py" in out
-    assert "--figure-number 2.19" in out
+    assert "Running the augmented regression (figure 2.19)" in out
+    assert "Figure 2.19 written to" in out
+
+    figure_calls = _figure_calls(calls)
+    assert len(figure_calls) == 1
+    figure_call = figure_calls[0]
+    assert figure_call[0] == manager.DEFAULT_PYTHON  # not the literal "python"
+    assert str(output_dir / "figure_2_19") in figure_call
 
 
 def test_advance_completion_honors_explicit_figure_number(
     monkeypatch, tmp_path, capsys
 ):
     _patch_config(monkeypatch, tmp_path, ranks=(2,))
-    _patch_prepare(monkeypatch)
     output_dir = tmp_path / "output"
     output_dir.mkdir()
-    _write_science_manifest(output_dir, [_fold("fold-a", ["s1"])])
-
-    monkeypatch.setattr(manager, "_active_identities", lambda *_: {})
+    _patch_completion_common(monkeypatch, tmp_path, output_dir)
+    calls = []
     monkeypatch.setattr(
-        manager, "_discovery_states", lambda *_: {2: {"state": "success"}}
-    )
-    monkeypatch.setattr(
-        manager,
-        "_inner_states",
-        lambda *a, **k: {("fold-a", 2, "s1"): {"state": "success"}},
-    )
-    monkeypatch.setattr(
-        adjacent_module,
-        "aggregate_outer_fold",
-        lambda *a, **k: {"status": "selected", "selection": {"selected_k": 2}},
-    )
-    monkeypatch.setattr(
-        manager, "_predictor_states", lambda *a, **k: {"fold-a": {"state": "success"}}
+        manager, "_run", lambda command, *, dry_run=False: calls.append(command) or ""
     )
 
     args = _args(tmp_path, output_dir, figure_number="2.20")
     manager._advance(args, ROOT)
 
     out = capsys.readouterr().out
-    assert "--figure-number 2.20" in out
-    assert "--output-dir results/figure_2_20" in out
+    assert "figure 2.20" in out
+    figure_calls = _figure_calls(calls)
+    assert len(figure_calls) == 1
+    assert str(output_dir / "figure_2_20") in figure_calls[0]
+    assert "2.20" in figure_calls[0]
+
+
+def test_advance_completion_dry_run_only_prints_command(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _patch_completion_common(monkeypatch, tmp_path, output_dir)
+    calls = []
+    monkeypatch.setattr(
+        manager, "_run", lambda command, *, dry_run=False: calls.append(command) or ""
+    )
+
+    args = _args(tmp_path, output_dir, dry_run=True)
+    manager._advance(args, ROOT)
+
+    out = capsys.readouterr().out
+    assert "Would run the augmented regression:" in out
+    assert "reproduce_figure_2_19_behavior.py" in out
+    assert _figure_calls(calls) == []
+
+
+def test_advance_completion_skips_when_figure_already_generated(
+    monkeypatch, tmp_path, capsys
+):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _patch_completion_common(monkeypatch, tmp_path, output_dir)
+    calls = []
+    monkeypatch.setattr(
+        manager, "_run", lambda command, *, dry_run=False: calls.append(command) or ""
+    )
+    marker = (
+        output_dir / "figure_2_19" / "figure_2_19_behavior_with_hierarchical_mlmdp.pdf"
+    )
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"%PDF-fake")
+
+    args = _args(tmp_path, output_dir)
+    manager._advance(args, ROOT)
+
+    out = capsys.readouterr().out
+    assert "already generated" in out
+    assert _figure_calls(calls) == []
 
 
 def test_advance_raises_on_incompatible_discovery(monkeypatch, tmp_path):

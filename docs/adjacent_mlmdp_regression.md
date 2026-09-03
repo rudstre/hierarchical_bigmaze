@@ -111,8 +111,14 @@ as-is; otherwise it defaults to and caches under
 submits inner-fit arrays sized to exactly the work that is missing or
 retryable in each configured rank band, runs aggregation locally once every
 inner shard is terminal, submits selected-rank refits banded by the selected
-k, and finally prints the exact `reproduce_figure_2_19_behavior.py` command
-below once every predictor is terminal. Resource bands, discovery resources,
+k, and finally runs `reproduce_figure_2_19_behavior.py` itself once every
+predictor is terminal, writing the regression/folds/summary/provenance/PNG/PDF
+outputs to `<output_dir>/figure_2_19/` (or `figure_2_20/`) alongside
+everything else this run has produced — not to a separate `results/`
+location. If those outputs already exist from a previous invocation, the
+manager reports where they are instead of regenerating them; delete the
+figure subdirectory (or output a different `--figure-number`) to force a
+fresh run. Resource bands, discovery resources,
 partition/account, and concurrency can be overridden with an optional
 top-level `"slurm"` object in the config (see
 `scripts/slurm/manage_adjacent_mlmdp.py` for the schema); omitting it uses
@@ -129,13 +135,13 @@ for interactive confirmation (`[Y/n]`) before doing so. The prompt is skipped
 automatically when stdin isn't a terminal (cron, scripts) or under
 `--dry-run`; pass `--yes`/`-y` to skip it explicitly even in a terminal.
 
-At completion, the manager asks which route model the final regression
-command should use — PCA routes (figure 2.19, the default) or HMM routes
-(figure 2.20); both are already fully supported by
-`reproduce_figure_2_19_behavior.py`. As with the stage-transition prompt,
-this is skipped (defaulting to 2.19) under `--dry-run`, `--yes`, or when
-stdin isn't a terminal; pass `--figure-number 2.19` or `--figure-number 2.20`
-to choose explicitly without being asked.
+At completion, the manager asks which route model the final regression run
+should use — PCA routes (figure 2.19, the default) or HMM routes (figure
+2.20); both are already fully supported by `reproduce_figure_2_19_behavior.py`.
+As with the stage-transition prompt, this is skipped (defaulting to 2.19)
+under `--dry-run`, `--yes`, or when stdin isn't a terminal; pass
+`--figure-number 2.19` or `--figure-number 2.20` to choose explicitly without
+being asked. Under `--dry-run` the command is printed rather than run.
 
 The remainder of this section documents the underlying manual/debugging
 commands the manager drives; use them directly only to investigate a single

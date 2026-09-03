@@ -845,10 +845,6 @@ def _submit_inner_band(
         f"array {array}",
         flush=True,
     )
-    print(
-        f"    task list: {_short_path(task_list_path, manifest['project_root'])}",
-        flush=True,
-    )
     return job_id
 
 
@@ -945,10 +941,6 @@ def _submit_refit_band(
         f"array {array}",
         flush=True,
     )
-    print(
-        f"    task list: {_short_path(task_list_path, manifest['project_root'])}",
-        flush=True,
-    )
     return job_id
 
 
@@ -1002,7 +994,9 @@ def _write_resource_usage_report(
     submission: dict[str, Any],
     *,
     dry_run: bool,
-) -> None:
+) -> dict[str, Any] | None:
+    if dry_run:
+        return None
     job_id = str(submission["job_id"])
     command = [
         "sacct",
@@ -1012,9 +1006,6 @@ def _write_resource_usage_report(
         "--noheader",
         "--format=JobID,Elapsed,MaxRSS,State,ExitCode",
     ]
-    print(shlex.join(command), flush=True)
-    if dry_run:
-        return
     result = subprocess.run(
         command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -1080,13 +1071,11 @@ def _write_resource_usage_report(
         "max_rss_bytes": _percentile_summary(rss_values),
     }
     _atomic_write(usage_dir / f"{label}.summary.json", summary)
-    print(
-        f"resource_usage kind={submission['kind']} job={job_id} tasks={len(rows)} "
-        f"elapsed_median={summary['elapsed_seconds']['median']} "
-        f"elapsed_p95={summary['elapsed_seconds']['p95']} "
-        f"max_rss_median_bytes={summary['max_rss_bytes']['median']}",
-        flush=True,
-    )
+    return {
+        "task_count": len(rows),
+        "elapsed_seconds": elapsed_values,
+        "max_rss_bytes": rss_values,
+    }
 
 
 def _finalize_resource_usage(
@@ -1114,21 +1103,58 @@ def _finalize_resource_usage(
         line.strip() for line in result.stdout.splitlines() if line.strip()
     }
     changed = False
+    collected: list[dict[str, Any]] = []
     for submission in submissions:
         job_id = str(submission["job_id"])
         if submission.get("resource_usage_recorded") or job_id in active_job_ids:
             continue
-        _write_resource_usage_report(manifest, run_dir, submission, dry_run=dry_run)
+        report = _write_resource_usage_report(
+            manifest, run_dir, submission, dry_run=dry_run
+        )
         if not dry_run:
             submission["resource_usage_recorded"] = True
             changed = True
+            if report is not None:
+                collected.append(report)
     if changed:
         _atomic_write(manifest_path, manifest)
+    if collected:
+        job_count = len(collected)
+        task_count = sum(item["task_count"] for item in collected)
+        elapsed = _percentile_summary(
+            [value for item in collected for value in item["elapsed_seconds"]]
+        )
+        line = f"resource usage: {job_count} job(s) / {task_count} task(s) recorded"
+        if elapsed["median"] is not None:
+            line += (
+                f" -- elapsed median {elapsed['median']:.0f}s, "
+                f"p95 {elapsed['p95']:.0f}s"
+            )
+        rss = _percentile_summary(
+            [value for item in collected for value in item["max_rss_bytes"]]
+        )
+        if rss["median"] is not None:
+            line += f", peak RSS median {rss['median'] / 1024 / 1024:.0f}MB"
+        usage_dir = _short_path(run_dir / "resource_usage", manifest["project_root"])
+        line += f" (details: {usage_dir})"
+        print(line, flush=True)
 
 
 # --------------------------------------------------------------------------
 # Completion
 # --------------------------------------------------------------------------
+
+
+def _figure_output_dir(manifest: dict[str, Any], figure_number: str) -> Path:
+    return Path(manifest["output_dir"]) / f"figure_{figure_number.replace('.', '_')}"
+
+
+def _figure_marker_path(manifest: dict[str, Any], figure_number: str) -> Path:
+    # reproduce_figure_2_19_behavior.py writes the PDF last of its six output
+    # files (regression/folds/summary/provenance/png/pdf), so its presence
+    # means a prior run completed the full write sequence successfully.
+    stem = f"figure_{figure_number.replace('.', '_')}_behavior_with_hierarchical_mlmdp"
+    return _figure_output_dir(manifest, figure_number) / f"{stem}.pdf"
 
 
 def _figure_command(
@@ -1140,7 +1166,7 @@ def _figure_command(
         "--data-root",
         config.dataset.data_root,
         "--output-dir",
-        f"results/figure_{figure_number.replace('.', '_')}",
+        str(_figure_output_dir(manifest, figure_number)),
         "--figure-number",
         figure_number,
     ]
@@ -1189,9 +1215,11 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
     output = Path(manifest["output_dir"])
     project_root = manifest["project_root"]
 
-    _print_header(f"Adjacent MLMDP regression: run '{manifest['run_id']}'")
-    print(f"config: {_short_path(config_path, project_root)}", flush=True)
-    print(f"output: {_short_path(output, project_root)}", flush=True)
+    _print_header(
+        f"Adjacent MLMDP regression: run '{manifest['run_id']}'  "
+        f"(config: {_short_path(config_path, project_root)}, "
+        f"output: {_short_path(output, project_root)})"
+    )
 
     # `prepare` reloads the full dataset and recomputes fold identities to
     # verify nothing has drifted -- real work, seconds even when nothing
@@ -1244,8 +1272,6 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
     )
     if held:
         print(f"held (admin-paused) SLURM elements: {', '.join(held)}", flush=True)
-    else:
-        print("held (admin-paused) SLURM elements: none", flush=True)
     if held and args.cancel_held:
         _run(["scancel", *held], dry_run=args.dry_run)
         verb = "would cancel" if args.dry_run else "cancelled"
@@ -1564,8 +1590,27 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
         flush=True,
     )
     figure_number = _prompt_figure_number(args)
-    print("\nRun the augmented regression:", flush=True)
-    print(f"  {_figure_command(config, manifest, figure_number)}", flush=True)
+    figure_command = _figure_command(config, manifest, figure_number)
+    marker = _figure_marker_path(manifest, figure_number)
+    figure_dir_display = _short_path(marker.parent, project_root)
+    if marker.is_file():
+        print(
+            f"\nFigure {figure_number} already generated: {figure_dir_display}",
+            flush=True,
+        )
+    elif args.dry_run:
+        print("\nWould run the augmented regression:", flush=True)
+        print(f"  {figure_command}", flush=True)
+    else:
+        print(
+            f"\nRunning the augmented regression (figure {figure_number}) -- "
+            "this fits the full/reduced seven-policy model and can take a while...",
+            flush=True,
+        )
+        figure_parts = shlex.split(figure_command)
+        figure_parts[0] = manifest["python_executable"]
+        _run(figure_parts, dry_run=False)
+        print(f"Figure {figure_number} written to {figure_dir_display}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1574,7 +1619,12 @@ def main(argv: list[str] | None = None) -> int:
         root = (args.project_root or Path.cwd()).resolve()
         _validate_run_id(args.run_id)
         _advance(args, root)
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except subprocess.CalledProcessError as error:
+        print(f"adjacent mlmdp submission failed: {error}", file=sys.stderr)
+        if error.stderr:
+            print(error.stderr, file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as error:
         print(f"adjacent mlmdp submission failed: {error}", file=sys.stderr)
         return 1
     return 0
