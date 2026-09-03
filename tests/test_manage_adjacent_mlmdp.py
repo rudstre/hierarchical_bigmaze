@@ -44,7 +44,14 @@ def _no_resource_usage(monkeypatch):
 
 
 def _args(
-    tmp_path, output, *, dry_run=False, cancel_held=False, yes=False, run_id="test"
+    tmp_path,
+    output,
+    *,
+    dry_run=False,
+    cancel_held=False,
+    yes=False,
+    run_id="test",
+    figure_number=None,
 ):
     return manager.build_parser().parse_args(
         [
@@ -59,6 +66,7 @@ def _args(
             *(["--dry-run"] if dry_run else []),
             *(["--cancel-held"] if cancel_held else []),
             *(["--yes"] if yes else []),
+            *(["--figure-number", figure_number] if figure_number else []),
         ]
     )
 
@@ -203,6 +211,56 @@ def test_figure_command_includes_dates_when_set(tmp_path):
     command = manager._figure_command(config, manifest)
     assert "--start-date 2022-06-30" in command
     assert "--end-date 2022-07-05" in command
+
+
+def test_figure_command_defaults_to_pca_routes(tmp_path):
+    config = _FakeConfig(tmp_path)
+    manifest = {"output_dir": str(tmp_path / "output")}
+    command = manager._figure_command(config, manifest)
+    assert "--figure-number 2.19" in command
+    assert "--output-dir results/figure_2_19" in command
+
+
+def test_figure_command_hmm_routes_uses_2_20(tmp_path):
+    config = _FakeConfig(tmp_path)
+    manifest = {"output_dir": str(tmp_path / "output")}
+    command = manager._figure_command(config, manifest, "2.20")
+    assert "--figure-number 2.20" in command
+    assert "--output-dir results/figure_2_20" in command
+
+
+def test_prompt_figure_number_explicit_flag_wins(tmp_path):
+    args = _args(tmp_path, tmp_path / "output", figure_number="2.20")
+    assert args.figure_number == "2.20"
+    assert manager._prompt_figure_number(args) == "2.20"
+
+
+def test_prompt_figure_number_bypassed_by_dry_run_yes_and_non_tty(
+    monkeypatch, tmp_path
+):
+    dry_run_args = _args(tmp_path, tmp_path / "output", dry_run=True)
+    assert manager._prompt_figure_number(dry_run_args) == "2.19"
+
+    yes_args = _args(tmp_path, tmp_path / "output", yes=True)
+    assert manager._prompt_figure_number(yes_args) == "2.19"
+
+    args = _args(tmp_path, tmp_path / "output")
+    monkeypatch.setattr(manager.sys.stdin, "isatty", lambda: False)
+    assert manager._prompt_figure_number(args) == "2.19"
+
+
+def test_prompt_figure_number_interactive_choice(monkeypatch, tmp_path):
+    args = _args(tmp_path, tmp_path / "output")
+    monkeypatch.setattr(manager.sys.stdin, "isatty", lambda: True)
+
+    monkeypatch.setattr("builtins.input", lambda _: "2")
+    assert manager._prompt_figure_number(args) == "2.20"
+
+    monkeypatch.setattr("builtins.input", lambda _: "1")
+    assert manager._prompt_figure_number(args) == "2.19"
+
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    assert manager._prompt_figure_number(args) == "2.19"
 
 
 def test_stage_status_classifies_not_started_in_progress_and_complete():
@@ -786,6 +844,42 @@ def test_advance_prints_figure_command_when_complete(monkeypatch, tmp_path, caps
     out = capsys.readouterr().out
     assert "predictors succeeded: 1" in out
     assert "doohan_data_interaction/reproduce_figure_2_19_behavior.py" in out
+    assert "--figure-number 2.19" in out
+
+
+def test_advance_completion_honors_explicit_figure_number(
+    monkeypatch, tmp_path, capsys
+):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    _patch_prepare(monkeypatch)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _write_science_manifest(output_dir, [_fold("fold-a", ["s1"])])
+
+    monkeypatch.setattr(manager, "_active_identities", lambda *_: {})
+    monkeypatch.setattr(
+        manager, "_discovery_states", lambda *_: {2: {"state": "success"}}
+    )
+    monkeypatch.setattr(
+        manager,
+        "_inner_states",
+        lambda *a, **k: {("fold-a", 2, "s1"): {"state": "success"}},
+    )
+    monkeypatch.setattr(
+        adjacent_module,
+        "aggregate_outer_fold",
+        lambda *a, **k: {"status": "selected", "selection": {"selected_k": 2}},
+    )
+    monkeypatch.setattr(
+        manager, "_predictor_states", lambda *a, **k: {"fold-a": {"state": "success"}}
+    )
+
+    args = _args(tmp_path, output_dir, figure_number="2.20")
+    manager._advance(args, ROOT)
+
+    out = capsys.readouterr().out
+    assert "--figure-number 2.20" in out
+    assert "--output-dir results/figure_2_20" in out
 
 
 def test_advance_raises_on_incompatible_discovery(monkeypatch, tmp_path):

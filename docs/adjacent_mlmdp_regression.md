@@ -129,6 +129,14 @@ for interactive confirmation (`[Y/n]`) before doing so. The prompt is skipped
 automatically when stdin isn't a terminal (cron, scripts) or under
 `--dry-run`; pass `--yes`/`-y` to skip it explicitly even in a terminal.
 
+At completion, the manager asks which route model the final regression
+command should use — PCA routes (figure 2.19, the default) or HMM routes
+(figure 2.20); both are already fully supported by
+`reproduce_figure_2_19_behavior.py`. As with the stage-transition prompt,
+this is skipped (defaulting to 2.19) under `--dry-run`, `--yes`, or when
+stdin isn't a terminal; pass `--figure-number 2.19` or `--figure-number 2.20`
+to choose explicitly without being asked.
+
 The remainder of this section documents the underlying manual/debugging
 commands the manager drives; use them directly only to investigate a single
 task or when working outside the managed workflow.

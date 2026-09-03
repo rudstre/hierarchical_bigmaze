@@ -66,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the confirmation prompt before starting a new stage",
     )
+    parser.add_argument(
+        "--figure-number",
+        choices=("2.19", "2.20"),
+        help=(
+            "route model for the final regression command (2.19 = PCA routes, "
+            "2.20 = HMM routes); skips the interactive choice at completion"
+        ),
+    )
     return parser
 
 
@@ -213,6 +221,29 @@ def _confirm(args: argparse.Namespace, prompt: str) -> bool:
     except EOFError:
         return True
     return answer in {"", "y", "yes"}
+
+
+def _prompt_figure_number(args: argparse.Namespace) -> str:
+    """Choose the route model for the final regression command: PCA (2.19,
+    the default) or HMM (2.20). --figure-number always wins outright; without
+    it, this only prompts at a real terminal -- --dry-run, --yes, and
+    non-interactive runs (cron, scripts) all fall back to the 2.19 default so
+    completion never blocks on unattended input."""
+
+    if args.figure_number is not None:
+        return args.figure_number
+    if args.dry_run or args.yes or not sys.stdin.isatty():
+        return "2.19"
+    try:
+        answer = input(
+            "\nWhich route model should the final regression use?\n"
+            "  [1] PCA routes (figure 2.19, default)\n"
+            "  [2] HMM routes (figure 2.20)\n"
+            "Choice [1/2, default 1]: "
+        ).strip()
+    except EOFError:
+        return "2.19"
+    return "2.20" if answer == "2" else "2.19"
 
 
 def _default_config_path(root: Path) -> Path:
@@ -1100,16 +1131,18 @@ def _finalize_resource_usage(
 # --------------------------------------------------------------------------
 
 
-def _figure_command(config: Any, manifest: dict[str, Any]) -> str:
+def _figure_command(
+    config: Any, manifest: dict[str, Any], figure_number: str = "2.19"
+) -> str:
     parts = [
         "python",
         "doohan_data_interaction/reproduce_figure_2_19_behavior.py",
         "--data-root",
         config.dataset.data_root,
         "--output-dir",
-        "results/figure_2_19",
+        f"results/figure_{figure_number.replace('.', '_')}",
         "--figure-number",
-        "2.19",
+        figure_number,
     ]
     for subject in config.dataset.subject_ids:
         parts += ["--subject-id", subject]
@@ -1530,8 +1563,9 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
         f"folds scientifically unavailable: {len(unavailable_folds)}",
         flush=True,
     )
+    figure_number = _prompt_figure_number(args)
     print("\nRun the augmented regression:", flush=True)
-    print(f"  {_figure_command(config, manifest)}", flush=True)
+    print(f"  {_figure_command(config, manifest, figure_number)}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
