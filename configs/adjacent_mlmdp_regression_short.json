@@ -2,10 +2,10 @@
   "schema_version": 2,
   "dataset": {
     "data_root": "external/GridMaze-mFC-ephys-DATA/data",
-    "subject_ids": ["m2", "m3", "m4", "m6", "m7", "m8"],
+    "subject_ids": ["m2"],
     "maze_name": "maze_1",
-    "start_date": null,
-    "end_date": null
+    "start_date": "2022-06-30",
+    "end_date": "2022-07-05"
   },
   "discovery_config": "configs/hierarchy_rank_validation_loso.json",
   "adam": {
@@ -40,5 +40,5 @@
     "future_restart_log_scale": 0.45
   },
   "rank_min": 2,
-  "rank_max": 49
+  "rank_max": 25
 }

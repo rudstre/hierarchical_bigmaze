@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 from test_rank_validation import _config
 
+import andrew_mlmdp.lmdp as lmdp
 import andrew_mlmdp.validation as validation
+from andrew_mlmdp.hierarchy.model import SubgoalBasis
 
 
 class _FakeEnvironment:
@@ -32,12 +34,12 @@ def _rank_result():
 
 def _install_template_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        validation.SubgoalBasis,
+        SubgoalBasis,
         "from_profiles",
         lambda maze, profiles, **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setattr(
-        validation,
+        lmdp,
         "soft_parameters",
         lambda k, **values: {"k": k, **values},
     )

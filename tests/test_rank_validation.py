@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import andrew_mlmdp.discovery as discovery
 import andrew_mlmdp.validation as validation
 import andrew_mlmdp.validation_aggregation as aggregation
 from andrew_mlmdp import FitResult, FitStep, ParameterValues, Trial
@@ -289,7 +290,7 @@ def test_worker_writes_failure_shard(tmp_path, monkeypatch):
         lambda _: dataset_context,
     )
     monkeypatch.setattr(validation, "_discovery_compatibility", lambda *a: {})
-    monkeypatch.setattr(validation, "discover_subgoals", lambda *a, **k: FakeStudy())
+    monkeypatch.setattr(discovery, "discover_subgoals", lambda *a, **k: FakeStudy())
     monkeypatch.setattr(
         validation,
         "_rank_result_payload",

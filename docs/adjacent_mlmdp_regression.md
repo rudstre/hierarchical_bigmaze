@@ -69,6 +69,70 @@ The existing k=2..25 sweep measured 144 fits and 12.63 CPU-hours. Extrapolation
 to the full nested grid is approximately 30,000 CPU-hours, so the manifest
 records that budget and an initial concurrency cap of 200.
 
+### Configuration
+
+`configs/adjacent_mlmdp_regression.json` is self-contained for everything
+that governs the regression itself: `dataset` (which subjects/sessions/dates
+feed the actual fits), `adam` (the ADAM optimizer hyperparameters used for
+every inner fit and refit), and `ranks`/`discovery_dir`/`slurm`.
+
+It references exactly one other file, `discovery_config` — a
+`RankValidationConfig`-shaped JSON such as `hierarchy_rank_validation_loso.json`
+(the same shape the standalone rank-validation workflow uses). That file's
+*only* two jobs here are: (1) its `discovery` section supplies the NMF
+hyperparameters handed directly to the shared discovery worker
+(`hierarchy_rank_discovery.sbatch` / `run_hierarchy_rank_discovery.py`,
+unchanged from the standalone workflow), and (2) its `dataset.maze_name` is
+used to derive the maze-topology fingerprint that keys the NMF-basis cache
+(`maze_sha256`). That fingerprint depends only on the maze's fixed topology
+lookup (`maze_configs.json`), not on which subjects/sessions/dates
+`discovery_config`'s own `dataset` restricts to — so `discovery_config` need
+not describe the same subjects or dates as this config's own `dataset`, only
+the same `maze_name`. Loading a config whose `discovery_config` names a
+different maze raises immediately rather than silently computing an
+incompatible fingerprint. `discovery_config`'s `adam` section is not used at
+all by the adjacent workflow — only its own `discovery` section is borrowed.
+
+### Automatic SLURM manager (recommended)
+
+Rerun the same idempotent command; it inspects artifacts and `squeue`, then
+advances the next safe stage (NMF discovery, then banded inner fits, then
+local aggregation, then banded refits) and prints the exact next command:
+
+    scripts/slurm/submit_adjacent_mlmdp.sh \
+      --run-id production \
+      --config configs/adjacent_mlmdp_regression.json \
+      --output-dir output/adjacent_mlmdp_regression/production
+
+It creates the scientific fold manifest automatically, discovers or reuses
+compatible NMF bases (an explicit `discovery_dir` in the config is reused
+as-is; otherwise it defaults to and caches under
+`<data_root>/nmf_bases/<maze_name>/<discovery-compatibility-digest>/`),
+submits inner-fit arrays sized to exactly the work that is missing or
+retryable in each configured rank band, runs aggregation locally once every
+inner shard is terminal, submits selected-rank refits banded by the selected
+k, and finally prints the exact `reproduce_figure_2_19_behavior.py` command
+below once every predictor is terminal. Resource bands, discovery resources,
+partition/account, and concurrency can be overridden with an optional
+top-level `"slurm"` object in the config (see
+`scripts/slurm/manage_adjacent_mlmdp.py` for the schema); omitting it uses
+the bands and defaults documented below. Pass `--dry-run` to preview the next
+submission without touching SLURM, and `--cancel-held` to release
+administrator-held array elements before retrying.
+
+Every invocation opens with a colored pipeline overview (discovery, inner
+fits, rank selection, refits, final command) showing each stage as done
+(green), in progress with a percentage (yellow), or not started (grey).
+Ordinary retries within an already-started stage submit automatically; the
+first time a stage is about to start submitting real work, the command asks
+for interactive confirmation (`[Y/n]`) before doing so. The prompt is skipped
+automatically when stdin isn't a terminal (cron, scripts) or under
+`--dry-run`; pass `--yes`/`-y` to skip it explicitly even in a terminal.
+
+The remainder of this section documents the underlying manual/debugging
+commands the manager drives; use them directly only to investigate a single
+task or when working outside the managed workflow.
+
 Prepare exact fold identities:
 
     python scripts/run_adjacent_mlmdp.py prepare \

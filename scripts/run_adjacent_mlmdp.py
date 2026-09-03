@@ -48,12 +48,36 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--fold-index", type=int)
     result.add_argument("--validation-session-id")
     result.add_argument("--task-index", type=int)
+    result.add_argument("--task-list", type=Path)
     result.add_argument("--pilot", action="store_true")
     result.add_argument("--print-task-count", action="store_true")
     result.add_argument("--rank-min", type=int)
     result.add_argument("--rank-max", type=int)
     result.add_argument("--force", action="store_true")
+    result.add_argument("--exclude-ranks", default="")
     return result
+
+
+def _parse_exclude_ranks(value: str) -> frozenset[int]:
+    stripped = value.strip()
+    if not stripped:
+        return frozenset()
+    return frozenset(int(item) for item in stripped.split(","))
+
+
+def _load_task_list(path: Path) -> list[dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError(f"Task list {path} has no tasks")
+    return tasks
+
+
+def _task_list_entry(path: Path, index: int) -> dict:
+    tasks = _load_task_list(path)
+    if not 0 <= index < len(tasks):
+        raise ValueError(f"task-index must be in 0..{len(tasks) - 1} for {path}")
+    return tasks[index]
 
 
 def _prepare(config, output_dir, *, force=False):
@@ -85,9 +109,7 @@ def _load_manifest(config, output_dir):
         config_path=config.source_path,
     )
     if manifest.get("source") != current_source:
-        raise ValueError(
-            "Manifest source is incompatible; rerun prepare with --force"
-        )
+        raise ValueError("Manifest source is incompatible; rerun prepare with --force")
     return manifest
 
 
@@ -151,23 +173,36 @@ def main(argv=None):
         return 0
 
     if args.command == "inner":
-        tasks = _tasks(config, manifest, args.pilot, args.rank_min, args.rank_max)
-        if args.print_task_count:
-            print(len(tasks))
-            return 0
-        if args.task_index is not None:
-            if not 0 <= args.task_index < len(tasks):
-                raise ValueError(f"task-index must be in 0..{len(tasks) - 1}")
-            fold, rank, session = tasks[args.task_index]
+        if args.task_list is not None:
+            if args.print_task_count:
+                print(len(_load_task_list(args.task_list)))
+                return 0
+            if args.task_index is None:
+                raise ValueError("--task-list requires --task-index")
+            entry = _task_list_entry(args.task_list, args.task_index)
+            fold = _fold_record(manifest, str(entry["fold_identity_digest"]))
+            rank = int(entry["k"])
+            session = str(entry["validation_session_id"])
         else:
-            if not (
-                args.fold_digest and args.k is not None and args.validation_session_id
-            ):
-                raise ValueError(
-                    "inner requires --task-index or fold/rank/session identity"
-                )
-            fold = _fold_record(manifest, args.fold_digest)
-            rank, session = args.k, args.validation_session_id
+            tasks = _tasks(config, manifest, args.pilot, args.rank_min, args.rank_max)
+            if args.print_task_count:
+                print(len(tasks))
+                return 0
+            if args.task_index is not None:
+                if not 0 <= args.task_index < len(tasks):
+                    raise ValueError(f"task-index must be in 0..{len(tasks) - 1}")
+                fold, rank, session = tasks[args.task_index]
+            else:
+                if not (
+                    args.fold_digest
+                    and args.k is not None
+                    and args.validation_session_id
+                ):
+                    raise ValueError(
+                        "inner requires --task-index or fold/rank/session identity"
+                    )
+                fold = _fold_record(manifest, args.fold_digest)
+                rank, session = args.k, args.validation_session_id
         result = run_inner_fit(
             config,
             output,
@@ -183,9 +218,18 @@ def main(argv=None):
         )
         return 0 if result["status"] != "operational_failure" else 1
 
-    if args.fold_digest is not None and args.fold_index is not None:
-        raise ValueError("Use only one of --fold-digest and --fold-index")
-    if args.fold_digest is not None:
+    identity_selectors = sum(
+        value is not None
+        for value in (args.fold_digest, args.fold_index, args.task_list)
+    )
+    if identity_selectors > 1:
+        raise ValueError("Use only one of --fold-digest, --fold-index, and --task-list")
+    if args.task_list is not None:
+        if args.task_index is None:
+            raise ValueError("--task-list requires --task-index")
+        entry = _task_list_entry(args.task_list, args.task_index)
+        selected = [_fold_record(manifest, str(entry["fold_identity_digest"]))]
+    elif args.fold_digest is not None:
         selected = [_fold_record(manifest, args.fold_digest)]
     elif args.fold_index is not None:
         if not 0 <= args.fold_index < len(manifest["folds"]):
@@ -193,12 +237,14 @@ def main(argv=None):
         selected = [manifest["folds"][args.fold_index]]
     else:
         selected = manifest["folds"]
+    exclude_ranks = _parse_exclude_ranks(args.exclude_ranks)
     if args.command == "aggregate":
         for fold in selected:
             result = aggregate_outer_fold(
                 config,
                 output,
                 fold_record=fold,
+                exclude_ranks=exclude_ranks,
             )
             print(f"fold={fold['fold_identity_digest']} status={result['status']}")
         return 0
@@ -210,6 +256,7 @@ def main(argv=None):
                 output,
                 fold_record=fold,
                 force=args.force,
+                exclude_ranks=exclude_ranks,
             )
             print(f"fold={fold['fold_identity_digest']} status={result['status']}")
             operational_failure |= result["status"] == "operational_failure"
@@ -217,7 +264,9 @@ def main(argv=None):
 
     counts = {"success": 0, "pending": 0, "unavailable": 0}
     for fold in manifest["folds"]:
-        result = aggregate_outer_fold(config, output, fold_record=fold)
+        result = aggregate_outer_fold(
+            config, output, fold_record=fold, exclude_ranks=exclude_ranks
+        )
         counts[result["status"]] = counts.get(result["status"], 0) + 1
     print(" ".join(f"{key}={value}" for key, value in sorted(counts.items())))
     return 0

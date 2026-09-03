@@ -7,6 +7,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from andrew_mlmdp.doohan_canonical import (
@@ -16,13 +17,17 @@ from andrew_mlmdp.doohan_canonical import (
 from andrew_mlmdp.doohan_dataset import DoohanDataset
 from andrew_mlmdp.nested_validation import nested_rank_selection
 from andrew_mlmdp.validation import (
+    AdamValidationConfig,
+    RankValidationConfig,
     RankValidationError,
     _atomic_write_json,
+    _discovery_compatibility,
     _discovery_reference,
     _fit_result_payload,
     _fitted_template,
     _initial_template,
     _json_value,
+    _load_dataset_context,
     _load_discovery_artifact,
     _payload_digest,
     _strict_score,
@@ -30,7 +35,7 @@ from andrew_mlmdp.validation import (
     source_code_fingerprint,
 )
 
-ADJACENT_SCHEMA_VERSION = 1
+ADJACENT_SCHEMA_VERSION = 2
 PRODUCTION_ADJACENT_RANKS = tuple(range(2, 50))
 PILOT_FUNCTIONAL_RANKS = (2, 5, 10)
 PILOT_SCALING_RANKS = (15, 20)
@@ -57,8 +62,9 @@ class AdjacentDatasetConfig:
 @dataclass(frozen=True)
 class AdjacentRegressionConfig:
     dataset: AdjacentDatasetConfig
-    base_validation_config: str
+    discovery_config: str
     discovery_dir: str
+    adam: AdamValidationConfig
     ranks: tuple[int, ...] = PRODUCTION_ADJACENT_RANKS
     project_root: Path = Path.cwd()
     source_path: Path | None = None
@@ -77,12 +83,11 @@ class AdjacentRegressionConfig:
             raise ValueError("ranks must be unique increasing integers in 2..49")
 
     def resolve_path(self, value: str) -> Path:
-        path = Path(value)
-        return (path if path.is_absolute() else self.project_root / path).resolve()
+        return _resolve_project_path(value, self.project_root)
 
     @property
-    def base_config_path(self) -> Path:
-        return self.resolve_path(self.base_validation_config)
+    def discovery_config_path(self) -> Path:
+        return self.resolve_path(self.discovery_config)
 
     @property
     def resolved_discovery_dir(self) -> Path:
@@ -92,8 +97,9 @@ class AdjacentRegressionConfig:
         return {
             "schema_version": ADJACENT_SCHEMA_VERSION,
             "dataset": _json_value(asdict(self.dataset)),
-            "base_validation_config": str(self.base_config_path),
+            "discovery_config": str(self.discovery_config_path),
             "discovery_dir": str(self.resolved_discovery_dir),
+            "adam": _json_value(asdict(self.adam)),
             "ranks": list(self.ranks),
         }
 
@@ -105,23 +111,19 @@ class AdjacentRegressionConfig:
 def load_adjacent_regression_config(path: str | Path) -> AdjacentRegressionConfig:
     config_path = Path(path).resolve()
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    common = {
-        "schema_version",
-        "dataset",
-        "base_validation_config",
-        "discovery_dir",
-    }
-    explicit_rank_keys = common | {"ranks"}
-    bounded_rank_keys = common | {"rank_min", "rank_max"}
+    required = {"schema_version", "dataset", "discovery_config", "adam"}
+    optional = {"discovery_dir", "slurm"}
     actual = set(payload) if isinstance(payload, dict) else set()
-    if actual not in (explicit_rank_keys, bounded_rank_keys):
+    rank_keys = actual - required - optional
+    if not required <= actual or rank_keys not in ({"ranks"}, {"rank_min", "rank_max"}):
         raise ValueError(
-            "Adjacent config must contain the common fields and exactly one rank "
-            "form: ranks, or rank_min plus rank_max"
+            "Adjacent config must contain the common fields, optionally "
+            "discovery_dir and slurm, and exactly one rank form: ranks, or "
+            "rank_min plus rank_max"
         )
     if payload["schema_version"] != ADJACENT_SCHEMA_VERSION:
         raise ValueError("Unsupported adjacent-regression schema version")
-    if actual == explicit_rank_keys:
+    if rank_keys == {"ranks"}:
         ranks = tuple(payload["ranks"])
     else:
         rank_min = payload["rank_min"]
@@ -136,19 +138,63 @@ def load_adjacent_regression_config(path: str | Path) -> AdjacentRegressionConfi
             raise ValueError("rank_min and rank_max must be ordered integers")
         ranks = tuple(range(rank_min, rank_max + 1))
     project_root = _find_project_root(config_path.parent)
+    dataset = AdjacentDatasetConfig(
+        **{
+            **payload["dataset"],
+            "subject_ids": tuple(payload["dataset"]["subject_ids"]),
+        }
+    )
+    adam = AdamValidationConfig(**payload["adam"])
+    discovery_config_path = _resolve_project_path(
+        payload["discovery_config"], project_root
+    )
+    discovery_config = load_validation_config(discovery_config_path)
+    if discovery_config.dataset.maze_name != dataset.maze_name:
+        raise ValueError(
+            "discovery_config dataset.maze_name "
+            f"({discovery_config.dataset.maze_name!r}) does not match this "
+            f"config's dataset.maze_name ({dataset.maze_name!r}); "
+            "discovery_config must describe the same maze"
+        )
+    discovery_dir = payload.get("discovery_dir")
+    if discovery_dir is None:
+        discovery_dir = str(
+            _default_discovery_dir(dataset, discovery_config, project_root)
+        )
     return AdjacentRegressionConfig(
-        dataset=AdjacentDatasetConfig(
-            **{
-                **payload["dataset"],
-                "subject_ids": tuple(payload["dataset"]["subject_ids"]),
-            }
-        ),
-        base_validation_config=payload["base_validation_config"],
-        discovery_dir=payload["discovery_dir"],
+        dataset=dataset,
+        discovery_config=payload["discovery_config"],
+        discovery_dir=discovery_dir,
+        adam=adam,
         ranks=ranks,
         project_root=project_root,
         source_path=config_path,
     )
+
+
+def _default_discovery_dir(
+    dataset: AdjacentDatasetConfig,
+    discovery_config: RankValidationConfig,
+    project_root: Path,
+) -> Path:
+    """Derive the shared NMF cache directory when discovery_dir is unset.
+
+    Mirrors the compatibility digest `_load_discovery_artifact` validates
+    against, so the same maze/discovery parameters always resolve to the same
+    cache directory regardless of which adjacent config or discovery_config
+    path references them.
+    """
+
+    context = _load_dataset_context(discovery_config)
+    compatibility = _discovery_compatibility(discovery_config, context)
+    digest = _payload_digest(compatibility)
+    data_root = _resolve_project_path(dataset.data_root, project_root)
+    return data_root / "nmf_bases" / dataset.maze_name / digest
+
+
+def _resolve_project_path(value: str | Path, project_root: Path) -> Path:
+    path = Path(value)
+    return (path if path.is_absolute() else project_root / path).resolve()
 
 
 def load_adjacent_dataset(
@@ -301,9 +347,9 @@ def run_inner_fit(
         dataset = load_adjacent_dataset(config, session_ids=route_sessions)
         training_trials = _trials_for_sessions(dataset, training_sessions)
         validation_trials = _trials_for_sessions(dataset, (validation_session_id,))
-        base = load_validation_config(config.base_config_path)
+        discovery_config = load_validation_config(config.discovery_config_path)
         discovery, profiles, discovery_digest = _load_discovery_artifact(
-            base,
+            discovery_config,
             k,
             config.resolved_discovery_dir,
         )
@@ -312,7 +358,7 @@ def run_inner_fit(
         fitted = _fit_explicit_split(
             dataset,
             profiles,
-            base,
+            SimpleNamespace(adam=config.adam, discovery=discovery_config.discovery),
             k,
             training_trials,
             validation_trials,
@@ -350,12 +396,16 @@ def aggregate_outer_fold(
     output_dir: str | Path,
     *,
     fold_record: dict[str, object],
+    exclude_ranks: frozenset[int] = frozenset(),
 ) -> dict[str, object]:
     output = Path(output_dir).resolve()
     digest = str(fold_record["fold_identity_digest"])
     sessions = tuple(
         str(value) for value in fold_record["inner_validation_session_ids"]
     )
+    eligible_ranks = tuple(k for k in config.ranks if k not in exclude_ranks)
+    if not eligible_ranks:
+        raise ValueError("No ranks remain eligible after applying exclude_ranks")
     records = []
     source = source_code_fingerprint(
         config.project_root,
@@ -365,7 +415,7 @@ def aggregate_outer_fold(
     route_sessions = tuple(
         str(value) for value in identity["route_training_session_ids"]
     )
-    for k in config.ranks:
+    for k in eligible_ranks:
         for session_id in sessions:
             path = _inner_shard_path(output, digest, k, session_id)
             if not path.is_file():
@@ -392,7 +442,7 @@ def aggregate_outer_fold(
             records.append(artifact)
     result = nested_rank_selection(
         records,
-        ranks=config.ranks,
+        ranks=eligible_ranks,
         validation_session_ids=sessions,
     )
     payload = {
@@ -413,6 +463,7 @@ def run_selected_refit(
     *,
     fold_record: dict[str, object],
     force: bool = False,
+    exclude_ranks: frozenset[int] = frozenset(),
 ) -> dict[str, object]:
     """Refit selected k on all route sessions and emit keyed action predictions."""
 
@@ -425,7 +476,9 @@ def run_selected_refit(
             raise ValueError(f"Refusing incompatible predictor artifact {destination}")
         if existing.get("status") in {"success", "unavailable"}:
             return existing
-    selection = aggregate_outer_fold(config, output, fold_record=fold_record)
+    selection = aggregate_outer_fold(
+        config, output, fold_record=fold_record, exclude_ranks=exclude_ranks
+    )
     selected_k = selection["selection"]["selected_k"]
     identity = fold_record["fold_identity"]
     payload: dict[str, object] = {
@@ -460,16 +513,16 @@ def run_selected_refit(
             str(value) for value in identity["route_training_session_ids"]
         )
         route_trials = _trials_for_sessions(dataset, route_sessions)
-        base = load_validation_config(config.base_config_path)
+        discovery_config = load_validation_config(config.discovery_config_path)
         discovery, profiles, discovery_digest = _load_discovery_artifact(
-            base,
+            discovery_config,
             int(selected_k),
             config.resolved_discovery_dir,
         )
         fitted = _fit_explicit_split(
             dataset,
             profiles,
-            base,
+            SimpleNamespace(adam=config.adam, discovery=discovery_config.discovery),
             int(selected_k),
             route_trials,
             None,

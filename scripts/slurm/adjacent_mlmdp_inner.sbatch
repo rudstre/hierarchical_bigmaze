@@ -20,6 +20,7 @@ output_dir="${HIERARCHY_ADJACENT_OUTPUT:-${project_root}/output/adjacent_mlmdp_r
 task_mode="${HIERARCHY_ADJACENT_TASK_MODE:-production}"
 rank_min="${HIERARCHY_ADJACENT_RANK_MIN:-2}"
 rank_max="${HIERARCHY_ADJACENT_RANK_MAX:-49}"
+task_list="${HIERARCHY_ADJACENT_TASK_LIST:-}"
 run_identifier="${HIERARCHY_RUN_IDENTIFIER:-${SLURM_ARRAY_JOB_ID}}"
 task_id="${SLURM_ARRAY_TASK_ID}"
 
@@ -32,17 +33,27 @@ log_dir="${project_root}/slurm_out/adjacent_mlmdp/job_${run_identifier}"
 mkdir -p "${log_dir}"
 exec >"${log_dir}/slurm-${SLURM_ARRAY_JOB_ID}_${task_id}.out" 2>&1
 
-pilot=()
-if [[ "${task_mode}" == "pilot" ]]; then
-  pilot=(--pilot)
-fi
-
 cd "${project_root}"
-"${python_executable}" scripts/run_adjacent_mlmdp.py inner \
-  --config "${config_path}" \
-  --output-dir "${output_dir}" \
-  --task-index "${task_id}" \
-  --rank-min "${rank_min}" \
-  --rank-max "${rank_max}" \
-  "${pilot[@]}"
+
+if [[ -n "${task_list}" ]]; then
+  # Managed workflow: SLURM_ARRAY_TASK_ID is a local 0..N-1 index into an
+  # immutable task-list file written by scripts/slurm/manage_adjacent_mlmdp.py.
+  "${python_executable}" scripts/run_adjacent_mlmdp.py inner \
+    --config "${config_path}" \
+    --output-dir "${output_dir}" \
+    --task-list "${task_list}" \
+    --task-index "${task_id}"
+else
+  pilot=()
+  if [[ "${task_mode}" == "pilot" ]]; then
+    pilot=(--pilot)
+  fi
+  "${python_executable}" scripts/run_adjacent_mlmdp.py inner \
+    --config "${config_path}" \
+    --output-dir "${output_dir}" \
+    --task-index "${task_id}" \
+    --rank-min "${rank_min}" \
+    --rank-max "${rank_max}" \
+    "${pilot[@]}"
+fi
 

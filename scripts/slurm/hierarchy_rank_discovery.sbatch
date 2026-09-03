@@ -43,9 +43,15 @@ if [[ -n "${identifier_error}" ]]; then
   exit 2
 fi
 
+force_flag=()
+if [[ "${HIERARCHY_DISCOVERY_FORCE:-0}" == "1" ]]; then
+  force_flag=(--force)
+fi
+
 cd "${project_root}"
 "${python_executable}" scripts/run_hierarchy_rank_discovery.py \
   --config "${config_path}" \
   --k "${array_task_id}" \
   --max-rank "${max_rank}" \
-  --output-dir "${discovery_dir}"
+  --output-dir "${discovery_dir}" \
+  "${force_flag[@]}"

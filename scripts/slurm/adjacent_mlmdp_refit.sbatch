@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=adjacent-mlmdp-refit
-#SBATCH --array=0-70
+# --array must be passed explicitly at submission time (fold count varies by data).
 #SBATCH --mem=12G
 #SBATCH --partition=cpu
 #SBATCH --time=08:00:00
@@ -18,8 +18,10 @@ project_root="${HIERARCHY_PROJECT_ROOT:-${SLURM_SUBMIT_DIR}}"
 python_executable="${HIERARCHY_PYTHON:-/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python}"
 config_path="${HIERARCHY_ADJACENT_CONFIG:-${project_root}/configs/adjacent_mlmdp_regression.json}"
 output_dir="${HIERARCHY_ADJACENT_OUTPUT:-${project_root}/output/adjacent_mlmdp_regression/production}"
+task_list="${HIERARCHY_ADJACENT_TASK_LIST:-}"
+exclude_ranks="${HIERARCHY_ADJACENT_EXCLUDE_RANKS:-}"
 run_identifier="${HIERARCHY_RUN_IDENTIFIER:-${SLURM_ARRAY_JOB_ID}}"
-fold_index="${SLURM_ARRAY_TASK_ID}"
+task_id="${SLURM_ARRAY_TASK_ID}"
 
 if [[ ! "${run_identifier}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   printf 'Invalid run identifier: %s\n' "${run_identifier}" >&2
@@ -28,11 +30,23 @@ fi
 
 log_dir="${project_root}/slurm_out/adjacent_mlmdp/job_${run_identifier}"
 mkdir -p "${log_dir}"
-exec >"${log_dir}/refit-${SLURM_ARRAY_JOB_ID}_${fold_index}.out" 2>&1
+exec >"${log_dir}/refit-${SLURM_ARRAY_JOB_ID}_${task_id}.out" 2>&1
 
 cd "${project_root}"
-"${python_executable}" scripts/run_adjacent_mlmdp.py refit \
-  --config "${config_path}" \
-  --output-dir "${output_dir}" \
-  --fold-index "${fold_index}"
+
+if [[ -n "${task_list}" ]]; then
+  # Managed workflow: SLURM_ARRAY_TASK_ID is a local 0..N-1 index into an
+  # immutable task-list file written by scripts/slurm/manage_adjacent_mlmdp.py.
+  "${python_executable}" scripts/run_adjacent_mlmdp.py refit \
+    --config "${config_path}" \
+    --output-dir "${output_dir}" \
+    --task-list "${task_list}" \
+    --task-index "${task_id}" \
+    --exclude-ranks "${exclude_ranks}"
+else
+  "${python_executable}" scripts/run_adjacent_mlmdp.py refit \
+    --config "${config_path}" \
+    --output-dir "${output_dir}" \
+    --fold-index "${task_id}"
+fi
 

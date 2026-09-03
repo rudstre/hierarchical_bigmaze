@@ -14,24 +14,27 @@ import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from functools import cached_property
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
 from andrew_mlmdp.dataset import Trial, TrialScore
-from andrew_mlmdp.discovery import (
-    NMFConfig,
-    NMFConnectivityConfig,
-    NMFRankResult,
-    NMFRestartResult,
-    discover_subgoals,
-)
 from andrew_mlmdp.doohan_dataset import DoohanDataset
-from andrew_mlmdp.fitting import FitResult
-from andrew_mlmdp.hierarchy.model import SubgoalBasis, Template, ThresholdRange
-from andrew_mlmdp.lmdp import Environment, soft_parameters
 from andrew_mlmdp.profiles import ProfileNormalization
+
+# NMF discovery, hierarchy fitting, and lmdp pull in sklearn/torch, which are
+# slow to import (especially over a network filesystem) and are only needed
+# by the functions below that actually fit or discover something. Everything
+# else in this module (config loading, artifact classification, compatibility
+# checks) stays import-light by deferring these to the functions that use
+# them; TYPE_CHECKING keeps static analysis working without a runtime cost.
+if TYPE_CHECKING:
+    from andrew_mlmdp.discovery import NMFRankResult, NMFRestartResult
+    from andrew_mlmdp.fitting import FitResult
+    from andrew_mlmdp.hierarchy.model import Template, ThresholdRange
+    from andrew_mlmdp.lmdp import Environment
 
 SCHEMA_VERSION = 3
 PRODUCTION_RANKS = tuple(range(2, 50))
@@ -129,6 +132,8 @@ class DiscoveryValidationConfig:
     tolerance: float = 1e-5
 
     def __post_init__(self) -> None:
+        from andrew_mlmdp.discovery_config import NMFConfig, NMFConnectivityConfig
+
         object.__setattr__(self, "restart_seeds", tuple(self.restart_seeds))
         if self.restart_seeds != PRODUCTION_NMF_RESTART_SEEDS:
             raise ValueError(
@@ -311,10 +316,18 @@ class _ProblemContext:
 @dataclass(frozen=True)
 class _DatasetContext:
     dataset: DoohanDataset
-    environment: Environment
     data_sha256: str
     maze_sha256: str
     runtime: dict[str, str]
+
+    @cached_property
+    def environment(self) -> Environment:
+        # Deferred: only fitting/discovery callers need a real Environment
+        # (and the torch import that comes with it); compatibility/status
+        # checks only ever read maze_sha256/runtime.
+        from andrew_mlmdp.lmdp import Environment as _Environment
+
+        return _Environment(self.dataset.definition.maze)
 
 
 def load_validation_config(path: str | Path) -> RankValidationConfig:
@@ -589,7 +602,6 @@ def _load_dataset_context(config: RankValidationConfig) -> _DatasetContext:
 
     return _DatasetContext(
         dataset=dataset,
-        environment=Environment(dataset.definition.maze),
         data_sha256=_data_fingerprint(dataset),
         maze_sha256=_maze_fingerprint(dataset),
         runtime=_runtime_versions(),
@@ -731,6 +743,12 @@ def run_rank_discovery(
     force: bool = False,
 ) -> dict[str, object]:
     """Fit and atomically store the split-independent NMF result for one rank."""
+
+    from andrew_mlmdp.discovery import (
+        NMFConfig,
+        NMFConnectivityConfig,
+        discover_subgoals,
+    )
 
     resolved = _coerce_config(config)
     if isinstance(k, bool) or not isinstance(k, int) or k not in resolved.ranks:
@@ -1057,6 +1075,9 @@ def _initial_template(
     k: int,
     goals: Iterable[tuple[int, int]],
 ) -> tuple[Template, ThresholdRange, dict[str, float]]:
+    from andrew_mlmdp.hierarchy.model import SubgoalBasis
+    from andrew_mlmdp.lmdp import soft_parameters
+
     profiles = _selected_profiles(result)
     probe_values = {
         **config.adam.initial_values,
@@ -1111,6 +1132,9 @@ def _fitted_template(
     best_values: Mapping[str, float],
     initial_template: Template,
 ) -> Template:
+    from andrew_mlmdp.hierarchy.model import SubgoalBasis
+    from andrew_mlmdp.lmdp import soft_parameters
+
     profiles = _selected_profiles(result)
     basis = SubgoalBasis.from_profiles(
         environment.maze,
