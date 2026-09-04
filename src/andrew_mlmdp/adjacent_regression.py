@@ -282,7 +282,27 @@ def write_adjacent_manifest(
         existing = _read_json(path)
         if existing == payload:
             return existing
-        raise ValueError(f"Refusing to overwrite incompatible manifest {path}")
+        # Every field here is derived from the data and config alone except
+        # "source" (which fitting-code commit computed it) -- fold identities
+        # are deterministic given the maze/sessions and don't depend on which
+        # version of the code discovered them. So a mismatch confined to
+        # "source" means only the code changed, not anything this manifest
+        # describes; re-stamping it is safe. A mismatch anywhere else means
+        # folds/config/data actually changed and still needs a human decision.
+        if {k: v for k, v in existing.items() if k != "source"} != {
+            k: v for k, v in payload.items() if k != "source"
+        }:
+            raise ValueError(
+                f"Refusing to overwrite incompatible manifest {path}: it "
+                "describes different data or configuration than the config "
+                "just loaded (e.g. a different subject/session selection or "
+                "discovery_dir), not just a code change. This usually means "
+                "a different config was previously prepared into the same "
+                "output directory. To proceed, either pass a different "
+                "--output-dir for this config, or back up and remove this "
+                "manifest.json (and its folds/ directory, if its contents "
+                "are disposable) and rerun prepare."
+            )
     _atomic_write_json(path, payload)
     return payload
 

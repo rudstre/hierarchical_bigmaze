@@ -32,6 +32,10 @@ DEFAULT_BANDS = [
 ]
 DEFAULT_DISCOVERY_RESOURCES = {"memory": "12G", "time": "08:00:00"}
 DEFAULT_MAX_CONCURRENT = 200
+# SLURM's --array=0-N ceiling (MaxArraySize in slurm.conf) is a hard cluster
+# limit independent of the %concurrency throttle; a band with more tasks than
+# this must be split into multiple array submissions rather than one huge one.
+DEFAULT_MAX_ARRAY_SIZE = 10000
 # squeue can lag behind sbatch registering a job (worse for large arrays);
 # a submission younger than this is treated as active even if squeue is
 # silent about it, so a slow-to-register job never looks resubmittable.
@@ -131,6 +135,11 @@ def _array(indices: list[int], limit: int | None = None) -> str:
     ranges.append(str(start) if start == previous else f"{start}-{previous}")
     result = ",".join(ranges)
     return result if limit is None else f"{result}%{min(limit, len(ordered))}"
+
+
+def _chunk(items: list, size: int) -> list[list]:
+    """Split into groups of at most `size`, preserving order."""
+    return [items[start : start + size] for start in range(0, len(items), size)]
 
 
 def _run(command: list[str], *, dry_run: bool = False) -> str:
@@ -250,8 +259,12 @@ def _default_config_path(root: Path) -> Path:
     return root / "configs/adjacent_mlmdp_regression.json"
 
 
-def _default_output_dir(root: Path) -> Path:
-    return root / "output/adjacent_mlmdp_regression/production"
+def _default_output_dir(root: Path, config_path: Path) -> Path:
+    # Keyed by the config file's own stem (not a fixed name) so that two
+    # different configs never collide on the same default directory when
+    # --output-dir is omitted -- that collision is exactly what stranded a
+    # real production manifest under a leftover test config's fold identities.
+    return root / "output/adjacent_mlmdp_regression" / config_path.stem
 
 
 def _ensure_src_on_path(root: Path) -> None:
@@ -326,6 +339,7 @@ def _general_resources(raw_config: dict[str, Any]) -> dict[str, Any]:
         "partition": slurm_config.get("partition", "cpu"),
         "account": slurm_config.get("account"),
         "max_concurrent": slurm_config.get("max_concurrent", DEFAULT_MAX_CONCURRENT),
+        "max_array_size": slurm_config.get("max_array_size", DEFAULT_MAX_ARRAY_SIZE),
         "discovery": {
             "memory": discovery_config.get(
                 "memory", DEFAULT_DISCOVERY_RESOURCES["memory"]
@@ -346,7 +360,9 @@ def _bootstrap_manifest(
     raw_config: dict[str, Any],
     config: Any,
 ) -> tuple[dict[str, Any], Path]:
-    output = _resolve(args.output_dir or _default_output_dir(root), root)
+    output = _resolve(
+        args.output_dir or _default_output_dir(root, config.source_path), root
+    )
     path = _manifest_path(output, args.run_id)
     resources = _general_resources(raw_config)
     resources["bands"] = _resolve_bands(raw_config, config.ranks)
@@ -449,25 +465,47 @@ def _inner_states(
     output: Path,
     folds: list[dict[str, Any]],
     eligible_ranks: tuple[int, ...],
+    *,
+    source: dict[str, Any] | None = None,
+    skip_digests: frozenset[str] | set[str] = frozenset(),
+    artifact_sink: dict[tuple[str, int, str], dict[str, Any]] | None = None,
 ) -> dict[tuple[str, int, str], dict[str, Any]]:
+    """Classify every inner-fit shard, reading each file at most once.
+
+    Folds in ``skip_digests`` are trusted as fully terminal from a prior run
+    (see ``_prior_inner_complete``) and their shards are never touched. When
+    ``artifact_sink`` is given, every parsed identity-valid shard is stashed in
+    it so the aggregation pass can reuse it instead of re-reading from disk.
+    """
+
     from andrew_mlmdp.adjacent_regression import (
         ADJACENT_SCHEMA_VERSION,
         _inner_compatibility,
         _inner_shard_path,
     )
-    from andrew_mlmdp.validation import source_code_fingerprint
 
-    source = source_code_fingerprint(
-        config.project_root, config_path=config.source_path
-    )
+    if source is None:
+        from andrew_mlmdp.validation import source_code_fingerprint
+
+        source = source_code_fingerprint(
+            config.project_root, config_path=config.source_path
+        )
     states: dict[tuple[str, int, str], dict[str, Any]] = {}
     for fold in folds:
         digest = str(fold["fold_identity_digest"])
         identity = fold["fold_identity"]
+        sessions = tuple(str(value) for value in fold["inner_validation_session_ids"])
+        if digest in skip_digests:
+            for rank in eligible_ranks:
+                for session in sessions:
+                    states[(digest, rank, session)] = {
+                        "state": "success",
+                        "path": None,
+                    }
+            continue
         route_sessions = tuple(
             str(value) for value in identity["route_training_session_ids"]
         )
-        sessions = tuple(str(value) for value in fold["inner_validation_session_ids"])
         for rank in eligible_ranks:
             for session in sessions:
                 key = (digest, rank, session)
@@ -497,7 +535,162 @@ def _inner_states(
                     states[key] = {"state": "incompatible", "path": path}
                     continue
                 states[key] = {"state": artifact.get("status"), "path": path}
+                if artifact_sink is not None:
+                    artifact_sink[key] = artifact
     return states
+
+
+def _load_cached_selection(
+    output: Path, digest: str, config_signature: str
+) -> dict[str, Any] | None:
+    """Return a fold's already-written selection.json if it is still valid.
+
+    Lets the aggregation pass skip re-reading ~24 inner shards per fold when a
+    prior run already selected a rank for it. ``configuration_signature`` pins
+    the config content and schema, so a stale selection is rejected here.
+    """
+
+    path = output / "folds" / digest / "selection.json"
+    if not path.is_file():
+        return None
+    try:
+        artifact = _read(path)
+    except (OSError, ValueError):
+        return None
+    if (
+        artifact.get("artifact_type") != "adjacent_mlmdp_selection"
+        or artifact.get("configuration_signature") != config_signature
+        or artifact.get("status") not in {"selected", "unavailable"}
+        or not isinstance(artifact.get("selection"), dict)
+    ):
+        return None
+    return artifact
+
+
+def _inner_complete_fingerprint(
+    config: Any, source: dict[str, Any], ineligible: list[int]
+) -> str:
+    """Identity under which a fold's inner stage may be trusted as terminal.
+
+    Any change to the config content, the worker/model source, or the set of
+    scientifically ineligible discovery ranks invalidates every recorded
+    completion and forces a full shard rescan.
+    """
+
+    payload = json.dumps(
+        [config.signature, source["content_sha256"], sorted(ineligible)],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _prior_inner_complete(
+    manifest: dict[str, Any],
+    config: Any,
+    folds: list[dict[str, Any]],
+    output: Path,
+    source: dict[str, Any],
+    ineligible: list[int],
+) -> tuple[set[str], dict[str, dict[str, Any]], str]:
+    """Folds whose inner stage a prior run finished and we can still trust.
+
+    Returns the set of fold digests safe to skip during the shard scan, the
+    cached selection artifact for each, and the fingerprint the current run
+    should record its own completions under.
+    """
+
+    fingerprint = _inner_complete_fingerprint(config, source, ineligible)
+    recorded = manifest.get("inner_complete") or {}
+    candidates = (
+        set(recorded.get("fold_digests", []))
+        if recorded.get("fingerprint") == fingerprint
+        else set()
+    )
+    skip: set[str] = set()
+    cached: dict[str, dict[str, Any]] = {}
+    for fold in folds:
+        digest = str(fold["fold_identity_digest"])
+        if digest not in candidates:
+            continue
+        selection = _load_cached_selection(output, digest, config.signature)
+        if selection is not None:
+            skip.add(digest)
+            cached[digest] = selection
+    return skip, cached, fingerprint
+
+
+def _record_inner_complete(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    fingerprint: str,
+    selections: dict[str, dict[str, Any]],
+    *,
+    dry_run: bool,
+) -> None:
+    digests = sorted(
+        digest
+        for digest, result in selections.items()
+        if result.get("status") in {"selected", "unavailable"}
+    )
+    payload = {"fingerprint": fingerprint, "fold_digests": digests}
+    if manifest.get("inner_complete") == payload:
+        return
+    manifest["inner_complete"] = payload
+    if not dry_run:
+        _atomic_write(manifest_path, manifest)
+
+
+def _aggregate_fold(
+    config: Any,
+    output: Path,
+    fold: dict[str, Any],
+    exclude_ranks: frozenset[int],
+    shard_artifacts: dict[tuple[str, int, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Rank-select one outer fold, reusing shards already parsed by
+    ``_inner_states`` instead of re-reading ~24 files per fold from disk.
+
+    This mirrors ``adjacent_regression.aggregate_outer_fold`` (identical
+    ``selection.json`` payload) but takes its inner-fit records from the
+    in-memory cache. ``_inner_states`` has already verified every cached
+    shard's identity and compatibility, so that check is not repeated here.
+    Falls back to the on-disk implementation when the cache holds nothing for
+    this fold (e.g. a mid-flight race).
+    """
+
+    from andrew_mlmdp.adjacent_regression import (
+        ADJACENT_SCHEMA_VERSION,
+        aggregate_outer_fold,
+    )
+    from andrew_mlmdp.nested_validation import nested_rank_selection
+    from andrew_mlmdp.validation import _atomic_write_json
+
+    digest = str(fold["fold_identity_digest"])
+    sessions = tuple(str(value) for value in fold["inner_validation_session_ids"])
+    eligible_ranks = tuple(k for k in config.ranks if k not in exclude_ranks)
+    records = [
+        shard_artifacts[(digest, k, session)]
+        for k in eligible_ranks
+        for session in sessions
+        if (digest, k, session) in shard_artifacts
+    ]
+    if not records:
+        return aggregate_outer_fold(
+            config, output, fold_record=fold, exclude_ranks=exclude_ranks
+        )
+    result = nested_rank_selection(
+        records, ranks=eligible_ranks, validation_session_ids=sessions
+    )
+    payload = {
+        "schema_version": ADJACENT_SCHEMA_VERSION,
+        "artifact_type": "adjacent_mlmdp_selection",
+        "fold_identity": fold["fold_identity"],
+        "fold_identity_digest": digest,
+        "configuration_signature": config.signature,
+        **result,
+    }
+    _atomic_write_json(output / "folds" / digest / "selection.json", payload)
+    return payload
 
 
 def _predictor_states(
@@ -659,8 +852,13 @@ def _write_task_list(
     *,
     run_id: str,
     config_signature: str,
+    label_suffix: str = "",
 ) -> Path:
-    path = run_dir / "task_lists" / f"{kind}_{wave:04d}_{_band_label(band)}.json"
+    path = (
+        run_dir
+        / "task_lists"
+        / f"{kind}_{wave:04d}_{_band_label(band)}{label_suffix}.json"
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": kind,
@@ -759,93 +957,99 @@ def _submit_inner_band(
     *,
     config_signature: str,
     dry_run: bool,
-) -> str | None:
-    wave = manifest["wave_counters"]["inner"] + 1
-    ordered = sorted(tasks)
-    entries = [
-        {
-            "index": index,
-            "fold_identity_digest": digest,
-            "k": rank,
-            "validation_session_id": session,
-        }
-        for index, (digest, rank, session) in enumerate(ordered)
-    ]
-    task_list_path = _write_task_list(
-        run_dir,
-        "inner",
-        wave,
-        band,
-        entries,
-        run_id=manifest["run_id"],
-        config_signature=config_signature,
-    )
+) -> list[str]:
     resources = manifest["resources"]
-    limit = resources["max_concurrent"]
-    array = _array(list(range(len(entries))), limit)
-    command = [
-        "sbatch",
-        "--parsable",
-        f"--partition={resources['partition']}",
-        f"--time={band['time']}",
-        f"--mem={band['memory']}",
-        f"--array={array}",
-    ]
-    if resources["account"]:
-        command.append(f"--account={resources['account']}")
-    exports = ",".join(
-        [
-            "ALL",
-            f"HIERARCHY_PROJECT_ROOT={manifest['project_root']}",
-            f"HIERARCHY_PYTHON={manifest['python_executable']}",
-            f"HIERARCHY_ADJACENT_CONFIG={manifest['config_path']}",
-            f"HIERARCHY_ADJACENT_OUTPUT={manifest['output_dir']}",
-            f"HIERARCHY_ADJACENT_TASK_LIST={task_list_path}",
-            f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
+    chunks = _chunk(sorted(tasks), resources["max_array_size"])
+    job_ids: list[str] = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        suffix = "" if len(chunks) == 1 else f" (part {chunk_index}/{len(chunks)})"
+        label_suffix = "" if len(chunks) == 1 else f"_part{chunk_index}of{len(chunks)}"
+        wave = manifest["wave_counters"]["inner"] + 1
+        entries = [
+            {
+                "index": index,
+                "fold_identity_digest": digest,
+                "k": rank,
+                "validation_session_id": session,
+            }
+            for index, (digest, rank, session) in enumerate(chunk)
         ]
-    )
-    command.extend(
-        [
-            f"--export={exports}",
-            str(
-                Path(manifest["project_root"])
-                / "scripts/slurm/adjacent_mlmdp_inner.sbatch"
-            ),
+        task_list_path = _write_task_list(
+            run_dir,
+            "inner",
+            wave,
+            band,
+            entries,
+            run_id=manifest["run_id"],
+            config_signature=config_signature,
+            label_suffix=label_suffix,
+        )
+        limit = resources["max_concurrent"]
+        array = _array(list(range(len(entries))), limit)
+        command = [
+            "sbatch",
+            "--parsable",
+            f"--partition={resources['partition']}",
+            f"--time={band['time']}",
+            f"--mem={band['memory']}",
+            f"--array={array}",
         ]
-    )
-    output = _run(command, dry_run=dry_run)
-    if dry_run:
+        if resources["account"]:
+            command.append(f"--account={resources['account']}")
+        exports = ",".join(
+            [
+                "ALL",
+                f"HIERARCHY_PROJECT_ROOT={manifest['project_root']}",
+                f"HIERARCHY_PYTHON={manifest['python_executable']}",
+                f"HIERARCHY_ADJACENT_CONFIG={manifest['config_path']}",
+                f"HIERARCHY_ADJACENT_OUTPUT={manifest['output_dir']}",
+                f"HIERARCHY_ADJACENT_TASK_LIST={task_list_path}",
+                f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
+            ]
+        )
+        command.extend(
+            [
+                f"--export={exports}",
+                str(
+                    Path(manifest["project_root"])
+                    / "scripts/slurm/adjacent_mlmdp_inner.sbatch"
+                ),
+            ]
+        )
+        output = _run(command, dry_run=dry_run)
+        if dry_run:
+            print(
+                f"  would submit inner-fit job: band {_band_label(band)}{suffix} "
+                f"({band['memory']}, {band['time']}) -- {len(entries)} tasks, "
+                f"array {array}",
+                flush=True,
+            )
+            continue
+        manifest["wave_counters"]["inner"] = wave
+        job_id = _job_id(output)
+        _record_submission(
+            manifest,
+            manifest_path,
+            {
+                "timestamp": _now(),
+                "kind": "inner",
+                "job_id": job_id,
+                "array": array,
+                "task_count": len(entries),
+                "task_list": str(task_list_path),
+                "band": band,
+                "ranks": None,
+                "resource_usage_recorded": False,
+            },
+        )
         print(
-            f"  would submit inner-fit job: band {_band_label(band)} "
+            f"  submitted inner-fit job {job_id}: band {_band_label(band)}{suffix} "
             f"({band['memory']}, {band['time']}) -- {len(entries)} tasks, "
             f"array {array}",
             flush=True,
         )
-        return None
-    manifest["wave_counters"]["inner"] = wave
-    job_id = _job_id(output)
-    _record_submission(
-        manifest,
-        manifest_path,
-        {
-            "timestamp": _now(),
-            "kind": "inner",
-            "job_id": job_id,
-            "array": array,
-            "task_count": len(entries),
-            "task_list": str(task_list_path),
-            "band": band,
-            "ranks": None,
-            "resource_usage_recorded": False,
-        },
-    )
-    print(
-        f"  submitted inner-fit job {job_id}: band {_band_label(band)} "
-        f"({band['memory']}, {band['time']}) -- {len(entries)} tasks, "
-        f"array {array}",
-        flush=True,
-    )
-    return job_id
+        job_ids.append(job_id)
+    return job_ids
 
 
 def _submit_refit_band(
@@ -858,90 +1062,96 @@ def _submit_refit_band(
     config_signature: str,
     exclude_ranks: frozenset[int],
     dry_run: bool,
-) -> str | None:
-    wave = manifest["wave_counters"]["refit"] + 1
-    ordered = sorted(folds)
-    entries = [
-        {"index": index, "fold_identity_digest": digest, "selected_k": selected_k}
-        for index, (digest, selected_k) in enumerate(ordered)
-    ]
-    task_list_path = _write_task_list(
-        run_dir,
-        "refit",
-        wave,
-        band,
-        entries,
-        run_id=manifest["run_id"],
-        config_signature=config_signature,
-    )
+) -> list[str]:
     resources = manifest["resources"]
-    limit = resources["max_concurrent"]
-    array = _array(list(range(len(entries))), limit)
-    command = [
-        "sbatch",
-        "--parsable",
-        f"--partition={resources['partition']}",
-        f"--time={band['time']}",
-        f"--mem={band['memory']}",
-        f"--array={array}",
-    ]
-    if resources["account"]:
-        command.append(f"--account={resources['account']}")
     exclude_ranks_csv = ",".join(str(rank) for rank in sorted(exclude_ranks))
-    exports = ",".join(
-        [
-            "ALL",
-            f"HIERARCHY_PROJECT_ROOT={manifest['project_root']}",
-            f"HIERARCHY_PYTHON={manifest['python_executable']}",
-            f"HIERARCHY_ADJACENT_CONFIG={manifest['config_path']}",
-            f"HIERARCHY_ADJACENT_OUTPUT={manifest['output_dir']}",
-            f"HIERARCHY_ADJACENT_TASK_LIST={task_list_path}",
-            f"HIERARCHY_ADJACENT_EXCLUDE_RANKS={exclude_ranks_csv}",
-            f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
+    chunks = _chunk(sorted(folds), resources["max_array_size"])
+    job_ids: list[str] = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        suffix = "" if len(chunks) == 1 else f" (part {chunk_index}/{len(chunks)})"
+        label_suffix = "" if len(chunks) == 1 else f"_part{chunk_index}of{len(chunks)}"
+        wave = manifest["wave_counters"]["refit"] + 1
+        entries = [
+            {"index": index, "fold_identity_digest": digest, "selected_k": selected_k}
+            for index, (digest, selected_k) in enumerate(chunk)
         ]
-    )
-    command.extend(
-        [
-            f"--export={exports}",
-            str(
-                Path(manifest["project_root"])
-                / "scripts/slurm/adjacent_mlmdp_refit.sbatch"
-            ),
+        task_list_path = _write_task_list(
+            run_dir,
+            "refit",
+            wave,
+            band,
+            entries,
+            run_id=manifest["run_id"],
+            config_signature=config_signature,
+            label_suffix=label_suffix,
+        )
+        limit = resources["max_concurrent"]
+        array = _array(list(range(len(entries))), limit)
+        command = [
+            "sbatch",
+            "--parsable",
+            f"--partition={resources['partition']}",
+            f"--time={band['time']}",
+            f"--mem={band['memory']}",
+            f"--array={array}",
         ]
-    )
-    output = _run(command, dry_run=dry_run)
-    if dry_run:
+        if resources["account"]:
+            command.append(f"--account={resources['account']}")
+        exports = ",".join(
+            [
+                "ALL",
+                f"HIERARCHY_PROJECT_ROOT={manifest['project_root']}",
+                f"HIERARCHY_PYTHON={manifest['python_executable']}",
+                f"HIERARCHY_ADJACENT_CONFIG={manifest['config_path']}",
+                f"HIERARCHY_ADJACENT_OUTPUT={manifest['output_dir']}",
+                f"HIERARCHY_ADJACENT_TASK_LIST={task_list_path}",
+                f"HIERARCHY_ADJACENT_EXCLUDE_RANKS={exclude_ranks_csv}",
+                f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
+            ]
+        )
+        command.extend(
+            [
+                f"--export={exports}",
+                str(
+                    Path(manifest["project_root"])
+                    / "scripts/slurm/adjacent_mlmdp_refit.sbatch"
+                ),
+            ]
+        )
+        output = _run(command, dry_run=dry_run)
+        if dry_run:
+            print(
+                f"  would submit refit job: band {_band_label(band)}{suffix} "
+                f"({band['memory']}, {band['time']}) -- {len(entries)} folds, "
+                f"array {array}",
+                flush=True,
+            )
+            continue
+        manifest["wave_counters"]["refit"] = wave
+        job_id = _job_id(output)
+        _record_submission(
+            manifest,
+            manifest_path,
+            {
+                "timestamp": _now(),
+                "kind": "refit",
+                "job_id": job_id,
+                "array": array,
+                "task_count": len(entries),
+                "task_list": str(task_list_path),
+                "band": band,
+                "ranks": None,
+                "resource_usage_recorded": False,
+            },
+        )
         print(
-            f"  would submit refit job: band {_band_label(band)} "
+            f"  submitted refit job {job_id}: band {_band_label(band)}{suffix} "
             f"({band['memory']}, {band['time']}) -- {len(entries)} folds, "
             f"array {array}",
             flush=True,
         )
-        return None
-    manifest["wave_counters"]["refit"] = wave
-    job_id = _job_id(output)
-    _record_submission(
-        manifest,
-        manifest_path,
-        {
-            "timestamp": _now(),
-            "kind": "refit",
-            "job_id": job_id,
-            "array": array,
-            "task_count": len(entries),
-            "task_list": str(task_list_path),
-            "band": band,
-            "ranks": None,
-            "resource_usage_recorded": False,
-        },
-    )
-    print(
-        f"  submitted refit job {job_id}: band {_band_label(band)} "
-        f"({band['memory']}, {band['time']}) -- {len(entries)} folds, "
-        f"array {array}",
-        flush=True,
-    )
-    return job_id
+        job_ids.append(job_id)
+    return job_ids
 
 
 # --------------------------------------------------------------------------
@@ -1201,10 +1411,7 @@ def _next_command(args: argparse.Namespace) -> str:
 
 def _advance(args: argparse.Namespace, root: Path) -> None:
     _ensure_src_on_path(root)
-    from andrew_mlmdp.adjacent_regression import (
-        aggregate_outer_fold,
-        load_adjacent_regression_config,
-    )
+    from andrew_mlmdp.adjacent_regression import load_adjacent_regression_config
 
     config_path = _resolve(args.config or _default_config_path(root), root)
     config = load_adjacent_regression_config(config_path)
@@ -1383,7 +1590,24 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
         )
 
     # -- Inner fits ------------------------------------------------------
-    inner_states = _inner_states(config, output, folds, eligible_ranks)
+    from andrew_mlmdp.validation import source_code_fingerprint
+
+    source = source_code_fingerprint(
+        config.project_root, config_path=config.source_path
+    )
+    skip_digests, cached_selections, inner_fingerprint = _prior_inner_complete(
+        manifest, config, folds, output, source, ineligible
+    )
+    shard_artifacts: dict[tuple[str, int, str], dict[str, Any]] = {}
+    inner_states = _inner_states(
+        config,
+        output,
+        folds,
+        eligible_ranks,
+        source=source,
+        skip_digests=skip_digests,
+        artifact_sink=shard_artifacts,
+    )
     incompatible_inner = [
         key for key, state in inner_states.items() if state["state"] == "incompatible"
     ]
@@ -1459,10 +1683,17 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
     exclude_ranks = frozenset(ineligible)
     selections: dict[str, dict[str, Any]] = {}
     for fold in folds:
-        result = aggregate_outer_fold(
-            config, output, fold_record=fold, exclude_ranks=exclude_ranks
+        digest = str(fold["fold_identity_digest"])
+        cached = cached_selections.get(digest)
+        if cached is not None:
+            selections[digest] = cached
+            continue
+        selections[digest] = _aggregate_fold(
+            config, output, fold, exclude_ranks, shard_artifacts
         )
-        selections[str(fold["fold_identity_digest"])] = result
+    _record_inner_complete(
+        manifest, manifest_path, inner_fingerprint, selections, dry_run=args.dry_run
+    )
 
     pending_folds = [
         digest for digest, result in selections.items() if result["status"] == "pending"

@@ -171,6 +171,21 @@ def test_general_resources_defaults_and_overrides():
     assert custom["discovery"]["time"] == "08:00:00"
 
 
+def test_general_resources_max_array_size_default_and_override():
+    assert (
+        manager._general_resources({})["max_array_size"]
+        == manager.DEFAULT_MAX_ARRAY_SIZE
+    )
+    custom = manager._general_resources({"slurm": {"max_array_size": 500}})
+    assert custom["max_array_size"] == 500
+
+
+def test_chunk_splits_preserving_order():
+    assert manager._chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
+    assert manager._chunk([], 2) == []
+    assert manager._chunk([1, 2], 5) == [[1, 2]]
+
+
 def test_percentile_summary_empty_and_populated():
     assert manager._percentile_summary([])["median"] is None
     summary = manager._percentile_summary([1.0, 2.0, 3.0, 4.0])
@@ -587,6 +602,144 @@ def test_advance_does_not_resubmit_within_grace_period_despite_squeue_silence(
 
 
 # --------------------------------------------------------------------------
+# Array-size splitting (SLURM MaxArraySize)
+# --------------------------------------------------------------------------
+
+
+def _minimal_manifest(tmp_path, *, max_array_size=10000, max_concurrent=200):
+    return {
+        "project_root": str(tmp_path),
+        "python_executable": "python",
+        "config_path": str(tmp_path / "adjacent.json"),
+        "output_dir": str(tmp_path / "output"),
+        "run_id": "test",
+        "resources": {
+            "partition": "cpu",
+            "account": None,
+            "max_concurrent": max_concurrent,
+            "max_array_size": max_array_size,
+        },
+        "submissions": [],
+        "wave_counters": {"inner": 0, "refit": 0},
+    }
+
+
+def test_submit_inner_band_splits_when_exceeding_max_array_size(tmp_path, monkeypatch):
+    manifest = _minimal_manifest(tmp_path, max_array_size=2)
+    manifest_path = tmp_path / "manifest.json"
+    band = {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"}
+    tasks = [("fold-a", 2, "s1"), ("fold-b", 2, "s1"), ("fold-c", 2, "s1")]
+
+    job_ids = iter(["100", "101"])
+    monkeypatch.setattr(
+        manager, "_run", lambda command, *, dry_run=False: next(job_ids)
+    )
+
+    result = manager._submit_inner_band(
+        manifest,
+        manifest_path,
+        tmp_path,
+        band,
+        tasks,
+        config_signature="sig",
+        dry_run=False,
+    )
+
+    assert result == ["100", "101"]
+    assert len(manifest["submissions"]) == 2
+    assert [item["task_count"] for item in manifest["submissions"]] == [2, 1]
+    assert manifest["wave_counters"]["inner"] == 2
+    task_lists = [item["task_list"] for item in manifest["submissions"]]
+    assert len(set(task_lists)) == 2
+    assert all(Path(path).is_file() for path in task_lists)
+    assert any("part1of2" in path for path in task_lists)
+    assert any("part2of2" in path for path in task_lists)
+    # each array uses local 0..N-1 indices regardless of chunk position
+    for path in task_lists:
+        indices = [
+            entry["index"] for entry in manager._load_task_list_tasks(Path(path))
+        ]
+        assert indices == list(range(len(indices)))
+
+
+def test_submit_inner_band_single_chunk_has_no_part_suffix(tmp_path, monkeypatch):
+    manifest = _minimal_manifest(tmp_path, max_array_size=10000)
+    manifest_path = tmp_path / "manifest.json"
+    band = {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"}
+
+    monkeypatch.setattr(manager, "_run", lambda command, *, dry_run=False: "900")
+
+    manager._submit_inner_band(
+        manifest,
+        manifest_path,
+        tmp_path,
+        band,
+        [("fold-a", 2, "s1")],
+        config_signature="sig",
+        dry_run=False,
+    )
+
+    assert len(manifest["submissions"]) == 1
+    assert "part" not in Path(manifest["submissions"][0]["task_list"]).name
+
+
+def test_submit_inner_band_dry_run_previews_each_chunk_and_records_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    manifest = _minimal_manifest(tmp_path, max_array_size=2)
+    manifest_path = tmp_path / "manifest.json"
+    band = {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"}
+    tasks = [("fold-a", 2, "s1"), ("fold-b", 2, "s1"), ("fold-c", 2, "s1")]
+
+    monkeypatch.setattr(manager, "_run", lambda command, *, dry_run=False: "")
+
+    result = manager._submit_inner_band(
+        manifest,
+        manifest_path,
+        tmp_path,
+        band,
+        tasks,
+        config_signature="sig",
+        dry_run=True,
+    )
+
+    assert result == []
+    assert manifest["submissions"] == []
+    assert manifest["wave_counters"]["inner"] == 0
+    out = capsys.readouterr().out
+    assert out.count("would submit inner-fit job") == 2
+    assert "part 1/2" in out
+    assert "part 2/2" in out
+
+
+def test_submit_refit_band_splits_when_exceeding_max_array_size(tmp_path, monkeypatch):
+    manifest = _minimal_manifest(tmp_path, max_array_size=2)
+    manifest_path = tmp_path / "manifest.json"
+    band = {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"}
+    folds = [("fold-a", 2), ("fold-b", 2), ("fold-c", 2)]
+
+    job_ids = iter(["200", "201"])
+    monkeypatch.setattr(
+        manager, "_run", lambda command, *, dry_run=False: next(job_ids)
+    )
+
+    result = manager._submit_refit_band(
+        manifest,
+        manifest_path,
+        tmp_path,
+        band,
+        folds,
+        config_signature="sig",
+        exclude_ranks=frozenset(),
+        dry_run=False,
+    )
+
+    assert result == ["200", "201"]
+    assert len(manifest["submissions"]) == 2
+    assert manifest["wave_counters"]["refit"] == 2
+
+
+# --------------------------------------------------------------------------
 # Resource-usage reporting
 # --------------------------------------------------------------------------
 
@@ -906,6 +1059,174 @@ def test_advance_stops_at_aggregation_when_fold_pending(monkeypatch, tmp_path, c
     assert refit_called == []
     out = capsys.readouterr().out
     assert "selected: 0   scientifically unavailable: 0   pending: 1" in out
+
+
+def _write_selection(
+    output_dir, digest, *, signature="config-signature", status="selected"
+):
+    path = output_dir / "folds" / digest / "selection.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "adjacent_mlmdp_selection",
+                "configuration_signature": signature,
+                "status": status,
+                "selection": {"selected_k": 2},
+            }
+        )
+    )
+    return path
+
+
+def test_load_cached_selection_accepts_valid_and_rejects_stale(tmp_path):
+    out = tmp_path / "output"
+    _write_selection(out, "fold-a")
+    assert manager._load_cached_selection(out, "fold-a", "config-signature")
+    assert manager._load_cached_selection(out, "fold-a", "other-signature") is None
+    assert manager._load_cached_selection(out, "missing", "config-signature") is None
+
+    _write_selection(out, "fold-b", status="pending")
+    assert manager._load_cached_selection(out, "fold-b", "config-signature") is None
+
+
+def test_prior_inner_complete_honors_fingerprint(monkeypatch, tmp_path):
+    config = _FakeConfig(tmp_path)
+    output_dir = tmp_path / "output"
+    _write_selection(output_dir, "fold-a")
+    folds = [_fold("fold-a", ["s1"])]
+    source = {"content_sha256": "src-hash"}
+
+    fingerprint = manager._inner_complete_fingerprint(config, source, [])
+    manifest = {
+        "inner_complete": {"fingerprint": fingerprint, "fold_digests": ["fold-a"]}
+    }
+    skip, cached, returned = manager._prior_inner_complete(
+        manifest, config, folds, output_dir, source, []
+    )
+    assert skip == {"fold-a"}
+    assert set(cached) == {"fold-a"}
+    assert returned == fingerprint
+
+    # A changed ineligible set changes the fingerprint and drops the skip.
+    skip, cached, _ = manager._prior_inner_complete(
+        manifest, config, folds, output_dir, source, [7]
+    )
+    assert skip == set()
+    assert cached == {}
+
+
+def test_aggregate_fold_matches_disk_implementation_using_cache(tmp_path):
+    import andrew_mlmdp.adjacent_regression as adjacent
+    from andrew_mlmdp.validation import AdamValidationConfig
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
+    config = adjacent.AdjacentRegressionConfig(
+        dataset=adjacent.AdjacentDatasetConfig("data", ("m2",)),
+        discovery_config="base.json",
+        discovery_dir="discovery",
+        adam=AdamValidationConfig(),
+        ranks=(2,),
+        project_root=tmp_path,
+    )
+    identity = {
+        "route_training_session_ids": ["route-a", "route-b", "route-c"],
+    }
+    digest = "fold-digest"
+    sessions = list(identity["route_training_session_ids"])
+    fold = {
+        "fold_identity_digest": digest,
+        "fold_identity": identity,
+        "inner_validation_session_ids": sessions,
+    }
+    output = tmp_path / "output"
+    source = adjacent.source_code_fingerprint(
+        config.project_root, config_path=config.source_path
+    )
+    for session in sessions:
+        training = tuple(v for v in sessions if v != session)
+        shard = adjacent._inner_shard_path(output, digest, 2, session)
+        shard.parent.mkdir(parents=True, exist_ok=True)
+        shard.write_text(
+            json.dumps(
+                {
+                    "schema_version": adjacent.ADJACENT_SCHEMA_VERSION,
+                    "artifact_type": "adjacent_mlmdp_inner_fit",
+                    "status": "success",
+                    "k": 2,
+                    "compatibility": adjacent._inner_compatibility(
+                        config, identity, digest, training, session, 2, source=source
+                    ),
+                    "validation_session_id": session,
+                    "validation_ll_per_transition": -1.0 - sessions.index(session),
+                }
+            )
+        )
+
+    from_disk = adjacent.aggregate_outer_fold(
+        config, output, fold_record=fold, exclude_ranks=frozenset()
+    )
+
+    sink: dict = {}
+    manager._inner_states(
+        config, output, [fold], (2,), source=source, artifact_sink=sink
+    )
+    for shard in (output / "folds" / digest / "inner").rglob("*.json"):
+        shard.unlink()
+    from_cache = manager._aggregate_fold(config, output, fold, frozenset(), sink)
+
+    assert from_cache == from_disk
+    written = json.loads(
+        (output / "folds" / digest / "selection.json").read_text()
+    )
+    assert written["status"] == from_disk["status"]
+
+
+def test_advance_skips_shard_scan_for_recorded_complete_folds(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    _patch_prepare(monkeypatch)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _write_science_manifest(output_dir, [_fold("fold-a", ["s1"])])
+
+    monkeypatch.setattr(manager, "_active_identities", lambda *_: {})
+    monkeypatch.setattr(
+        manager, "_discovery_states", lambda *_: {2: {"state": "success"}}
+    )
+    monkeypatch.setattr(
+        manager, "_predictor_states", lambda *a, **k: {"fold-a": {"state": "success"}}
+    )
+
+    inner_skip_args = []
+
+    def spy_inner_states(config, output, folds, eligible_ranks, **kwargs):
+        inner_skip_args.append(set(kwargs.get("skip_digests", set())))
+        return {("fold-a", 2, "s1"): {"state": "success"}}
+
+    monkeypatch.setattr(manager, "_inner_states", spy_inner_states)
+
+    aggregate_calls = []
+
+    def fake_aggregate(config, output, *, fold_record, exclude_ranks):
+        digest = fold_record["fold_identity_digest"]
+        aggregate_calls.append(digest)
+        _write_selection(output, digest, signature=config.signature)
+        return {
+            "artifact_type": "adjacent_mlmdp_selection",
+            "configuration_signature": config.signature,
+            "status": "selected",
+            "selection": {"selected_k": 2},
+        }
+
+    monkeypatch.setattr(adjacent_module, "aggregate_outer_fold", fake_aggregate)
+
+    args = _args(tmp_path, output_dir)
+    manager._advance(args, ROOT)
+    manager._advance(args, ROOT)
+
+    assert inner_skip_args == [set(), {"fold-a"}]
+    # fold-a aggregated on the first pass only; the second reuses selection.json.
+    assert aggregate_calls == ["fold-a"]
 
 
 def test_advance_submits_refit_once_selected(monkeypatch, tmp_path, capsys):

@@ -104,6 +104,19 @@ local aggregation, then banded refits) and prints the exact next command:
       --config configs/adjacent_mlmdp_regression.json \
       --output-dir output/adjacent_mlmdp_regression/production
 
+`--output-dir` is optional: omitting it defaults to
+`output/adjacent_mlmdp_regression/<config filename without .json>`, so two
+different config files never default to the same directory and silently
+collide (an earlier version defaulted to one fixed `production` path
+regardless of which config was used, which let a throwaway test config's
+manifest strand a real run). `--run-id` is independent of `--output-dir` and
+may be reused or varied freely for runs that share the same config/output
+directory. If a manifest ever does legitimately refuse to load because a
+*different* config was previously prepared into the same output directory,
+the error names the exact fix: pass a different `--output-dir` for this
+config, or back up and remove the existing `manifest.json` (and `folds/`, if
+its contents are disposable) and rerun `prepare`.
+
 It creates the scientific fold manifest automatically, discovers or reuses
 compatible NMF bases (an explicit `discovery_dir` in the config is reused
 as-is; otherwise it defaults to and caches under
@@ -125,6 +138,25 @@ top-level `"slurm"` object in the config (see
 the bands and defaults documented below. Pass `--dry-run` to preview the next
 submission without touching SLURM, and `--cancel-held` to release
 administrator-held array elements before retrying.
+
+A band whose task count exceeds the cluster's `--array=0-N` ceiling
+(`MaxArraySize` in `slurm.conf`; independent of the `%concurrency` throttle)
+is submitted as multiple sequential array jobs rather than one oversized
+`sbatch` call that SLURM would reject outright. The ceiling defaults to
+10,000 and is configurable via `"slurm": {"max_array_size": N}`; each
+resulting sub-array still uses local `0..N-1` indices into its own immutable
+task-list file, named with a `_partXofY` suffix when a band is split.
+
+Every invocation re-derives pipeline state from the artifacts on disk, which
+for a production run means classifying tens of thousands of inner-fit shards.
+To keep reruns cheap the manager (1) parses each inner shard at most once per
+invocation, handing the aggregation pass its in-memory copy instead of reading
+every shard a second time, and (2) records in the orchestration manifest which
+outer folds have a fully terminal inner stage, keyed by a fingerprint of the
+config content, the worker/model source, and the ineligible-rank set. On the
+next run those folds' shards are not touched at all — their `selection.json`
+is reused directly. Any change to that fingerprint discards the record and
+forces a full rescan, so the fast path can never serve a stale selection.
 
 Every invocation opens with a colored pipeline overview (discovery, inner
 fits, rank selection, refits, final command) showing each stage as done

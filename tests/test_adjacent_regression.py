@@ -454,3 +454,87 @@ def test_inner_input_failure_remains_operational(tmp_path, monkeypatch):
 
     assert result["status"] == "operational_failure"
     assert result["stage"] == "load_inputs"
+
+
+def _manifest_fold(session_ids, *, subject_id="m2", fold_index=0):
+    identity = _Identity(
+        {
+            "maze_id": 1,
+            "subject_id": subject_id,
+            "regression_training_session_ids": ["regression"],
+            "validation_session_id": "validation",
+            "route_training_session_ids": list(session_ids),
+        }
+    )
+    return SimpleNamespace(
+        identity=lambda maze_id: identity,
+        route_training_session_ids=list(session_ids),
+        fold_index=fold_index,
+    )
+
+
+def test_write_adjacent_manifest_reuses_existing_when_only_source_differs(
+    tmp_path, monkeypatch
+):
+    config = _worker_config(tmp_path)
+    folds = [_manifest_fold(["route-a", "route-b"])]
+    output = tmp_path / "output"
+
+    monkeypatch.setattr(adjacent, "source_code_fingerprint", lambda *a, **k: "old-sha")
+    first = adjacent.write_adjacent_manifest(
+        config, output, folds=folds, canonical_signature="canon"
+    )
+    assert first["source"] == "old-sha"
+
+    # Simulate an unrelated code edit changing the fingerprint: everything
+    # this manifest actually describes (folds/config/data) is unchanged.
+    monkeypatch.setattr(adjacent, "source_code_fingerprint", lambda *a, **k: "new-sha")
+    second = adjacent.write_adjacent_manifest(
+        config, output, folds=folds, canonical_signature="canon"
+    )
+
+    assert second["source"] == "new-sha"
+    assert second["folds"] == first["folds"]
+    on_disk = json.loads((output / "manifest.json").read_text())
+    assert on_disk["source"] == "new-sha"
+
+
+def test_write_adjacent_manifest_rejects_when_folds_actually_differ(
+    tmp_path, monkeypatch
+):
+    config = _worker_config(tmp_path)
+    output = tmp_path / "output"
+    monkeypatch.setattr(adjacent, "source_code_fingerprint", lambda *a, **k: "sha")
+
+    adjacent.write_adjacent_manifest(
+        config,
+        output,
+        folds=[_manifest_fold(["route-a", "route-b"])],
+        canonical_signature="canon",
+    )
+
+    with pytest.raises(ValueError, match="Refusing to overwrite incompatible"):
+        adjacent.write_adjacent_manifest(
+            config,
+            output,
+            folds=[_manifest_fold(["route-a", "route-c"])],
+            canonical_signature="canon",
+        )
+
+
+def test_write_adjacent_manifest_rejects_when_canonical_signature_differs(
+    tmp_path, monkeypatch
+):
+    config = _worker_config(tmp_path)
+    output = tmp_path / "output"
+    folds = [_manifest_fold(["route-a", "route-b"])]
+    monkeypatch.setattr(adjacent, "source_code_fingerprint", lambda *a, **k: "sha")
+
+    adjacent.write_adjacent_manifest(
+        config, output, folds=folds, canonical_signature="canon-1"
+    )
+
+    with pytest.raises(ValueError, match="Refusing to overwrite incompatible"):
+        adjacent.write_adjacent_manifest(
+            config, output, folds=folds, canonical_signature="canon-2"
+        )
