@@ -187,6 +187,9 @@ class AdamValidationConfig:
     initialization_count: int = 1
     initialization_seed: int = 123
     future_restart_log_scale: float = 0.45
+    goal_reward_mode: Literal["inpainted", "fixed", "deferred"] = "inpainted"
+    commitment_mode: Literal["termination", "radius", "both"] = "termination"
+    commitment_radius: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fitted_names", tuple(self.fitted_names))
@@ -228,6 +231,29 @@ class AdamValidationConfig:
             self.future_restart_log_scale <= 0.0
         ):
             raise ValueError("future_restart_log_scale must be finite and positive")
+        if self.goal_reward_mode not in ("inpainted", "fixed", "deferred"):
+            raise ValueError(
+                "goal_reward_mode must be 'inpainted', 'fixed', or 'deferred'"
+            )
+        if self.commitment_mode not in ("termination", "radius", "both"):
+            raise ValueError(
+                "commitment_mode must be 'termination', 'radius', or 'both'"
+            )
+        if self.commitment_mode == "termination":
+            if self.commitment_radius is not None:
+                raise ValueError(
+                    "commitment_radius must be None when commitment_mode is "
+                    "'termination'"
+                )
+        elif (
+            isinstance(self.commitment_radius, bool)
+            or not isinstance(self.commitment_radius, int)
+            or self.commitment_radius < 0
+        ):
+            raise ValueError(
+                "commitment_radius must be a non-negative integer when "
+                "commitment_mode is 'radius' or 'both'"
+            )
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1119,9 @@ def _initial_template(
     probe_template = environment.hierarchy(
         probe_basis,
         parameters=soft_parameters(k, **probe_values),
+        goal_reward_mode=config.adam.goal_reward_mode,
+        commitment_mode=config.adam.commitment_mode,
+        commitment_radius=config.adam.commitment_radius,
     )
     threshold_range = probe_template.threshold_range(goals)
     threshold_cap = float(threshold_range.maximum)
@@ -1120,6 +1149,9 @@ def _initial_template(
     template = environment.hierarchy(
         basis,
         parameters=soft_parameters(k, **values),
+        goal_reward_mode=config.adam.goal_reward_mode,
+        commitment_mode=config.adam.commitment_mode,
+        commitment_radius=config.adam.commitment_radius,
     )
     return template, threshold_range, values
 
@@ -1149,6 +1181,9 @@ def _fitted_template(
         task_library=initial_template.task_library,
         composition_exponent=initial_template.composition_exponent,
         composition_mode=initial_template.composition_mode,
+        goal_reward_mode=initial_template.goal_reward_mode,
+        commitment_mode=initial_template.commitment_mode,
+        commitment_radius=initial_template.commitment_radius,
     )
 
 

@@ -191,6 +191,56 @@ def test_initial_core_threshold_fraction_must_be_strictly_between_zero_and_one(
         validation.AdamValidationConfig(initial_core_threshold_fraction=fraction)
 
 
+def test_adam_config_validates_goal_reward_mode():
+    with pytest.raises(ValueError, match="goal_reward_mode"):
+        validation.AdamValidationConfig(goal_reward_mode="invalid")
+
+    config = validation.AdamValidationConfig(goal_reward_mode="deferred")
+    assert config.goal_reward_mode == "deferred"
+
+
+def test_adam_config_validates_commitment_mode_and_radius_together():
+    with pytest.raises(ValueError, match="commitment_mode"):
+        validation.AdamValidationConfig(commitment_mode="invalid")
+    with pytest.raises(ValueError, match="commitment_radius must be None"):
+        validation.AdamValidationConfig(commitment_radius=2)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        validation.AdamValidationConfig(
+            commitment_mode="radius", commitment_radius=None
+        )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        validation.AdamValidationConfig(
+            commitment_mode="radius", commitment_radius=-1
+        )
+
+    default = validation.AdamValidationConfig()
+    assert default.commitment_mode == "termination"
+    assert default.commitment_radius is None
+
+    radius = validation.AdamValidationConfig(
+        commitment_mode="both", commitment_radius=3
+    )
+    assert radius.commitment_mode == "both"
+    assert radius.commitment_radius == 3
+
+
+def test_commitment_settings_change_the_sweep_signature(tmp_path):
+    from dataclasses import replace
+
+    baseline = _config(tmp_path)
+    changed = replace(
+        baseline,
+        adam=replace(
+            baseline.adam,
+            goal_reward_mode="deferred",
+            commitment_mode="radius",
+            commitment_radius=1,
+        ),
+    )
+
+    assert baseline.sweep_signature != changed.sweep_signature
+
+
 def test_source_fingerprint_changes_with_dirty_source(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")

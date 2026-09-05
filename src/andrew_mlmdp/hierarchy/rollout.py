@@ -313,6 +313,50 @@ def _run_rollout(
         )
     ]
 
+    commitment_radius = model.template.commitment_radius
+    goal_distances = (
+        model.maze.distances_from(model.goal)
+        if commitment_radius is not None
+        else None
+    )
+
+    def maybe_commit_by_radius() -> None:
+        nonlocal current_plan, hierarchy_disabled
+        if (
+            hierarchy_disabled
+            or goal_distances is None
+            or goal_distances[current] > commitment_radius
+        ):
+            return
+        hierarchy_disabled = True
+        current_plan = _goal_only_plan(
+            model,
+            current,
+            goal_desirability=goal_desirability,
+        )
+        events.append(
+            RolloutEvent(
+                event="commitment_radius",
+                coordinate=current,
+                trajectory=tuple(trajectory),
+                plan=current_plan,
+                entered_state=None,
+                physical_steps=physical_steps,
+                abstract_accesses=len(upper_transitions),
+                passive_access=None,
+                policy_access=None,
+                refractory=True,
+                goal_desirability=(
+                    None
+                    if goal_desirability is None
+                    else goal_desirability.copy()
+                ),
+                z_iterations=z_iterations,
+            )
+        )
+
+    maybe_commit_by_radius()
+
     def finish(status: str, reached_goal: bool = False) -> _EngineResult:
         if not (
             events
@@ -421,6 +465,7 @@ def _run_rollout(
                     z_iterations=z_iterations,
                 )
             )
+            maybe_commit_by_radius()
             continue
 
         boundary_state = next_state - n_interior
@@ -491,8 +536,10 @@ def _run_rollout(
             )
         )
 
-        terminal_probability = float(
-            model.upper_controlled[-1, entered_state]
+        terminal_probability = (
+            0.0
+            if model.template.commitment_mode == "radius"
+            else float(model.upper_controlled[-1, entered_state])
         )
         terminated = random_generator.random() < terminal_probability
         transition = _UpperTransition(

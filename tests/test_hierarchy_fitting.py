@@ -20,7 +20,7 @@ from andrew_mlmdp.hierarchy.fitting import (
 )
 
 
-def _template(*, threshold=0.2):
+def _template(*, threshold=0.2, goal_reward_mode="inpainted"):
     maze = Maze.from_ascii("......")
     basis = SubgoalBasis.from_profiles(
         maze,
@@ -47,7 +47,11 @@ def _template(*, threshold=0.2):
         core_threshold=0.75,
         core_exponent=2.0,
     )
-    return Environment(maze).hierarchy(basis, parameters=parameters)
+    return Environment(maze).hierarchy(
+        basis,
+        parameters=parameters,
+        goal_reward_mode=goal_reward_mode,
+    )
 
 
 def _trials():
@@ -248,6 +252,68 @@ def test_selected_gradients_are_finite_and_frozen_values_do_not_change():
     best = result.best_values.as_floats()
     for name in initial.keys() - set(result.names):
         assert best[name] == initial[name]
+
+
+def test_deferred_goal_reward_mode_has_finite_fitting_gradients():
+    # ``goal_reward_mode="deferred"`` builds the goal boundary's target
+    # desirability directly as a hard zero rather than through
+    # ``exp(-inf / lower_control_cost)``, which would backprop a ``0 * inf``
+    # NaN into every parameter dividing the reward vector.
+    template = _template(goal_reward_mode="deferred")
+    result = fit_parameters(
+        template,
+        _trials(),
+        names=("alpha", "beta", "lower_control_cost", "upper_control_cost"),
+        max_steps=3,
+        patience=20,
+    )
+    assert result.best_values is not None
+    assert all(
+        np.isfinite(gradient)
+        for evaluation in result.history
+        for gradient in evaluation.gradients.values()
+    )
+
+
+def test_commitment_radius_prevents_deferred_nonfinite_loss_abort():
+    # A trajectory whose final step goes straight into the goal from a
+    # non-subgoal state has exactly zero probability under
+    # ``goal_reward_mode="deferred"`` alone (no access is possible away from
+    # a subgoal coordinate), which drives the loss to +inf and aborts the
+    # fit with ``reason="nonfinite_loss"`` -- the exact condition that later
+    # crashes a JSON cache writer that does not tolerate non-finite history
+    # entries. ``commitment_mode="radius"`` must prevent that abort by
+    # routing states near the goal through the exact goal-only policy.
+    maze = Maze.from_ascii("......")
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    parameters = Parameters(goal_reward=0.4, beta=0.7)
+    trials = (Trial("s", 1, (0, 5), ((0, 4), (0, 5))),)
+
+    deferred = Environment(maze).hierarchy(
+        basis, parameters=parameters, goal_reward_mode="deferred"
+    )
+    aborted = fit_parameters(
+        deferred, trials, names=("alpha", "beta"), max_steps=5, patience=20
+    )
+    assert aborted.reason == "nonfinite_loss"
+
+    committed = Environment(maze).hierarchy(
+        basis,
+        parameters=parameters,
+        goal_reward_mode="deferred",
+        commitment_mode="radius",
+        commitment_radius=1,
+    )
+    result = fit_parameters(
+        committed, trials, names=("alpha", "beta"), max_steps=5, patience=20
+    )
+    assert result.reason != "nonfinite_loss"
+    assert result.best_values is not None
+    assert all(
+        np.isfinite(gradient)
+        for evaluation in result.history
+        for gradient in evaluation.gradients.values()
+    )
 
 
 def test_zero_step_and_singleton_dataset_have_explicit_behavior():

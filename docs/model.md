@@ -338,6 +338,51 @@ multiplies the single-boundary upper and goal-only desirabilities by a common
 factor. Column normalization cancels that factor, so `goal_reward` does not
 change upper termination, the goal-only policy, or trajectory likelihood.
 
+`goal_reward_mode` on `Environment.hierarchy` (or `Template`) changes this one
+step, for the terminal physical-goal entry of `r^1_t` only. Its default,
+`"inpainted"`, is the paper's original construction above. `"fixed"` holds
+that entry at the constant `goal_reward` gauge instead of
+`\beta\,(u^2 - p^2)`, so abstract control reshapes only the `k` subgoal
+boundary rewards; the composed policy can still reach the goal directly at
+any time, just not reactively to the abstract policy. `"deferred"` holds that
+entry at `-\infty` instead, so its target desirability is exactly zero and the
+composed pre-termination policy cannot reach the goal directly at all — the
+`k+1`-th task-basis column (the goal's own precomputed policy) contributes
+nothing to `z_i^1` until upper termination fires. In every mode, upper
+termination itself is unaffected: `model.upper_controlled[-1, :]` is still
+solved from the real `goal_reward`/`interior_reward`/`upper_control_cost` at
+the abstract level ([`_solve_upper`](../src/andrew_mlmdp/hierarchy/equations.py)),
+and firing it still installs the exact goal-only policy via
+[`_goal_only_plan`](../src/andrew_mlmdp/hierarchy/equations.py) exactly as
+before. Everything else downstream (pseudoinverse, clipping,
+`composition_exponent`) is unchanged; `"fixed"` and `"deferred"` both alter
+`z_target`, the composed weights, and trajectory likelihood, so fits must be
+re-run when the mode is changed. Under `"deferred"`, every trajectory's
+approach to the goal must be explainable through a (possibly latent) subgoal
+access followed by upper termination — a trajectory that reaches the goal
+with no plausible nearby subgoal access will score poorly (indeed, with no
+subgoal reachable from a state at all, it scores exactly zero, since no
+access event exists through which upper termination could ever fire).
+
+`commitment_mode`/`commitment_radius` on `Environment.hierarchy` (or
+`Template`) control *when* upper termination's exact goal-only policy is
+installed, independent of `goal_reward_mode`. The default, `"termination"`
+(with `commitment_radius=None`), is exactly the mechanism above: the only
+trigger is the stochastic draw at a subgoal access,
+`upper_controlled[-1, entered_state]`. `"radius"` disables that draw
+entirely (it is forced to zero everywhere it is read — `_solve_upper` itself,
+and hence the abstract layer, is untouched) and instead installs the exact
+goal-only policy unconditionally whenever the agent's physical state is
+within `commitment_radius` grid steps of the goal, regardless of subgoal
+access. `"both"` keeps the termination draw active and applies the radius
+check on top of it. `commitment_radius` is a grid-searched integer, not a
+fitted parameter — it has no gradient and must be swept manually. Combining
+`commitment_mode="radius"` with `goal_reward_mode="deferred"` makes
+`"deferred"` well-posed for arbitrary trajectories: since a state one grid
+step from the goal is within any radius `>= 1`, the final approach into the
+goal is always scored by the exact goal-only policy, never by the composed
+mixture whose direct-to-goal weight `"deferred"` zeroes.
+
 Second, the target is expressed in the reusable task basis:
 
 ```math

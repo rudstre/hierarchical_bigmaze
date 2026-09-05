@@ -135,6 +135,57 @@ def test_likelihood_sums_direct_and_latent_access_routes():
     assert kernel[next_state, 1:, 0].sum() > 0.0
 
 
+def test_commitment_radius_rescues_deferred_direct_approach_from_negative_infinity():
+    # Under ``goal_reward_mode="deferred"`` alone, a step straight into the
+    # goal from a non-subgoal state has exactly zero probability (no access
+    # is even possible away from a subgoal coordinate, so the only route to
+    # the goal -- direct continuation -- is the one ``"deferred"`` zeroes).
+    # ``commitment_mode="radius"`` should make that step scoreable again by
+    # routing states near the goal through the exact goal-only policy
+    # regardless of subgoal access.
+    maze = Maze.from_ascii("......")
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    parameters = Parameters(goal_reward=0.4, beta=0.7)
+    goal = (0, 5)
+    trajectory = ((0, 4), (0, 5))
+
+    deferred = (
+        Environment(maze)
+        .hierarchy(basis, parameters=parameters, goal_reward_mode="deferred")
+        .task(goal)
+    )
+    assert deferred.log_likelihood(trajectory) == -np.inf
+
+    for commitment_mode in ("radius", "both"):
+        committed = (
+            Environment(maze)
+            .hierarchy(
+                basis,
+                parameters=parameters,
+                goal_reward_mode="deferred",
+                commitment_mode=commitment_mode,
+                commitment_radius=1,
+            )
+            .task(goal)
+        )
+        assert np.isfinite(committed.log_likelihood(trajectory))
+
+    # Outside the radius, a direct approach from a non-subgoal state is
+    # still impossible -- the radius only forces commitment near the goal.
+    far_committed = (
+        Environment(maze)
+        .hierarchy(
+            basis,
+            parameters=parameters,
+            goal_reward_mode="deferred",
+            commitment_mode="radius",
+            commitment_radius=0,
+        )
+        .task(goal)
+    )
+    assert far_committed.log_likelihood(trajectory) == -np.inf
+
+
 def test_distributed_likelihood_regressions():
     reference = _regression()
     ungated = _likelihood_task()

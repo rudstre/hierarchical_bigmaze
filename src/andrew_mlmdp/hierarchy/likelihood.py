@@ -38,6 +38,8 @@ class _PreparedGoal:
     closure_start_indices: Tensor
     closure_shared_indices: Tensor
     closure_x_interior: Tensor
+    shared_within_radius: Tensor
+    closure_within_radius: Tensor
 
 
 @dataclass(frozen=True)
@@ -165,6 +167,19 @@ def prepare_batch(
                 maze.state_index(coordinate): index
                 for index, coordinate in enumerate(template.basis.locations)
             }
+        if template.commitment_radius is None:
+            shared_within_radius = tuple(False for _ in shared_states)
+            closure_within_radius = tuple(False for _ in closures)
+        else:
+            distances = maze.distances_from(goal)
+            shared_within_radius = tuple(
+                distances[maze.coordinate(state)] <= template.commitment_radius
+                for state in shared_states
+            )
+            closure_within_radius = tuple(
+                distances[maze.coordinate(current)] <= template.commitment_radius
+                for _, current in closures
+            )
         goal_metadata.append(
             _PreparedGoal(
                 goal=goal,
@@ -187,6 +202,8 @@ def prepare_batch(
                 closure_x_interior=_long(
                     (interior_by_state[current] for _, current in closures), device
                 ),
+                shared_within_radius=_bool(shared_within_radius, device),
+                closure_within_radius=_bool(closure_within_radius, device),
             )
         )
         shared_offset += len(shared_states)
@@ -239,6 +256,10 @@ def prepare_batch(
 
 def _long(values, device: torch.device) -> Tensor:
     return torch.tensor(tuple(values), dtype=torch.long, device=device)
+
+
+def _bool(values, device: torch.device) -> Tensor:
+    return torch.tensor(tuple(values), dtype=torch.bool, device=device)
 
 
 def prepared_log_likelihoods(
@@ -347,6 +368,7 @@ def _prepared_log_likelihoods(
                 initial_policies,
                 continuation_after_access,
                 goal_after_access,
+                goal_policy,
                 projection,
             )
         )
@@ -747,7 +769,12 @@ def _shared_column_bank(
     goal_after_access = goal_policy[:, access_interior].permute(1, 2, 0)
     goal_after_access = _suppressed_physical(goal_after_access, projection)
 
-    termination = model.upper_controlled[-1, :n_subtasks]
+    if model.template.commitment_mode == "radius":
+        termination = torch.zeros(
+            n_subtasks, dtype=model.dtype, device=model.device
+        )
+    else:
+        termination = model.upper_controlled[-1, :n_subtasks]
     continuation = torch.einsum(
         "xqj,xjn,j->xnjq",
         access,
@@ -778,6 +805,11 @@ def _shared_column_bank(
     )
     goal_source[:, :, -1] = goal_at_x
     shared = torch.cat((enabled, goal_source.unsqueeze(-1)), dim=-1)
+    if model.template.commitment_radius is not None:
+        override = torch.zeros_like(shared)
+        override[:, :, -1, :] = goal_at_x.unsqueeze(-1)
+        mask = metadata.shared_within_radius.view(-1, 1, 1, 1)
+        shared = torch.where(mask, override, shared)
     return shared, continuation_after_access, goal_after_access
 
 
@@ -787,6 +819,7 @@ def _initial_column_bank(
     initial_policies: Tensor,
     continuation_after_access: Tensor,
     goal_after_access: Tensor,
+    goal_policy: Tensor,
     projection: Tensor,
 ) -> Tensor:
     n_subtasks = model.n_subtasks
@@ -800,7 +833,12 @@ def _initial_column_bank(
     access = probabilities[:, n_interior : n_interior + n_subtasks]
     continuation_physical = continuation_after_access[metadata.closure_shared_indices]
     goal_physical = goal_after_access[metadata.closure_shared_indices]
-    termination = model.upper_controlled[-1, :n_subtasks]
+    if model.template.commitment_mode == "radius":
+        termination = torch.zeros(
+            n_subtasks, dtype=model.dtype, device=model.device
+        )
+    else:
+        termination = model.upper_controlled[-1, :n_subtasks]
     continuation = torch.einsum(
         "cj,cjn,j->cnj",
         access,
@@ -808,7 +846,15 @@ def _initial_column_bank(
         1.0 - termination,
     )
     goal = torch.einsum("cj,cjn,j->cn", access, goal_physical, termination)
-    return torch.cat((direct.unsqueeze(2), continuation, goal.unsqueeze(2)), dim=2)
+    output = torch.cat((direct.unsqueeze(2), continuation, goal.unsqueeze(2)), dim=2)
+    if model.template.commitment_radius is not None:
+        goal_at_closure_x = goal_policy[:, metadata.closure_x_interior].T
+        goal_at_closure_x = _suppressed_physical(goal_at_closure_x, projection)
+        override = torch.zeros_like(output)
+        override[:, :, -1] = goal_at_closure_x
+        mask = metadata.closure_within_radius.view(-1, 1, 1)
+        output = torch.where(mask, override, output)
+    return output
 
 
 def _batched_departure_closures(self_kernels: Tensor) -> Tensor:

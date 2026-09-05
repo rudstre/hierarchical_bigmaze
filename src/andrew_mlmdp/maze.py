@@ -176,6 +176,25 @@ class Maze:
 
         return reached
 
+    def distances_from(self, start: Coordinate) -> dict[Coordinate, int]:
+        """Return BFS step-distances from ``start`` to every reachable free cell."""
+
+        if not self.is_free(start):
+            raise ValueError(f"Coordinate {start} is not a free cell")
+
+        distances = {start: 0}
+        cells_to_visit = deque([start])
+
+        while cells_to_visit:
+            coordinate = cells_to_visit.popleft()
+            for command in ("north", "south", "east", "west"):
+                neighbour = self.command_outcome(coordinate, command)
+                if neighbour not in distances:
+                    distances[neighbour] = distances[coordinate] + 1
+                    cells_to_visit.append(neighbour)
+
+        return distances
+
     def to_ascii(self) -> str:
         """Return the normalized source layout."""
 

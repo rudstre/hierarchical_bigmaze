@@ -282,6 +282,37 @@ def test_task_library_and_composition_configuration_validate_against_basis():
         environment.hierarchy(basis, composition_mode="invalid")
 
 
+def test_commitment_mode_and_radius_validate_together():
+    maze = Maze.from_ascii(".....")
+    environment = Environment(maze)
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+
+    with pytest.raises(ValueError, match="commitment_mode"):
+        environment.hierarchy(basis, commitment_mode="invalid")
+    with pytest.raises(ValueError, match="commitment_radius must be None"):
+        environment.hierarchy(basis, commitment_radius=2)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        environment.hierarchy(basis, commitment_mode="radius", commitment_radius=None)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        environment.hierarchy(basis, commitment_mode="radius", commitment_radius=-1)
+
+    default = environment.hierarchy(basis)
+    assert default.commitment_mode == "termination"
+    assert default.commitment_radius is None
+
+    radius = environment.hierarchy(
+        basis, commitment_mode="radius", commitment_radius=0
+    )
+    assert radius.commitment_mode == "radius"
+    assert radius.commitment_radius == 0
+
+    both = environment.hierarchy(
+        basis, commitment_mode="both", commitment_radius=3
+    )
+    assert both.commitment_mode == "both"
+    assert both.commitment_radius == 3
+
+
 def test_threshold_range_reports_all_limiting_goal_subgoal_pairs():
     maze = Maze.from_ascii("....")
     profiles = np.asarray(
@@ -650,6 +681,77 @@ def test_plan_inpaints_and_exactly_composes_canonical_boundary():
     assert plan.desirability.shape == (5,)
     assert plan.lower_policy.shape == (7, 4)
     assert np.allclose(plan.lower_policy.sum(axis=0), 1.0)
+
+
+def test_goal_reward_mode_fixed_pins_goal_boundary_and_only_reshapes_subgoals():
+    maze = Maze.from_ascii(".....")
+    environment = Environment(maze)
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    parameters = Parameters(goal_reward=0.4, beta=0.7)
+    inpainted = environment.hierarchy(basis, parameters=parameters).task((0, 4))
+    pinned = environment.hierarchy(
+        basis,
+        parameters=parameters,
+        goal_reward_mode="fixed",
+    ).task((0, 4))
+
+    for upper_state in (None, 0, 1):
+        free_plan = inpainted.plan((0, 0), upper_state=upper_state)
+        pinned_plan = pinned.plan((0, 0), upper_state=upper_state)
+
+        subgoal_inpaint = parameters.beta.item() * (
+            pinned_plan.upper_policy - pinned_plan.upper_passive
+        )
+        # Subgoal boundary rewards are still inpainted as usual.
+        assert pinned_plan.rewards[:-1] == pytest.approx(subgoal_inpaint[:-1])
+        # The physical-goal boundary keeps the constant gauge instead.
+        assert pinned_plan.rewards[-1] == pytest.approx(parameters.goal_reward.item())
+        assert free_plan.rewards[-1] != pytest.approx(parameters.goal_reward.item())
+        # The abstract layer itself is untouched; only Layer-1 composition changes.
+        assert pinned_plan.upper_policy == pytest.approx(free_plan.upper_policy)
+        assert not np.allclose(pinned_plan.lower_policy, free_plan.lower_policy)
+        assert np.allclose(pinned_plan.lower_policy.sum(axis=0), 1.0)
+
+    trajectory = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4))
+    assert np.isfinite(pinned.log_likelihood(trajectory))
+
+
+def test_goal_reward_mode_deferred_excludes_goal_policy_before_termination():
+    maze = Maze.from_ascii(".....")
+    environment = Environment(maze)
+    basis = SubgoalBasis.from_locations(maze, ((0, 1), (0, 3)))
+    parameters = Parameters(goal_reward=0.4, beta=0.7)
+    inpainted = environment.hierarchy(basis, parameters=parameters).task((0, 4))
+    deferred = environment.hierarchy(
+        basis,
+        parameters=parameters,
+        goal_reward_mode="deferred",
+    ).task((0, 4))
+
+    n_interior = len(deferred.interior_states)
+    goal_boundary_row = n_interior + deferred.n_subtasks
+    goal_state = deferred.maze.state_index((0, 4))
+
+    for upper_state in (None, 0, 1):
+        free_plan = inpainted.plan((0, 0), upper_state=upper_state)
+        deferred_plan = deferred.plan((0, 0), upper_state=upper_state)
+
+        assert np.isneginf(deferred_plan.rewards[-1])
+        # The goal's own task-basis column contributes nothing to z_i^1...
+        assert deferred_plan.weights[-1] == 0.0
+        assert deferred_plan.desirability[goal_state] == 0.0
+        # ...so the composed policy can never jump straight to the goal.
+        assert np.all(deferred_plan.lower_policy[goal_boundary_row, :] == 0.0)
+        assert np.allclose(deferred_plan.lower_policy.sum(axis=0), 1.0)
+        # The abstract layer (and hence upper-termination probabilities) is
+        # completely unaffected.
+        assert deferred_plan.upper_policy == pytest.approx(free_plan.upper_policy)
+        assert deferred_plan.upper_passive == pytest.approx(free_plan.upper_passive)
+
+    # A trajectory that passes through the subgoals stays explainable purely
+    # via latent subgoal accesses followed by upper termination.
+    trajectory = ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4))
+    assert np.isfinite(deferred.log_likelihood(trajectory))
 
 
 def test_goal_only_plan_keeps_fixed_exact_goal_task():

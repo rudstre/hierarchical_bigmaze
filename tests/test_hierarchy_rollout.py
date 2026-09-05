@@ -89,3 +89,48 @@ def test_online_learning_can_continue_across_episodes():
     assert second.goal_desirability_history[0] == pytest.approx(initial)
     assert second.goal_desirability_history[0] is not initial
 
+
+def _radius_task(*, commitment_mode="radius", commitment_radius=1):
+    maze = Maze.from_ascii("......")
+    return Environment(maze).hierarchy(
+        SubgoalBasis.from_locations(maze, ((0, 1), (0, 3))),
+        parameters=Parameters(goal_reward=0.4, beta=0.7),
+        commitment_mode=commitment_mode,
+        commitment_radius=commitment_radius,
+    ).task((0, 5))
+
+
+def test_commitment_radius_installs_goal_only_policy_immediately_when_already_close():
+    task = _radius_task()
+    rollout = task.rollout((0, 4), seed=0, max_steps=50)
+
+    assert rollout.reached_goal
+    commitment_events = [
+        event for event in rollout.events if event.event == "commitment_radius"
+    ]
+    assert len(commitment_events) == 1
+    assert commitment_events[0].physical_steps == 0
+    assert not any(event.event == "upper_termination" for event in rollout.events)
+
+
+def test_commitment_radius_fires_once_the_agent_moves_close_enough():
+    task = _radius_task()
+    rollout = task.rollout((0, 0), seed=2, max_steps=50)
+
+    assert rollout.reached_goal
+    commitment_events = [
+        event for event in rollout.events if event.event == "commitment_radius"
+    ]
+    assert len(commitment_events) == 1
+    assert commitment_events[0].physical_steps > 0
+    # "radius" mode disables the stochastic termination draw entirely, so no
+    # subgoal access can ever install the goal-only policy on its own.
+    assert not any(event.event == "upper_termination" for event in rollout.events)
+    # Once committed, the agent takes no further latent subgoal accesses.
+    commitment_step = commitment_events[0].physical_steps
+    assert not any(
+        event.event in {"lower_access", "upper_command"}
+        and event.physical_steps > commitment_step
+        for event in rollout.events
+    )
+

@@ -421,6 +421,9 @@ def _template_with_values(
         task_library=template.task_library,
         composition_exponent=template.composition_exponent,
         composition_mode=template.composition_mode,
+        goal_reward_mode=template.goal_reward_mode,
+        commitment_mode=template.commitment_mode,
+        commitment_radius=template.commitment_radius,
     )
 
 
@@ -450,6 +453,9 @@ def _cache_specification(
         "profile_normalization": basis.profile_normalization,
         "composition_exponent": template.composition_exponent,
         "composition_mode": template.composition_mode,
+        "goal_reward_mode": template.goal_reward_mode,
+        "commitment_mode": template.commitment_mode,
+        "commitment_radius": template.commitment_radius,
         "trials": [
             {
                 "session_id": trial.session_id,

@@ -36,7 +36,12 @@ def _parameters(**overrides):
     return Parameters(**values)
 
 
-def _gated_template(profile_normalization="peak"):
+def _gated_template(
+    profile_normalization="peak",
+    *,
+    commitment_mode="termination",
+    commitment_radius=None,
+):
     maze = Maze.from_ascii("......")
     profiles = np.asarray(
         [
@@ -58,7 +63,12 @@ def _gated_template(profile_normalization="peak"):
     # These inactive gate fields deliberately disagree with the basis.  The
     # differentiable path must follow the basis definition exactly.
     parameters = _parameters(core_threshold=0.75, core_exponent=2.0)
-    return Environment(maze).hierarchy(basis, parameters=parameters)
+    return Environment(maze).hierarchy(
+        basis,
+        parameters=parameters,
+        commitment_mode=commitment_mode,
+        commitment_radius=commitment_radius,
+    )
 
 
 def _tensor_values(template, *, requires_grad=False):
@@ -568,10 +578,23 @@ def test_prepared_batch_does_not_reuse_parameter_dependent_graphs():
     assert second_values["alpha"].grad is not None
 
 
-def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts():
+@pytest.mark.parametrize(
+    "commitment_mode,commitment_radius",
+    [
+        ("termination", None),
+        ("radius", 3),
+        ("both", 3),
+    ],
+)
+def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts(
+    commitment_mode, commitment_radius
+):
     from andrew_mlmdp.hierarchy import likelihood as batch_module
 
-    template = _gated_template()
+    template = _gated_template(
+        commitment_mode=commitment_mode,
+        commitment_radius=commitment_radius,
+    )
     goal = (0, 5)
     trials = (
         Trial("s", 1, goal, ((0, 0), (0, 1), (0, 2))),
@@ -614,6 +637,7 @@ def test_vectorized_complete_kernel_assembly_matches_reference_for_all_contexts(
         initial,
         continuation_after_access,
         goal_after_access,
+        goal_policy,
         projection,
     )
 

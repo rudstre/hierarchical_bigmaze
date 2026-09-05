@@ -471,7 +471,17 @@ def _plan_composition(
     boundary_pinv: Tensor | None = None,
     beta: float | Tensor | None = None,
 ) -> _Composition:
-    """Inpaint and compose one plan or a bank along the final axis."""
+    """Inpaint and compose one plan or a bank along the final axis.
+
+    ``template.goal_reward_mode`` controls the terminal physical-goal entry of
+    the inpainted reward vector. ``"inpainted"`` (default) leaves it as the
+    abstract probability-difference term like every subgoal boundary.
+    ``"fixed"`` replaces it with the constant ``goal_reward`` gauge, so
+    abstract control reshapes only the subgoal boundary rewards. ``"deferred"``
+    replaces it with ``-inf`` (zero weight), so the composed policy cannot
+    reach the goal directly at all before upper termination installs the
+    exact goal-only plan.
+    """
 
     inpainting_scale = (
         model.parameter_values["beta"]
@@ -481,7 +491,42 @@ def _plan_composition(
     if not bool(torch.isfinite(inpainting_scale) & (inpainting_scale > 0.0)):
         raise ValueError("Beta must be finite and positive")
     rewards = inpainting_scale * (controlled - passive)
-    target = torch.exp(rewards / model.parameter_values["lower_control_cost"])
+    goal_reward_mode = model.template.goal_reward_mode
+    if goal_reward_mode == "fixed":
+        fixed_goal = model.parameter_values["goal_reward"].reshape(()).to(
+            dtype=rewards.dtype,
+            device=rewards.device,
+        )
+        rewards = torch.cat(
+            (rewards[..., :-1], fixed_goal.expand(*rewards.shape[:-1], 1)),
+            dim=-1,
+        )
+        target = torch.exp(rewards / model.parameter_values["lower_control_cost"])
+    elif goal_reward_mode == "deferred":
+        # ``-inf / lower_control_cost`` followed by ``exp`` is 0 in the
+        # forward pass, but its backward pass computes ``0 * inf`` for
+        # lower_control_cost's gradient, which is NaN. Build the target
+        # directly as a hard, non-differentiable zero instead (matching
+        # ``_goal_only_plan``'s pattern), and keep ``-inf`` only in the
+        # reported ``rewards`` field.
+        deferred_goal = torch.full(
+            (*rewards.shape[:-1], 1),
+            float("-inf"),
+            dtype=rewards.dtype,
+            device=rewards.device,
+        )
+        rewards = torch.cat((rewards[..., :-1], deferred_goal), dim=-1)
+        subgoal_target = torch.exp(
+            rewards[..., :-1] / model.parameter_values["lower_control_cost"]
+        )
+        zero_goal_target = torch.zeros(
+            (*rewards.shape[:-1], 1),
+            dtype=rewards.dtype,
+            device=rewards.device,
+        )
+        target = torch.cat((subgoal_target, zero_goal_target), dim=-1)
+    else:
+        target = torch.exp(rewards / model.parameter_values["lower_control_cost"])
     if boundary_pinv is None:
         boundary_pinv = torch.linalg.pinv(
             model.task_basis.boundary_desirability,
@@ -765,8 +810,31 @@ def _physical_step_kernel(
         dtype=model.dtype,
         device=model.device,
     )
+    goal_mode = n_modes - 1
+    goal_only = _rollout_column(
+        plans[goal_mode],
+        current_interior,
+        n_interior,
+        model.n_subtasks,
+        suppress_access=True,
+    )
+    goal_outcome = _physical_outcomes(model, goal_only)
+    commitment_radius = model.template.commitment_radius
+    if commitment_radius is None:
+        within_radius = False
+    else:
+        within_radius = (
+            model.template.maze.distances_from(model.goal)[current]
+            <= commitment_radius
+        )
+
     old_columns = []
     for old_mode in range(model.n_subtasks + 1):
+        if within_radius:
+            outcomes = [zero_physical for _ in range(n_modes)]
+            outcomes[goal_mode] = goal_outcome
+            old_columns.append(torch.stack(outcomes, dim=1))
+            continue
         probabilities = _rollout_column(
             plans[old_mode],
             current_interior,
@@ -794,15 +862,17 @@ def _physical_step_kernel(
                 model.n_subtasks,
                 suppress_access=True,
             )
-            goal_mode = n_modes - 1
-            goal_only = _rollout_column(
+            access_goal_only = _rollout_column(
                 plans[goal_mode],
                 access_interior,
                 n_interior,
                 model.n_subtasks,
                 suppress_access=True,
             )
-            termination = model.upper_controlled[-1, entered_state]
+            if model.template.commitment_mode == "radius":
+                termination = torch.zeros((), dtype=model.dtype, device=model.device)
+            else:
+                termination = model.upper_controlled[-1, entered_state]
             outcomes[continuation_mode] = outcomes[
                 continuation_mode
             ] + access_probability * (1.0 - termination) * _physical_outcomes(
@@ -810,22 +880,13 @@ def _physical_step_kernel(
             )
             outcomes[goal_mode] = outcomes[
                 goal_mode
-            ] + access_probability * termination * _physical_outcomes(model, goal_only)
+            ] + access_probability * termination * _physical_outcomes(
+                model, access_goal_only
+            )
         old_columns.append(torch.stack(outcomes, dim=1))
 
-    goal_mode = n_modes - 1
-    goal_only = _rollout_column(
-        plans[goal_mode],
-        current_interior,
-        n_interior,
-        model.n_subtasks,
-        suppress_access=True,
-    )
     outcomes = [zero_physical for _ in range(n_modes)]
-    outcomes[goal_mode] = outcomes[goal_mode] + _physical_outcomes(
-        model,
-        goal_only,
-    )
+    outcomes[goal_mode] = outcomes[goal_mode] + goal_outcome
     old_columns.append(torch.stack(outcomes, dim=1))
     kernel = torch.stack(old_columns, dim=2)
     _require_finite(kernel)

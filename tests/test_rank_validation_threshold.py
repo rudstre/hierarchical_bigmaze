@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,6 +8,7 @@ from test_rank_validation import _config
 import andrew_mlmdp.lmdp as lmdp
 import andrew_mlmdp.validation as validation
 from andrew_mlmdp.hierarchy.model import SubgoalBasis
+from andrew_mlmdp.validation import AdamValidationConfig
 
 
 class _FakeEnvironment:
@@ -16,8 +18,18 @@ class _FakeEnvironment:
         self.threshold_cap = threshold_cap
         self.calls = []
 
-    def hierarchy(self, basis, *, parameters):
-        self.calls.append((basis, parameters))
+    def hierarchy(
+        self,
+        basis,
+        *,
+        parameters,
+        goal_reward_mode="inpainted",
+        commitment_mode="termination",
+        commitment_radius=None,
+    ):
+        self.calls.append(
+            (basis, parameters, goal_reward_mode, commitment_mode, commitment_radius)
+        )
         return SimpleNamespace(
             threshold_range=lambda goals: SimpleNamespace(
                 maximum=self.threshold_cap,
@@ -67,6 +79,37 @@ def test_initial_template_resolves_fraction_against_small_rank_cap(
     assert environment.calls[0][0].core_threshold == 0.0
     assert environment.calls[1][0].core_threshold == pytest.approx(4e-7)
     assert template is not None
+    # Default config: both hierarchy() calls use the unmodified defaults.
+    for call in environment.calls:
+        assert call[2:] == ("inpainted", "termination", None)
+
+
+def test_initial_template_threads_goal_reward_mode_and_commitment_settings(
+    tmp_path,
+    monkeypatch,
+):
+    _install_template_fakes(monkeypatch)
+    config = replace(
+        _config(tmp_path),
+        adam=AdamValidationConfig(
+            goal_reward_mode="deferred",
+            commitment_mode="radius",
+            commitment_radius=2,
+        ),
+    )
+    environment = _FakeEnvironment(threshold_cap=1e-1)
+
+    validation._initial_template(
+        environment,
+        _rank_result(),
+        config,
+        49,
+        {(0, 1)},
+    )
+
+    assert len(environment.calls) == 2
+    for call in environment.calls:
+        assert call[2:] == ("deferred", "radius", 2)
 
 
 def test_initial_template_rejects_unrepresentable_threshold_domain(

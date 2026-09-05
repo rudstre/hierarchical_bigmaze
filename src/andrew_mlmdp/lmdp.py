@@ -601,6 +601,9 @@ class Environment:
         task_library=None,
         composition_exponent: float = 1.0,
         composition_mode: Literal["power", "winner_take_all"] = "power",
+        goal_reward_mode: Literal["inpainted", "fixed", "deferred"] = "inpainted",
+        commitment_mode: Literal["termination", "radius", "both"] = "termination",
+        commitment_radius: int | None = None,
     ):
         """Create a reusable hierarchy template for a supplied subgoal basis.
 
@@ -609,6 +612,46 @@ class Environment:
         the same one-hot profiles supplied through the distributed API.
         Calibrated soft workflows should pass
         :func:`soft_parameters` explicitly.
+
+        ``goal_reward_mode`` controls how Layer-1 reward inpainting treats the
+        terminal physical-goal boundary, before upper termination:
+
+        - ``"inpainted"`` (default): the goal boundary is inpainted exactly
+          like every subgoal boundary, from the abstract probability-difference
+          term ``beta * (u - p)``. This is the paper's original construction.
+        - ``"fixed"``: the goal boundary keeps the constant ``goal_reward``
+          gauge instead, so the abstract layer reshapes only the subgoal
+          weights. The composed policy can still jump straight to the goal at
+          any time, just not reactively.
+        - ``"deferred"``: the goal boundary's reward is held at ``-inf``
+          (weight exactly zero), so the composed pre-termination policy cannot
+          reach the goal directly at all. The agent can only reach the goal
+          after an upper-termination event fires at a subgoal access, which
+          installs the exact goal-only policy
+          (:func:`andrew_mlmdp.hierarchy.equations._goal_only_plan`). Upper
+          termination itself is unaffected by this setting: it is still
+          solved from the real ``goal_reward``/``interior_reward``/
+          ``upper_control_cost`` at the abstract level.
+
+        ``commitment_mode`` and ``commitment_radius`` control *when* the
+        composed policy is replaced by the exact goal-only policy, i.e. the
+        docs' "upper termination" event:
+
+        - ``"termination"`` (default, ``commitment_radius`` must be
+          ``None``): the only trigger is the existing stochastic
+          upper-termination draw at a subgoal access
+          (``upper_controlled[-1, entered_state]``).
+        - ``"radius"``: the termination draw is disabled entirely (it never
+          fires); instead, whenever the agent's physical state is within
+          ``commitment_radius`` grid steps of the goal, the exact goal-only
+          policy is installed unconditionally, independent of any subgoal
+          access.
+        - ``"both"``: the termination draw stays active and the radius check
+          is applied on top of it, so either can trigger the switch.
+
+        ``commitment_radius`` is a grid-searched integer, not a fitted
+        parameter: it is not differentiable, so it must be swept manually
+        rather than passed to ``Template.fit``.
         """
 
         from andrew_mlmdp.hierarchy import Template
@@ -622,6 +665,9 @@ class Environment:
             task_library=task_library,
             composition_exponent=composition_exponent,
             composition_mode=composition_mode,
+            goal_reward_mode=goal_reward_mode,
+            commitment_mode=commitment_mode,
+            commitment_radius=commitment_radius,
         )
 
 

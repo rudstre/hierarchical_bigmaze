@@ -281,6 +281,9 @@ class Template:
         task_library: TaskLibrary | None = None,
         composition_exponent: float = 1.0,
         composition_mode: Literal["power", "winner_take_all"] = "power",
+        goal_reward_mode: Literal["inpainted", "fixed", "deferred"] = "inpainted",
+        commitment_mode: Literal["termination", "radius", "both"] = "termination",
+        commitment_radius: int | None = None,
     ) -> None:
         if basis.maze != environment.maze:
             raise ValueError(
@@ -311,12 +314,40 @@ class Template:
             raise ValueError(
                 "composition_mode must be 'power' or 'winner_take_all'"
             )
+        if goal_reward_mode not in ("inpainted", "fixed", "deferred"):
+            raise ValueError(
+                "goal_reward_mode must be 'inpainted', 'fixed', or 'deferred'"
+            )
+        if commitment_mode not in ("termination", "radius", "both"):
+            raise ValueError(
+                "commitment_mode must be 'termination', 'radius', or 'both'"
+            )
+        if commitment_mode == "termination":
+            if commitment_radius is not None:
+                raise ValueError(
+                    "commitment_radius must be None when commitment_mode is "
+                    "'termination'"
+                )
+        elif (
+            isinstance(commitment_radius, (bool, np.bool_))
+            or not isinstance(commitment_radius, (int, np.integer))
+            or commitment_radius < 0
+        ):
+            raise ValueError(
+                "commitment_radius must be a non-negative integer when "
+                "commitment_mode is 'radius' or 'both'"
+            )
         self.environment = environment
         self.basis = basis
         self.parameters = parameters
         self.task_library = task_library
         self.composition_exponent = exponent
         self.composition_mode = composition_mode
+        self.goal_reward_mode = goal_reward_mode
+        self.commitment_mode = commitment_mode
+        self.commitment_radius = (
+            None if commitment_radius is None else int(commitment_radius)
+        )
         self._task_cache: dict[Coordinate, Task] = {}
         self._passive_dynamics: np.ndarray | None = None
 

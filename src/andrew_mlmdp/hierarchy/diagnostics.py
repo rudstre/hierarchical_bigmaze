@@ -1051,6 +1051,9 @@ def _template_with_parameter(
         task_library=template.task_library,
         composition_exponent=composition_exponent,
         composition_mode=template.composition_mode,
+        goal_reward_mode=template.goal_reward_mode,
+        commitment_mode=template.commitment_mode,
+        commitment_radius=template.commitment_radius,
     )
 
 
