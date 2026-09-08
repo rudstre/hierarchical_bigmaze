@@ -61,12 +61,20 @@ class RolloutPlayer:
 
     figure: go.Figure
     controls: object
+    panel: object
     _renderer: "_RolloutRenderer"
     _frame_slider: _IntValueWidget
     _goal_component_checkbox: _BoolValueWidget
     _normalization_checkbox: _BoolValueWidget
     _recompute_callback: Callable[[], None]
     _location_state: _LocationState
+
+    def _ipython_display_(self) -> None:
+        """Display controls and the live figure as one unit in a notebook."""
+
+        from IPython.display import display
+
+        display(self.panel)
 
     @property
     def model(self) -> Task:
@@ -312,10 +320,27 @@ def plot_rank_diagnostics(
     return figure
 
 
+def _live_figure(figure: go.Figure) -> go.Figure:
+    """Return a widget-backed figure whose traces redraw when mutated.
+
+    A plain ``go.Figure`` is rendered once as static HTML, so control
+    callbacks that mutate it never reach the notebook output.
+    """
+
+    try:
+        return go.FigureWidget(figure)
+    except ImportError as error:  # pragma: no cover
+        raise ImportError(
+            "The interactive rollout player needs a live Plotly figure: "
+            "pip install 'andrew-mlmdp[notebook]'"
+        ) from error
+
+
 def _trace_rollout(
     model: Task,
     start: Coordinate,
     *,
+    goal_learning: Literal["exact", "online"],
     beta: float | None,
     max_steps: int,
     max_abstract_accesses: int,
@@ -323,6 +348,7 @@ def _trace_rollout(
 ) -> tuple[Rollout, list[_ProfileFrame]]:
     rollout = model.rollout(
         start,
+        goal_learning=goal_learning,
         beta=beta,
         max_steps=max_steps,
         max_abstract_accesses=max_abstract_accesses,
@@ -335,6 +361,7 @@ def _build_renderer(
     model: Task,
     start: Coordinate,
     *,
+    goal_learning: Literal["exact", "online"] = "exact",
     beta: float | None = None,
     max_steps: int = 500,
     max_abstract_accesses: int = 500,
@@ -345,6 +372,7 @@ def _build_renderer(
     rollout, frames = _trace_rollout(
         model,
         start,
+        goal_learning=goal_learning,
         beta=beta,
         max_steps=max_steps,
         max_abstract_accesses=max_abstract_accesses,
@@ -394,7 +422,7 @@ def _build_renderer(
     goal_component = {"included": True}
     normalization = {"enabled": True}
 
-    def update(frame_index: int) -> None:
+    def draw(frame_index: int) -> None:
         current_model = run_state["model"]
         current_rollout = run_state["rollout"]
         frame = run_state["frames"][frame_index]
@@ -512,6 +540,12 @@ def _build_renderer(
             }
         )
 
+    def update(frame_index: int) -> None:
+        """Redraw one frame as a single batched figure mutation."""
+
+        with figure.batch_update():
+            draw(frame_index)
+
     def set_goal_component(visible: bool) -> None:
         goal_component["included"] = bool(visible)
 
@@ -524,6 +558,7 @@ def _build_renderer(
         new_rollout, new_frames = _trace_rollout(
             new_model,
             new_start,
+            goal_learning=goal_learning,
             beta=beta,
             max_steps=max_steps,
             max_abstract_accesses=max_abstract_accesses,
@@ -551,6 +586,7 @@ def _build_renderer(
     )
     figure.update_xaxes(visible=False, row=2, col=3)
     figure.update_yaxes(visible=False, row=2, col=3)
+    figure = _live_figure(figure)
     renderer = _RolloutRenderer(
         figure=figure,
         _run_state=run_state,
@@ -568,6 +604,7 @@ def explore_rollout(
     start: Coordinate,
     goal: Coordinate,
     *,
+    goal_learning: Literal["exact", "online"] = "exact",
     beta: float | None = None,
     max_steps: int = 500,
     max_abstract_accesses: int = 500,
@@ -575,7 +612,11 @@ def explore_rollout(
     subtask_labels: list[str] | tuple[str, ...] | None = None,
     figsize: tuple[float, float] = (14, 8),
 ) -> RolloutPlayer:
-    """Build a paused ipywidgets controller backed by a Plotly figure."""
+    """Build a paused ipywidgets controller backed by a live Plotly figure.
+
+    Display the returned player itself, or its ``panel``, so the controls and
+    the figure they mutate stay attached in the notebook output.
+    """
 
     try:
         widgets = import_module("ipywidgets")
@@ -590,6 +631,7 @@ def explore_rollout(
     renderer = _build_renderer(
         model,
         start,
+        goal_learning=goal_learning,
         beta=beta,
         max_steps=max_steps,
         max_abstract_accesses=max_abstract_accesses,
@@ -620,9 +662,8 @@ def explore_rollout(
         value=start,
         description="Start",
     )
-    goal_options = tuple(coordinate for coordinate in free_cells if coordinate != start)
     goal_dropdown = widgets.Dropdown(
-        options=[(str(coordinate), coordinate) for coordinate in goal_options],
+        options=[(str(coordinate), coordinate) for coordinate in free_cells],
         value=goal,
         description="Goal",
     )
@@ -638,10 +679,13 @@ def explore_rollout(
         "error": None,
     }
 
+    def refresh_step_buttons() -> None:
+        previous_button.disabled = frame_slider.value == frame_slider.min
+        next_button.disabled = frame_slider.value == frame_slider.max
+
     def render(change) -> None:
         renderer.update(int(change["new"]))
-        previous_button.disabled = frame_slider.value == 0
-        next_button.disabled = frame_slider.value == frame_slider.max
+        refresh_step_buttons()
 
     def toggle_goal(change) -> None:
         renderer.set_goal_component(bool(change["new"]))
@@ -675,6 +719,7 @@ def explore_rollout(
             frame_slider.max = len(renderer.frames) - 1
             frame_slider.value = 0
             renderer.update(0)
+            refresh_step_buttons()
             location_status.value = (
                 f"<b>Current:</b> start {pending_start}, goal {pending_goal}, "
                 f"seed {new_seed}."
@@ -705,6 +750,7 @@ def explore_rollout(
     )
     recompute_button.on_click(lambda _button: recompute_rollout())
     location_status.value = f"<b>Current:</b> start {start}, goal {goal}, seed {seed}."
+    refresh_step_buttons()
     controls = widgets.VBox(
         [
             widgets.HBox(
@@ -720,9 +766,11 @@ def explore_rollout(
             location_status,
         ]
     )
+    panel = widgets.VBox([controls, renderer.figure])
     return RolloutPlayer(
         figure=renderer.figure,
         controls=controls,
+        panel=panel,
         _renderer=renderer,
         _frame_slider=cast(_IntValueWidget, frame_slider),
         _goal_component_checkbox=cast(_BoolValueWidget, goal_component_checkbox),

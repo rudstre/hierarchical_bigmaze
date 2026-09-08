@@ -238,7 +238,8 @@ def test_figure_command_defaults_to_pca_routes(tmp_path):
     manifest = {"output_dir": str(tmp_path / "output")}
     command = manager._figure_command(config, manifest)
     assert "--figure-number 2.19" in command
-    assert str(Path(manifest["output_dir"]) / "figure_2_19") in command
+    assert str(Path(manifest["output_dir"]) / "regression_mlmdp_routes") in command
+    assert "--exclude-routes" not in command
 
 
 def test_figure_command_hmm_routes_uses_2_20(tmp_path):
@@ -246,7 +247,15 @@ def test_figure_command_hmm_routes_uses_2_20(tmp_path):
     manifest = {"output_dir": str(tmp_path / "output")}
     command = manager._figure_command(config, manifest, "2.20")
     assert "--figure-number 2.20" in command
-    assert str(Path(manifest["output_dir"]) / "figure_2_20") in command
+    assert str(Path(manifest["output_dir"]) / "regression_mlmdp_hmm_routes") in command
+
+
+def test_figure_command_exclude_routes(tmp_path):
+    config = _FakeConfig(tmp_path)
+    manifest = {"output_dir": str(tmp_path / "output")}
+    command = manager._figure_command(config, manifest, exclude_routes=True)
+    assert "--exclude-routes" in command
+    assert str(Path(manifest["output_dir"]) / "regression_mlmdp_no-routes") in command
 
 
 def test_figure_marker_path_matches_final_output_file(tmp_path):
@@ -255,8 +264,15 @@ def test_figure_marker_path_matches_final_output_file(tmp_path):
     assert marker == (
         tmp_path
         / "output"
-        / "figure_2_19"
-        / "figure_2_19_behavior_with_hierarchical_mlmdp.pdf"
+        / "regression_mlmdp_routes"
+        / "regression_mlmdp_routes.pdf"
+    )
+    no_routes = manager._figure_marker_path(manifest, "2.19", exclude_routes=True)
+    assert no_routes == (
+        tmp_path
+        / "output"
+        / "regression_mlmdp_no-routes"
+        / "regression_mlmdp_no-routes.pdf"
     )
 
 
@@ -292,6 +308,40 @@ def test_prompt_figure_number_interactive_choice(monkeypatch, tmp_path):
 
     monkeypatch.setattr("builtins.input", lambda _: "")
     assert manager._prompt_figure_number(args) == "2.19"
+
+
+def test_prompt_exclude_routes_flag_wins(tmp_path):
+    args = manager.build_parser().parse_args(
+        [
+            "--project-root",
+            str(ROOT),
+            "--run-id",
+            "test",
+            "--config",
+            str(tmp_path / "adjacent.json"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--exclude-routes",
+        ]
+    )
+    assert args.exclude_routes is True
+    assert manager._prompt_exclude_routes(args) is True
+
+
+def test_prompt_exclude_routes_defaults_and_interactive(monkeypatch, tmp_path):
+    dry_run_args = _args(tmp_path, tmp_path / "output", dry_run=True)
+    assert dry_run_args.exclude_routes is None
+    assert manager._prompt_exclude_routes(dry_run_args) is False
+
+    args = _args(tmp_path, tmp_path / "output")
+    monkeypatch.setattr(manager.sys.stdin, "isatty", lambda: False)
+    assert manager._prompt_exclude_routes(args) is False
+
+    monkeypatch.setattr(manager.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert manager._prompt_exclude_routes(args) is True
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    assert manager._prompt_exclude_routes(args) is False
 
 
 def test_stage_status_classifies_not_started_in_progress_and_complete():
@@ -373,8 +423,128 @@ def test_bootstrap_manifest_rejects_band_conflict_on_rerun(tmp_path):
             ]
         }
     }
-    with pytest.raises(ValueError, match="conflicts with manifest"):
+    with pytest.raises(ValueError, match="different slurm resources/bands"):
         manager._bootstrap_manifest(args, ROOT, conflicting_raw, config)
+
+
+# --------------------------------------------------------------------------
+# Self-contained run directories
+# --------------------------------------------------------------------------
+
+
+def test_default_output_dir_is_keyed_by_run_id_not_config():
+    root = Path("/project")
+    assert manager._default_output_dir(root, "full_run2") == (
+        root / "output/adjacent_mlmdp_regression/full_run2"
+    )
+    # Two runs of the *same* config get separate directories -- editing a
+    # config between runs must never collide with the earlier run's manifest.
+    assert manager._default_output_dir(root, "full_run1") != (
+        manager._default_output_dir(root, "full_run2")
+    )
+
+
+def test_run_artifacts_all_live_under_the_run_directory(tmp_path):
+    output = tmp_path / "output" / "full_run2"
+    # Orchestration state is named distinctly from the scientific manifest.json
+    # that `prepare` writes into the very same directory.
+    assert manager._manifest_path(output) == output / "orchestration.json"
+    assert manager._manifest_path(output).parent == output
+    assert manager._log_dir(output) == output / "logs"
+
+
+def test_bootstrap_manifest_defaults_output_dir_to_the_run_directory(tmp_path):
+    config = _FakeConfig(tmp_path)
+    args = manager.build_parser().parse_args(
+        ["--project-root", str(ROOT), "--run-id", "full_run2"]
+    )
+    _, path = manager._bootstrap_manifest(args, tmp_path, {}, config)
+    assert path == (
+        tmp_path / "output/adjacent_mlmdp_regression/full_run2/orchestration.json"
+    )
+
+
+def test_submissions_route_slurm_logs_into_the_run_directory(tmp_path, monkeypatch):
+    manifest = _minimal_manifest(tmp_path)
+    manifest["discovery_dir"] = str(tmp_path / "discovery")
+    manifest["discovery_config"] = str(tmp_path / "base.json")
+    manifest["resources"]["discovery"] = {"memory": "12G", "time": "08:00:00"}
+    commands: list[list[str]] = []
+
+    def _capture(command, *, dry_run=False):
+        commands.append(command)
+        return "900"
+
+    monkeypatch.setattr(manager, "_run", _capture)
+
+    manager._submit_discovery(manifest, tmp_path / "m.json", [2], dry_run=False)
+    manager._submit_inner_band(
+        manifest,
+        tmp_path / "m.json",
+        tmp_path,
+        {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"},
+        [("fold-a", 2, "s1")],
+        config_signature="sig",
+        dry_run=False,
+    )
+    manager._submit_refit_band(
+        manifest,
+        tmp_path / "m.json",
+        tmp_path,
+        {"rank_min": 2, "rank_max": 12, "memory": "2G", "time": "01:00:00"},
+        [("fold-a", 2)],
+        config_signature="sig",
+        exclude_ranks=frozenset(),
+        dry_run=False,
+    )
+
+    expected = f"HIERARCHY_SLURM_LOG_DIR={tmp_path / 'output' / 'logs'}"
+    assert len(commands) == 3
+    for command in commands:
+        export = next(part for part in command if part.startswith("--export="))
+        assert expected in export
+
+
+def test_advance_copies_the_configs_into_the_run_directory(monkeypatch, tmp_path):
+    config = _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    (tmp_path / "base.json").write_text(json.dumps({"discovery": "params"}))
+    _patch_prepare(monkeypatch)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _write_science_manifest(output_dir, [])
+    monkeypatch.setattr(manager, "_active_identities", lambda *_: {})
+    monkeypatch.setattr(
+        manager, "_discovery_states", lambda *_: {2: {"state": "success"}}
+    )
+    monkeypatch.setattr(manager, "_inner_states", lambda *a, **k: {})
+
+    manager._advance(_args(tmp_path, output_dir, yes=True), ROOT)
+
+    assert (output_dir / "config.json").read_bytes() == (
+        Path(config.source_path).read_bytes()
+    )
+    assert (output_dir / "discovery_config.json").read_bytes() == (
+        (tmp_path / "base.json").read_bytes()
+    )
+
+
+def test_advance_writes_no_provenance_on_dry_run(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    (tmp_path / "base.json").write_text(json.dumps({"discovery": "params"}))
+    _patch_prepare(monkeypatch)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _write_science_manifest(output_dir, [])
+    monkeypatch.setattr(manager, "_active_identities", lambda *_: {})
+    monkeypatch.setattr(
+        manager, "_discovery_states", lambda *_: {2: {"state": "success"}}
+    )
+    monkeypatch.setattr(manager, "_inner_states", lambda *a, **k: {})
+
+    manager._advance(_args(tmp_path, output_dir, dry_run=True), ROOT)
+
+    assert not (output_dir / "config.json").exists()
+    assert not (output_dir / "discovery_config.json").exists()
 
 
 def _prepare_calls(calls: list[list[str]]) -> list[list[str]]:
@@ -543,7 +713,7 @@ def test_advance_does_not_resubmit_within_grace_period_despite_squeue_silence(
     output_dir.mkdir()
     _write_science_manifest(output_dir, [])
 
-    manifest_path = manager._manifest_path(output_dir, "test")
+    manifest_path = manager._manifest_path(output_dir)
     resources = manager._general_resources({})
     resources["bands"] = manager._resolve_bands({}, (2, 3))
     manager._atomic_write(
@@ -1324,14 +1494,14 @@ def test_advance_runs_figure_regression_when_complete(monkeypatch, tmp_path, cap
 
     out = capsys.readouterr().out
     assert "predictors succeeded: 1" in out
-    assert "Running the augmented regression (figure 2.19)" in out
-    assert "Figure 2.19 written to" in out
+    assert "Running the augmented regression (figure 2.19" in out
+    assert "Final regression written to" in out
 
     figure_calls = _figure_calls(calls)
     assert len(figure_calls) == 1
     figure_call = figure_calls[0]
     assert figure_call[0] == manager.DEFAULT_PYTHON  # not the literal "python"
-    assert str(output_dir / "figure_2_19") in figure_call
+    assert str(output_dir / "regression_mlmdp_routes") in figure_call
 
 
 def test_advance_completion_honors_explicit_figure_number(
@@ -1353,8 +1523,28 @@ def test_advance_completion_honors_explicit_figure_number(
     assert "figure 2.20" in out
     figure_calls = _figure_calls(calls)
     assert len(figure_calls) == 1
-    assert str(output_dir / "figure_2_20") in figure_calls[0]
+    assert str(output_dir / "regression_mlmdp_hmm_routes") in figure_calls[0]
     assert "2.20" in figure_calls[0]
+
+
+def test_advance_completion_honors_exclude_routes_flag(monkeypatch, tmp_path, capsys):
+    _patch_config(monkeypatch, tmp_path, ranks=(2,))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    _patch_completion_common(monkeypatch, tmp_path, output_dir)
+    calls = []
+    monkeypatch.setattr(
+        manager, "_run", lambda command, *, dry_run=False: calls.append(command) or ""
+    )
+
+    args = _args(tmp_path, output_dir)
+    args.exclude_routes = True
+    manager._advance(args, ROOT)
+
+    figure_calls = _figure_calls(calls)
+    assert len(figure_calls) == 1
+    assert "--exclude-routes" in figure_calls[0]
+    assert str(output_dir / "regression_mlmdp_no-routes") in figure_calls[0]
 
 
 def test_advance_completion_dry_run_only_prints_command(monkeypatch, tmp_path, capsys):
@@ -1388,7 +1578,7 @@ def test_advance_completion_skips_when_figure_already_generated(
         manager, "_run", lambda command, *, dry_run=False: calls.append(command) or ""
     )
     marker = (
-        output_dir / "figure_2_19" / "figure_2_19_behavior_with_hierarchical_mlmdp.pdf"
+        output_dir / "regression_mlmdp_routes" / "regression_mlmdp_routes.pdf"
     )
     marker.parent.mkdir(parents=True)
     marker.write_bytes(b"%PDF-fake")
@@ -1479,5 +1669,5 @@ def test_advance_dry_run_does_not_write_manifest(monkeypatch, tmp_path):
     args = _args(tmp_path, output_dir, dry_run=True)
     manager._advance(args, ROOT)
 
-    manifest_path = manager._manifest_path(output_dir, "test")
+    manifest_path = manager._manifest_path(output_dir)
     assert not manifest_path.is_file()

@@ -238,7 +238,7 @@ low-rank LMDP/HMM routes:
 ```bash
 python doohan_data_interaction/reproduce_figure_2_19_behavior.py \
     --data-root external/GridMaze-mFC-ephys-DATA/data \
-    --output-dir results/figure_2_19 \
+    --output-dir results/adjacent_regression \
     --figure-number 2.19 \
     --subject-id m2 \
     --subject-id m3
@@ -257,6 +257,13 @@ sessions, so route predictors are in-sample on the training rows (the held-out
 session is still fully excluded from both fits). Leave-one-out gives one
 validation point per session and uses far more data per fold, so its numbers
 are not directly comparable to the adjacent scheme.
+
+Output names describe the regression rather than a thesis figure:
+`regression_routes` (PCA routes), `regression_hmm_routes` (HMM routes), and with
+`--include-hierarchical-mlmdp` the `regression_mlmdp_*` variants. Passing
+`--exclude-routes` (which requires `--include-hierarchical-mlmdp`) drops Qin's
+route and route-planning regressors, leaving the synthetic-agent regressors and
+the hierarchical MLMDP predictor, and writes `regression_mlmdp_no-routes_*`.
 
 Omit `--subject-id` to select every animal for the requested maze. The command
 writes the raw regression result (`.pt`), a fold-by-policy CSV grid, a

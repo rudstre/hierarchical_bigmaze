@@ -233,7 +233,7 @@ def test_figure_2_20_selects_hmm_routes_and_distinct_outputs():
     )
     assert "hmm_route" in set(group.predictor)
     assert "pca_route" not in set(group.predictor)
-    assert figure_2_19.output_files("2.20")["png"] == ("figure_2_20_behavior.png")
+    assert figure_2_19.output_files("2.20")["png"] == "regression_hmm_routes.png"
     figure = figure_2_19.make_figure(
         table, group, subject_ids=["A"], maze_id=1, figure_number="2.20"
     )
@@ -268,6 +268,11 @@ def test_hierarchical_mlmdp_opt_in_has_distinct_outputs_and_cli():
         "2.19",
         include_hierarchical_mlmdp=True,
     )
+    no_routes = figure_2_19.output_files(
+        "2.19",
+        include_hierarchical_mlmdp=True,
+        include_routes=False,
+    )
     args = figure_2_19.build_arg_parser().parse_args(
         [
             "--data-root",
@@ -275,12 +280,24 @@ def test_hierarchical_mlmdp_opt_in_has_distinct_outputs_and_cli():
             "--output-dir",
             "/out",
             "--include-hierarchical-mlmdp",
+            "--exclude-routes",
             "--hierarchical-mlmdp-run-dir",
             "/artifacts",
         ]
     )
 
-    assert default["png"] == "figure_2_19_behavior.png"
-    assert augmented["png"] == ("figure_2_19_behavior_with_hierarchical_mlmdp.png")
+    assert default["png"] == "regression_routes.png"
+    assert augmented["png"] == "regression_mlmdp_routes.png"
+    assert no_routes["png"] == "regression_mlmdp_no-routes.png"
     assert args.include_hierarchical_mlmdp is True
+    assert args.exclude_routes is True
     assert args.hierarchical_mlmdp_run_dir == Path("/artifacts")
+
+
+def test_exclude_routes_requires_hierarchical_mlmdp(tmp_path):
+    with pytest.raises(ValueError, match="exclude-routes"):
+        figure_2_19.run_reproduction(
+            data_root=tmp_path,
+            output_dir=tmp_path / "out",
+            exclude_routes=True,
+        )

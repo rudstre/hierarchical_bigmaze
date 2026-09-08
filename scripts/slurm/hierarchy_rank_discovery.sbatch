@@ -32,7 +32,10 @@ else
   identifier_error="Invalid run identifier '${requested_run_identifier}'; use only letters, numbers, periods, underscores, and hyphens."
 fi
 
-slurm_log_dir="${project_root}/slurm_out/rank_val/job_${run_identifier}"
+# The adjacent-MLMDP manager exports HIERARCHY_SLURM_LOG_DIR so discovery
+# logs land inside the run directory that requested them; the rank-validation
+# workflow leaves it unset and keeps the shared slurm_out/ location.
+slurm_log_dir="${HIERARCHY_SLURM_LOG_DIR:-${project_root}/slurm_out/rank_val/job_${run_identifier}}"
 slurm_log_path="${slurm_log_dir}/nmf-${array_job_id}_${array_task_id}.out"
 
 mkdir -p "${slurm_log_dir}"

@@ -78,6 +78,23 @@ def build_parser() -> argparse.ArgumentParser:
             "2.20 = HMM routes); skips the interactive choice at completion"
         ),
     )
+    parser.add_argument(
+        "--exclude-routes",
+        dest="exclude_routes",
+        action="store_true",
+        default=None,
+        help=(
+            "drop Qin's route and route-planning regressors from the final "
+            "regression, leaving the synthetic-agent regressors and the "
+            "hierarchical MLMDP predictor; skips the interactive choice"
+        ),
+    )
+    parser.add_argument(
+        "--include-routes",
+        dest="exclude_routes",
+        action="store_false",
+        help="keep Qin's route regressors in the final regression (the default)",
+    )
     return parser
 
 
@@ -255,16 +272,43 @@ def _prompt_figure_number(args: argparse.Namespace) -> str:
     return "2.20" if answer == "2" else "2.19"
 
 
+def _prompt_exclude_routes(args: argparse.Namespace) -> bool:
+    """Choose whether the final regression drops Qin's route regressors.
+
+    ``--exclude-routes`` / ``--include-routes`` win outright; without either this
+    only prompts at a real terminal -- ``--dry-run``, ``--yes`` and
+    non-interactive runs all keep the route regressors so completion never
+    blocks on unattended input."""
+
+    if args.exclude_routes is not None:
+        return args.exclude_routes
+    if args.dry_run or args.yes or not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(
+            "\nInclude Qin's route regressors in the final regression?\n"
+            "  [Y] yes -- synthetic agents, route models, hierarchical MLMDP\n"
+            "  [n] no  -- synthetic agents and hierarchical MLMDP only\n"
+            "Choice [Y/n, default Y]: "
+        ).strip().lower()
+    except EOFError:
+        return False
+    return answer in {"n", "no"}
+
+
 def _default_config_path(root: Path) -> Path:
     return root / "configs/adjacent_mlmdp_regression.json"
 
 
-def _default_output_dir(root: Path, config_path: Path) -> Path:
-    # Keyed by the config file's own stem (not a fixed name) so that two
-    # different configs never collide on the same default directory when
-    # --output-dir is omitted -- that collision is exactly what stranded a
-    # real production manifest under a leftover test config's fold identities.
-    return root / "output/adjacent_mlmdp_regression" / config_path.stem
+def _default_output_dir(root: Path, run_id: str) -> Path:
+    # One run == one self-contained directory, keyed by --run-id. Everything
+    # the run produces lives under it: the scientific manifest, fold
+    # artifacts, task lists, SLURM logs, resource-usage reports and the final
+    # regression. So a fresh --run-id is always a clean slate, and two runs
+    # can never collide no matter which config file each was launched from --
+    # including the same config edited in between, which is the normal way to
+    # explore a parameter change.
+    return root / "output/adjacent_mlmdp_regression" / run_id
 
 
 def _ensure_src_on_path(root: Path) -> None:
@@ -273,12 +317,16 @@ def _ensure_src_on_path(root: Path) -> None:
         sys.path.insert(0, src)
 
 
-def _run_dir(output: Path, run_id: str) -> Path:
-    return output / "slurm_runs" / run_id
+def _manifest_path(output: Path) -> Path:
+    # The run directory is the run, so orchestration state sits at its top
+    # level rather than under a slurm_runs/<run_id>/ subtree that only ever
+    # holds one entry. Named distinctly from the scientific manifest.json
+    # that run_adjacent_mlmdp.py prepare writes into the same directory.
+    return output / "orchestration.json"
 
 
-def _manifest_path(output: Path, run_id: str) -> Path:
-    return _run_dir(output, run_id) / "manifest.json"
+def _log_dir(output: Path) -> Path:
+    return output / "logs"
 
 
 # --------------------------------------------------------------------------
@@ -360,10 +408,8 @@ def _bootstrap_manifest(
     raw_config: dict[str, Any],
     config: Any,
 ) -> tuple[dict[str, Any], Path]:
-    output = _resolve(
-        args.output_dir or _default_output_dir(root, config.source_path), root
-    )
-    path = _manifest_path(output, args.run_id)
+    output = _resolve(args.output_dir or _default_output_dir(root, args.run_id), root)
+    path = _manifest_path(output)
     resources = _general_resources(raw_config)
     resources["bands"] = _resolve_bands(raw_config, config.ranks)
     if path.is_file():
@@ -379,11 +425,17 @@ def _bootstrap_manifest(
         for key, expected in checks.items():
             if manifest.get(key) != expected:
                 raise ValueError(
-                    f"run conflicts with manifest {key}; use a new --run-id"
+                    f"run {args.run_id!r} was started with a different {key} "
+                    f"({manifest.get(key)!r}, now {expected!r}). A run "
+                    "directory is immutable once created -- pass a new "
+                    "--run-id to start a fresh run."
                 )
         if manifest.get("resources") != resources:
             raise ValueError(
-                "run conflicts with manifest slurm resources/bands; use a new --run-id"
+                f"run {args.run_id!r} was started with different slurm "
+                "resources/bands than the config now specifies. A run "
+                "directory is immutable once created -- pass a new --run-id "
+                "to start a fresh run."
             )
         return manifest, path
     manifest = {
@@ -405,6 +457,35 @@ def _bootstrap_manifest(
     if not args.dry_run:
         _atomic_write(path, manifest)
     return manifest, path
+
+
+def _write_run_provenance(output: Path, config: Any, *, dry_run: bool) -> None:
+    """Copy the configs this run was launched from into the run directory.
+
+    A run directory should explain itself: months later, config.json and
+    discovery_config.json sitting beside the results say exactly what
+    produced them, with no need to work out which revision of which file in
+    configs/ happened to be on disk at submission time. These are provenance
+    copies only -- the manager still reads the live config files each
+    invocation, so editing a config mid-run is still caught by the manifest
+    and signature checks rather than silently ignored.
+    """
+
+    if dry_run:
+        return
+    sources = (
+        ("config.json", config.source_path),
+        ("discovery_config.json", config.discovery_config_path),
+    )
+    for name, source in sources:
+        if source is None or not Path(source).is_file():
+            continue
+        payload = Path(source).read_bytes()
+        destination = output / name
+        if destination.is_file() and destination.read_bytes() == payload:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
 
 
 # --------------------------------------------------------------------------
@@ -904,6 +985,7 @@ def _submit_discovery(
             f"HIERARCHY_SWEEP_CONFIG={manifest['discovery_config']}",
             f"HIERARCHY_DISCOVERY_OUTPUT={manifest['discovery_dir']}",
             f"HIERARCHY_RUN_IDENTIFIER=adjacent-{manifest['run_id']}",
+            f"HIERARCHY_SLURM_LOG_DIR={_log_dir(Path(manifest['output_dir']))}",
             "HIERARCHY_DISCOVERY_FORCE=1",
         ]
     )
@@ -1005,6 +1087,7 @@ def _submit_inner_band(
                 f"HIERARCHY_ADJACENT_OUTPUT={manifest['output_dir']}",
                 f"HIERARCHY_ADJACENT_TASK_LIST={task_list_path}",
                 f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
+                f"HIERARCHY_SLURM_LOG_DIR={_log_dir(Path(manifest['output_dir']))}",
             ]
         )
         command.extend(
@@ -1107,6 +1190,7 @@ def _submit_refit_band(
                 f"HIERARCHY_ADJACENT_TASK_LIST={task_list_path}",
                 f"HIERARCHY_ADJACENT_EXCLUDE_RANKS={exclude_ranks_csv}",
                 f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
+                f"HIERARCHY_SLURM_LOG_DIR={_log_dir(Path(manifest['output_dir']))}",
             ]
         )
         command.extend(
@@ -1355,20 +1439,49 @@ def _finalize_resource_usage(
 # --------------------------------------------------------------------------
 
 
-def _figure_output_dir(manifest: dict[str, Any], figure_number: str) -> Path:
-    return Path(manifest["output_dir"]) / f"figure_{figure_number.replace('.', '_')}"
+_ROUTE_MODEL_BY_FIGURE = {"2.19": "pca", "2.20": "hmm"}
 
 
-def _figure_marker_path(manifest: dict[str, Any], figure_number: str) -> Path:
+def _regression_stem(figure_number: str, *, exclude_routes: bool) -> str:
+    """Descriptive stem for the final regression, matching
+    reproduce_figure_2_19_behavior.regression_stem for the manager's always-on
+    --include-hierarchical-mlmdp case."""
+    parts = ["regression", "mlmdp"]
+    if exclude_routes:
+        parts.append("no-routes")
+    else:
+        parts.append(
+            "routes" if _ROUTE_MODEL_BY_FIGURE[figure_number] == "pca" else "hmm_routes"
+        )
+    return "_".join(parts)
+
+
+def _figure_output_dir(
+    manifest: dict[str, Any], figure_number: str, *, exclude_routes: bool = False
+) -> Path:
+    return Path(manifest["output_dir"]) / _regression_stem(
+        figure_number, exclude_routes=exclude_routes
+    )
+
+
+def _figure_marker_path(
+    manifest: dict[str, Any], figure_number: str, *, exclude_routes: bool = False
+) -> Path:
     # reproduce_figure_2_19_behavior.py writes the PDF last of its six output
     # files (regression/folds/summary/provenance/png/pdf), so its presence
     # means a prior run completed the full write sequence successfully.
-    stem = f"figure_{figure_number.replace('.', '_')}_behavior_with_hierarchical_mlmdp"
-    return _figure_output_dir(manifest, figure_number) / f"{stem}.pdf"
+    stem = _regression_stem(figure_number, exclude_routes=exclude_routes)
+    return _figure_output_dir(
+        manifest, figure_number, exclude_routes=exclude_routes
+    ) / f"{stem}.pdf"
 
 
 def _figure_command(
-    config: Any, manifest: dict[str, Any], figure_number: str = "2.19"
+    config: Any,
+    manifest: dict[str, Any],
+    figure_number: str = "2.19",
+    *,
+    exclude_routes: bool = False,
 ) -> str:
     parts = [
         "python",
@@ -1376,7 +1489,7 @@ def _figure_command(
         "--data-root",
         config.dataset.data_root,
         "--output-dir",
-        str(_figure_output_dir(manifest, figure_number)),
+        str(_figure_output_dir(manifest, figure_number, exclude_routes=exclude_routes)),
         "--figure-number",
         figure_number,
     ]
@@ -1392,6 +1505,8 @@ def _figure_command(
         "--hierarchical-mlmdp-run-dir",
         manifest["output_dir"],
     ]
+    if exclude_routes:
+        parts.append("--exclude-routes")
     return shlex.join(parts)
 
 
@@ -1418,9 +1533,13 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
     raw_config = json.loads(config_path.read_text(encoding="utf-8"))
 
     manifest, manifest_path = _bootstrap_manifest(args, root, raw_config, config)
-    run_dir = manifest_path.parent
     output = Path(manifest["output_dir"])
+    # The run directory *is* the output directory: scientific manifest, fold
+    # artifacts, task lists, SLURM logs, resource-usage reports and the final
+    # regression are all children of it.
+    run_dir = output
     project_root = manifest["project_root"]
+    _write_run_provenance(output, config, dry_run=args.dry_run)
 
     _print_header(
         f"Adjacent MLMDP regression: run '{manifest['run_id']}'  "
@@ -1821,12 +1940,22 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
         flush=True,
     )
     figure_number = _prompt_figure_number(args)
-    figure_command = _figure_command(config, manifest, figure_number)
-    marker = _figure_marker_path(manifest, figure_number)
+    exclude_routes = _prompt_exclude_routes(args)
+    figure_command = _figure_command(
+        config, manifest, figure_number, exclude_routes=exclude_routes
+    )
+    marker = _figure_marker_path(
+        manifest, figure_number, exclude_routes=exclude_routes
+    )
     figure_dir_display = _short_path(marker.parent, project_root)
+    policy_note = (
+        "synthetic-agent and hierarchical MLMDP policies"
+        if exclude_routes
+        else "full/reduced policy set"
+    )
     if marker.is_file():
         print(
-            f"\nFigure {figure_number} already generated: {figure_dir_display}",
+            f"\nFinal regression already generated: {figure_dir_display}",
             flush=True,
         )
     elif args.dry_run:
@@ -1834,14 +1963,15 @@ def _advance(args: argparse.Namespace, root: Path) -> None:
         print(f"  {figure_command}", flush=True)
     else:
         print(
-            f"\nRunning the augmented regression (figure {figure_number}) -- "
-            "this fits the full/reduced seven-policy model and can take a while...",
+            f"\nRunning the augmented regression (figure {figure_number}, "
+            f"{policy_note}) -- this fits the full/reduced model and can take "
+            "a while...",
             flush=True,
         )
         figure_parts = shlex.split(figure_command)
         figure_parts[0] = manifest["python_executable"]
         _run(figure_parts, dry_run=False)
-        print(f"Figure {figure_number} written to {figure_dir_display}", flush=True)
+        print(f"Final regression written to {figure_dir_display}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

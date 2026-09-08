@@ -28,7 +28,10 @@ if [[ ! "${run_identifier}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   exit 2
 fi
 
-log_dir="${project_root}/slurm_out/adjacent_mlmdp/job_${run_identifier}"
+# The managed workflow exports HIERARCHY_SLURM_LOG_DIR so a run's job logs
+# land inside its own run directory alongside everything else it produced.
+# The fallback keeps standalone/manual sbatch invocations working.
+log_dir="${HIERARCHY_SLURM_LOG_DIR:-${project_root}/slurm_out/adjacent_mlmdp/job_${run_identifier}}"
 mkdir -p "${log_dir}"
 exec >"${log_dir}/refit-${SLURM_ARRAY_JOB_ID}_${task_id}.out" 2>&1
 

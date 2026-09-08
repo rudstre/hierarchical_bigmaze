@@ -67,6 +67,16 @@ FIGURE_REGRESSORS_BY_NUMBER = {
     "2.20": FIGURE_2_20_REGRESSORS,
 }
 
+# --figure-number selects which route model the regression fits; the output
+# names describe that choice rather than naming a thesis figure.
+ROUTE_MODEL_BY_FIGURE = {"2.19": "pca", "2.20": "hmm"}
+
+# The route and route-planning regressors dropped by --exclude-routes, for both
+# route models (only one model's pair is ever present in a given run).
+ROUTE_REGRESSOR_NAMES = frozenset(
+    {"pca_route", "pca_route_planning", "hmm_route", "hmm_route_planning"}
+)
+
 OUTPUT_SUFFIXES = {
     "regression": "_regression.pt",
     "folds": "_folds.csv",
@@ -77,12 +87,43 @@ OUTPUT_SUFFIXES = {
 }
 
 
-def output_files(figure_number, *, include_hierarchical_mlmdp=False):
+def regression_stem(
+    figure_number,
+    *,
+    include_hierarchical_mlmdp=False,
+    include_routes=True,
+):
+    """Descriptive output stem for one regression variant.
+
+    The stem names what the regression contains rather than which thesis figure
+    it resembles: an optional ``mlmdp`` token, then the route status --
+    ``routes`` / ``hmm_routes`` when Qin's route regressors are in, ``no-routes``
+    when ``--exclude-routes`` drops them.
+    """
     if figure_number not in FIGURE_REGRESSORS_BY_NUMBER:
         raise ValueError(f"Unknown figure number: {figure_number!r}")
-    stem = f"figure_{figure_number.replace('.', '_')}_behavior"
+    route_model = ROUTE_MODEL_BY_FIGURE[figure_number]
+    parts = ["regression"]
     if include_hierarchical_mlmdp:
-        stem += "_with_hierarchical_mlmdp"
+        parts.append("mlmdp")
+    if include_routes:
+        parts.append("routes" if route_model == "pca" else "hmm_routes")
+    else:
+        parts.append("no-routes")
+    return "_".join(parts)
+
+
+def output_files(
+    figure_number,
+    *,
+    include_hierarchical_mlmdp=False,
+    include_routes=True,
+):
+    stem = regression_stem(
+        figure_number,
+        include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        include_routes=include_routes,
+    )
     return {name: f"{stem}{suffix}" for name, suffix in OUTPUT_SUFFIXES.items()}
 
 
@@ -234,6 +275,7 @@ def make_figure(
     subject_ids: list,
     maze_id: int,
     figure_number: str = "2.19",
+    route_regressors_included: bool = True,
 ):
     """Two panels: unique predictability per policy, and its session profile."""
     per_animal = animal_means(fold_table)
@@ -318,8 +360,10 @@ def make_figure(
     session_axis.set_ylabel(_Y_LABEL)
     session_axis.set_title("By session order (mean ± SD across animals)")
 
+    routes_note = "" if route_regressors_included else " — routes excluded"
     figure.suptitle(
-        f"Figure {figure_number} behavioural reproduction — Qin maze {maze_id}",
+        f"Figure {figure_number} behavioural reproduction — Qin maze {maze_id}"
+        f"{routes_note}",
         fontsize=13,
     )
     return figure
@@ -342,6 +386,7 @@ def write_outputs(
     figure_number: str = "2.19",
     overwrite: bool = False,
     include_hierarchical_mlmdp: bool = False,
+    include_routes: bool = True,
     dpi: int = 200,
 ) -> dict:
     """Render the figure, then publish every output atomically.
@@ -354,11 +399,13 @@ def write_outputs(
         output_dir,
         figure_number=figure_number,
         include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        include_routes=include_routes,
         overwrite=overwrite,
     )
     files = output_files(
         figure_number,
         include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        include_routes=include_routes,
     )
     paths = {name: output_dir / filename for name, filename in files.items()}
     record = {
@@ -377,6 +424,7 @@ def write_outputs(
         subject_ids=subject_ids,
         maze_id=maze_id,
         figure_number=figure_number,
+        route_regressors_included=include_routes,
     )
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -468,6 +516,9 @@ def build_provenance(
         },
         "regression": {
             "regressors": list(regression_result["regressors"]),
+            "route_regressors_included": regression_result.get(
+                "route_regressors_included", True
+            ),
             "random_seed": regression_result["random_seed"],
             "pca_configuration": regression_result["pca_configuration"],
             "hmm_configuration": regression_result.get("hmm_configuration"),
@@ -505,6 +556,7 @@ def run_reproduction(
     figure_number="2.19",
     fold_scheme="adjacent",
     include_hierarchical_mlmdp=False,
+    exclude_routes=False,
     hierarchical_mlmdp_run_dir=None,
     pca_alpha=0.1,
     pca_components=3,
@@ -559,10 +611,18 @@ def run_reproduction(
         raise ValueError(
             "--hierarchical-mlmdp-run-dir is required when the predictor is enabled"
         )
+    if exclude_routes and not include_hierarchical_mlmdp:
+        raise ValueError(
+            "--exclude-routes drops Qin's route and route-planning regressors, "
+            "leaving only the synthetic-agent regressors; enable "
+            "--include-hierarchical-mlmdp so the reduced set still contains the "
+            "hierarchical MLMDP predictor"
+        )
     _refuse_existing(
         output_dir,
         figure_number=figure_number,
         include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        include_routes=not exclude_routes,
         overwrite=overwrite,
     )
 
@@ -583,6 +643,8 @@ def run_reproduction(
     canonical = canonical_decision_table(doohan_to_canonical_decisions(dataset))
     selected = _subjects_present(canonical, requested)
     regressors = list(FIGURE_REGRESSORS_BY_NUMBER[figure_number])
+    if exclude_routes:
+        regressors = [r for r in regressors if r not in ROUTE_REGRESSOR_NAMES]
     external_fold_predictors = None
     if include_hierarchical_mlmdp:
         regressors.insert(regressors.index("optimal") + 1, "hierarchical_mlmdp")
@@ -601,7 +663,7 @@ def run_reproduction(
         f"{len(canonical)} decisions, {len(selected)} animals, "
         f"policies [{', '.join(regressors)}]",
     )
-    if figure_number == "2.20" and not quiet:
+    if figure_number == "2.20" and not exclude_routes and not quiet:
         _status(
             quiet,
             f"  note: each fold fits a low-rank LMDP route model "
@@ -627,6 +689,7 @@ def run_reproduction(
         verbose=not quiet,
     )
     regression_result["figure_number"] = figure_number
+    regression_result["route_regressors_included"] = not exclude_routes
     regression_result["hierarchical_mlmdp_run_dir"] = (
         None
         if hierarchical_mlmdp_run_dir is None
@@ -657,6 +720,7 @@ def run_reproduction(
         figure_number=figure_number,
         overwrite=overwrite,
         include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        include_routes=not exclude_routes,
         dpi=dpi,
     )
     _status(quiet, f"Done. Wrote {len(paths)} files to {Path(output_dir).resolve()}")
@@ -698,6 +762,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--include-hierarchical-mlmdp",
         action="store_true",
         help="Add the precomputed nested-CV hierarchical MLMDP predictor.",
+    )
+    parser.add_argument(
+        "--exclude-routes",
+        action="store_true",
+        help=(
+            "Drop Qin's route and route-planning regressors, leaving the "
+            "synthetic-agent regressors and the hierarchical MLMDP predictor. "
+            "Requires --include-hierarchical-mlmdp; writes *_no-routes_* outputs."
+        ),
     )
     parser.add_argument(
         "--hierarchical-mlmdp-run-dir",
@@ -766,6 +839,7 @@ def _refuse_existing(
     *,
     figure_number: str = "2.19",
     include_hierarchical_mlmdp: bool = False,
+    include_routes: bool = True,
     overwrite: bool,
 ) -> None:
     if overwrite:
@@ -774,11 +848,12 @@ def _refuse_existing(
     files = output_files(
         figure_number,
         include_hierarchical_mlmdp=include_hierarchical_mlmdp,
+        include_routes=include_routes,
     )
     existing = [name for name in files.values() if (output_dir / name).exists()]
     if existing:
         raise FileExistsError(
-            f"Refusing to overwrite existing Figure {figure_number} outputs: "
+            "Refusing to overwrite existing regression outputs: "
             + ", ".join(sorted(existing))
         )
 

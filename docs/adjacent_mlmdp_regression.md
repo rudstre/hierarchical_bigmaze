@@ -1,8 +1,10 @@
 # Adjacent-regression hierarchical MLMDP predictor
 
 This workflow adds one four-action hierarchical MLMDP policy to Qin's
-full/reduced regression. It is opt-in; the existing Figure 2.19 predictor set
-and output filenames are unchanged.
+full/reduced regression. It is opt-in; the Qin predictor set is unchanged
+unless `--exclude-routes` is passed, and the MLMDP-augmented outputs are
+written under their own `regression_mlmdp_*` stems so they never overwrite the
+plain `regression_routes` result.
 
 ## Statistical partitions
 
@@ -76,6 +78,14 @@ that governs the regression itself: `dataset` (which subjects/sessions/dates
 feed the actual fits), `adam` (the ADAM optimizer hyperparameters used for
 every inner fit and refit), and `ranks`/`discovery_dir`/`slurm`.
 
+The `adam` block also carries the hierarchy's goal-handling modes, written
+explicitly at their defaults: `goal_reward_mode` (`"inpainted"` / `"fixed"` /
+`"deferred"`), `commitment_mode` (`"termination"` / `"radius"` / `"both"`),
+and `commitment_radius` (`null`, or a non-negative integer grid step count
+required when `commitment_mode` is `"radius"` or `"both"`). See
+[`docs/model.md`](model.md) for their semantics; changing any of them alters
+trajectory likelihood, so a new manifest must be prepared.
+
 It references exactly one other file, `discovery_config` — a
 `RankValidationConfig`-shaped JSON such as `hierarchy_rank_validation_loso.json`
 (the same shape the standalone rank-validation workflow uses). That file's
@@ -101,21 +111,41 @@ local aggregation, then banded refits) and prints the exact next command:
 
     scripts/slurm/submit_adjacent_mlmdp.sh \
       --run-id production \
-      --config configs/adjacent_mlmdp_regression.json \
-      --output-dir output/adjacent_mlmdp_regression/production
+      --config configs/adjacent_mlmdp_regression.json
 
-`--output-dir` is optional: omitting it defaults to
-`output/adjacent_mlmdp_regression/<config filename without .json>`, so two
-different config files never default to the same directory and silently
-collide (an earlier version defaulted to one fixed `production` path
-regardless of which config was used, which let a throwaway test config's
-manifest strand a real run). `--run-id` is independent of `--output-dir` and
-may be reused or varied freely for runs that share the same config/output
-directory. If a manifest ever does legitimately refuse to load because a
-*different* config was previously prepared into the same output directory,
-the error names the exact fix: pass a different `--output-dir` for this
-config, or back up and remove the existing `manifest.json` (and `folds/`, if
-its contents are disposable) and rerun `prepare`.
+#### One run, one directory
+
+`--run-id` is the unit of isolation. It names a single self-contained run
+directory holding everything that run produces:
+
+    output/adjacent_mlmdp_regression/<run-id>/
+      config.json               copy of the config this run was launched from
+      discovery_config.json     copy of the discovery config it referenced
+      manifest.json             scientific manifest (fold identities)
+      orchestration.json        SLURM bookkeeping: submissions, waves, events
+      folds/<digest>/           inner shards, selection.json, predictor.json
+      task_lists/               immutable per-array task lists
+      resource_usage/           per-job elapsed/RSS reports
+      logs/                     stdout/stderr of every array element
+      regression_mlmdp_routes/  final regression outputs
+
+So a new `--run-id` is always a clean slate. Reusing a config file across
+runs is fine, and *editing* a config between runs is fine — the next run-id
+gets its own directory and cannot collide with an earlier run's manifest.
+Nothing is shared between runs except the NMF basis cache, which is
+content-addressed (see `discovery_dir` below) and so can only ever be reused
+when the discovery parameters genuinely match.
+
+`--output-dir` is optional and rarely needed; it overrides the default
+location above if you want a run directory somewhere else.
+
+A run directory is immutable once created. If you edit a config *while* a run
+is in flight and then rerun the same `--run-id`, the manager refuses rather
+than mixing two configurations' artifacts, and the error names the fix: pass
+a new `--run-id`. The `config.json`/`discovery_config.json` copies are
+provenance only — the manager reads the live config files each invocation, so
+they record what a finished run was built from without silently masking a
+mid-run edit.
 
 It creates the scientific fold manifest automatically, discovers or reuses
 compatible NMF bases (an explicit `discovery_dir` in the config is reused
@@ -126,12 +156,15 @@ retryable in each configured rank band, runs aggregation locally once every
 inner shard is terminal, submits selected-rank refits banded by the selected
 k, and finally runs `reproduce_figure_2_19_behavior.py` itself once every
 predictor is terminal, writing the regression/folds/summary/provenance/PNG/PDF
-outputs to `<output_dir>/figure_2_19/` (or `figure_2_20/`) alongside
+outputs to a descriptively named subdirectory of `<output_dir>` alongside
 everything else this run has produced — not to a separate `results/`
-location. If those outputs already exist from a previous invocation, the
-manager reports where they are instead of regenerating them; delete the
-figure subdirectory (or output a different `--figure-number`) to force a
-fresh run. Resource bands, discovery resources,
+location. The subdirectory and file stems name the regression, not a thesis
+figure: `regression_mlmdp_routes` (PCA routes, the default),
+`regression_mlmdp_hmm_routes` (HMM routes), or `regression_mlmdp_no-routes`
+when route regressors are dropped (see `--exclude-routes` below). If those
+outputs already exist from a previous invocation, the manager reports where
+they are instead of regenerating them; delete the subdirectory (or choose a
+different route model / route option) to force a fresh run. Resource bands, discovery resources,
 partition/account, and concurrency can be overridden with an optional
 top-level `"slurm"` object in the config (see
 `scripts/slurm/manage_adjacent_mlmdp.py` for the schema); omitting it uses
@@ -174,6 +207,16 @@ As with the stage-transition prompt, this is skipped (defaulting to 2.19)
 under `--dry-run`, `--yes`, or when stdin isn't a terminal; pass
 `--figure-number 2.19` or `--figure-number 2.20` to choose explicitly without
 being asked. Under `--dry-run` the command is printed rather than run.
+
+It then asks whether to keep Qin's route regressors in the final regression.
+Answering no (or passing `--exclude-routes`) drops the route and
+route-planning regressors and refits the full/reduced model over just the
+synthetic-agent regressors and the hierarchical MLMDP predictor — a genuine
+ablation, so every remaining policy's held-out ΔNLL is measured against the
+smaller full model. The outputs land in `regression_mlmdp_no-routes/`. This
+prompt is skipped (keeping routes) under `--dry-run`, `--yes`, or a
+non-terminal stdin; pass `--exclude-routes` / `--include-routes` to decide
+without being asked.
 
 The remainder of this section documents the underlying manual/debugging
 commands the manager drives; use them directly only to investigate a single
@@ -227,11 +270,13 @@ Finally run the augmented adjacent regression:
 
     python doohan_data_interaction/reproduce_figure_2_19_behavior.py \
       --data-root external/GridMaze-mFC-ephys-DATA/data \
-      --output-dir results/figure_2_19 \
+      --output-dir results/adjacent_regression \
       --fold-scheme adjacent \
       --include-hierarchical-mlmdp \
       --hierarchical-mlmdp-run-dir output/adjacent_mlmdp_regression/production
 
-The augmented files include with_hierarchical_mlmdp in their names, so they do
-not overwrite the original seven-predictor result.
+The augmented files carry the `regression_mlmdp_routes` stem, so they do not
+overwrite the plain `regression_routes` seven-predictor result. Add
+`--exclude-routes` to also drop the route regressors and write
+`regression_mlmdp_no-routes_*` instead.
 

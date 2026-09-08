@@ -37,7 +37,10 @@
     "min_lr": 1e-3,
     "initialization_count": 1,
     "initialization_seed": 123,
-    "future_restart_log_scale": 0.45
+    "future_restart_log_scale": 0.45,
+    "goal_reward_mode": "inpainted",
+    "commitment_mode": "termination",
+    "commitment_radius": null
   },
   "rank_min": 2,
   "rank_max": 25
