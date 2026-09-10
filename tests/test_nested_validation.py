@@ -83,3 +83,17 @@ def test_missing_or_operational_fit_keeps_selection_pending(record):
 
     assert result["status"] == "pending"
     assert result["selection"]["selected_k"] is None
+
+
+def test_nested_selection_preserves_typed_session_identity():
+    result = nested_rank_selection(
+        [
+            _success(2, 1, -1.0),
+            _success(2, "1", -1.0),
+        ],
+        ranks=(2,),
+        validation_session_ids=(1, "1"),
+    )
+
+    assert result["status"] == "selected"
+    assert result["rank_rows"][0]["successful_inner_fits"] == 2

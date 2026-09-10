@@ -212,9 +212,7 @@ dataset = DoohanDataset.from_data_root(
     end_date="2022-06-30",
     maze_name="maze_1",
 )
-flat_report = dataset.report(
-    score_flat_dataset(environment, dataset.trials)
-)
+flat_report = dataset.report(score_flat_dataset(environment, dataset.trials))
 print(flat_report.summary_record())
 ```
 
@@ -228,54 +226,102 @@ assumption. Pandas is only required while loading the processed TSV files and
 is available
 through the `notebook` optional dependency.
 
-## Reproduce the Figure 2.19 or 2.20 behavioral panels
+## Held-out-session regression workflow
 
-The dedicated analysis command runs Qin's seven-policy full/reduced regression
-from processed Doohan decisions for one animal, any animal subset, or all
-available animals. Figure 2.19 uses PCA routes; Figure 2.20 uses Qin's fitted
-low-rank LMDP/HMM routes:
+The regression workflow has two deliberately separate CV levels. A predictor
+partition reserves one session, fits MLMDP, route, and habit models on every
+other selected session for that subject, and generates one fixed causal feature
+artifact for the reserved session. Blocked whole-trial folds then fit regression
+coefficients only within that reserved session. Regression folds never refit or
+select predictors.
 
-```bash
-python doohan_data_interaction/reproduce_figure_2_19_behavior.py \
-    --data-root external/GridMaze-mFC-ephys-DATA/data \
-    --output-dir results/adjacent_regression \
-    --figure-number 2.19 \
-    --subject-id m2 \
-    --subject-id m3
+[`configs/regression_workflow.json`](configs/regression_workflow.json) is the
+complete example. Set `heldout_sessions` to `"last"`, `"all"`, or explicit
+typed records:
+
+```json
+"heldout_sessions": [
+  {"subject_id": "m2", "session_id": "2022-07-05_m2"},
+  {"subject_id": "m3", "session_id": "2022-07-05_m3"}
+]
 ```
 
-For Figure 2.20, pass `--figure-number 2.20`; the HMM fit defaults reproduce
-the settings in Qin's original regressor construction and are exposed as
-`--hmm-*` options. Each fold fits routes only on its explicit route-training
-sessions and records the fitted state and likelihood trace.
+Choose subgoal rank with `session_cv`, `training_ll`, or `fixed`.
+`session_cv` leaves out each predictor-training session in turn and selects by
+held-out likelihood, then refits the selected rank on all predictor-training
+sessions. `training_ll` fits every rank on all predictor-training sessions and
+selects the highest total training log likelihood, breaking ties toward the
+lower rank. `fixed` uses `rank_range: [k, k]`. Every configured range is an
+inclusive `[lower, higher]` pair; arbitrary rank lists are rejected.
 
-`--fold-scheme` selects the cross-validation split. The default `adjacent`
-trains regression coefficients on session k and evaluates on k+1, with routes
-fitted on the other sessions. `leave_one_out` trains on every other session and
-evaluates on the held-out one; routes are then fitted on the same training
-sessions, so route predictors are in-sample on the training rows (the held-out
-session is still fully excluded from both fits). Leave-one-out gives one
-validation point per session and uses far more data per fold, so its numbers
-are not directly comparable to the adjacent scheme.
+A local run, suitable for a small selection, is:
 
-Output names describe the regression rather than a thesis figure:
-`regression_routes` (PCA routes), `regression_hmm_routes` (HMM routes), and with
-`--include-hierarchical-mlmdp` the `regression_mlmdp_*` variants. Passing
-`--exclude-routes` (which requires `--include-hierarchical-mlmdp`) drops Qin's
-route and route-planning regressors, leaving the synthetic-agent regressors and
-the hierarchical MLMDP predictor, and writes `regression_mlmdp_no-routes_*`.
+```bash
+python scripts/run_regression_workflow.py complete \
+  --config configs/regression_workflow.json \
+  --output-dir output/regression_workflow/local-pca
+```
 
-Omit `--subject-id` to select every animal for the requested maze. The command
-writes the raw regression result (`.pt`), a fold-by-policy CSV grid, a
-per-policy across-animal summary CSV, a JSON provenance record, and PNG/PDF
-figures. Held-out Δ mean NLL is averaged within each animal before the
-across-animal mean ± SEM shown in the left panel; the right panel groups the
-same fold grid by validation-session order. Failed and unavailable folds
-remain explicit in the fold grid and provenance rather than being dropped.
-Subjects may have unequal numbers of sessions and folds. Use `--overwrite`
-only when intentionally replacing an existing output set. This command
-reproduces only the behavioral panels; the theoretical-agent panels and
-thesis significance annotations are not included.
+The same CLI exposes `prepare`, `candidate`, `selection`, `selected-refit`,
+`predictor-bundle`, `feature-generation`, `regression`, `aggregation`,
+`plotting`, and `status` for inspection or manual execution. Plotting reads
+completed numerical artifacts and never initiates fitting.
+
+Preview the idempotent SLURM graph without submitting jobs:
+
+```bash
+python scripts/slurm/manage_regression_workflow.py \
+  --config configs/regression_workflow.json \
+  --run-id pca-session-cv \
+  --dry-run
+```
+
+Use `--status` to combine artifact states with `squeue`/`sacct`, and
+`--retry-missing` to submit exact missing, pending, or operationally failed task
+identities. Scientific fit failures are terminal. Existing runs are immutable
+with respect to predictor-affecting configuration; changing only regression
+folds locally rebuilds the split manifest while reusing compatible predictor
+and feature artifacts.
+
+For `P` predictor partitions, `R = higher - lower + 1` ranks, and `T_p`
+predictor-training sessions in partition `p`, task counts are:
+
+- discovery: `R`;
+- candidates: `R * sum(T_p)` for `session_cv`, otherwise `P * R`;
+- selected-rank refits: `P` for `session_cv`, otherwise zero;
+- selection, predictor bundle, feature generation, and regression: `P` each;
+- aggregation and plotting: one each.
+
+Each regression task internally fits the full Qin model plus the
+intercept-omitted model and all eight leave-one-predictor-out models in every
+blocked fold. The fixed predictor order is vector, optimal, hierarchical
+MLMDP, route, route planning, habit, forward, and reverse; route names are PCA
+or HMM according to `predictors.route_family`.
+
+Run artifacts are organized as:
+
+```text
+manifest.json
+partitions/<partition-digest>/
+  candidates/inner/*.json
+  candidates/all_training/*.json
+  selection.json
+  predictor.json
+  features.json
+  regression.json
+report/
+  regression_<route>_<selection>_heldout-<scheme>_results.json
+  ..._folds.csv, ..._sessions.csv, ..._subjects.csv, ..._group.csv
+  ..._provenance.json, .html, .png, .svg, .pdf
+```
+
+Reports pool fold likelihoods by decision count, average held-out sessions
+equally within subject, and average subjects equally at group level. The
+headline group estimate is omitted unless the complete expected partition grid
+is present; partial tables and Plotly figures retain available observations and
+sample sizes. See
+[`docs/regression_workflow.md`](docs/regression_workflow.md) for stage and
+resume details.
 
 ## Distributed subgoals discovered with NMF
 

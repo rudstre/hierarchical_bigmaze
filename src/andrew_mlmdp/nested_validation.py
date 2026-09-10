@@ -17,7 +17,7 @@ def nested_rank_selection(
     records: Iterable[Mapping[str, object]],
     *,
     ranks: Sequence[int],
-    validation_session_ids: Sequence[str],
+    validation_session_ids: Sequence[object],
 ) -> dict[str, object]:
     """Apply terminal-state checks and the one-standard-error rank rule.
 
@@ -29,7 +29,7 @@ def nested_rank_selection(
     """
 
     expected_ranks = tuple(int(rank) for rank in ranks)
-    expected_sessions = tuple(str(value) for value in validation_session_ids)
+    expected_sessions = tuple(validation_session_ids)
     if not expected_ranks or len(set(expected_ranks)) != len(expected_ranks):
         raise ValueError("ranks must be non-empty and unique")
     if not expected_sessions or len(set(expected_sessions)) != len(expected_sessions):
@@ -40,10 +40,10 @@ def nested_rank_selection(
         for rank in expected_ranks
         for session_id in expected_sessions
     }
-    indexed: dict[tuple[int, str], Mapping[str, object]] = {}
+    indexed: dict[tuple[int, object], Mapping[str, object]] = {}
     for record in records:
         rank = int(record["k"])
-        session_id = str(record["validation_session_id"])
+        session_id = record["validation_session_id"]
         key = (rank, session_id)
         if key not in expected_keys:
             raise ValueError(f"Unexpected inner-fit identity: {key}")
@@ -66,12 +66,12 @@ def nested_rank_selection(
             if record is None
         ]
         operational = [
-            str(record["validation_session_id"])
+            record["validation_session_id"]
             for record in rank_records
             if record is not None and record["status"] == "operational_failure"
         ]
         scientific = [
-            str(record["validation_session_id"])
+            record["validation_session_id"]
             for record in rank_records
             if record is not None and record["status"] == "scientific_failure"
         ]

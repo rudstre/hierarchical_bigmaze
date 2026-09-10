@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,7 @@ from andrew_mlmdp.validation import (
     _payload_digest,
     _read_json,
     _summary_row,
-    validate_max_rank,
+    validate_rank_range,
 )
 
 
@@ -473,9 +474,7 @@ def _rank_fold_summary(
 ) -> dict[str, object]:
     successful = [row for row in fold_rows if row["status"] == "success"]
     missing_count = sum(row["status"] == "missing" for row in fold_rows)
-    failed_count = sum(
-        row["status"] not in {"success", "missing"} for row in fold_rows
-    )
+    failed_count = sum(row["status"] not in {"success", "missing"} for row in fold_rows)
     eligible = len(successful) == expected_fold_count
     status = "success" if eligible else ("failure" if failed_count else "missing")
     row: dict[str, object] = {
@@ -497,9 +496,7 @@ def _rank_fold_summary(
         if isinstance(selected, dict) and _finite_number(
             selected.get("reconstruction_error")
         ):
-            row["nmf_reconstruction_error"] = float(
-                selected["reconstruction_error"]
-            )
+            row["nmf_reconstruction_error"] = float(selected["reconstruction_error"])
 
     metrics = (
         "validation_ll_per_transition",
@@ -527,7 +524,7 @@ def aggregate_rank_results(
     shard_dir: str | Path,
     output_dir: str | Path,
     *,
-    max_rank: int = 49,
+    rank_range: Sequence[int] | None = None,
     show_plots: bool = False,
 ) -> dict[str, object]:
     """Aggregate the complete expected rank/fold grid with session-level SEs."""
@@ -541,8 +538,15 @@ def aggregate_rank_results(
             output_dir,
             show_plots=show_plots,
         )
-    validate_max_rank(max_rank)
-    expected_ranks = tuple(rank for rank in resolved.ranks if rank <= max_rank)
+    effective_range = (
+        resolved.rank_range if rank_range is None else validate_rank_range(rank_range)
+    )
+    if (
+        effective_range[0] < resolved.rank_range[0]
+        or effective_range[1] > resolved.rank_range[1]
+    ):
+        raise ValueError("rank_range must be contained in the configured rank_range")
+    expected_ranks = tuple(range(effective_range[0], effective_range[1] + 1))
     root = Path(shard_dir).resolve()
     dataset = _load_dataset_context(resolved)
     fold_count = (
@@ -632,9 +636,7 @@ def aggregate_rank_results(
             row = _aggregation_summary_row(k, shard)
             row["fold_index"] = fold_index
             row["training_sessions"] = (
-                None
-                if shard is None
-                else "|".join(shard["split"]["training_sessions"])
+                None if shard is None else "|".join(shard["split"]["training_sessions"])
             )
             row["validation_sessions"] = (
                 None
@@ -680,7 +682,7 @@ def aggregate_rank_results(
     aggregate = {
         "schema_version": SCHEMA_VERSION,
         "configuration": resolved.normalized_payload(),
-        "max_rank": max_rank,
+        "rank_range": list(effective_range),
         "fold_count": fold_count,
         "complete": complete,
         "best_k": selection["selected_k"],
@@ -700,12 +702,8 @@ def aggregate_rank_results(
         "uncertainty": "sample standard deviation across sessions / sqrt(n)",
         "missing_folds": missing_folds,
         "failed_folds": failed_folds,
-        "missing_ranks": [
-            row["k"] for row in rows if row["missing_fold_count"] > 0
-        ],
-        "failed_ranks": [
-            row["k"] for row in rows if row["failed_fold_count"] > 0
-        ],
+        "missing_ranks": [row["k"] for row in rows if row["missing_fold_count"] > 0],
+        "failed_ranks": [row["k"] for row in rows if row["failed_fold_count"] > 0],
         "ranking": [row["k"] for row in ranked],
         "summary_rows": rows,
         "fold_rows": fold_rows,
@@ -784,9 +782,7 @@ def _one_standard_error_selection(
     best_mean = float(best["validation_ll_per_transition_mean"])
     stored_standard_error = best.get("validation_ll_per_transition_se")
     standard_error = (
-        float(stored_standard_error)
-        if _finite_number(stored_standard_error)
-        else 0.0
+        float(stored_standard_error) if _finite_number(stored_standard_error) else 0.0
     )
     threshold = best_mean - standard_error
     selected = min(

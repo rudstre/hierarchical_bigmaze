@@ -36,7 +36,8 @@ if TYPE_CHECKING:
     from andrew_mlmdp.hierarchy.model import Template, ThresholdRange
     from andrew_mlmdp.lmdp import Environment
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+PRODUCTION_RANK_RANGE = (2, 49)
 PRODUCTION_RANKS = tuple(range(2, 50))
 PRODUCTION_NMF_RESTART_SEEDS = tuple(range(50))
 FITTED_PARAMETER_NAMES = (
@@ -265,24 +266,27 @@ class RankValidationConfig:
         default_factory=DiscoveryValidationConfig
     )
     adam: AdamValidationConfig = field(default_factory=AdamValidationConfig)
-    ranks: tuple[int, ...] = PRODUCTION_RANKS
+    rank_range: tuple[int, int] = PRODUCTION_RANK_RANGE
     project_root: Path = field(default_factory=Path.cwd, repr=False, compare=False)
     source_path: Path | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ranks", tuple(self.ranks))
+        object.__setattr__(self, "rank_range", validate_rank_range(self.rank_range))
         object.__setattr__(self, "project_root", Path(self.project_root).resolve())
         if self.source_path is not None:
             object.__setattr__(self, "source_path", Path(self.source_path).resolve())
-        if self.ranks != PRODUCTION_RANKS:
-            raise ValueError("Production validation ranks must be every integer 2..49")
+
+    @property
+    def ranks(self) -> tuple[int, ...]:
+        lower, higher = self.rank_range
+        return tuple(range(lower, higher + 1))
 
     def normalized_payload(self) -> dict[str, object]:
         """Return the path-independent configuration used for signatures."""
 
         return {
             "schema_version": SCHEMA_VERSION,
-            "ranks": list(self.ranks),
+            "rank_range": list(self.rank_range),
             "dataset": _json_value(asdict(self.dataset)),
             "discovery": _json_value(asdict(self.discovery)),
             "adam": _json_value(asdict(self.adam)),
@@ -300,8 +304,13 @@ class RankValidationConfig:
 
         config_path = Path(path).resolve()
         payload = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(payload, Mapping) and "ranks" in payload:
+            raise ValueError(
+                "Obsolete ranks list; use inclusive rank_range: [lower, higher]"
+            )
         _require_keys(
-            payload, {"schema_version", "ranks", "dataset", "discovery", "adam"}
+            payload,
+            {"schema_version", "rank_range", "dataset", "discovery", "adam"},
         )
         if payload["schema_version"] != SCHEMA_VERSION:
             raise ValueError(
@@ -309,7 +318,7 @@ class RankValidationConfig:
             )
         project_root = _find_project_root(config_path.parent)
         return cls(
-            ranks=tuple(payload["ranks"]),
+            rank_range=tuple(payload["rank_range"]),
             dataset=DatasetValidationConfig(**payload["dataset"]),
             discovery=DiscoveryValidationConfig(
                 **{
@@ -538,39 +547,44 @@ def _check_expected_count(name: str, actual: int, expected: int | None) -> None:
         raise ValueError(f"Expected {expected} {name} trials, found {actual}")
 
 
-def validate_max_rank(max_rank: int) -> int:
-    """Validate and return an inclusive production rank upper bound."""
+def validate_rank_range(rank_range: Sequence[int]) -> tuple[int, int]:
+    """Validate one inclusive contiguous rank range."""
 
+    if not isinstance(rank_range, (list, tuple)) or len(rank_range) != 2:
+        raise ValueError("rank_range must be [lower, higher] (inclusive)")
+    lower, higher = rank_range
     if (
-        isinstance(max_rank, bool)
-        or not isinstance(max_rank, int)
-        or not 2 <= max_rank <= PRODUCTION_RANKS[-1]
+        isinstance(lower, bool)
+        or not isinstance(lower, int)
+        or isinstance(higher, bool)
+        or not isinstance(higher, int)
+        or not 2 <= lower <= higher <= PRODUCTION_RANK_RANGE[1]
     ):
-        raise ValueError("max_rank must be an integer in the inclusive range 2..49")
-    return max_rank
+        raise ValueError("rank_range must contain ordered integer bounds within 2..49")
+    return lower, higher
 
 
 def rank_fold_from_array_task(
     task_id: int,
     fold_count: int,
     *,
-    max_rank: int = PRODUCTION_RANKS[-1],
+    rank_range: Sequence[int] = PRODUCTION_RANK_RANGE,
 ) -> tuple[int, int]:
     """Map a zero-based SLURM task to its deterministic rank and fold."""
 
-    validate_max_rank(max_rank)
+    lower, higher = validate_rank_range(rank_range)
     if (
         isinstance(fold_count, bool)
         or not isinstance(fold_count, int)
         or fold_count < 1
     ):
         raise ValueError("fold_count must be a positive integer")
-    task_count = (max_rank - 1) * fold_count
+    task_count = (higher - lower + 1) * fold_count
     if isinstance(task_id, bool) or not isinstance(task_id, int):
         raise ValueError("task_id must be an integer")
     if not 0 <= task_id < task_count:
         raise ValueError(f"task_id must be in the inclusive range 0..{task_count - 1}")
-    return 2 + task_id // fold_count, task_id % fold_count
+    return lower + task_id // fold_count, task_id % fold_count
 
 
 def validation_fold_count(config: RankValidationConfig | str | Path) -> int:
@@ -1653,9 +1667,9 @@ def aggregate_rank_results(
     shard_dir: str | Path,
     output_dir: str | Path,
     *,
-    max_rank: int = 49,
+    rank_range: Sequence[int] | None = None,
 ) -> dict[str, object]:
-    """Aggregate schema-v3 rank/fold shards via the presentation module."""
+    """Aggregate schema-v4 rank/fold shards via the presentation module."""
 
     from andrew_mlmdp.validation_aggregation import (
         aggregate_rank_results as aggregate,
@@ -1665,5 +1679,5 @@ def aggregate_rank_results(
         config,
         shard_dir,
         output_dir,
-        max_rank=max_rank,
+        rank_range=rank_range,
     )

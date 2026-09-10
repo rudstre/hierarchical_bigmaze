@@ -167,6 +167,22 @@ _LAZY_ATTRS = (
     }
     | {name: "andrew_mlmdp.maze" for name in ("Coordinate", "Maze")}
     | {
+        name: "andrew_mlmdp.regression_workflow"
+        for name in (
+            "PredictorConfig",
+            "PredictorPartition",
+            "RegressionCVConfig",
+            "RegressionDatasetConfig",
+            "RegressionWorkflowConfig",
+            "SubgoalSelectionConfig",
+            "load_regression_workflow_config",
+            "run_local_workflow",
+        )
+    }
+    | {
+        "write_regression_report": "andrew_mlmdp.regression_reporting",
+    }
+    | {
         "ProfileNormalization": "andrew_mlmdp.profiles",
     }
 )

@@ -107,7 +107,6 @@ def test_worker_fingerprint_excludes_only_aggregation_sources(tmp_path: Path):
     assert presentation_edit["content_sha256"] != worker_edit["content_sha256"]
 
 
-
 def test_aggregate_cli_uses_matching_submission_manifest(tmp_path: Path):
     config = tmp_path / "config.json"
     config.write_text("{}")
@@ -119,12 +118,12 @@ def test_aggregate_cli_uses_matching_submission_manifest(tmp_path: Path):
             {
                 "config_path": str(config.resolve()),
                 "output_dir": str(output.resolve()),
-                "max_rank": 7,
+                "rank_range": [4, 7],
             }
         )
     )
 
-    assert aggregate_cli._manifest_max_rank(output, config) == 7
+    assert aggregate_cli._manifest_rank_range(output, config) == (4, 7)
 
 
 def test_aggregate_cli_ignores_nonmatching_submission_manifests(tmp_path: Path):
@@ -138,33 +137,44 @@ def test_aggregate_cli_ignores_nonmatching_submission_manifests(tmp_path: Path):
             {
                 "config_path": str((tmp_path / "other.json").resolve()),
                 "output_dir": str(output.resolve()),
-                "max_rank": 7,
+                "rank_range": [4, 7],
             }
         )
     )
 
-    assert aggregate_cli._manifest_max_rank(output, config) is None
+    assert aggregate_cli._manifest_rank_range(output, config) is None
+
 
 def test_aggregate_cli_show_plot_switches():
-    assert aggregate_cli.build_parser().parse_args(
-        [
-            "--config",
-            "config.json",
-            "--shard-dir",
-            "shards",
-            "--output-dir",
-            "aggregate",
-            "--show-plots",
-        ]
-    ).show_plots is True
-    assert aggregate_cli.build_parser().parse_args(
-        [
-            "--config",
-            "config.json",
-            "--shard-dir",
-            "shards",
-            "--output-dir",
-            "aggregate",
-            "--no-show-plots",
-        ]
-    ).show_plots is False
+    assert (
+        aggregate_cli.build_parser()
+        .parse_args(
+            [
+                "--config",
+                "config.json",
+                "--shard-dir",
+                "shards",
+                "--output-dir",
+                "aggregate",
+                "--show-plots",
+            ]
+        )
+        .show_plots
+        is True
+    )
+    assert (
+        aggregate_cli.build_parser()
+        .parse_args(
+            [
+                "--config",
+                "config.json",
+                "--shard-dir",
+                "shards",
+                "--output-dir",
+                "aggregate",
+                "--no-show-plots",
+            ]
+        )
+        .show_plots
+        is False
+    )

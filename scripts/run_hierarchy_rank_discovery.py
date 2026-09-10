@@ -12,8 +12,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from andrew_mlmdp.validation import (  # noqa: E402
     RankValidationError,
+    load_validation_config,
     run_rank_discovery,
-    validate_max_rank,
+    validate_rank_range,
 )
 
 
@@ -21,7 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--k", required=True, type=int)
-    parser.add_argument("--max-rank", type=int, default=49)
+    parser.add_argument(
+        "--rank-range",
+        type=int,
+        nargs=2,
+        metavar=("LOWER", "HIGHER"),
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
         "--force",
@@ -34,9 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        max_rank = validate_max_rank(args.max_rank)
-        if args.k > max_rank:
-            raise ValueError("k cannot exceed --max-rank")
+        config = load_validation_config(args.config)
+        rank_range = validate_rank_range(
+            config.rank_range if args.rank_range is None else args.rank_range
+        )
+        if not rank_range[0] <= args.k <= rank_range[1]:
+            raise ValueError("k must lie within --rank-range")
         result = run_rank_discovery(
             args.config,
             args.k,

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_PYTHON = "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python"
 
 
@@ -22,7 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path)
     parser.add_argument("--run-id", default="loso")
-    parser.add_argument("--max-rank", type=int)
+    parser.add_argument(
+        "--rank-range",
+        type=int,
+        nargs=2,
+        metavar=("LOWER", "HIGHER"),
+    )
     parser.add_argument("--max-concurrent", type=int)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -144,7 +149,8 @@ def _exports(manifest: dict[str, Any], fold: int | None) -> str:
         f"HIERARCHY_SWEEP_OUTPUT={manifest['output_dir']}",
         f"HIERARCHY_DISCOVERY_OUTPUT={manifest['discovery_dir']}",
         f"HIERARCHY_RUN_IDENTIFIER={manifest['run_id']}",
-        f"HIERARCHY_MAX_RANK={manifest['max_rank']}",
+        f"HIERARCHY_RANK_LOWER={manifest['rank_range'][0]}",
+        f"HIERARCHY_RANK_HIGHER={manifest['rank_range'][1]}",
     ]
     if fold is not None:
         values.append(f"HIERARCHY_FOLD_INDEX={fold}")
@@ -204,7 +210,7 @@ def _submit(
             "timestamp": _now(),
             "kind": kind,
             "job_id": job_id,
-            "ranks": sorted(ranks),
+            "task_ids": sorted(ranks),
             "array": array,
             "fold_index": fold,
             "dependency": dependency,
@@ -217,9 +223,6 @@ def _submit(
 
 
 def _new_manifest(args: argparse.Namespace, root: Path) -> dict[str, Any]:
-    max_rank = 49 if args.max_rank is None else args.max_rank
-    if not 2 <= max_rank <= 49:
-        raise ValueError("max rank must be in 2..49")
     config = _resolve(
         args.config
         or Path(
@@ -240,6 +243,21 @@ def _new_manifest(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         ),
         root,
     )
+    configured_range = _read(config).get("rank_range")
+    rank_range = configured_range if args.rank_range is None else args.rank_range
+    if (
+        not isinstance(rank_range, (list, tuple))
+        or len(rank_range) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in rank_range
+        )
+        or not 2 <= rank_range[0] <= rank_range[1] <= 49
+    ):
+        raise ValueError("rank_range must be ordered integer bounds within 2..49")
+    if args.rank_range is not None and list(args.rank_range) != configured_range:
+        raise ValueError("--rank-range must equal the config rank_range")
+    rank_range = list(rank_range)
     folds = _fold_count(config, root)
     if args.max_concurrent is not None and args.max_concurrent < folds:
         raise ValueError(f"max concurrent must be at least the fold count ({folds})")
@@ -252,7 +270,7 @@ def _new_manifest(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "config_path": str(config),
         "output_dir": str(output),
         "discovery_dir": str(output / "discovery"),
-        "max_rank": max_rank,
+        "rank_range": rank_range,
         "fold_count": folds,
         "resources": {
             "partition": args.partition or "cpu",
@@ -273,7 +291,7 @@ def _initial(args: argparse.Namespace, root: Path) -> None:
         raise ValueError(f"manifest exists: {path}; use --retry-missing")
     if not args.dry_run:
         _atomic_write(path, manifest)
-    ranks = list(range(2, manifest["max_rank"] + 1))
+    ranks = list(range(manifest["rank_range"][0], manifest["rank_range"][1] + 1))
     discovery = _submit(
         manifest,
         path,
@@ -321,8 +339,8 @@ def _load_manifest(args: argparse.Namespace, root: Path) -> tuple[dict[str, Any]
         "project_root": str(root),
         "output_dir": str(output),
     }
-    if args.max_rank is not None:
-        checks["max_rank"] = args.max_rank
+    if args.rank_range is not None:
+        checks["rank_range"] = list(args.rank_range)
     if args.config is not None:
         checks["config_path"] = str(_resolve(args.config, root))
     for key, expected in checks.items():
@@ -369,7 +387,7 @@ def _active(
         parent, task, state, reason = fields
         rank = int(task)
         submission = submissions[parent]
-        if rank not in submission["ranks"]:
+        if rank not in submission["task_ids"]:
             continue
         key = (submission["kind"], submission.get("fold_index"), rank)
         active[key].append(
@@ -411,7 +429,7 @@ def _artifact_states(
     output = Path(manifest["output_dir"])
     discovery_states: dict[int, str] = {}
     digests: dict[int, str] = {}
-    for rank in range(2, manifest["max_rank"] + 1):
+    for rank in range(manifest["rank_range"][0], manifest["rank_range"][1] + 1):
         path = output / "discovery" / f"k_{rank:02d}.json"
         if not path.is_file():
             discovery_states[rank] = "missing"
@@ -433,7 +451,7 @@ def _artifact_states(
             digests[rank] = _payload_digest(artifact)
 
     fold_states: dict[tuple[int, int], str] = {}
-    for rank in range(2, manifest["max_rank"] + 1):
+    for rank in range(manifest["rank_range"][0], manifest["rank_range"][1] + 1):
         for fold, context in enumerate(contexts):
             path = output / "folds" / f"k_{rank:02d}_fold_{fold:02d}.json"
             key = (rank, fold)

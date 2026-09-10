@@ -43,7 +43,7 @@ Submission-time options include:
 ```bash
 scripts/slurm/submit_hierarchy_rank_validation.sh \
   --run-id production_loso \
-  --max-rank 49 \
+  --rank-range 2 49 \
   --max-concurrent 48 \
   --mem 12G \
   --partition PARTITION \
@@ -51,8 +51,9 @@ scripts/slurm/submit_hierarchy_rank_validation.sh \
   --account ACCOUNT
 ```
 
-`--max-rank` is inclusive, accepts 2 through 49, and defaults to 49. It
-reduces both arrays and the expected aggregation grid. `--max-concurrent`
+`--rank-range LOWER HIGHER` is inclusive and accepts any ordered bounds from
+2 through 49, including a singleton range. By default it uses the exact
+`rank_range` in the JSON config. `--max-concurrent`
 keeps every requested task and bounds aggregate fit concurrency by dividing
 the cap evenly across the fold arrays; it must therefore be at least the
 number of folds (six for production LOSO). If omitted, all requested array
@@ -134,8 +135,8 @@ python scripts/aggregate_hierarchy_rank_validation.py \
 ```
 
 When the shard directory contains exactly one matching SLURM submission
-manifest, aggregation uses its submitted maximum rank. Pass `--max-rank K` to
-override that value; without a matching manifest, the production default is 49.
+manifest, aggregation uses its submitted `rank_range`. Pass
+`--rank-range LOWER HIGHER` to explicitly select the same configured subset.
 When run from an interactive terminal, the command also opens the live Plotly
 figures in the default browser as soon as aggregation finishes. Use
 `--no-show-plots` to suppress this, or `--show-plots` to request it explicitly

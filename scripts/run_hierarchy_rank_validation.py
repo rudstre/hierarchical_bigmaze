@@ -12,9 +12,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from andrew_mlmdp.validation import (  # noqa: E402
     RankValidationError,
+    load_validation_config,
     rank_fold_from_array_task,
     run_rank_validation,
-    validate_max_rank,
+    validate_rank_range,
     validation_fold_count,
 )
 
@@ -26,7 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     identity.add_argument("--k", type=int)
     identity.add_argument("--array-task-id", type=int)
     parser.add_argument("--fold-index", type=int, default=0)
-    parser.add_argument("--max-rank", type=int, default=49)
+    parser.add_argument(
+        "--rank-range",
+        type=int,
+        nargs=2,
+        metavar=("LOWER", "HIGHER"),
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--discovery-dir", type=Path)
     parser.add_argument("--print-fold-count", action="store_true")
@@ -41,8 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        max_rank = validate_max_rank(args.max_rank)
-        fold_count = validation_fold_count(args.config)
+        config = load_validation_config(args.config)
+        rank_range = validate_rank_range(
+            config.rank_range if args.rank_range is None else args.rank_range
+        )
+        fold_count = validation_fold_count(config)
         if args.print_fold_count:
             print(fold_count)
             return 0
@@ -52,12 +61,12 @@ def main(argv: list[str] | None = None) -> int:
             k, fold_index = rank_fold_from_array_task(
                 args.array_task_id,
                 fold_count,
-                max_rank=max_rank,
+                rank_range=rank_range,
             )
         elif args.k is not None:
             k, fold_index = args.k, args.fold_index
-            if k > max_rank:
-                raise ValueError("k cannot exceed --max-rank")
+            if not rank_range[0] <= k <= rank_range[1]:
+                raise ValueError("k must lie within --rank-range")
         else:
             raise ValueError("provide either --k or --array-task-id")
         result = run_rank_validation(

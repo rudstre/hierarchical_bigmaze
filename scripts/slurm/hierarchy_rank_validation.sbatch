@@ -19,7 +19,8 @@ python_executable="${HIERARCHY_PYTHON:-/nfs/nhome/live/rudyg/micromamba/envs/Gri
 config_path="${HIERARCHY_SWEEP_CONFIG:-${project_root}/configs/hierarchy_rank_validation_loso.json}"
 output_dir="${HIERARCHY_SWEEP_OUTPUT:-${project_root}/output/hierarchy_rank_validation/production_loso}"
 discovery_dir="${HIERARCHY_DISCOVERY_OUTPUT:-${output_dir}/discovery}"
-max_rank="${HIERARCHY_MAX_RANK:-49}"
+rank_lower="${HIERARCHY_RANK_LOWER:-2}"
+rank_higher="${HIERARCHY_RANK_HIGHER:-49}"
 array_job_id="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
 array_task_id="${SLURM_ARRAY_TASK_ID}"
 fold_index="${HIERARCHY_FOLD_INDEX:-0}"
@@ -49,6 +50,6 @@ cd "${project_root}"
   --config "${config_path}" \
   --k "${array_task_id}" \
   --fold-index "${fold_index}" \
-  --max-rank "${max_rank}" \
+  --rank-range "${rank_lower}" "${rank_higher}" \
   --output-dir "${output_dir}" \
   --discovery-dir "${discovery_dir}"

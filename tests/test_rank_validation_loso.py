@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,8 +32,7 @@ def _loso_config(tmp_path, session_count=3):
 
 def _dataset_context(session_count=3):
     sessions = tuple(
-        SimpleNamespace(session_id=f"session-{index}")
-        for index in range(session_count)
+        SimpleNamespace(session_id=f"session-{index}") for index in range(session_count)
     )
     trials = tuple(
         Trial(
@@ -77,9 +77,7 @@ def test_loso_folds_hold_out_every_session_exactly_once(tmp_path, monkeypatch):
         for fold_index in range(3)
     ]
 
-    held_out = [
-        context.split_payload["validation_sessions"][0] for context in contexts
-    ]
+    held_out = [context.split_payload["validation_sessions"][0] for context in contexts]
     assert held_out == ["session-0", "session-1", "session-2"]
     for context in contexts:
         training = set(context.split_payload["training_sessions"])
@@ -111,19 +109,34 @@ def test_audited_loso_fold_count_does_not_load_trial_data(tmp_path, monkeypatch)
     ],
 )
 def test_rank_fold_array_mapping(task_id, expected):
-    assert validation.rank_fold_from_array_task(
-        task_id,
-        3,
-        max_rank=3,
-    ) == expected
+    assert (
+        validation.rank_fold_from_array_task(
+            task_id,
+            3,
+            rank_range=(2, 3),
+        )
+        == expected
+    )
 
 
-@pytest.mark.parametrize("max_rank", [1, 50, True])
-def test_max_rank_validation_rejects_out_of_range_values(max_rank):
-    with pytest.raises(ValueError, match="max_rank"):
-        validation.validate_max_rank(max_rank)
+@pytest.mark.parametrize("rank_range", [(1, 3), (2, 50), (4, 3), (True, 3), (2, 3, 4)])
+def test_rank_range_validation_rejects_invalid_ranges(rank_range):
+    with pytest.raises(ValueError, match="rank_range"):
+        validation.validate_rank_range(rank_range)
 
 
+@pytest.mark.parametrize(
+    ("task_id", "expected"),
+    [(0, (7, 0)), (1, (7, 1)), (2, (8, 0)), (3, (8, 1))],
+)
+def test_rank_fold_array_mapping_supports_arbitrary_lower_bound(task_id, expected):
+    assert (
+        validation.rank_fold_from_array_task(task_id, 2, rank_range=(7, 8)) == expected
+    )
+
+
+def test_rank_fold_array_mapping_supports_singleton_range():
+    assert validation.rank_fold_from_array_task(0, 1, rank_range=(9, 9)) == (9, 0)
 
 
 def test_legacy_discovery_artifact_ignores_only_scheduler_scope_changes():
@@ -168,6 +181,7 @@ def test_legacy_discovery_artifact_ignores_only_scheduler_scope_changes():
 
     current["source"]["files"][0]["sha256"] = "changed-science"
     assert not validation._discovery_compatibility_matches(stored, current)
+
 
 def _successful_fold_row(value):
     return {
@@ -332,10 +346,7 @@ def test_worker_compatibility_uses_content_hash_not_git_head():
         "source": {**current["source"], "content_sha256": "changed-content"},
     }
     assert not aggregation._worker_compatibility_matches(stored, changed_source)
-    assert not aggregation._worker_compatibility_matches(
-        stored, {**current, "fold": 1}
-    )
-
+    assert not aggregation._worker_compatibility_matches(stored, {**current, "fold": 1})
 
 
 def test_slurm_defaults_and_submission_controls_are_explicit():
@@ -361,7 +372,7 @@ def test_slurm_defaults_and_submission_controls_are_explicit():
     assert "#SBATCH --time=08:00:00" in discovery_batch
     assert "#SBATCH --mem=12G" in validation_batch
     assert "#SBATCH --mem=12G" in discovery_batch
-    assert "--max-rank" in manager
+    assert "--rank-range" in manager
     assert "--max-concurrent" in manager
     assert "aftercorr:" in manager
     assert "afterany:" not in manager
@@ -370,7 +381,7 @@ def test_slurm_defaults_and_submission_controls_are_explicit():
     assert "--retry-missing" in manager
     assert "--cancel-held" in manager
     assert "--dry-run" in manager
-    assert 'BASH_SOURCE[0]' in submit
+    assert "BASH_SOURCE[0]" in submit
     assert "SLURM_SUBMIT_DIR" not in submit
     assert "expected_session_trial_counts" in manager
     assert "manage_hierarchy_rank_validation.py" in submit
@@ -472,7 +483,7 @@ def test_fold_aggregation_limits_grid_and_computes_mean_se(
         config,
         root,
         tmp_path / "aggregate",
-        max_rank=2,
+        rank_range=(2, 2),
     )
 
     assert result["complete"]
@@ -488,3 +499,21 @@ def test_fold_aggregation_limits_grid_and_computes_mean_se(
     assert (tmp_path / "aggregate" / "rank_summary.csv").is_file()
 
 
+def test_rank_config_requires_inclusive_range_and_rejects_rank_lists(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    config = _loso_config(tmp_path)
+    payload = config.normalized_payload()
+    payload["rank_range"] = [7, 9]
+    path = tmp_path / "range.json"
+    path.write_text(json.dumps(payload))
+
+    loaded = validation.load_validation_config(path)
+
+    assert loaded.rank_range == (7, 9)
+    assert loaded.ranks == (7, 8, 9)
+
+    payload["ranks"] = payload.pop("rank_range")
+    obsolete = tmp_path / "obsolete.json"
+    obsolete.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="Obsolete ranks list"):
+        validation.load_validation_config(obsolete)

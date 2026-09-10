@@ -15,14 +15,14 @@ SPEC.loader.exec_module(retry)
 def _manifest(tmp_path):
     output = tmp_path / "output"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": "test",
         "project_root": str(ROOT),
         "python_executable": "python",
         "config_path": str(tmp_path / "config.json"),
         "output_dir": str(output),
         "discovery_dir": str(output / "discovery"),
-        "max_rank": 4,
+        "rank_range": [2, 4],
         "fold_count": 2,
         "resources": {
             "partition": "cpu",
@@ -35,19 +35,19 @@ def _manifest(tmp_path):
             {
                 "kind": "discovery",
                 "job_id": "100",
-                "ranks": [2, 3, 4],
+                "task_ids": [2, 3, 4],
                 "fold_index": None,
             },
             {
                 "kind": "validation",
                 "job_id": "101",
-                "ranks": [2, 3, 4],
+                "task_ids": [2, 3, 4],
                 "fold_index": 0,
             },
             {
                 "kind": "validation",
                 "job_id": "102",
-                "ranks": [2, 3, 4],
+                "task_ids": [2, 3, 4],
                 "fold_index": 1,
             },
         ],
@@ -77,7 +77,7 @@ def test_sparse_array_is_compacted_with_limit():
 def test_initial_submission_records_manifest_and_resources(monkeypatch, tmp_path):
     config = tmp_path / "config.json"
     config.write_text(
-        '{"dataset":{"validation_mode":"leave_one_session_out",'
+        '{"rank_range":[2,3],"dataset":{"validation_mode":"leave_one_session_out",'
         '"expected_session_trial_counts":{"a":1,"b":1}}}'
     )
     output = tmp_path / "output"
@@ -91,7 +91,8 @@ def test_initial_submission_records_manifest_and_resources(monkeypatch, tmp_path
             str(config),
             "--output-dir",
             str(output),
-            "--max-rank",
+            "--rank-range",
+            "2",
             "3",
             "--max-concurrent",
             "4",
@@ -125,7 +126,9 @@ def test_initial_submission_records_manifest_and_resources(monkeypatch, tmp_path
 
 def test_partial_submission_keeps_recorded_job_ids(monkeypatch, tmp_path):
     config = tmp_path / "config.json"
-    config.write_text('{"dataset":{"validation_mode":"chronological_holdout"}}')
+    config.write_text(
+        '{"rank_range":[2,2],"dataset":{"validation_mode":"chronological_holdout"}}'
+    )
     output = tmp_path / "output"
     args = retry.build_parser().parse_args(
         [
@@ -135,7 +138,8 @@ def test_partial_submission_keeps_recorded_job_ids(monkeypatch, tmp_path):
             str(config),
             "--output-dir",
             str(output),
-            "--max-rank",
+            "--rank-range",
+            "2",
             "2",
         ]
     )

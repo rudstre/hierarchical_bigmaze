@@ -20,9 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shard-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
-        "--max-rank",
+        "--rank-range",
         type=int,
-        help="Inclusive maximum rank; overrides the matching SLURM manifest.",
+        nargs=2,
+        metavar=("LOWER", "HIGHER"),
+        help="Inclusive rank range; overrides the matching SLURM manifest.",
     )
     parser.add_argument(
         "--show-plots",
@@ -36,15 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _manifest_max_rank(
+def _manifest_rank_range(
     shard_dir: Path,
     config: Path,
-) -> int | None:
-    """Return the submitted rank limit when exactly one manifest matches."""
+) -> tuple[int, int] | None:
+    """Return the submitted rank range when exactly one manifest matches."""
 
     root = shard_dir.resolve()
     config_path = config.resolve()
-    matches: list[tuple[Path, int]] = []
+    matches: list[tuple[Path, tuple[int, int]]] = []
     for path in (root / "slurm_runs").glob("*.json"):
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -56,14 +58,17 @@ def _manifest_max_rank(
             continue
         if manifest.get("config_path") != str(config_path):
             continue
-        max_rank = manifest.get("max_rank")
-        if isinstance(max_rank, int) and not isinstance(max_rank, bool):
-            matches.append((path, max_rank))
+        rank_range = manifest.get("rank_range")
+        if (
+            isinstance(rank_range, list)
+            and len(rank_range) == 2
+            and all(isinstance(value, int) for value in rank_range)
+        ):
+            matches.append((path, tuple(rank_range)))
     if len(matches) > 1:
         paths = ", ".join(str(path) for path, _ in matches)
         raise ValueError(
-            "multiple matching SLURM manifests; pass --max-rank explicitly "
-            f"({paths})"
+            f"multiple matching SLURM manifests; pass --rank-range explicitly ({paths})"
         )
     return matches[0][1] if matches else None
 
@@ -71,14 +76,14 @@ def _manifest_max_rank(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        max_rank = args.max_rank
-        if max_rank is None:
-            max_rank = _manifest_max_rank(args.shard_dir, args.config)
+        rank_range = args.rank_range
+        if rank_range is None:
+            rank_range = _manifest_rank_range(args.shard_dir, args.config)
         result = aggregate_rank_results(
             args.config,
             args.shard_dir,
             args.output_dir,
-            max_rank=49 if max_rank is None else max_rank,
+            rank_range=rank_range,
             show_plots=(
                 sys.stdout.isatty() if args.show_plots is None else args.show_plots
             ),
