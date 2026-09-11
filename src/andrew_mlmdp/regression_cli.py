@@ -8,10 +8,14 @@ from pathlib import Path
 
 from andrew_mlmdp.doohan_canonical import doohan_to_canonical_decisions
 from andrew_mlmdp.doohan_dataset import DoohanDataset
-from andrew_mlmdp.regression_execution import run_predictor_bundle
+from andrew_mlmdp.regression_execution import (
+    regression_artifact_type,
+    regression_compatibility,
+    run_predictor_bundle,
+)
 from andrew_mlmdp.regression_reporting import write_regression_report
 from andrew_mlmdp.regression_workflow import (
-    _stage_source,
+    PredictorPartition,
     aggregate_partition,
     build_predictor_partitions,
     load_candidate_records,
@@ -109,7 +113,7 @@ def _regression_records(config, output_dir, manifest):
         record = json.loads(path.read_text(encoding="utf-8"))
         if (
             record.get("schema_version") != 1
-            or record.get("artifact_type") != "blocked_qin_regression"
+            or record.get("artifact_type") != regression_artifact_type(config)
             or record.get("partition_digest") != digest
             or record.get("partition") != expected["partition"]
         ):
@@ -126,19 +130,12 @@ def _regression_records(config, output_dir, manifest):
             or feature.get("artifact_digest") != _content_digest(feature)
         ):
             raise ValueError(f"Feature artifact is invalid: {feature_path}")
-        compatibility = {
-            "artifact_type": "blocked_qin_regression",
-            "partition_digest": digest,
-            "feature_artifact_digest": feature["artifact_digest"],
-            "splits": expected["regression_splits"],
-            "settings": {
-                "method": config.regression_cv.method,
-                "n_splits": config.regression_cv.n_splits,
-                "optimizer": "scipy_BFGS_Qin",
-                "standardization": "training_decisions_only_population_sd",
-            },
-            "source": _stage_source(config, "regression"),
-        }
+        compatibility = regression_compatibility(
+            config,
+            PredictorPartition(**expected["partition"]),
+            feature["artifact_digest"],
+            expected["regression_splits"],
+        )
         if record.get("compatibility") != compatibility:
             raise ValueError(f"Regression artifact is incompatible: {path}")
         if record.get("status") == "success" and (

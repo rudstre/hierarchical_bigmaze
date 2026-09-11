@@ -12,14 +12,19 @@ All preprocessing statistics and coefficients are fitted from the other blocks.
 The response is the observed four-way action. The design contains an intercept
 and four-action values for vector, optimal, hierarchical MLMDP, route, route
 planning, habit, forward, and reverse predictors. Impossible actions retain
-Qin's exact `-1e10` additive mask. Each fold fits Qin's full conditional-logit
-model, the intercept-omitted model, and one model omitting each predictor.
-Unique predictability is reduced minus full held-out mean NLL in nats/decision.
+Qin's exact `-1e10` additive mask. In k-fold mode, each fold fits Qin's full
+conditional-logit model, the intercept-omitted model, and one model omitting
+each predictor. Unique predictability is reduced minus full held-out mean NLL
+in nats/decision. In learning-curve mode, each split fits only the full model
+and reports test log likelihood in nats/decision.
 
 ## Configuration
 
-The versioned example is
-[`configs/regression_workflow.json`](../configs/regression_workflow.json).
+The versioned examples are
+[`configs/regression_workflow.json`](../configs/regression_workflow.json) for
+k-fold ablation and
+[`configs/regression_workflow_learning_curve.json`](../configs/regression_workflow_learning_curve.json)
+for the full-model learning curve.
 
 - `heldout_sessions: "last"` creates one partition per subject.
 - `heldout_sessions: "all"` creates every possible held-out-session partition.
@@ -29,7 +34,20 @@ The versioned example is
 - `subgoal_selection.rank_range` is always inclusive `[lower, higher]`.
 - `predictors.route_family` is `pca` or `hmm`; the unused family's settings do
   not affect predictor compatibility.
-- `regression_cv.n_splits` changes only regression splits and results.
+- `regression_cv.method: "blocked_trial_kfold"` runs the original full/reduced
+  ablation analysis; `n_splits` changes only regression splits and results.
+- `regression_cv.method: "blocked_trial_learning_curve"` fits only the full
+  regression model. Its sole parameter, `n_subdivisions`, sets the number of
+  equal intervals between train-on-one-trial and leave-one-trial-out.
+
+Learning-curve percentages refer to regression-coefficient fitting within the
+reserved session. The MLMDP, route, and habit predictors remain fitted from the
+complementary sessions. For every distinct requested training size, the workflow
+fits all circular placements of the contiguous test block, so a session with
+`N` trials performs `N` fits per distinct size. Circular wrapping selects trial
+membership only; decision rows remain chronological and trial boundaries remain
+intact. Requested sizes that round to the same whole-trial count share their
+fits.
 
 `session_cv` fits rank candidates once for each omitted predictor-training
 session, selects using only those held-out scores, and refits the winner on all
@@ -109,3 +127,8 @@ mean and SEM, a zero reference, units, sample counts, stable colors, and hover
 metadata. Output includes self-contained HTML plus PNG, SVG, and PDF through
 Kaleido. Incomplete grids retain partial diagnostics but have no headline group
 estimate.
+
+Learning-curve reporting instead writes split, session, subject, and group CSV
+tables and plots training-trial percentage against mean test log likelihood.
+Split LL is pooled by decisions within each session and training size; sessions
+are averaged equally within subjects and subjects equally within the group.

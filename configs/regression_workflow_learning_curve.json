@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "dataset": {
+    "data_root": "external/GridMaze-mFC-ephys-DATA/data",
+    "subject_ids": ["m2", "m3", "m4", "m6", "m7", "m8"],
+    "maze_name": "maze_1",
+    "start_date": "2022-06-30",
+    "end_date": "2022-07-05"
+  },
+  "discovery_config": "configs/hierarchy_rank_validation_loso.json",
+  "discovery_dir": "output/hierarchy_rank_discovery",
+  "adam": {},
+  "heldout_sessions": "last",
+  "subgoal_selection": {
+    "method": "session_cv",
+    "rank_range": [2, 25]
+  },
+  "predictors": {
+    "route_family": "pca",
+    "pca": {
+      "history": true,
+      "future": true,
+      "combine": "sum",
+      "normalize": true,
+      "alpha": 0.1,
+      "n_components": 3
+    },
+    "hmm": {
+      "n_routes": 7,
+      "cognitive_constant": 20.0,
+      "action_cost": 0.15,
+      "reward_value": 1.0,
+      "route_entropy_param": 0.0,
+      "action_entropy_param": 0.0,
+      "noise": 0.0,
+      "noise_decay": 0.0,
+      "learning_rate": 0.05,
+      "epochs": 500
+    }
+  },
+  "regression_cv": {
+    "method": "blocked_trial_learning_curve",
+    "n_subdivisions": 10
+  },
+  "random_seed": 123,
+  "slurm": {
+    "partition": "cpu",
+    "account": null,
+    "max_concurrent": 48,
+    "default_memory": "4G",
+    "default_time": "02:00:00",
+    "resource_bands": [
+      {
+        "rank_range": [2, 12],
+        "memory": "2G",
+        "time": "01:00:00"
+      },
+      {
+        "rank_range": [13, 25],
+        "memory": "4G",
+        "time": "04:00:00"
+      }
+    ]
+  }
+}

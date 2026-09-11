@@ -455,6 +455,37 @@ def _model_names(predictors: Sequence[str]) -> list[str]:
     ]
 
 
+def regression_artifact_type(config) -> str:
+    if config.regression_cv.method == "blocked_trial_learning_curve":
+        return "full_model_learning_curve_regression"
+    return "blocked_qin_regression"
+
+
+def regression_compatibility(config, partition, feature_digest, splits):
+    from andrew_mlmdp.regression_workflow import _stage_source
+
+    return {
+        "artifact_type": regression_artifact_type(config),
+        "partition_digest": partition.digest,
+        "feature_artifact_digest": feature_digest,
+        "splits": [
+            split.metadata() if hasattr(split, "metadata") else split
+            for split in splits
+        ],
+        "settings": {
+            **config.regression_cv.normalized_settings,
+            "optimizer": "scipy_BFGS_Qin",
+            "standardization": "training_decisions_only_population_sd",
+            "models": (
+                "full_only"
+                if config.regression_cv.method == "blocked_trial_learning_curve"
+                else "full_and_leave_one_predictor_out"
+            ),
+        },
+        "source": _stage_source(config, "regression"),
+    }
+
+
 def _validate_cached_artifact(
     path: Path,
     artifact: Mapping[str, object],
@@ -483,6 +514,82 @@ def _validate_cached_artifact(
     return artifact
 
 
+def _write_regression_checkpoint(
+    destination, artifact_type, partition, features, compatibility, folds
+):
+    _atomic_write_json(
+        destination,
+        {
+            "schema_version": 1,
+            "artifact_type": artifact_type,
+            "status": "partial",
+            "partition": _json_value(partition.metadata()),
+            "partition_digest": partition.digest,
+            "feature_artifact_digest": features["artifact_digest"],
+            "compatibility": compatibility,
+            "folds": folds,
+        },
+    )
+
+
+def _validate_learning_curve_coverage(splits):
+    by_size = {}
+    for split in splits:
+        by_size.setdefault(split.training_trial_count, []).append(split)
+    for training_count, size_splits in by_size.items():
+        all_trials = set(size_splits[0].training_trial_keys) | set(
+            size_splits[0].test_trial_keys
+        )
+        if len(size_splits) != len(all_trials):
+            raise AssertionError(
+                f"Learning curve size {training_count} lacks one block per trial"
+            )
+        test_counts = {
+            trial: sum(trial in split.test_trial_keys for split in size_splits)
+            for trial in all_trials
+        }
+        expected_count = len(all_trials) - training_count
+        if set(test_counts.values()) != {expected_count}:
+            raise AssertionError(
+                f"Learning curve size {training_count} has unequal test coverage"
+            )
+
+
+def _pool_learning_curve(folds, n_trials):
+    by_size = {}
+    for fold in folds:
+        by_size.setdefault(fold["training_trial_count"], []).append(fold)
+    points = []
+    for training_count, size_folds in sorted(by_size.items()):
+        successful = [fold for fold in size_folds if fold["status"] == "success"]
+        total_decisions = sum(fold["n_test_decisions"] for fold in successful)
+        total_ll = sum(
+            fold["models"]["full"]["total_log_likelihood"] for fold in successful
+        )
+        correct = sum(
+            fold["models"]["full"]["accuracy"] * fold["n_test_decisions"]
+            for fold in successful
+        )
+        points.append(
+            {
+                "training_trial_count": training_count,
+                "training_percentage": 100.0 * training_count / n_trials,
+                "subdivision_indices": size_folds[0]["subdivision_indices"],
+                "n_expected_splits": len(size_folds),
+                "n_successful_splits": len(successful),
+                "n_failed_splits": len(size_folds) - len(successful),
+                "n_test_decisions": total_decisions,
+                "total_test_log_likelihood": total_ll if successful else None,
+                "mean_test_log_likelihood": (
+                    total_ll / total_decisions if total_decisions else None
+                ),
+                "accuracy": correct / total_decisions if total_decisions else None,
+                "complete": len(successful) == len(size_folds),
+            }
+        )
+    return points
+
+
 def run_blocked_regression(
     config,
     output_dir: str | Path,
@@ -491,13 +598,12 @@ def run_blocked_regression(
     *,
     force: bool = False,
 ) -> dict[str, object]:
-    """Fit Qin's full model and every leave-one-predictor-out model per fold."""
+    """Run blocked k-fold ablations or the exhaustive full-model learning curve."""
     import torch
 
     from andrew_mlmdp.regression_workflow import (
         _read_json,
-        _stage_source,
-        blocked_trial_kfold,
+        regression_splits,
     )
 
     root = Path(output_dir).resolve()
@@ -506,32 +612,38 @@ def run_blocked_regression(
     if features["status"] != "success":
         return {"status": features["status"], "partition_digest": partition.digest}
     rows = _heldout_rows(config, partition, table)
-    splits = blocked_trial_kfold(
-        rows, partition, config.regression_cv.n_splits, config=config
+    splits = regression_splits(rows, partition, config)
+    artifact_type = regression_artifact_type(config)
+    compatibility = regression_compatibility(
+        config, partition, features["artifact_digest"], splits
     )
-    regression_compatibility = {
-        "artifact_type": "blocked_qin_regression",
-        "partition_digest": partition.digest,
-        "feature_artifact_digest": features["artifact_digest"],
-        "splits": [split.metadata() for split in splits],
-        "settings": {
-            "method": config.regression_cv.method,
-            "n_splits": config.regression_cv.n_splits,
-            "optimizer": "scipy_BFGS_Qin",
-            "standardization": "training_decisions_only_population_sd",
-        },
-        "source": _stage_source(config, "regression"),
-    }
+    existing_folds = {}
     if destination.is_file() and not force:
         existing = _validate_cached_artifact(
             destination,
             _read_json(destination),
-            artifact_type="blocked_qin_regression",
+            artifact_type=artifact_type,
             partition=partition,
-            compatibility=regression_compatibility,
+            compatibility=compatibility,
         )
         if existing.get("status") in {"success", "scientific_failure"}:
             return existing
+        if existing.get("status") == "partial":
+            expected_by_digest = {split.digest: split for split in splits}
+            partial_folds = existing.get("folds", [])
+            partial_digests = [fold.get("split_digest") for fold in partial_folds]
+            if len(partial_digests) != len(set(partial_digests)):
+                raise ValueError(f"Cached checkpoint repeats a split: {destination}")
+            for fold in partial_folds:
+                split = expected_by_digest.get(fold.get("split_digest"))
+                if split is None or any(
+                    fold.get(key) != value for key, value in split.metadata().items()
+                ):
+                    raise ValueError(
+                        "Cached checkpoint contains an incompatible split: "
+                        f"{destination}"
+                    )
+            existing_folds = {fold["split_digest"]: fold for fold in partial_folds}
 
     predictor_values = np.asarray(features["predictor_action_values"], dtype=np.float64)
     actions = np.asarray(features["responses"], dtype=np.int64)
@@ -569,10 +681,15 @@ def run_blocked_regression(
 
     qin = _qin_regression_imports(config.project_root)
     finder = qin["finder"](list(config.predictors.names), config.random_seed)
-    names = _model_names(config.predictors.names)
+    learning_curve = config.regression_cv.method == "blocked_trial_learning_curve"
+    names = ["full"] if learning_curve else _model_names(config.predictors.names)
     fold_records = []
     tested_trials = []
     for split in splits:
+        if split.digest in existing_folds:
+            fold_records.append(existing_folds[split.digest])
+            tested_trials.extend(split.test_trial_keys)
+            continue
         train_indices = [
             row for key in split.training_trial_keys for row in trial_to_rows[key]
         ]
@@ -585,7 +702,7 @@ def run_blocked_regression(
         y_train = torch.nn.functional.one_hot(torch.tensor(actions[train_indices]), 4)
         y_test = torch.nn.functional.one_hot(torch.tensor(actions[test_indices]), 4)
         try:
-            fit = finder.get_unique_predictability(
+            fit_args = (
                 torch.tensor(train_design, dtype=torch.float32),
                 y_train,
                 torch.tensor(mask[train_indices, :, None], dtype=torch.float32),
@@ -593,16 +710,45 @@ def run_blocked_regression(
                 y_test,
                 torch.tensor(mask[test_indices, :, None], dtype=torch.float32),
             )
+            fit = (
+                finder.get_unique_predictability(*fit_args, full_only=True)
+                if learning_curve
+                else finder.get_unique_predictability(*fit_args)
+            )
         except RuntimeError as error:
             if not str(error).startswith("Regression optimizer failed for model"):
                 raise
+            if learning_curve:
+                fold_records.append(
+                    {
+                        **split.metadata(),
+                        "split_digest": split.digest,
+                        "status": "scientific_failure",
+                        "n_training_decisions": len(train_indices),
+                        "n_test_decisions": len(test_indices),
+                        "failure": {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        },
+                    }
+                )
+                tested_trials.extend(split.test_trial_keys)
+                _write_regression_checkpoint(
+                    destination,
+                    artifact_type,
+                    partition,
+                    features,
+                    compatibility,
+                    fold_records,
+                )
+                continue
             failure = {
                 "schema_version": 1,
-                "artifact_type": "blocked_qin_regression",
+                "artifact_type": artifact_type,
                 "status": "scientific_failure",
                 "partition": _json_value(partition.metadata()),
                 "partition_digest": partition.digest,
-                "compatibility": regression_compatibility,
+                "compatibility": compatibility,
                 "stage": "regression_optimizer",
                 "fold_index": split.fold_index,
                 "failure": {"type": type(error).__name__, "message": str(error)},
@@ -624,35 +770,75 @@ def run_blocked_regression(
                 "coefficients": coefficients[model_index].tolist(),
                 "optimizer_iterations": int(iterations[model_index]),
             }
-        full_nll = model_results["full"]["mean_negative_log_likelihood"]
-        unique = {
-            predictor: (
-                model_results[f"without_{predictor}"]["mean_negative_log_likelihood"]
-                - full_nll
-            )
-            for predictor in config.predictors.names
-        }
+        if learning_curve:
+            unique = None
+        else:
+            full_nll = model_results["full"]["mean_negative_log_likelihood"]
+            unique = {
+                predictor: (
+                    model_results[f"without_{predictor}"][
+                        "mean_negative_log_likelihood"
+                    ]
+                    - full_nll
+                )
+                for predictor in config.predictors.names
+            }
         fold_records.append(
             {
-                "fold_index": split.fold_index,
+                **split.metadata(),
                 "split_digest": split.digest,
-                "training_trial_keys": _json_value(split.training_trial_keys),
-                "test_trial_keys": _json_value(split.test_trial_keys),
+                "status": "success",
                 "n_training_decisions": len(train_indices),
                 "n_test_decisions": n_test,
                 "training_feature_mean": mean,
                 "training_feature_scale": scale,
                 "models": model_results,
-                "unique_predictability": unique,
+                **({} if learning_curve else {"unique_predictability": unique}),
             }
         )
         tested_trials.extend(split.test_trial_keys)
+        if learning_curve:
+            _write_regression_checkpoint(
+                destination,
+                artifact_type,
+                partition,
+                features,
+                compatibility,
+                fold_records,
+            )
 
-    expected_trials = [key for split in splits for key in split.test_trial_keys]
-    if len(tested_trials) != len(set(tested_trials)) or set(tested_trials) != set(
-        expected_trials
-    ):
-        raise AssertionError("Blocked CV must test each eligible trial exactly once")
+    if learning_curve:
+        _validate_learning_curve_coverage(splits)
+    else:
+        expected_trials = [key for split in splits for key in split.test_trial_keys]
+        if len(tested_trials) != len(set(tested_trials)) or set(tested_trials) != set(
+            expected_trials
+        ):
+            raise AssertionError(
+                "Blocked CV must test each eligible trial exactly once"
+            )
+
+    session_order = int(rows["session_order"].iloc[0])
+    if learning_curve:
+        payload = {
+            "schema_version": 1,
+            "artifact_type": artifact_type,
+            "status": "success",
+            "partition": _json_value(partition.metadata()),
+            "partition_digest": partition.digest,
+            "heldout_session_order": session_order,
+            "selection_method": config.subgoal_selection.method,
+            "route_family": config.predictors.route_family,
+            "predictor_names": list(config.predictors.names),
+            "feature_artifact_digest": features["artifact_digest"],
+            "compatibility": compatibility,
+            "n_trials": len(trial_to_rows),
+            "folds": fold_records,
+            "learning_curve": _pool_learning_curve(fold_records, len(trial_to_rows)),
+        }
+        payload["artifact_digest"] = _payload_digest(payload)
+        _atomic_write_json(destination, payload)
+        return _json_value(payload)
 
     pooled_models = {}
     total_decisions = sum(record["n_test_decisions"] for record in fold_records)
@@ -677,10 +863,9 @@ def run_blocked_regression(
         )
         for predictor in config.predictors.names
     }
-    session_order = int(rows["session_order"].iloc[0])
     payload = {
         "schema_version": 1,
-        "artifact_type": "blocked_qin_regression",
+        "artifact_type": artifact_type,
         "status": "success",
         "partition": _json_value(partition.metadata()),
         "partition_digest": partition.digest,
@@ -689,7 +874,7 @@ def run_blocked_regression(
         "route_family": config.predictors.route_family,
         "predictor_names": list(config.predictors.names),
         "feature_artifact_digest": features["artifact_digest"],
-        "compatibility": regression_compatibility,
+        "compatibility": compatibility,
         "folds": fold_records,
         "pooled": {
             "n_decisions": total_decisions,
@@ -724,12 +909,240 @@ def _session_rows(records: Sequence[Mapping[str, object]]) -> list[dict[str, obj
     return rows
 
 
+def aggregate_learning_curve_results(
+    records: Sequence[Mapping[str, object]],
+    expected_partitions: Sequence[Mapping[str, object]] | None = None,
+    unavailable_partitions: Mapping[str, object] | Sequence[object] | None = None,
+) -> dict[str, object]:
+    """Aggregate sizes through sessions and subjects without counting split repeats."""
+    digests = [
+        str(record["partition_digest"])
+        for record in records
+        if record.get("partition_digest") is not None
+    ]
+    if len(digests) != len(set(digests)):
+        raise ValueError("Duplicate regression artifacts for one predictor partition")
+    actual = {
+        str(record["partition_digest"]): record
+        for record in records
+        if record.get("partition_digest") is not None
+    }
+    expected_records = (
+        [
+            {"partition_digest": digest, "partition": record.get("partition", {})}
+            for digest, record in actual.items()
+        ]
+        if expected_partitions is None
+        else list(expected_partitions)
+    )
+    expected_by_digest = {
+        str(item.get("partition_digest", item.get("digest"))): item
+        for item in expected_records
+    }
+    if len(expected_by_digest) != len(expected_records):
+        raise ValueError("Duplicate expected predictor partitions")
+    expected = set(expected_by_digest)
+    present = {
+        digest for digest, record in actual.items() if record.get("status") != "missing"
+    }
+    missing = sorted(expected - present)
+    failed = [
+        {"partition_digest": digest, "status": actual[digest].get("status")}
+        for digest in sorted(expected & present)
+        if actual[digest].get("status") != "success"
+    ]
+    successful = [
+        (digest, actual[digest])
+        for digest in sorted(expected & present)
+        if actual[digest].get("status") == "success"
+    ]
+
+    requested_indices = set()
+    for expected_record in expected_records:
+        for split in expected_record.get("regression_splits", []):
+            requested_indices.update(split.get("subdivision_indices", []))
+
+    session_rows = []
+    split_rows = []
+    for digest, record in successful:
+        expected_record = expected_by_digest[digest]
+        if expected_record.get("partition") is not None and record.get(
+            "partition"
+        ) != expected_record.get("partition"):
+            raise ValueError(f"Regression partition metadata mismatch for {digest}")
+        expected_splits = expected_record.get("regression_splits")
+        if expected_splits is not None:
+            expected_digests = [_payload_digest(split) for split in expected_splits]
+            actual_digests = [fold.get("split_digest") for fold in record["folds"]]
+            if actual_digests != expected_digests:
+                raise ValueError(f"Regression fold grid mismatch for {digest}")
+        partition = record["partition"]
+        for fold in record["folds"]:
+            model = fold.get("models", {}).get("full", {})
+            split_rows.append(
+                {
+                    "partition_digest": digest,
+                    "subject_id": partition["subject_id"],
+                    "heldout_session_id": partition["heldout_session_id"],
+                    "fold_index": fold["fold_index"],
+                    "training_trial_count": fold["training_trial_count"],
+                    "subdivision_indices": fold["subdivision_indices"],
+                    "block_start": fold["block_start"],
+                    "n_training_decisions": fold["n_training_decisions"],
+                    "n_test_decisions": fold["n_test_decisions"],
+                    "status": fold["status"],
+                    "test_log_likelihood": model.get("total_log_likelihood"),
+                    "mean_test_log_likelihood": (
+                        -model["mean_negative_log_likelihood"] if model else None
+                    ),
+                    "failure": fold.get("failure"),
+                }
+            )
+        for point in record["learning_curve"]:
+            requested_indices.update(point["subdivision_indices"])
+            for subdivision_index in point["subdivision_indices"]:
+                session_rows.append(
+                    {
+                        "partition_digest": digest,
+                        "subject_id": partition["subject_id"],
+                        "heldout_session_id": partition["heldout_session_id"],
+                        "heldout_session_order": record.get("heldout_session_order"),
+                        "subdivision_index": subdivision_index,
+                        "training_trial_count": point["training_trial_count"],
+                        "total_trial_count": record["n_trials"],
+                        "training_percentage": point["training_percentage"],
+                        "n_expected_splits": point["n_expected_splits"],
+                        "n_successful_splits": point["n_successful_splits"],
+                        "n_failed_splits": point["n_failed_splits"],
+                        "n_test_decisions": point["n_test_decisions"],
+                        "mean_test_log_likelihood": point["mean_test_log_likelihood"],
+                        "complete": point["complete"],
+                    }
+                )
+
+    expected_sessions_by_subject = {}
+    for item in expected_records:
+        partition = item.get("partition", {})
+        if "subject_id" in partition:
+            expected_sessions_by_subject.setdefault(partition["subject_id"], 0)
+            expected_sessions_by_subject[partition["subject_id"]] += 1
+
+    subject_rows = []
+    for subject in expected_sessions_by_subject:
+        for subdivision_index in sorted(requested_indices):
+            rows = [
+                row
+                for row in session_rows
+                if row["subject_id"] == subject
+                and row["subdivision_index"] == subdivision_index
+            ]
+            values = [
+                row["mean_test_log_likelihood"]
+                for row in rows
+                if row["mean_test_log_likelihood"] is not None
+            ]
+            percentages = [row["training_percentage"] for row in rows]
+            complete = len(rows) == expected_sessions_by_subject[subject] and all(
+                row["complete"] for row in rows
+            )
+            subject_rows.append(
+                {
+                    "subject_id": subject,
+                    "subdivision_index": subdivision_index,
+                    "n_sessions": len(rows),
+                    "training_percentage": (
+                        float(np.mean(percentages)) if percentages else None
+                    ),
+                    "training_percentage_min": (
+                        min(percentages) if percentages else None
+                    ),
+                    "training_percentage_max": (
+                        max(percentages) if percentages else None
+                    ),
+                    "mean_test_log_likelihood": (
+                        float(np.mean(values)) if values else None
+                    ),
+                    "complete": complete,
+                }
+            )
+
+    unavailable = {} if unavailable_partitions is None else unavailable_partitions
+    group_rows = []
+    expected_subjects = set(expected_sessions_by_subject)
+    for subdivision_index in sorted(requested_indices):
+        rows = [
+            row
+            for row in subject_rows
+            if row["subdivision_index"] == subdivision_index
+            and row["mean_test_log_likelihood"] is not None
+        ]
+        values = np.asarray(
+            [row["mean_test_log_likelihood"] for row in rows], dtype=float
+        )
+        percentages = [
+            row["training_percentage"]
+            for row in rows
+            if row["training_percentage"] is not None
+        ]
+        complete = (
+            not missing
+            and not failed
+            and not unavailable
+            and {row["subject_id"] for row in rows} == expected_subjects
+            and all(row["complete"] for row in rows)
+            and bool(expected_subjects)
+        )
+        partial_mean = float(values.mean()) if len(values) else None
+        group_rows.append(
+            {
+                "subdivision_index": subdivision_index,
+                "training_percentage": (
+                    float(np.mean(percentages)) if percentages else None
+                ),
+                "training_percentage_min": min(percentages) if percentages else None,
+                "training_percentage_max": max(percentages) if percentages else None,
+                "mean_test_log_likelihood": partial_mean if complete else None,
+                "partial_mean_test_log_likelihood": partial_mean,
+                "sem_across_subjects": (
+                    float(values.std(ddof=1) / np.sqrt(len(values)))
+                    if len(values) > 1
+                    else None
+                ),
+                "n_subjects": len(values),
+                "complete": complete,
+            }
+        )
+    complete = bool(group_rows) and all(row["complete"] for row in group_rows)
+    return {
+        "analysis": "full_model_learning_curve",
+        "status": "complete"
+        if complete
+        else ("incomplete" if expected or unavailable else "unavailable"),
+        "split_rows": split_rows,
+        "sessions": session_rows,
+        "subjects": subject_rows,
+        "group": group_rows if complete else None,
+        "partial_group": {"rows": group_rows, "n_subjects": len(expected_subjects)},
+        "missing_partitions": missing,
+        "failed_partitions": failed,
+        "failed_splits": sum(row["status"] != "success" for row in split_rows),
+        "unavailable_partitions": _json_value(unavailable),
+    }
+
+
 def aggregate_regression_results(
     records: Sequence[Mapping[str, object]],
     expected_partitions: Sequence[Mapping[str, object]] | None = None,
     unavailable_partitions: Mapping[str, object] | Sequence[object] | None = None,
 ) -> dict[str, object]:
     """Weight folds by decisions, sessions equally, then subjects equally."""
+    if any(
+        record.get("artifact_type") == "full_model_learning_curve_regression"
+        for record in records
+    ):
+        return aggregate_learning_curve_results(
+            records, expected_partitions, unavailable_partitions
+        )
     digests = [
         str(record["partition_digest"])
         for record in records

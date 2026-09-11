@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 import andrew_mlmdp.regression_execution as execution
 import andrew_mlmdp.regression_workflow as workflow
@@ -96,6 +97,97 @@ def test_blocked_regression_runs_every_qin_reduced_model(monkeypatch, tmp_path):
             assert len(model["coefficients"]) == len(config.predictors.names) + 1
 
 
+def test_learning_curve_fits_only_full_model_for_every_size_and_block(
+    monkeypatch, tmp_path
+):
+    config = _config()
+    object.__setattr__(
+        config,
+        "regression_cv",
+        workflow.RegressionCVConfig(
+            method="blocked_trial_learning_curve", n_subdivisions=2
+        ),
+    )
+    partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
+    table = _heldout_table()
+    actions = table["action_class"].to_numpy()
+    features = {
+        "status": "success",
+        "artifact_digest": "features",
+        "predictor_names": list(config.predictors.names),
+        "decision_keys": list(
+            table.loc[
+                :, ("subject_id", "session_id", "trial_id", "decision_order")
+            ].itertuples(index=False, name=None)
+        ),
+        "responses": actions.tolist(),
+        "predictor_action_values": np.zeros(
+            (len(table), 4, len(config.predictors.names))
+        ).tolist(),
+        "impossible_action_mask": np.zeros((len(table), 4)).tolist(),
+    }
+    calls = []
+
+    class Finder:
+        def get_unique_predictability(self, *args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Regression optimizer failed for model 9: precision loss"
+                )
+            return {
+                "neg_log_likelihoods": torch.tensor([1.25]),
+                "accuracies": torch.tensor([0.5]),
+                "coefs": torch.zeros((1, len(config.predictors.names) + 1)),
+                "optimizer_iterations": torch.ones(1, dtype=torch.int64),
+            }
+
+    monkeypatch.setattr(execution, "write_feature_artifact", lambda *a, **k: features)
+    monkeypatch.setattr(
+        execution,
+        "_qin_regression_imports",
+        lambda root: {"finder": lambda *args: Finder()},
+    )
+
+    result = execution.run_blocked_regression(config, tmp_path, partition, table)
+
+    assert result["artifact_type"] == "full_model_learning_curve_regression"
+    assert len(result["folds"]) == 24
+    assert len(result["learning_curve"]) == 3
+    assert all(call == {"full_only": True} for call in calls)
+    assert result["folds"][0]["status"] == "scientific_failure"
+    assert all(
+        set(fold["models"]) == {"full"}
+        for fold in result["folds"]
+        if fold["status"] == "success"
+    )
+    assert [point["training_trial_count"] for point in result["learning_curve"]] == [
+        1,
+        4,
+        7,
+    ]
+    assert all(
+        point["mean_test_log_likelihood"] == -1.25 for point in result["learning_curve"]
+    )
+    assert result["learning_curve"][0]["complete"] is False
+    assert result["learning_curve"][0]["n_failed_splits"] == 1
+
+    checkpoint = dict(result)
+    checkpoint["status"] = "partial"
+    checkpoint["folds"] = result["folds"][:2]
+    checkpoint.pop("artifact_digest")
+    workflow._atomic_write_json(
+        tmp_path / "partitions" / partition.digest / "regression.json", checkpoint
+    )
+    calls.clear()
+
+    resumed = execution.run_blocked_regression(config, tmp_path, partition, table)
+
+    assert len(calls) == 22
+    assert resumed["folds"][:2] == result["folds"][:2]
+    assert len(resumed["folds"]) == 24
+
+
 def test_fixed_impossible_mask_assigns_exactly_zero_probability():
     from scipy.special import softmax
 
@@ -105,6 +197,42 @@ def test_fixed_impossible_mask_assigns_exactly_zero_probability():
     assert probabilities[0, 1] == 0.0
     assert probabilities[0, 3] == 0.0
     assert probabilities[0, [0, 2]].sum() == 1.0
+
+
+def test_qin_full_only_fit_matches_full_row_of_ablation_fit():
+    execution._prepare_qin_imports(workflow._find_project_root(workflow.Path.cwd()))
+    from regressionhelper.regressor_building_funcs import UniquePredictabilityFinder
+
+    generator = torch.Generator().manual_seed(7)
+    design = torch.randn((80, 4, 3), generator=generator)
+    design[..., 0] = 1.0
+    coefficients = torch.tensor([0.2, -0.5, 0.8])
+    responses = torch.nn.functional.one_hot((design @ coefficients).argmax(dim=-1), 4)
+    mask = torch.zeros((80, 4, 1))
+    finder = UniquePredictabilityFinder(["vector", "optimal"])
+
+    ablations = finder.get_unique_predictability(
+        design[:60],
+        responses[:60],
+        mask[:60],
+        design[60:],
+        responses[60:],
+        mask[60:],
+    )
+    full_only = finder.get_unique_predictability(
+        design[:60],
+        responses[:60],
+        mask[:60],
+        design[60:],
+        responses[60:],
+        mask[60:],
+        full_only=True,
+    )
+
+    assert torch.equal(
+        full_only["neg_log_likelihoods"][0], ablations["neg_log_likelihoods"][-1]
+    )
+    assert torch.equal(full_only["coefs"][0], ablations["coefs"][-1])
 
 
 def test_only_explicit_qin_optimizer_failure_becomes_scientific_failure(

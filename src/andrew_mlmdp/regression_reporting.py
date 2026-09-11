@@ -11,7 +11,10 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from andrew_mlmdp.regression_execution import aggregate_regression_results
+from andrew_mlmdp.regression_execution import (
+    aggregate_learning_curve_results,
+    aggregate_regression_results,
+)
 from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
 
 _PREDICTOR_STYLE = {
@@ -288,6 +291,114 @@ def make_regression_figure(summary, predictor_names):
     return figure
 
 
+def make_learning_curve_figure(summary):
+    """Plot subject curves and the complete group estimate by subdivision."""
+    import plotly.graph_objects as go
+
+    figure = go.Figure()
+    subjects = sorted(
+        {row["subject_id"] for row in summary["subjects"]}, key=lambda value: str(value)
+    )
+    for subject in subjects:
+        rows = sorted(
+            (row for row in summary["subjects"] if row["subject_id"] == subject),
+            key=lambda row: row["subdivision_index"],
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=[row["training_percentage"] for row in rows],
+                y=[row["mean_test_log_likelihood"] for row in rows],
+                mode="lines+markers",
+                name=f"Subject {subject}",
+                line={"width": 1.2},
+                marker={"size": 5},
+                opacity=0.35,
+                customdata=[
+                    [
+                        row["subdivision_index"],
+                        row["n_sessions"],
+                        row["training_percentage_min"],
+                        row["training_percentage_max"],
+                        row["complete"],
+                    ]
+                    for row in rows
+                ],
+                hovertemplate=(
+                    "Subject: " + str(subject) + "<br>Subdivision: %{customdata[0]}"
+                    "<br>Training: %{x:.2f}%"
+                    "<br>Session range: %{customdata[2]:.2f}–%{customdata[3]:.2f}%"
+                    "<br>Sessions: %{customdata[1]}"
+                    "<br>Mean test LL: %{y:.4f} nats/decision"
+                    "<br>Complete: %{customdata[4]}<extra></extra>"
+                ),
+            )
+        )
+    group_rows = summary["partial_group"]["rows"]
+    group_sems = [row["sem_across_subjects"] for row in group_rows]
+    figure.add_trace(
+        go.Scatter(
+            x=[row["training_percentage"] for row in group_rows],
+            y=[row["mean_test_log_likelihood"] for row in group_rows],
+            mode="lines+markers",
+            name="Group mean +/- SEM",
+            connectgaps=False,
+            line={"color": "#111111", "width": 3},
+            marker={"color": "#111111", "size": 9, "symbol": "diamond"},
+            error_y={
+                "type": "data",
+                "array": [0.0 if value is None else value for value in group_sems],
+                "visible": any(value is not None for value in group_sems),
+                "thickness": 1.4,
+                "width": 4,
+            },
+            customdata=[
+                [
+                    row["subdivision_index"],
+                    row["n_subjects"],
+                    row["training_percentage_min"],
+                    row["training_percentage_max"],
+                    row["complete"],
+                    row["partial_mean_test_log_likelihood"],
+                ]
+                for row in group_rows
+            ],
+            hovertemplate=(
+                "Subdivision: %{customdata[0]}<br>Training: %{x:.2f}%"
+                "<br>Subject range: %{customdata[2]:.2f}–%{customdata[3]:.2f}%"
+                "<br>Mean test LL: %{y:.4f} nats/decision"
+                "<br>Subjects: %{customdata[1]}"
+                "<br>Complete: %{customdata[4]}<extra></extra>"
+            ),
+        )
+    )
+    figure.update_layout(
+        template="plotly_white",
+        width=1000,
+        height=620,
+        title="Full-model regression learning curve",
+        xaxis_title="Training trials (%)",
+        yaxis_title="Mean test log-likelihood (nats/decision; higher is better)",
+        hovermode="closest",
+        font={"family": "Arial, sans-serif", "size": 13},
+    )
+    if summary["status"] != "complete":
+        figure.add_annotation(
+            x=0.5,
+            y=1.08,
+            xref="paper",
+            yref="paper",
+            text=(
+                f"Incomplete result: {len(summary['missing_partitions'])} missing, "
+                f"{len(summary['failed_partitions'])} failed, "
+                f"{len(summary.get('unavailable_partitions', {}))} unavailable "
+                f"partitions, {summary.get('failed_splits', 0)} failed splits"
+            ),
+            showarrow=False,
+            font={"color": "#B22222", "size": 13},
+        )
+    return figure
+
+
 def report_stem(config):
     selection = config.subgoal_selection.method.replace("_", "-")
     heldout = (
@@ -295,7 +406,12 @@ def report_stem(config):
         if isinstance(config.heldout_sessions, str)
         else "explicit"
     )
-    return f"regression_{config.predictors.route_family}_{selection}_heldout-{heldout}"
+    base = f"regression_{config.predictors.route_family}_{selection}_heldout-{heldout}"
+    return (
+        f"{base}_learning-curve"
+        if config.regression_cv.method == "blocked_trial_learning_curve"
+        else base
+    )
 
 
 def write_plotly_outputs(figure, output_dir, stem):
@@ -330,13 +446,21 @@ def write_regression_report(
     """Write numerical artifacts, four CSV levels, provenance, and Plotly."""
     destination = Path(output_dir).resolve() / "report"
     expected = manifest["partitions"]
-    summary = aggregate_regression_results(
-        records, expected, manifest.get("unavailable_partitions")
+    learning_curve = config.regression_cv.method == "blocked_trial_learning_curve"
+    aggregator = (
+        aggregate_learning_curve_results
+        if learning_curve
+        else aggregate_regression_results
     )
+    summary = aggregator(records, expected, manifest.get("unavailable_partitions"))
     stem = report_stem(config)
     numerical = {
         "schema_version": 1,
-        "artifact_type": "heldout_regression_report",
+        "artifact_type": (
+            "full_model_learning_curve_report"
+            if learning_curve
+            else "heldout_regression_report"
+        ),
         "status": summary["status"],
         "summary": summary,
         "records": list(records),
@@ -344,49 +468,116 @@ def write_regression_report(
     numerical["artifact_digest"] = _payload_digest(numerical)
     _atomic_write_json(destination / f"{stem}_results.json", numerical)
 
-    table_specs = {
-        "folds": (
-            summary["fold_rows"],
-            (
-                "partition_digest",
-                "subject_id",
-                "heldout_session_id",
-                "fold_index",
-                "n_test_decisions",
-                "predictor",
-                "unique_predictability",
+    if not learning_curve:
+        table_specs = {
+            "folds": (
+                summary["fold_rows"],
+                (
+                    "partition_digest",
+                    "subject_id",
+                    "heldout_session_id",
+                    "fold_index",
+                    "n_test_decisions",
+                    "predictor",
+                    "unique_predictability",
+                ),
             ),
-        ),
-        "sessions": (
-            summary["sessions"],
-            (
-                "subject_id",
-                "heldout_session_id",
-                "heldout_session_order",
-                "predictor",
-                "n_decisions",
-                "unique_predictability",
+            "sessions": (
+                summary["sessions"],
+                (
+                    "subject_id",
+                    "heldout_session_id",
+                    "heldout_session_order",
+                    "predictor",
+                    "n_decisions",
+                    "unique_predictability",
+                ),
             ),
-        ),
-        "subjects": (
-            summary["subjects"],
-            (
-                "subject_id",
-                "predictor",
-                "n_sessions",
-                "unique_predictability",
+            "subjects": (
+                summary["subjects"],
+                (
+                    "subject_id",
+                    "predictor",
+                    "n_sessions",
+                    "unique_predictability",
+                ),
             ),
-        ),
-        "group": (
-            summary["partial_group"]["rows"],
-            (
-                "predictor",
-                "mean_unique_predictability",
-                "sem_across_subjects",
-                "n_subjects",
+            "group": (
+                summary["partial_group"]["rows"],
+                (
+                    "predictor",
+                    "mean_unique_predictability",
+                    "sem_across_subjects",
+                    "n_subjects",
+                ),
             ),
-        ),
-    }
+        }
+    else:
+        table_specs = {
+            "splits": (
+                summary["split_rows"],
+                (
+                    "partition_digest",
+                    "subject_id",
+                    "heldout_session_id",
+                    "fold_index",
+                    "training_trial_count",
+                    "subdivision_indices",
+                    "block_start",
+                    "n_training_decisions",
+                    "n_test_decisions",
+                    "status",
+                    "test_log_likelihood",
+                    "mean_test_log_likelihood",
+                    "failure",
+                ),
+            ),
+            "sessions": (
+                summary["sessions"],
+                (
+                    "partition_digest",
+                    "subject_id",
+                    "heldout_session_id",
+                    "subdivision_index",
+                    "training_trial_count",
+                    "total_trial_count",
+                    "training_percentage",
+                    "n_expected_splits",
+                    "n_successful_splits",
+                    "n_failed_splits",
+                    "n_test_decisions",
+                    "mean_test_log_likelihood",
+                    "complete",
+                ),
+            ),
+            "subjects": (
+                summary["subjects"],
+                (
+                    "subject_id",
+                    "subdivision_index",
+                    "n_sessions",
+                    "training_percentage",
+                    "training_percentage_min",
+                    "training_percentage_max",
+                    "mean_test_log_likelihood",
+                    "complete",
+                ),
+            ),
+            "group": (
+                summary["partial_group"]["rows"],
+                (
+                    "subdivision_index",
+                    "training_percentage",
+                    "training_percentage_min",
+                    "training_percentage_max",
+                    "mean_test_log_likelihood",
+                    "partial_mean_test_log_likelihood",
+                    "sem_across_subjects",
+                    "n_subjects",
+                    "complete",
+                ),
+            ),
+        }
     csv_paths = {}
     for level, (rows, columns) in table_specs.items():
         path = destination / f"{stem}_{level}.csv"
@@ -409,7 +600,10 @@ def write_regression_report(
         "route_family": config.predictors.route_family,
         "predictor_order": list(config.predictors.names),
         "aggregation": (
-            "fold LL pooled by decisions; sessions equal within subject; "
+            "split LL pooled by decisions within training size; sessions equal "
+            "within subject; subjects equal within group"
+            if learning_curve
+            else "fold LL pooled by decisions; sessions equal within subject; "
             "subjects equal within group"
         ),
         "status": summary["status"],
@@ -417,7 +611,11 @@ def write_regression_report(
     _atomic_write_json(destination / f"{stem}_provenance.json", provenance)
     plot_paths = {}
     if plot:
-        figure = make_regression_figure(summary, config.predictors.names)
+        figure = (
+            make_learning_curve_figure(summary)
+            if learning_curve
+            else make_regression_figure(summary, config.predictors.names)
+        )
         plot_paths = write_plotly_outputs(figure, destination, stem)
     return {
         "status": summary["status"],

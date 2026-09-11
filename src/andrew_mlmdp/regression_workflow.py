@@ -111,18 +111,48 @@ class SubgoalSelectionConfig:
 
 @dataclass(frozen=True)
 class RegressionCVConfig:
-    method: Literal["blocked_trial_kfold"] = "blocked_trial_kfold"
-    n_splits: int = 5
+    method: Literal["blocked_trial_kfold", "blocked_trial_learning_curve"] = (
+        "blocked_trial_kfold"
+    )
+    n_splits: int | None = None
+    n_subdivisions: int | None = None
 
     def __post_init__(self) -> None:
-        if self.method != "blocked_trial_kfold":
-            raise ValueError("regression_cv.method must be blocked_trial_kfold")
-        if (
-            isinstance(self.n_splits, bool)
-            or not isinstance(self.n_splits, int)
-            or self.n_splits < 2
-        ):
-            raise ValueError("regression_cv.n_splits must be an integer at least two")
+        if self.method == "blocked_trial_kfold":
+            if self.n_splits is None:
+                object.__setattr__(self, "n_splits", 5)
+            if self.n_subdivisions is not None:
+                raise ValueError("blocked_trial_kfold does not accept n_subdivisions")
+            if (
+                isinstance(self.n_splits, bool)
+                or not isinstance(self.n_splits, int)
+                or self.n_splits < 2
+            ):
+                raise ValueError(
+                    "regression_cv.n_splits must be an integer at least two"
+                )
+        elif self.method == "blocked_trial_learning_curve":
+            if self.n_splits is not None:
+                raise ValueError(
+                    "blocked_trial_learning_curve does not accept n_splits"
+                )
+            if (
+                isinstance(self.n_subdivisions, bool)
+                or not isinstance(self.n_subdivisions, int)
+                or self.n_subdivisions < 1
+            ):
+                raise ValueError(
+                    "regression_cv.n_subdivisions must be a positive integer"
+                )
+        else:
+            raise ValueError(
+                "regression_cv.method must be blocked_trial_kfold or "
+                "blocked_trial_learning_curve"
+            )
+
+    @property
+    def normalized_settings(self) -> dict[str, object]:
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
 
 @dataclass(frozen=True)
@@ -254,7 +284,13 @@ class RegressionWorkflowConfig:
                 ]
             ),
             "subgoal_selection": _json_value(asdict(self.subgoal_selection)),
-            "regression_cv": _json_value(asdict(self.regression_cv)),
+            "regression_cv": _json_value(
+                {
+                    key: value
+                    for key, value in asdict(self.regression_cv).items()
+                    if value is not None
+                }
+            ),
             "predictors": _json_value(asdict(self.predictors)),
             "random_seed": self.random_seed,
         }
@@ -366,6 +402,9 @@ class RegressionSplit:
     fold_index: int
     training_trial_keys: tuple[tuple[Any, ...], ...]
     test_trial_keys: tuple[tuple[Any, ...], ...]
+    training_trial_count: int | None = None
+    subdivision_indices: tuple[int, ...] = ()
+    block_start: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -376,12 +415,17 @@ class RegressionSplit:
         object.__setattr__(
             self, "test_trial_keys", tuple(tuple(k) for k in self.test_trial_keys)
         )
+        object.__setattr__(self, "subdivision_indices", tuple(self.subdivision_indices))
         if not self.training_trial_keys or not self.test_trial_keys:
             raise ValueError(
                 "Regression split must have non-empty train and test trials"
             )
         if set(self.training_trial_keys) & set(self.test_trial_keys):
             raise ValueError("Regression split train/test trials overlap")
+        if self.training_trial_count is not None and self.training_trial_count != len(
+            self.training_trial_keys
+        ):
+            raise ValueError("training_trial_count does not match the split")
 
     def metadata(self) -> dict[str, object]:
         return _json_value(asdict(self))
@@ -459,26 +503,7 @@ def blocked_trial_kfold(
     config: RegressionWorkflowConfig | None = None,
 ) -> list[RegressionSplit]:
     """Split chronologically ordered complete trials into balanced contiguous blocks."""
-    table = (
-        _canonical_table(table) if config is None else _filtered_table(table, config)
-    )
-    rows = table.loc[
-        (table.subject_id == partition.subject_id)
-        & (table.session_id == partition.heldout_session_id)
-    ]
-    rows = rows.loc[
-        (rows.trial_phase == "navigation") & (rows.pos_idx != rows.reward_idx)
-    ]
-    trial_columns = ["subject_id", "session_id", "trial_id"]
-    trials = (
-        rows.loc[:, trial_columns + ["trial_order"]]
-        .drop_duplicates(trial_columns)
-        .sort_values("trial_order", kind="stable")
-    )
-    keys = [
-        tuple(row)
-        for row in trials.loc[:, trial_columns].itertuples(index=False, name=None)
-    ]
+    keys = _eligible_trial_keys(table, partition, config=config)
     if len(keys) < n_splits:
         raise ValueError("fewer eligible trials than requested regression folds")
     base, remainder = divmod(len(keys), n_splits)
@@ -503,15 +528,116 @@ def blocked_trial_kfold(
     ]
 
 
+def _eligible_trial_keys(
+    table,
+    partition: PredictorPartition,
+    *,
+    config: RegressionWorkflowConfig | None = None,
+) -> list[tuple[Any, ...]]:
+    table = (
+        _canonical_table(table) if config is None else _filtered_table(table, config)
+    )
+    rows = table.loc[
+        (table.subject_id == partition.subject_id)
+        & (table.session_id == partition.heldout_session_id)
+        & (table.trial_phase == "navigation")
+        & (table.pos_idx != table.reward_idx)
+    ]
+    trial_columns = ["subject_id", "session_id", "trial_id"]
+    trials = (
+        rows.loc[:, trial_columns + ["trial_order"]]
+        .drop_duplicates(trial_columns)
+        .sort_values("trial_order", kind="stable")
+    )
+    return [
+        tuple(row)
+        for row in trials.loc[:, trial_columns].itertuples(index=False, name=None)
+    ]
+
+
+def learning_curve_training_sizes(
+    n_trials: int, n_subdivisions: int
+) -> list[tuple[int, tuple[int, ...]]]:
+    """Return distinct trial counts and the requested grid indices they represent."""
+    if n_trials < 2:
+        raise ValueError(
+            "learning-curve regression requires at least two eligible trials"
+        )
+    if (
+        isinstance(n_subdivisions, bool)
+        or not isinstance(n_subdivisions, int)
+        or n_subdivisions < 1
+    ):
+        raise ValueError("n_subdivisions must be a positive integer")
+    by_size: dict[int, list[int]] = {}
+    for subdivision_index in range(n_subdivisions + 1):
+        numerator = subdivision_index * (n_trials - 2)
+        rounded_half_up = (2 * numerator + n_subdivisions) // (2 * n_subdivisions)
+        size = 1 + rounded_half_up
+        by_size.setdefault(size, []).append(subdivision_index)
+    return [(size, tuple(indices)) for size, indices in by_size.items()]
+
+
+def blocked_trial_learning_curve(
+    table,
+    partition: PredictorPartition,
+    n_subdivisions: int,
+    *,
+    config: RegressionWorkflowConfig | None = None,
+) -> list[RegressionSplit]:
+    """Build exhaustive circular test blocks at each requested training size."""
+    keys = _eligible_trial_keys(table, partition, config=config)
+    sizes = learning_curve_training_sizes(len(keys), n_subdivisions)
+    splits = []
+    fold_index = 0
+    for training_count, subdivision_indices in sizes:
+        test_count = len(keys) - training_count
+        for block_start in range(len(keys)):
+            test_positions = {
+                (block_start + offset) % len(keys) for offset in range(test_count)
+            }
+            splits.append(
+                RegressionSplit(
+                    partition.digest,
+                    fold_index,
+                    tuple(
+                        key
+                        for index, key in enumerate(keys)
+                        if index not in test_positions
+                    ),
+                    tuple(
+                        key for index, key in enumerate(keys) if index in test_positions
+                    ),
+                    training_trial_count=training_count,
+                    subdivision_indices=subdivision_indices,
+                    block_start=block_start,
+                )
+            )
+            fold_index += 1
+    return splits
+
+
+def regression_splits(
+    table,
+    partition: PredictorPartition,
+    config: RegressionWorkflowConfig,
+) -> list[RegressionSplit]:
+    if config.regression_cv.method == "blocked_trial_kfold":
+        return blocked_trial_kfold(
+            table, partition, config.regression_cv.n_splits, config=config
+        )
+    return blocked_trial_learning_curve(
+        table, partition, config.regression_cv.n_subdivisions, config=config
+    )
+
+
 def build_manifest(config: RegressionWorkflowConfig, table) -> dict[str, object]:
     table = _filtered_table(table, config)
     partitions, unavailable = build_predictor_partitions(table, config)
     records = []
     for partition in partitions:
         try:
-            splits = blocked_trial_kfold(
-                table, partition, config.regression_cv.n_splits, config=config
-            )
+            splits = regression_splits(table, partition, config)
             records.append(
                 {
                     "partition": partition.metadata(),

@@ -80,6 +80,71 @@ def test_blocked_folds_are_contiguous_balanced_and_complete():
     assert len({key for split in splits for key in split.test_trial_keys}) == 3
 
 
+def test_learning_curve_sizes_include_endpoints_and_deduplicate():
+    assert workflow.learning_curve_training_sizes(6, 4) == [
+        (1, (0,)),
+        (2, (1,)),
+        (3, (2,)),
+        (4, (3,)),
+        (5, (4,)),
+    ]
+    assert workflow.learning_curve_training_sizes(3, 10) == [
+        (1, (0, 1, 2, 3, 4)),
+        (2, (5, 6, 7, 8, 9, 10)),
+    ]
+    assert workflow.learning_curve_training_sizes(2, 10) == [(1, tuple(range(11)))]
+    with pytest.raises(ValueError, match="at least two"):
+        workflow.learning_curve_training_sizes(1, 10)
+
+
+def test_learning_curve_circular_blocks_are_exhaustive_and_balanced():
+    config = _config(
+        regression_cv=workflow.RegressionCVConfig(
+            method="blocked_trial_learning_curve", n_subdivisions=2
+        )
+    )
+    partition = workflow.build_predictor_partitions(_table(), config)[0][0]
+    splits = workflow.regression_splits(_table(), partition, config)
+
+    assert len(splits) == 6
+    by_size = {}
+    for split in splits:
+        by_size.setdefault(split.training_trial_count, []).append(split)
+        assert not set(split.training_trial_keys) & set(split.test_trial_keys)
+        assert len(split.training_trial_keys) + len(split.test_trial_keys) == 3
+        assert list(split.training_trial_keys) == sorted(
+            split.training_trial_keys, key=lambda key: key[-1]
+        )
+        assert list(split.test_trial_keys) == sorted(
+            split.test_trial_keys, key=lambda key: key[-1]
+        )
+    assert set(by_size) == {1, 2}
+    for training_count, size_splits in by_size.items():
+        counts = {
+            trial: sum(trial in split.test_trial_keys for split in size_splits)
+            for trial in ((10, 3, 0), (10, 3, 1), (10, 3, 2))
+        }
+        assert set(counts.values()) == {3 - training_count}
+
+
+def test_learning_curve_config_has_only_subdivision_parameter():
+    config = workflow.RegressionCVConfig(
+        method="blocked_trial_learning_curve", n_subdivisions=10
+    )
+    assert config.normalized_settings == {
+        "method": "blocked_trial_learning_curve",
+        "n_subdivisions": 10,
+    }
+    with pytest.raises(ValueError, match="does not accept n_splits"):
+        workflow.RegressionCVConfig(
+            method="blocked_trial_learning_curve", n_splits=5, n_subdivisions=10
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        workflow.RegressionCVConfig(
+            method="blocked_trial_learning_curve", n_subdivisions=0
+        )
+
+
 def test_rank_range_is_inclusive_and_fixed_requires_singleton():
     assert workflow.SubgoalSelectionConfig("training_ll", (3, 5)).ranks == (3, 4, 5)
     assert workflow.SubgoalSelectionConfig("fixed", (4, 4)).ranks == (4,)
@@ -96,6 +161,16 @@ def test_compatibility_reuses_predictors_and_features_when_fold_count_changes():
     assert first_signatures["predictor"] == second_signatures["predictor"]
     assert first_signatures["feature"] == second_signatures["feature"]
     assert first_signatures["regression"] != second_signatures["regression"]
+
+    learning_curve = _config(
+        regression_cv=workflow.RegressionCVConfig(
+            method="blocked_trial_learning_curve", n_subdivisions=4
+        )
+    )
+    learning_signatures = workflow.compatibility_signatures(learning_curve)
+    assert first_signatures["predictor"] == learning_signatures["predictor"]
+    assert first_signatures["feature"] == learning_signatures["feature"]
+    assert first_signatures["regression"] != learning_signatures["regression"]
 
 
 def test_training_ll_strict_tie_breaks_to_smaller_rank():
@@ -353,3 +428,67 @@ def test_aggregation_rejects_duplicate_results_and_wrong_fold_grid():
                 }
             ],
         )
+
+
+def test_learning_curve_aggregation_weights_sessions_then_subjects():
+    def record(subject, session, digest, n_trials, values):
+        partition = {
+            "maze_id": 1,
+            "subject_id": subject,
+            "heldout_session_id": session,
+            "training_session_ids": [0],
+        }
+        points = []
+        folds = []
+        for subdivision_index, (training_count, value) in enumerate(values):
+            points.append(
+                {
+                    "training_trial_count": training_count,
+                    "training_percentage": 100 * training_count / n_trials,
+                    "subdivision_indices": [subdivision_index],
+                    "n_expected_splits": n_trials,
+                    "n_successful_splits": n_trials,
+                    "n_failed_splits": 0,
+                    "n_test_decisions": 20,
+                    "mean_test_log_likelihood": value,
+                    "complete": True,
+                }
+            )
+        return {
+            "artifact_type": "full_model_learning_curve_regression",
+            "status": "success",
+            "partition_digest": digest,
+            "partition": partition,
+            "heldout_session_order": int(session),
+            "n_trials": n_trials,
+            "folds": folds,
+            "learning_curve": points,
+        }
+
+    records = [
+        record("a", 1, "a1", 4, [(1, -1.0), (3, -0.6)]),
+        record("a", 2, "a2", 5, [(1, -1.4), (4, -0.8)]),
+        record("b", 1, "b1", 5, [(1, -0.8), (4, -0.4)]),
+    ]
+    expected = [
+        {
+            "partition_digest": item["partition_digest"],
+            "partition": item["partition"],
+        }
+        for item in records
+    ]
+
+    result = execution.aggregate_learning_curve_results(records, expected)
+
+    subject = {
+        (row["subject_id"], row["subdivision_index"]): row for row in result["subjects"]
+    }
+    assert subject[("a", 0)]["mean_test_log_likelihood"] == pytest.approx(-1.2)
+    assert subject[("a", 0)]["training_percentage"] == pytest.approx(22.5)
+    assert result["partial_group"]["rows"][0][
+        "mean_test_log_likelihood"
+    ] == pytest.approx(-1.0)
+    assert result["partial_group"]["rows"][0]["training_percentage"] == pytest.approx(
+        21.25
+    )
+    assert result["status"] == "complete"
