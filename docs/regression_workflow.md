@@ -47,7 +47,9 @@ fits all circular placements of the contiguous test block, so a session with
 `N` trials performs `N` fits per distinct size. Circular wrapping selects trial
 membership only; decision rows remain chronological and trial boundaries remain
 intact. Requested sizes that round to the same whole-trial count share their
-fits.
+fits. The manifest stores the chronological trial sequence once and represents
+each split by its training count and block start; this compact representation
+still determines every train/test assignment exactly.
 
 `session_cv` fits rank candidates once for each omitted predictor-training
 session, selects using only those held-out scores, and refits the winner on all

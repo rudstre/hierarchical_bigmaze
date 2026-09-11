@@ -435,6 +435,70 @@ class RegressionSplit:
         return _payload_digest(self.metadata())
 
 
+@dataclass(frozen=True)
+class LearningCurveSplit:
+    """Compact circular split over one shared chronological trial sequence."""
+
+    partition_digest: str
+    fold_index: int
+    ordered_trial_keys: tuple[tuple[Any, ...], ...]
+    training_trial_count: int
+    subdivision_indices: tuple[int, ...]
+    block_start: int
+    trial_keys_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ordered_trial_keys, tuple) or any(
+            not isinstance(key, tuple) for key in self.ordered_trial_keys
+        ):
+            object.__setattr__(
+                self,
+                "ordered_trial_keys",
+                tuple(tuple(key) for key in self.ordered_trial_keys),
+            )
+        object.__setattr__(self, "subdivision_indices", tuple(self.subdivision_indices))
+        n_trials = len(self.ordered_trial_keys)
+        if not 1 <= self.training_trial_count < n_trials:
+            raise ValueError("Learning-curve training count must be in 1..N-1")
+        if not self.subdivision_indices:
+            raise ValueError("Learning-curve split requires subdivision indices")
+        if not 0 <= self.block_start < n_trials:
+            raise ValueError("Learning-curve block start is outside the trial sequence")
+
+    @property
+    def test_trial_keys(self) -> tuple[tuple[Any, ...], ...]:
+        n_trials = len(self.ordered_trial_keys)
+        test_positions = {
+            (self.block_start + offset) % n_trials
+            for offset in range(n_trials - self.training_trial_count)
+        }
+        return tuple(
+            key
+            for index, key in enumerate(self.ordered_trial_keys)
+            if index in test_positions
+        )
+
+    @property
+    def training_trial_keys(self) -> tuple[tuple[Any, ...], ...]:
+        tested = set(self.test_trial_keys)
+        return tuple(key for key in self.ordered_trial_keys if key not in tested)
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "partition_digest": self.partition_digest,
+            "fold_index": self.fold_index,
+            "training_trial_count": self.training_trial_count,
+            "subdivision_indices": list(self.subdivision_indices),
+            "block_start": self.block_start,
+            "total_trial_count": len(self.ordered_trial_keys),
+            "ordered_trial_keys_digest": self.trial_keys_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        return _payload_digest(self.metadata())
+
+
 def _filtered_table(table, config: RegressionWorkflowConfig):
     """Validate, then select exactly the configured maze and subjects.
 
@@ -584,33 +648,24 @@ def blocked_trial_learning_curve(
     n_subdivisions: int,
     *,
     config: RegressionWorkflowConfig | None = None,
-) -> list[RegressionSplit]:
+) -> list[LearningCurveSplit]:
     """Build exhaustive circular test blocks at each requested training size."""
-    keys = _eligible_trial_keys(table, partition, config=config)
+    keys = tuple(_eligible_trial_keys(table, partition, config=config))
     sizes = learning_curve_training_sizes(len(keys), n_subdivisions)
+    trial_keys_digest = _payload_digest(_json_value(keys))
     splits = []
     fold_index = 0
     for training_count, subdivision_indices in sizes:
-        test_count = len(keys) - training_count
         for block_start in range(len(keys)):
-            test_positions = {
-                (block_start + offset) % len(keys) for offset in range(test_count)
-            }
             splits.append(
-                RegressionSplit(
+                LearningCurveSplit(
                     partition.digest,
                     fold_index,
-                    tuple(
-                        key
-                        for index, key in enumerate(keys)
-                        if index not in test_positions
-                    ),
-                    tuple(
-                        key for index, key in enumerate(keys) if index in test_positions
-                    ),
-                    training_trial_count=training_count,
-                    subdivision_indices=subdivision_indices,
-                    block_start=block_start,
+                    keys,
+                    training_count,
+                    subdivision_indices,
+                    block_start,
+                    trial_keys_digest,
                 )
             )
             fold_index += 1
@@ -621,7 +676,7 @@ def regression_splits(
     table,
     partition: PredictorPartition,
     config: RegressionWorkflowConfig,
-) -> list[RegressionSplit]:
+) -> list[RegressionSplit | LearningCurveSplit]:
     if config.regression_cv.method == "blocked_trial_kfold":
         return blocked_trial_kfold(
             table, partition, config.regression_cv.n_splits, config=config
@@ -638,13 +693,16 @@ def build_manifest(config: RegressionWorkflowConfig, table) -> dict[str, object]
     for partition in partitions:
         try:
             splits = regression_splits(table, partition, config)
-            records.append(
-                {
-                    "partition": partition.metadata(),
-                    "partition_digest": partition.digest,
-                    "regression_splits": [split.metadata() for split in splits],
-                }
-            )
+            record = {
+                "partition": partition.metadata(),
+                "partition_digest": partition.digest,
+                "regression_splits": [split.metadata() for split in splits],
+            }
+            if splits and isinstance(splits[0], LearningCurveSplit):
+                record["regression_trial_keys"] = _json_value(
+                    splits[0].ordered_trial_keys
+                )
+            records.append(record)
         except ValueError as error:
             unavailable[f"{partition.subject_id}/{partition.heldout_session_id}"] = str(
                 error

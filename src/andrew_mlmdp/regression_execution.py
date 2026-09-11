@@ -537,21 +537,20 @@ def _validate_learning_curve_coverage(splits):
     for split in splits:
         by_size.setdefault(split.training_trial_count, []).append(split)
     for training_count, size_splits in by_size.items():
-        all_trials = set(size_splits[0].training_trial_keys) | set(
-            size_splits[0].test_trial_keys
-        )
-        if len(size_splits) != len(all_trials):
+        n_trials = len(size_splits[0].ordered_trial_keys)
+        if len(size_splits) != n_trials or {
+            split.block_start for split in size_splits
+        } != set(range(n_trials)):
             raise AssertionError(
                 f"Learning curve size {training_count} lacks one block per trial"
             )
-        test_counts = {
-            trial: sum(trial in split.test_trial_keys for split in size_splits)
-            for trial in all_trials
-        }
-        expected_count = len(all_trials) - training_count
-        if set(test_counts.values()) != {expected_count}:
+        if any(
+            split.ordered_trial_keys != size_splits[0].ordered_trial_keys
+            or split.training_trial_count != training_count
+            for split in size_splits
+        ):
             raise AssertionError(
-                f"Learning curve size {training_count} has unequal test coverage"
+                f"Learning curve size {training_count} changes its trial sequence"
             )
 
 
@@ -833,6 +832,7 @@ def run_blocked_regression(
             "feature_artifact_digest": features["artifact_digest"],
             "compatibility": compatibility,
             "n_trials": len(trial_to_rows),
+            "regression_trial_keys": _json_value(splits[0].ordered_trial_keys),
             "folds": fold_records,
             "learning_curve": _pool_learning_curve(fold_records, len(trial_to_rows)),
         }
@@ -970,6 +970,10 @@ def aggregate_learning_curve_results(
             "partition"
         ) != expected_record.get("partition"):
             raise ValueError(f"Regression partition metadata mismatch for {digest}")
+        if expected_record.get("regression_trial_keys") is not None and record.get(
+            "regression_trial_keys"
+        ) != expected_record.get("regression_trial_keys"):
+            raise ValueError(f"Regression trial sequence mismatch for {digest}")
         expected_splits = expected_record.get("regression_splits")
         if expected_splits is not None:
             expected_digests = [_payload_digest(split) for split in expected_splits]

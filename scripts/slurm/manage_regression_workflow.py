@@ -497,8 +497,23 @@ def main(argv=None):
     else:
         if args.retry_missing or args.status:
             raise ValueError(f"No workflow run at {output}")
+        print(
+            "Loading and canonicalizing selected sessions for the workflow manifest...",
+            file=sys.stderr,
+            flush=True,
+        )
         table = _table(config)
+        print(
+            f"Loaded {len(table):,} decisions; building compact regression splits...",
+            file=sys.stderr,
+            flush=True,
+        )
         workflow_manifest = build_manifest(config, table)
+        print(
+            f"Prepared {len(workflow_manifest['partitions'])} predictor partitions.",
+            file=sys.stderr,
+            flush=True,
+        )
         manager = {
             "schema_version": MANAGER_SCHEMA_VERSION,
             "artifact_type": "regression_workflow_slurm_manager",

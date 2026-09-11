@@ -107,6 +107,11 @@ def test_learning_curve_circular_blocks_are_exhaustive_and_balanced():
     splits = workflow.regression_splits(_table(), partition, config)
 
     assert len(splits) == 6
+    assert all(
+        split.ordered_trial_keys is splits[0].ordered_trial_keys for split in splits
+    )
+    assert "training_trial_keys" not in splits[0].metadata()
+    assert "test_trial_keys" not in splits[0].metadata()
     by_size = {}
     for split in splits:
         by_size.setdefault(split.training_trial_count, []).append(split)
@@ -125,6 +130,14 @@ def test_learning_curve_circular_blocks_are_exhaustive_and_balanced():
             for trial in ((10, 3, 0), (10, 3, 1), (10, 3, 2))
         }
         assert set(counts.values()) == {3 - training_count}
+
+    manifest = workflow.build_manifest(config, _table())
+    partition_record = manifest["partitions"][0]
+    assert partition_record["regression_trial_keys"] == [
+        [10, 3, 0],
+        [10, 3, 1],
+        [10, 3, 2],
+    ]
 
 
 def test_learning_curve_config_has_only_subdivision_parameter():
