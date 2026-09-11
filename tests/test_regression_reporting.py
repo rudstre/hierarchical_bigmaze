@@ -1,12 +1,16 @@
 from pathlib import Path
 
+import numpy as np
 import plotly.graph_objects as go
+import pytest
 
 from andrew_mlmdp.regression_reporting import (
+    _load_uniform_baseline,
     make_learning_curve_figure,
     make_regression_figure,
     write_plotly_outputs,
 )
+from andrew_mlmdp.validation import _atomic_write_json, _payload_digest
 
 
 def _summary(*, complete=True):
@@ -136,7 +140,19 @@ def test_learning_curve_figure_has_subjects_group_sem_and_scientific_units():
         "unavailable_partitions": {},
     }
 
+    summary["uniform_baseline"] = {"mean_log_likelihood": -1.1}
     figure = make_learning_curve_figure(summary)
+    uniform = [trace for trace in figure.data if trace.name == "Uniform policy"]
+    assert len(uniform) == 1
+    assert uniform[0].line.dash == "dash"
+    assert list(uniform[0].y) == [-1.1, -1.1]
+    summary["uniform_baseline"]["mean_log_likelihood"] = None
+    incomplete = make_learning_curve_figure(summary)
+    assert not any(trace.name == "Uniform policy" for trace in incomplete.data)
+    assert any(
+        "Uniform policy unavailable" in item.text
+        for item in incomplete.layout.annotations
+    )
 
     assert any(trace.name == "Subject m2" for trace in figure.data)
     group = next(trace for trace in figure.data if trace.name == "Group mean +/- SEM")
@@ -165,3 +181,55 @@ def test_plotly_writer_requests_self_contained_html_and_all_static_formats(tmp_p
         ".pdf",
     }
     assert set(paths) == {"html", "png", "svg", "pdf"}
+
+
+@pytest.mark.parametrize(
+    "problem", [None, "missing", "digest", "identity", "trials", "geometry", "count"]
+)
+def test_uniform_baseline_validates_saved_features(tmp_path, problem):
+    partition = {"subject_id": "m2", "heldout_session_id": 3}
+    feature = {
+        "schema_version": 1,
+        "artifact_type": "heldout_feature_tensor",
+        "status": "success",
+        "partition_digest": "p",
+        "partition": partition,
+        "predictor_names": ["vector"],
+        "decision_keys": [["m2", 3, 1, 0], ["m2", 3, 2, 0]],
+        "responses": [0, 1],
+        "impossible_action_mask": [[0, -1e10, -1e10, -1e10], [0, 0, 0, 0]],
+    }
+    if problem == "identity":
+        feature["partition_digest"] = "wrong"
+    if problem == "geometry":
+        feature["responses"][0] = 1
+    feature["artifact_digest"] = _payload_digest(feature)
+    record = {
+        "status": "success",
+        "partition_digest": "p",
+        "partition": partition,
+        "predictor_names": ["vector"],
+        "feature_artifact_digest": feature["artifact_digest"],
+        "regression_trial_keys": [["m2", 3, 1], ["m2", 3, 2]],
+        "folds": [{"n_training_decisions": 1, "n_test_decisions": 1}],
+    }
+    if problem == "digest":
+        feature["responses"][0] = 1
+    if problem == "trials":
+        record["regression_trial_keys"].reverse()
+    if problem == "count":
+        record["folds"][0]["n_test_decisions"] = 2
+    if problem != "missing":
+        _atomic_write_json(tmp_path / "partitions/p/features.json", feature)
+    expected = [{"partition_digest": "p", "partition": partition}]
+    if problem not in (None, "missing"):
+        with pytest.raises(ValueError, match="Uniform baseline"):
+            _load_uniform_baseline(tmp_path, [record], expected, complete=True)
+    else:
+        baseline = _load_uniform_baseline(tmp_path, [record], expected, complete=True)
+        if problem == "missing":
+            assert baseline["mean_log_likelihood"] is None
+            assert baseline["missing_partitions"] == ["p"]
+        else:
+            assert baseline["mean_log_likelihood"] == pytest.approx(-np.log(4) / 2)
+            assert baseline["n_decisions"] == 2

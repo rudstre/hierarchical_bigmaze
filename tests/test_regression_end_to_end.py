@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -52,10 +53,19 @@ def _config(method):
     ("method", "expected_mlmdp_fits"),
     [("session_cv", 3), ("training_ll", 1), ("fixed", 1)],
 )
+@pytest.mark.parametrize("learning_curve", [False, True])
 def test_synthetic_workflow_reuses_predictors_across_regression_folds(
-    method, expected_mlmdp_fits, monkeypatch, tmp_path
+    method, expected_mlmdp_fits, learning_curve, monkeypatch, tmp_path
 ):
     config = _config(method)
+    if learning_curve:
+        object.__setattr__(
+            config,
+            "regression_cv",
+            workflow.RegressionCVConfig(
+                method="blocked_trial_learning_curve", n_subdivisions=1
+            ),
+        )
     table = _table()
     counts = {"mlmdp": 0, "route_habit": 0, "features": 0, "regression": 0}
 
@@ -135,9 +145,9 @@ def test_synthetic_workflow_reuses_predictors_across_regression_folds(
             return {"X_t": design, "Y_t": responses}
 
     class Finder:
-        def get_unique_predictability(self, *args):
+        def get_unique_predictability(self, *args, full_only=False):
             counts["regression"] += 1
-            n_models = len(config.predictors.names) + 2
+            n_models = 1 if full_only else len(config.predictors.names) + 2
             losses = torch.linspace(1.2, 1.0, n_models)
             return {
                 "neg_log_likelihoods": losses,
@@ -183,5 +193,20 @@ def test_synthetic_workflow_reuses_predictors_across_regression_folds(
         "mlmdp": expected_mlmdp_fits,
         "route_habit": 1,
         "features": 1,
-        "regression": 2,
+        "regression": 6 if learning_curve else 2,
     }
+    if learning_curve:
+        report = result["report"]
+        numerical = workflow._read_json(Path(report["result"]))
+        baseline = numerical["summary"]["uniform_baseline"]
+        assert baseline["mean_log_likelihood"] == pytest.approx(-np.log(4))
+        assert baseline["n_decisions"] == 6
+        before = counts.copy()
+        saved = list((tmp_path / method / "partitions").glob("*/features.json"))
+        feature_bytes = saved[0].read_bytes()
+        manifest = workflow._read_json(tmp_path / method / "manifest.json")
+        write_report(
+            config, tmp_path / method, numerical["records"], manifest, plot=False
+        )
+        assert counts == before
+        assert saved[0].read_bytes() == feature_bytes

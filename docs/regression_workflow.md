@@ -134,3 +134,31 @@ Learning-curve reporting instead writes split, session, subject, and group CSV
 tables and plots training-trial percentage against mean test log likelihood.
 Split LL is pooled by decisions within each session and training size; sessions
 are averaged equally within subjects and subjects equally within the group.
+
+The learning-curve plot also includes a dashed **Uniform policy** reference.
+At each decision this policy assigns `1 / n_allowed` to each action permitted
+by maze geometry and exactly zero to forbidden actions. Its observed-action
+log likelihood is `-log(n_allowed)` in nats/decision. Decisions are averaged
+within each reserved session, sessions equally within subjects, and subjects
+equally for the group line. Complete circular test-block coverage gives this
+same reference at every training size, even with unequal trial lengths.
+
+The pure NumPy calculation and aggregation live in `regression_baselines.py`.
+Reporting loads the saved feature masks, checks their content digests against
+the regression records, and validates partition and decision alignment. A
+forbidden observed action is a data error; no epsilon probability is added.
+Missing inputs suppress the group reference and are recorded explicitly in
+the baseline status and plot annotation. Per-session and per-subject values
+and decision counts appear in the CSVs; report JSON and provenance retain
+the baseline definition, aggregation, source digests, and cohort counts.
+
+To add the reference to an existing learning-curve run without refitting:
+
+```bash
+python scripts/run_regression_workflow.py plotting \
+  --config configs/regression_workflow_learning_curve.json \
+  --output-dir output/regression_workflow/example
+```
+
+Use the original run's configuration and output directory. This rewrites only
+report outputs; predictor and regression artifacts remain unchanged.

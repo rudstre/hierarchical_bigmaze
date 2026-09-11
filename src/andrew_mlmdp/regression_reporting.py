@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 import os
 import tempfile
@@ -11,6 +13,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from andrew_mlmdp import regression_baselines
 from andrew_mlmdp.regression_execution import (
     aggregate_learning_curve_results,
     aggregate_regression_results,
@@ -29,6 +32,93 @@ _PREDICTOR_STYLE = {
     "forward": ("Forward", "#000000"),
     "reverse": ("Reverse", "#7F7F7F"),
 }
+
+
+def _load_uniform_baseline(output_dir, records, expected, *, complete):
+    """Score saved masks without touching fitted artifacts or their fingerprints."""
+    actual = {record["partition_digest"]: record for record in records}
+    sessions = []
+    missing = []
+    for item in expected:
+        digest = item.get("partition_digest", item.get("digest"))
+        record = actual.get(digest)
+        path = Path(output_dir) / "partitions" / digest / "features.json"
+        if record is None or record.get("status") != "success" or not path.is_file():
+            missing.append(digest)
+            continue
+        feature = json.loads(path.read_text(encoding="utf-8"))
+        unsigned = {
+            key: value for key, value in feature.items() if key != "artifact_digest"
+        }
+        source_digest = _payload_digest(unsigned)
+        if (
+            feature.get("artifact_digest") != source_digest
+            or record.get("feature_artifact_digest") != source_digest
+        ):
+            raise ValueError(f"Uniform baseline feature digest mismatch for {digest}")
+        if (
+            feature.get("schema_version") != 1
+            or feature.get("artifact_type") != "heldout_feature_tensor"
+            or feature.get("status") != "success"
+            or feature.get("partition_digest") != digest
+            or feature.get("partition") != record["partition"]
+            or feature.get("partition") != item["partition"]
+            or feature.get("predictor_names") != record.get("predictor_names")
+        ):
+            raise ValueError(f"Uniform baseline feature identity mismatch for {digest}")
+        keys = feature["decision_keys"]
+        partition = record["partition"]
+        if (
+            not keys
+            or any(
+                len(key) != 4
+                or key[:2] != [partition["subject_id"], partition["heldout_session_id"]]
+                for key in keys
+            )
+            or len({tuple(key) for key in keys}) != len(keys)
+        ):
+            raise ValueError(
+                f"Uniform baseline decision alignment mismatch for {digest}"
+            )
+        trials = list(dict.fromkeys(tuple(key[:3]) for key in keys))
+        if [list(key) for key in trials] != record["regression_trial_keys"]:
+            raise ValueError(f"Uniform baseline trial alignment mismatch for {digest}")
+        mask = np.asarray(feature["impossible_action_mask"])
+        if mask.shape != (len(keys), 4) or not np.isin(mask, (0.0, -1e10)).all():
+            raise ValueError(f"Uniform baseline invalid geometry mask for {digest}")
+        likelihood = regression_baselines.uniform_action_log_likelihood(
+            mask == 0, feature["responses"]
+        )
+        if not np.isfinite(likelihood).all():
+            raise ValueError(
+                f"Uniform baseline geometry-invalid observation for {digest}"
+            )
+        if any(
+            fold["n_training_decisions"] + fold["n_test_decisions"] != len(keys)
+            for fold in record["folds"]
+        ):
+            raise ValueError(f"Uniform baseline decision count mismatch for {digest}")
+        sessions.append(
+            {
+                "partition_digest": digest,
+                "subject_id": partition["subject_id"],
+                "heldout_session_id": partition["heldout_session_id"],
+                "n_decisions": len(keys),
+                "total_log_likelihood": float(likelihood.sum()),
+                "feature_artifact_digest": source_digest,
+            }
+        )
+    baseline = regression_baselines.aggregate_uniform_baseline(sessions)
+    baseline["status"] = "complete" if complete and not missing else "incomplete"
+    baseline["missing_partitions"] = missing
+    if baseline["status"] != "complete":
+        baseline["mean_log_likelihood"] = None
+    baseline["definition"] = "p(a|s) = 1/n_allowed for allowed actions; zero otherwise"
+    baseline["aggregation"] = "decisions within session; sessions equal; subjects equal"
+    baseline["calculation_source_sha256"] = hashlib.sha256(
+        Path(regression_baselines.__file__).read_bytes()
+    ).hexdigest()
+    return baseline
 
 
 def _write_csv(path: Path, rows, columns):
@@ -371,6 +461,37 @@ def make_learning_curve_figure(summary):
             ),
         )
     )
+    baseline = summary.get("uniform_baseline")
+    if baseline is not None and baseline["mean_log_likelihood"] is not None:
+        percentages = [
+            row["training_percentage"]
+            for row in group_rows
+            if row["training_percentage"] is not None
+        ]
+        if percentages:
+            value = baseline["mean_log_likelihood"]
+            figure.add_trace(
+                go.Scatter(
+                    x=[min(percentages), max(percentages)],
+                    y=[value, value],
+                    mode="lines",
+                    name="Uniform policy",
+                    line={"color": "#666666", "dash": "dash", "width": 2},
+                    hovertemplate=(
+                        "Uniform policy<br>Mean LL: %{y:.4f} "
+                        "nats/decision<extra></extra>"
+                    ),
+                )
+            )
+    elif baseline is not None:
+        figure.add_annotation(
+            x=0.5,
+            y=1.16,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            text="Uniform policy unavailable: incomplete comparison inputs",
+        )
     figure.update_layout(
         template="plotly_white",
         width=1000,
@@ -453,6 +574,20 @@ def write_regression_report(
         else aggregate_regression_results
     )
     summary = aggregator(records, expected, manifest.get("unavailable_partitions"))
+    if learning_curve:
+        baseline = _load_uniform_baseline(
+            output_dir, records, expected, complete=summary["status"] == "complete"
+        )
+        summary["uniform_baseline"] = baseline
+        for level, identity in (
+            ("sessions", "partition_digest"),
+            ("subjects", "subject_id"),
+        ):
+            values = {row[identity]: row for row in baseline[level]}
+            for row in summary[level]:
+                source = values.get(row[identity], {})
+                row["uniform_mean_log_likelihood"] = source.get("mean_log_likelihood")
+                row["uniform_n_decisions"] = source.get("n_decisions")
     stem = report_stem(config)
     numerical = {
         "schema_version": 1,
@@ -578,6 +713,13 @@ def write_regression_report(
                 ),
             ),
         }
+    if learning_curve:
+        for level in ("sessions", "subjects"):
+            rows, columns = table_specs[level]
+            table_specs[level] = (
+                rows,
+                (*columns, "uniform_mean_log_likelihood", "uniform_n_decisions"),
+            )
     csv_paths = {}
     for level, (rows, columns) in table_specs.items():
         path = destination / f"{stem}_{level}.csv"
@@ -608,6 +750,8 @@ def write_regression_report(
         ),
         "status": summary["status"],
     }
+    if learning_curve:
+        provenance["uniform_baseline"] = summary["uniform_baseline"]
     _atomic_write_json(destination / f"{stem}_provenance.json", provenance)
     plot_paths = {}
     if plot:
