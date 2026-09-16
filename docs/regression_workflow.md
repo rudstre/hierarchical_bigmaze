@@ -149,6 +149,13 @@ Split LL is pooled by decisions within each session and training size; sessions
 are averaged equally within subjects and subjects equally within the group.
 The companion accuracy curve applies the same hierarchy to full-model action
 accuracy and uses a fixed 0–100% axis.
+Both learning-curve figures include a dashed uniform-policy baseline. At each
+decision the baseline assigns equal probability to every valid action. Its log
+likelihood is `log(1 / n_valid_actions)`, and its accuracy reference is the
+expected correct-action rate `1 / n_valid_actions` under uniform random action
+sampling. Baselines use the same decision, session, and contributing-subject
+weighting as the plotted group estimate, so the all-decision and 3–4-action
+panels have separate data-derived reference lines.
 At each training size, the plotted group mean and SEM use only subjects whose
 session and split results are complete at that size. The hover data and group
 CSV report the contributing and expected subject counts. Failed fits remain in

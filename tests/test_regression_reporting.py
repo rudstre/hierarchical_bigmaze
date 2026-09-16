@@ -258,6 +258,8 @@ def test_learning_curve_figure_has_subjects_group_sem_and_scientific_units():
                     "mean_accuracy": 0.6,
                     "partial_mean_accuracy": 0.6,
                     "accuracy_sem_across_subjects": None,
+                    "uniform_mean_log_likelihood": -1.1,
+                    "uniform_expected_accuracy": 1 / 3,
                     "n_subjects": 1,
                     "complete": True,
                 },
@@ -272,6 +274,8 @@ def test_learning_curve_figure_has_subjects_group_sem_and_scientific_units():
                     "mean_accuracy": 0.8,
                     "partial_mean_accuracy": 0.8,
                     "accuracy_sem_across_subjects": None,
+                    "uniform_mean_log_likelihood": -1.1,
+                    "uniform_expected_accuracy": 1 / 3,
                     "n_subjects": 1,
                     "complete": True,
                 },
@@ -301,6 +305,10 @@ def test_learning_curve_figure_has_subjects_group_sem_and_scientific_units():
         for annotation in figure.layout.annotations
     )
     assert "nats/decision" in figure.layout.yaxis.title.text
+    uniform = [trace for trace in figure.data if trace.name == "Uniform policy"]
+    assert len(uniform) == 2
+    assert uniform[0].line.dash == "dash"
+    assert list(uniform[0].y) == pytest.approx([-1.1, -1.1])
 
     accuracy_figure = make_learning_curve_accuracy_figure(summary)
     accuracy_groups = [
@@ -313,6 +321,11 @@ def test_learning_curve_figure_has_subjects_group_sem_and_scientific_units():
     assert accuracy_figure.layout.yaxis.range == (0, 100)
     assert accuracy_figure.layout.yaxis2.range == (0, 100)
     assert "predicted correctly (%)" in accuracy_figure.layout.yaxis.title.text
+    accuracy_uniform = [
+        trace for trace in accuracy_figure.data if trace.name == "Uniform policy"
+    ]
+    assert len(accuracy_uniform) == 2
+    assert list(accuracy_uniform[0].y) == pytest.approx([100 / 3, 100 / 3])
 
 
 def test_learning_curve_figure_uses_available_complete_subject_mean():
@@ -531,6 +544,62 @@ def test_learning_curve_accuracy_averages_sessions_then_subjects():
     assert subject_accuracy == pytest.approx({"a": 0.6, "b": 0.9})
     assert group["partial_mean_accuracy"] == pytest.approx(0.75)
     assert group["accuracy_sem_across_subjects"] == pytest.approx(0.15)
+
+
+def test_uniform_policy_baseline_uses_valid_actions_and_report_weighting():
+    records = [
+        {
+            "status": "success",
+            "partition_digest": "a1",
+            "partition": {"subject_id": "a"},
+        },
+        {
+            "status": "success",
+            "partition_digest": "a2",
+            "partition": {"subject_id": "a"},
+        },
+        {
+            "status": "success",
+            "partition_digest": "b1",
+            "partition": {"subject_id": "b"},
+        },
+    ]
+
+    def mask(valid_actions):
+        return [[0.0] * valid_actions + [-1e10] * (4 - valid_actions)]
+
+    features = {
+        "a1": {"impossible_action_mask": mask(2)},
+        "a2": {"impossible_action_mask": mask(4)},
+        "b1": {"impossible_action_mask": mask(3)},
+    }
+    summary = {
+        "sessions": [
+            {"partition_digest": digest}
+            for digest in ("a1", "a2", "b1")
+        ],
+        "subjects": [
+            {
+                "subject_id": subject,
+                "subdivision_index": 0,
+                "complete": True,
+                "mean_test_log_likelihood": -1.0,
+            }
+            for subject in ("a", "b")
+        ],
+        "partial_group": {"rows": [{"subdivision_index": 0}]},
+    }
+
+    reporting._add_uniform_policy_baseline(summary, records, features)
+
+    group = summary["partial_group"]["rows"][0]
+    expected_subject_a_ll = (-np.log(2) - np.log(4)) / 2
+    expected_group_ll = (expected_subject_a_ll - np.log(3)) / 2
+    assert group["uniform_mean_log_likelihood"] == pytest.approx(expected_group_ll)
+    assert group["uniform_expected_accuracy"] == pytest.approx(
+        ((1 / 2 + 1 / 4) / 2 + 1 / 3) / 2
+    )
+    assert summary["uniform_policy_baseline"]["valid_action_counts"] == "all"
 
 
 def test_plotly_writer_requests_self_contained_html_and_all_static_formats(tmp_path):

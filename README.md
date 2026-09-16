@@ -324,7 +324,8 @@ is present; partial tables and Plotly figures retain available observations and
 sample sizes. Each likelihood figure is accompanied by an `_accuracy` figure:
 learning curves show the percentage of held-out actions predicted correctly,
 while predictor-ablation figures show the percentage-point accuracy loss when
-each predictor is removed. See
+each predictor is removed. Learning curves include a dashed, data-derived
+uniform-over-valid-actions reference line. See
 [`docs/regression_workflow.md`](docs/regression_workflow.md) for stage and
 resume details.
 

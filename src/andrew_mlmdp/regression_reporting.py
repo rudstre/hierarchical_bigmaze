@@ -159,19 +159,110 @@ def _junction_scored_record(record, features, nll_function, accuracy_function):
     return rescored_record
 
 
-def _junction_learning_curve_summary(config, output_dir, records, manifest):
-    nll_function, accuracy_function = _qin_scoring_imports(config.project_root)
+def _learning_curve_features(output_dir, records):
     root = Path(output_dir).resolve()
+    features = {}
+    for record in records:
+        if record.get("status") != "success":
+            continue
+        digest = record["partition_digest"]
+        path = root / "partitions" / digest / "features.json"
+        feature = json.loads(path.read_text(encoding="utf-8"))
+        if feature.get("artifact_digest") != record.get("feature_artifact_digest"):
+            raise ValueError("Feature artifact does not match regression artifact")
+        features[digest] = feature
+    return features
+
+
+def _add_uniform_policy_baseline(
+    summary, records, features, *, valid_action_counts=None
+):
+    """Add uniform-over-valid-actions scores with report-level weighting."""
+    session_baselines = {}
+    subject_sessions = {}
+    allowed = None if valid_action_counts is None else tuple(valid_action_counts)
+    for record in records:
+        if record.get("status") != "success":
+            continue
+        digest = record["partition_digest"]
+        mask = np.asarray(features[digest]["impossible_action_mask"], dtype=float)
+        counts = np.count_nonzero(mask == 0, axis=1)
+        if np.any((counts < 1) | (counts > mask.shape[1])):
+            raise ValueError("Feature artifact has an invalid valid-action count")
+        if allowed is not None:
+            counts = counts[np.isin(counts, allowed)]
+        if not len(counts):
+            continue
+        baseline = {
+            "uniform_mean_log_likelihood": float(-np.log(counts).mean()),
+            "uniform_expected_accuracy": float(np.mean(1.0 / counts)),
+        }
+        session_baselines[digest] = baseline
+        subject = record["partition"]["subject_id"]
+        subject_sessions.setdefault(subject, []).append(baseline)
+
+    subject_baselines = {
+        subject: {
+            key: float(np.mean([session[key] for session in sessions]))
+            for key in (
+                "uniform_mean_log_likelihood",
+                "uniform_expected_accuracy",
+            )
+        }
+        for subject, sessions in subject_sessions.items()
+    }
+    for row in summary["sessions"]:
+        baseline = session_baselines.get(row["partition_digest"])
+        if baseline is not None:
+            row.update(baseline)
+    for row in summary["subjects"]:
+        baseline = subject_baselines.get(row["subject_id"])
+        if baseline is not None:
+            row.update(baseline)
+    for group_row in summary["partial_group"]["rows"]:
+        subjects = [
+            row["subject_id"]
+            for row in summary["subjects"]
+            if row["subdivision_index"] == group_row["subdivision_index"]
+            and row["complete"]
+            and row["mean_test_log_likelihood"] is not None
+            and row["subject_id"] in subject_baselines
+        ]
+        for key in (
+            "uniform_mean_log_likelihood",
+            "uniform_expected_accuracy",
+        ):
+            group_row[key] = (
+                float(
+                    np.mean(
+                        [subject_baselines[subject][key] for subject in subjects]
+                    )
+                )
+                if subjects
+                else None
+            )
+    summary["uniform_policy_baseline"] = {
+        "policy": "uniform_over_valid_actions",
+        "log_likelihood": "mean -log(number of valid actions)",
+        "accuracy": "expected correct-action rate under uniform random sampling",
+        "valid_action_counts": "all" if allowed is None else list(allowed),
+        "aggregation": "sessions equal within subject; contributing subjects equal",
+    }
+
+
+def _junction_learning_curve_summary(config, records, manifest, features):
+    nll_function, accuracy_function = _qin_scoring_imports(config.project_root)
     rescored = []
     for record in records:
         if record.get("status") != "success":
             rescored.append(deepcopy(record))
             continue
-        path = root / "partitions" / record["partition_digest"] / "features.json"
-        features = json.loads(path.read_text(encoding="utf-8"))
         rescored.append(
             _junction_scored_record(
-                record, features, nll_function, accuracy_function
+                record,
+                features[record["partition_digest"]],
+                nll_function,
+                accuracy_function,
             )
         )
     summary = aggregate_learning_curve_results(
@@ -181,6 +272,9 @@ def _junction_learning_curve_summary(config, output_dir, records, manifest):
     )
     _add_learning_curve_accuracy(summary, rescored)
     _use_complete_subject_group_estimates(summary)
+    _add_uniform_policy_baseline(
+        summary, records, features, valid_action_counts=(3, 4)
+    )
     for row in summary["split_rows"]:
         if row["status"] == "success" and row["n_test_decisions"] == 0:
             row["status"] = "not_applicable"
@@ -678,6 +772,8 @@ def _make_learning_curve_figure(summary, *, accuracy):
         group_sem_key = "accuracy_sem_across_subjects"
         scale = 100.0
         value_hover = "Actions correct: %{y:.2f}%"
+        baseline_key = "uniform_expected_accuracy"
+        baseline_hover = "Uniform-policy expectation: %{y:.2f}%"
         y_title = "Held-out actions predicted correctly (%)"
         figure_title = "Full-model regression accuracy learning curve"
     else:
@@ -686,6 +782,8 @@ def _make_learning_curve_figure(summary, *, accuracy):
         group_sem_key = "sem_across_subjects"
         scale = 1.0
         value_hover = "Mean test LL: %{y:.4f} nats/decision"
+        baseline_key = "uniform_mean_log_likelihood"
+        baseline_hover = "Uniform-policy mean LL: %{y:.4f} nats/decision"
         y_title = "Mean test log-likelihood (nats/decision; higher is better)"
         figure_title = "Full-model regression learning curve"
 
@@ -811,6 +909,26 @@ def _make_learning_curve_figure(summary, *, accuracy):
             row=1,
             col=column,
         )
+        baseline_values = [row.get(baseline_key) for row in group_rows]
+        if any(value is not None for value in baseline_values):
+            figure.add_trace(
+                go.Scatter(
+                    x=[row["training_percentage"] for row in group_rows],
+                    y=[scaled(value) for value in baseline_values],
+                    mode="lines",
+                    name="Uniform policy",
+                    legendgroup="uniform-policy",
+                    showlegend=column == 1,
+                    connectgaps=False,
+                    line={"color": "#666666", "width": 2, "dash": "dash"},
+                    hovertemplate=(
+                        "Scope: " + scope + "<br>" + baseline_hover
+                        + "<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=column,
+            )
         figure.update_xaxes(title_text="Training trials (%)", row=1, col=column)
     figure.update_yaxes(title_text=y_title, row=1, col=1)
     if accuracy:
@@ -917,6 +1035,8 @@ def _learning_curve_table_specs(summary):
                 "n_test_decisions",
                 "mean_test_log_likelihood",
                 "accuracy",
+                "uniform_mean_log_likelihood",
+                "uniform_expected_accuracy",
                 "complete",
             ),
         ),
@@ -931,6 +1051,8 @@ def _learning_curve_table_specs(summary):
                 "training_percentage_max",
                 "mean_test_log_likelihood",
                 "accuracy",
+                "uniform_mean_log_likelihood",
+                "uniform_expected_accuracy",
                 "complete",
             ),
         ),
@@ -947,6 +1069,8 @@ def _learning_curve_table_specs(summary):
                 "mean_accuracy",
                 "partial_mean_accuracy",
                 "accuracy_sem_across_subjects",
+                "uniform_mean_log_likelihood",
+                "uniform_expected_accuracy",
                 "n_subjects",
                 "n_expected_subjects",
                 "complete",
@@ -974,18 +1098,20 @@ def write_regression_report(
     )
     summary = aggregator(records, expected, manifest.get("unavailable_partitions"))
     if learning_curve:
+        features = _learning_curve_features(output_dir, records)
         _add_learning_curve_accuracy(summary, records)
         _use_complete_subject_group_estimates(summary)
+        _add_uniform_policy_baseline(summary, records, features)
         summary["decision_location_subsets"] = {
             "three_or_four_valid_actions": _junction_learning_curve_summary(
-                config, output_dir, records, manifest
+                config, records, manifest, features
             )
         }
     else:
         _add_regression_accuracy(summary, records)
     stem = report_stem(config)
     numerical = {
-        "schema_version": 3 if learning_curve else 2,
+        "schema_version": 4 if learning_curve else 2,
         "artifact_type": (
             "full_model_learning_curve_report"
             if learning_curve
@@ -1065,7 +1191,7 @@ def write_regression_report(
         csv_paths[level] = path
 
     provenance = {
-        "schema_version": 3 if learning_curve else 2,
+        "schema_version": 4 if learning_curve else 2,
         "artifact_type": "heldout_regression_report_provenance",
         "configuration": config.normalized_payload(),
         "configuration_signature": config.signature,
@@ -1101,6 +1227,21 @@ def write_regression_report(
             ),
             "chance_correction": None,
         },
+        "uniform_policy_baseline": (
+            {
+                "policy": "equal probability over the valid actions at each decision",
+                "log_likelihood": "mean log(1 / valid action count)",
+                "accuracy": (
+                    "expected correct-action rate under uniform random sampling"
+                ),
+                "aggregation": (
+                    "decisions equal within session; sessions equal within subject; "
+                    "contributing subjects equal at each training size"
+                ),
+            }
+            if learning_curve
+            else None
+        ),
         "evaluation_scopes": (
             {
                 "overall": "all eligible held-out decisions",
