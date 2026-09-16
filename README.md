@@ -265,7 +265,9 @@ python scripts/run_regression_workflow.py complete \
 The same CLI exposes `prepare`, `candidate`, `selection`, `selected-refit`,
 `predictor-bundle`, `feature-generation`, `regression`, `aggregation`,
 `plotting`, and `status` for inspection or manual execution. Plotting reads
-completed numerical artifacts and never initiates fitting.
+completed numerical artifacts and never initiates fitting. Commands print a
+short status summary by default; pass `--json` to print the complete result for
+machine processing.
 
 Preview the idempotent SLURM graph without submitting jobs:
 
@@ -319,7 +321,10 @@ Reports pool fold likelihoods by decision count, average held-out sessions
 equally within subject, and average subjects equally at group level. The
 headline group estimate is omitted unless the complete expected partition grid
 is present; partial tables and Plotly figures retain available observations and
-sample sizes. See
+sample sizes. Each likelihood figure is accompanied by an `_accuracy` figure:
+learning curves show the percentage of held-out actions predicted correctly,
+while predictor-ablation figures show the percentage-point accuracy loss when
+each predictor is removed. See
 [`docs/regression_workflow.md`](docs/regression_workflow.md) for stage and
 resume details.
 

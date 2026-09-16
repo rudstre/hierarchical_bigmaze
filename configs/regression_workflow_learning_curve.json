@@ -40,7 +40,7 @@
   },
   "regression_cv": {
     "method": "blocked_trial_learning_curve",
-    "n_subdivisions": 10
+    "n_subdivisions": 50
   },
   "random_seed": 123,
   "slurm": {

@@ -1,4 +1,5 @@
 import importlib.util
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -104,6 +105,123 @@ def test_task_lists_store_scalar_retry_identities_not_rank_ranges(tmp_path):
     assert payload["tasks"] == tasks
     assert "rank_range" not in payload["tasks"][0]
     assert manager._read(path)["task_list_digest"] == payload["task_list_digest"]
+
+
+def test_submission_summary_exposes_job_ids_and_dependencies():
+    submissions = [
+        {
+            "stage": "regression",
+            "label": "",
+            "job_id": "123",
+            "task_list": "/tmp/tasks.json",
+            "task_list_digest": "digest",
+            "task_count": 6,
+            "dependency": ["122"],
+            "submitted_at": "2026-09-16T00:00:00+00:00",
+        }
+    ]
+
+    assert manager._submission_summary(submissions) == [
+        {
+            "stage": "regression",
+            "job_id": "123",
+            "task_count": 6,
+            "dependency": ["122"],
+        }
+    ]
+
+
+def test_submission_output_is_concise_by_default(tmp_path):
+    rendered = manager._format_submission(
+        tmp_path,
+        [
+            {
+                "stage": "regression",
+                "job_id": "123",
+                "task_count": 6,
+                "dependency": ["122"],
+            }
+        ],
+        {"regression": Counter({"success": 2, "missing": 4})},
+        dry_run=False,
+    )
+
+    assert rendered.splitlines() == [
+        "Submitted workflow: 1 jobs",
+        f"Output: {tmp_path}",
+        "Existing artifacts: 2/6 successful",
+        "  regression: job 123, 6 tasks, dependency 122",
+    ]
+
+
+def test_array_task_states_combine_expanded_and_compact_slurm_records():
+    submission = {
+        "job_id": "123",
+        "task_count": 6,
+    }
+    records = {
+        "123": {
+            "123_0": "COMPLETED",
+            "123_1": "RUNNING",
+            "123_[2-5%6]": "PENDING",
+        }
+    }
+
+    assert manager._submission_task_states(submission, records) == Counter(
+        {"COMPLETED": 1, "RUNNING": 1, "PENDING": 4}
+    )
+
+
+def test_status_report_uses_only_latest_attempt(monkeypatch):
+    submissions = [
+        {
+            "stage": "regression",
+            "job_id": "100",
+            "task_count": 2,
+            "dependency": [],
+            "task_list": "/tmp/regression_attempt-01.json",
+        },
+        {
+            "stage": "regression",
+            "job_id": "200",
+            "task_count": 2,
+            "dependency": ["199"],
+            "task_list": "/tmp/regression_attempt-02.json",
+        },
+    ]
+    monkeypatch.setattr(
+        manager,
+        "_scheduler_records",
+        lambda _manager: {
+            "100": {"100_[0-1%2]": "FAILED"},
+            "200": {"200_0": "COMPLETED", "200_1": "RUNNING"},
+        },
+    )
+
+    report = manager._status_report(
+        {"regression": Counter({"success": 1, "missing": 1})},
+        {"submissions": submissions},
+    )
+
+    assert report["summary"] == {
+        "state": "RUNNING",
+        "current_stage": "regression",
+        "completed_stages": 0,
+        "total_stages": 1,
+    }
+    assert report["stages"]["regression"] == {
+        "state": "RUNNING",
+        "artifacts": {"success": 1, "missing": 1, "total": 2},
+        "latest_attempt": 2,
+        "job_ids": ["200"],
+        "scheduler_tasks": {"COMPLETED": 1, "RUNNING": 1},
+    }
+
+
+    rendered = manager._format_status(report)
+    assert "Workflow: RUNNING (0/1 stages complete)" in rendered
+    assert "Current stage: regression" in rendered
+    assert "200: 1 completed, 1 running" in rendered
 
 
 def test_dry_run_builds_complete_dependency_graph_without_writing(

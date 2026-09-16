@@ -76,7 +76,8 @@ python scripts/run_regression_workflow.py status \
 Partition stages additionally require `--partition-digest`. Candidate tasks
 also require scalar `--k` and, for an inner candidate, a typed JSON value in
 `--validation-session-json`. Scalar task identities are not configured rank
-ranges.
+ranges. Workflow commands print concise status and artifact locations by
+default. Pass `--json` when a caller needs the complete machine-readable result.
 
 SLURM preview and resume:
 
@@ -96,8 +97,10 @@ python scripts/slurm/manage_regression_workflow.py \
 
 The manager writes immutable task lists, chunks arrays, assigns inclusive rank
 resource bands, records job dependencies and task-list digests, and consults
-both `squeue` and `sacct`. Retries contain exact scalar tasks. No production job
-is submitted by tests.
+both `squeue` and `sacct`. Status output reports artifact completion and array
+task counts for the latest attempt of each stage; prior submissions remain in
+`slurm_manager.json`. Pass `--json` with `--status` for machine-readable status.
+Retries contain exact scalar tasks. No production job is submitted by tests.
 
 ## Artifacts and reuse
 
@@ -130,7 +133,31 @@ metadata. Output includes self-contained HTML plus PNG, SVG, and PDF through
 Kaleido. Incomplete grids retain partial diagnostics but have no headline group
 estimate.
 
+Each likelihood figure has a companion `_accuracy` figure generated from the
+same held-out folds. Accuracy is the fraction of individual actions for which
+the model's highest-probability action matches the observed action; JSON and CSV
+store this fraction in `[0, 1]`, while figures display percentages. For the
+predictor-ablation report, the plotted quantity is full-model accuracy minus
+the accuracy of the model without that predictor, in percentage points. Fold
+accuracies are pooled by held-out decision count, sessions are averaged equally
+within subjects, and subjects are averaged equally for the group mean and SEM.
+No chance correction is applied.
+
 Learning-curve reporting instead writes split, session, subject, and group CSV
 tables and plots training-trial percentage against mean test log likelihood.
 Split LL is pooled by decisions within each session and training size; sessions
 are averaged equally within subjects and subjects equally within the group.
+The companion accuracy curve applies the same hierarchy to full-model action
+accuracy and uses a fixed 0–100% axis.
+At each training size, the plotted group mean and SEM use only subjects whose
+session and split results are complete at that size. The hover data and group
+CSV report the contributing and expected subject counts. Failed fits remain in
+the diagnostics and keep the overall report status incomplete; incomplete
+subject points appear as gaps rather than contributing partial estimates.
+The report also reconstructs each stored fold and scores the same fitted model
+only at held-out locations with three or four valid actions. This junction-only
+likelihood and accuracy curve appears in a separate panel and has separate
+`valid-actions-3-4` CSVs. Splits with no matching decisions are marked not
+applicable and have no likelihood or accuracy value.
+Training still uses every eligible decision. Reconstruction must reproduce the
+stored all-decision fold likelihood before junction scores are accepted.

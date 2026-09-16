@@ -55,7 +55,8 @@ def main(argv=None):
             int(task["k"]),
             directory,
         )
-        print(json.dumps(result, default=str))
+        status = result.get("status", "complete")
+        print(f"discovery: {status}\nRank: {task['k']}\nOutput: {directory}")
         return 0
 
     command = [

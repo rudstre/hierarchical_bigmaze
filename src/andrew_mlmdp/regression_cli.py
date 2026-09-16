@@ -51,6 +51,11 @@ def parser():
     result.add_argument("--k", type=int)
     result.add_argument("--validation-session-json")
     result.add_argument("--force", action="store_true")
+    result.add_argument(
+        "--json",
+        action="store_true",
+        help="print the complete machine-readable result instead of a short summary",
+    )
     return result
 
 
@@ -257,7 +262,10 @@ def main(argv=None):
                 table,
                 force=args.force,
             )
-    print(json.dumps(_json_ready(result), sort_keys=True))
+    if args.json:
+        print(json.dumps(_json_ready(result), sort_keys=True))
+    else:
+        print(_format_result(command, result, args.output_dir))
     return (
         1
         if isinstance(result, dict) and result.get("status") == "operational_failure"
@@ -273,3 +281,71 @@ def _json_ready(value):
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _format_result(command, result, output_dir):
+    """Render the useful identity and status without dumping artifact contents."""
+    output = Path(output_dir).resolve()
+    if command == "status":
+        rows = result["partitions"]
+        lines = [f"Workflow status: {len(rows)} partitions"]
+        for stage in ("selection", "predictor_bundle", "features", "regression"):
+            counts = {}
+            for row in rows:
+                state = row[stage]
+                counts[state] = counts.get(state, 0) + 1
+            detail = ", ".join(
+                f"{count} {state}" for state, count in sorted(counts.items())
+            )
+            lines.append(f"  {stage}: {detail or 'none'}")
+        lines.append(f"Unavailable partitions: {len(result['unavailable_partitions'])}")
+        return "\n".join(lines)
+
+    if command == "prepare":
+        unavailable = result.get("unavailable_partitions", {})
+        return "\n".join(
+            (
+                f"prepare: {len(result.get('partitions', []))} partitions",
+                f"Unavailable partitions: {len(unavailable)}",
+                f"Manifest: {output / 'manifest.json'}",
+            )
+        )
+
+    if command == "complete":
+        partitions = result.get("partitions", [])
+        successful = sum(item.get("status") == "success" for item in partitions)
+        report = result.get("report", {})
+        return "\n".join(
+            (
+                f"complete: {result.get('summary', {}).get('status', 'unknown')}",
+                f"Regression partitions: {successful}/{len(partitions)} successful",
+                f"Report: {report.get('result', output / 'report')}",
+            )
+        )
+
+    if command in {"aggregation", "plotting"}:
+        lines = [f"{command}: {result.get('status', 'unknown')}"]
+        if result.get("result") is not None:
+            lines.append(f"Results: {result['result']}")
+        if result.get("provenance") is not None:
+            lines.append(f"Provenance: {result['provenance']}")
+        if command == "plotting":
+            lines.append(f"Figures: {output / 'report'}")
+        return "\n".join(lines)
+
+    status = (
+        result.get("status", "complete")
+        if isinstance(result, dict)
+        else "complete"
+    )
+    lines = [f"{command}: {status}"]
+    if isinstance(result, dict):
+        digest = result.get("partition_digest")
+        if digest is not None:
+            lines.append(f"Partition: {str(digest)[:12]}")
+        if result.get("k") is not None:
+            lines.append(f"Rank: {result['k']}")
+        artifact_type = result.get("artifact_type")
+        if artifact_type is not None:
+            lines.append(f"Artifact: {artifact_type}")
+    return "\n".join(lines)

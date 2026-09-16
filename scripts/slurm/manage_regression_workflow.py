@@ -44,6 +44,7 @@ def parser():
     result.add_argument("--max-array-size", type=int, default=1000)
     result.add_argument("--retry-missing", action="store_true")
     result.add_argument("--status", action="store_true")
+    result.add_argument("--json", action="store_true")
     result.add_argument("--dry-run", action="store_true")
     return result
 
@@ -361,42 +362,183 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
     return "pending"
 
 
-def _job_states(manager):
+def _normalized_slurm_state(value):
+    return value.strip().split(maxsplit=1)[0].removesuffix("+")
+
+
+def _scheduler_records(manager):
+    """Return logical array records, with live queue states overriding accounting."""
     ids = [item["job_id"] for item in manager["submissions"]]
+    records = {job_id: {} for job_id in ids}
     if not ids:
-        return {}
-    states = {}
-    queue = subprocess.run(
-        ["squeue", "--noheader", "--jobs", ",".join(ids), "--format=%A|%T"],
+        return records
+
+    def incorporate(output):
+        for line in output.splitlines():
+            fields = line.strip().split("|", 2)
+            if len(fields) < 2:
+                continue
+            logical_id, state = fields[:2]
+            if "." in logical_id:
+                continue
+            for job_id in ids:
+                if logical_id == job_id or logical_id.startswith(f"{job_id}_"):
+                    records[job_id][logical_id] = _normalized_slurm_state(state)
+                    break
+
+    accounting = subprocess.run(
+        [
+            "sacct",
+            "--noheader",
+            "--parsable2",
+            "--jobs",
+            ",".join(ids),
+            "--format=JobID,State",
+        ],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    for line in queue.stdout.splitlines():
-        job, state = line.split("|", 1)
-        states[job] = state
-    missing = [job for job in ids if job not in states]
-    if missing:
-        accounting = subprocess.run(
-            [
-                "sacct",
-                "--noheader",
-                "--parsable2",
-                "--jobs",
-                ",".join(missing),
-                "--format=JobIDRaw,State",
-            ],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        for line in accounting.stdout.splitlines():
-            fields = line.split("|")
-            if len(fields) >= 2 and fields[0] in missing:
-                states[fields[0]] = fields[1]
+    incorporate(accounting.stdout)
+    queue = subprocess.run(
+        ["squeue", "--noheader", "--jobs", ",".join(ids), "--format=%i|%T"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    incorporate(queue.stdout)
+    return records
+
+
+def _submission_attempt(submission):
+    stem = Path(submission["task_list"]).stem
+    return int(stem.rsplit("_attempt-", 1)[1])
+
+
+def _submission_task_states(submission, records):
+    """Expand one SLURM array's compact accounting rows into task counts."""
+    job_id = submission["job_id"]
+    task_count = submission["task_count"]
+    job_records = records.get(job_id, {})
+    individual = {
+        logical_id: state
+        for logical_id, state in job_records.items()
+        if "_[" not in logical_id and logical_id != job_id
+    }
+    states = Counter(individual.values())
+    compact = [
+        state for logical_id, state in job_records.items() if "_[" in logical_id
+    ]
+    remaining = task_count - len(individual)
+    if compact and remaining > 0:
+        states[compact[-1]] += remaining
+    elif not individual and job_id in job_records:
+        states[job_records[job_id]] += task_count
+    elif not job_records:
+        states["UNKNOWN"] += task_count
     return states
+
+
+def _stage_state(artifacts, scheduler, submissions):
+    total = sum(artifacts.values())
+    if total and artifacts.get("success", 0) == total:
+        return "COMPLETE"
+    if any(scheduler.get(state, 0) for state in ("RUNNING", "COMPLETING")):
+        return "RUNNING"
+    if any(scheduler.get(state, 0) for state in ("PENDING", "CONFIGURING")):
+        has_dependency = any(item["dependency"] for item in submissions)
+        return "WAITING" if has_dependency else "PENDING"
+    if any(
+        scheduler.get(state, 0) for state in ("FAILED", "TIMEOUT", "OUT_OF_MEMORY")
+    ):
+        return "FAILED"
+    if scheduler.get("CANCELLED", 0):
+        return "CANCELLED"
+    if submissions:
+        return "INCOMPLETE"
+    return "NOT_SUBMITTED"
+
+
+def _status_report(states, manager):
+    records = _scheduler_records(manager)
+    stages = {}
+    for stage, artifact_counter in states.items():
+        submissions = [
+            item for item in manager["submissions"] if item["stage"] == stage
+        ]
+        if submissions:
+            latest_attempt = max(_submission_attempt(item) for item in submissions)
+            latest = [
+                item
+                for item in submissions
+                if _submission_attempt(item) == latest_attempt
+            ]
+        else:
+            latest_attempt = None
+            latest = []
+        scheduler = Counter()
+        for submission in latest:
+            scheduler.update(_submission_task_states(submission, records))
+        artifacts = dict(artifact_counter)
+        artifacts["total"] = sum(artifact_counter.values())
+        stages[stage] = {
+            "state": _stage_state(artifact_counter, scheduler, latest),
+            "artifacts": artifacts,
+            "latest_attempt": latest_attempt,
+            "job_ids": [item["job_id"] for item in latest],
+            "scheduler_tasks": dict(scheduler),
+        }
+    incomplete = [
+        stage for stage, record in stages.items() if record["state"] != "COMPLETE"
+    ]
+    failed = [
+        stage
+        for stage in incomplete
+        if stages[stage]["state"] in {"FAILED", "CANCELLED", "INCOMPLETE"}
+    ]
+    summary_state = (
+        "FAILED" if failed else ("COMPLETE" if not incomplete else "RUNNING")
+    )
+    return {
+        "summary": {
+            "state": summary_state,
+            "current_stage": incomplete[0] if incomplete else None,
+            "completed_stages": len(stages) - len(incomplete),
+            "total_stages": len(stages),
+        },
+        "stages": stages,
+    }
+
+
+def _format_status(report):
+    summary = report["summary"]
+    lines = [
+        f"Workflow: {summary['state']} "
+        f"({summary['completed_stages']}/{summary['total_stages']} stages complete)"
+    ]
+    if summary["current_stage"] is not None:
+        lines.append(f"Current stage: {summary['current_stage']}")
+    heading = f"{'STAGE':20} {'STATE':10} {'ARTIFACTS':15} {'ATTEMPT':7} JOB / TASKS"
+    lines.extend(("", heading))
+    for stage, record in report["stages"].items():
+        artifacts = record["artifacts"]
+        success = artifacts.get("success", 0)
+        artifact_progress = f"{success}/{artifacts['total']} success"
+        attempt = record["latest_attempt"]
+        attempt_text = "-" if attempt is None else str(attempt)
+        jobs = ",".join(record["job_ids"]) or "-"
+        task_counts = ", ".join(
+            f"{count} {state.lower()}"
+            for state, count in record["scheduler_tasks"].items()
+        )
+        detail = jobs if not task_counts else f"{jobs}: {task_counts}"
+        lines.append(
+            f"{stage:20} {record['state']:10} {artifact_progress:15} "
+            f"{attempt_text:7} {detail}"
+        )
+    return "\n".join(lines)
 
 
 def _resources(raw, bands):
@@ -411,6 +553,37 @@ def _resources(raw, bands):
     return common, [
         {**common, "memory": band["memory"], "time": band["time"]} for band in bands
     ]
+
+
+def _submission_summary(submissions):
+    """Return the scheduler identities needed to monitor a submission."""
+    return [
+        {
+            "stage": submission["stage"],
+            "job_id": submission["job_id"],
+            "task_count": submission["task_count"],
+            "dependency": submission["dependency"],
+        }
+        for submission in submissions
+    ]
+
+
+def _format_submission(output, submitted_jobs, states, *, dry_run):
+    total_artifacts = sum(sum(counter.values()) for counter in states.values())
+    successful = sum(counter.get("success", 0) for counter in states.values())
+    action = "Dry-run plan" if dry_run else "Submitted workflow"
+    lines = [
+        f"{action}: {len(submitted_jobs)} jobs",
+        f"Output: {output}",
+        f"Existing artifacts: {successful}/{total_artifacts} successful",
+    ]
+    for job in submitted_jobs:
+        dependencies = ":".join(job["dependency"]) or "none"
+        lines.append(
+            f"  {job['stage']}: job {job['job_id']}, "
+            f"{job['task_count']} tasks, dependency {dependencies}"
+        )
+    return "\n".join(lines)
 
 
 def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
@@ -543,13 +716,8 @@ def main(argv=None):
         for stage, stage_tasks in tasks.items()
     }
     if args.status:
-        print(
-            json.dumps(
-                {"artifacts": states, "jobs": _job_states(manager)},
-                default=dict,
-                indent=2,
-            )
-        )
+        report = _status_report(states, manager)
+        print(json.dumps(report, indent=2) if args.json else _format_status(report))
         return 0
 
     if args.retry_missing:
@@ -562,13 +730,20 @@ def main(argv=None):
             ]
             for stage, stage_tasks in tasks.items()
         }
+    previous_submission_count = len(manager["submissions"])
     _submit_pipeline(manager, manager_path, config, raw, tasks, dry_run=args.dry_run)
+    submitted_jobs = _submission_summary(
+        manager["submissions"][previous_submission_count:]
+    )
+    submission_result = {
+        "output_dir": str(output),
+        "submitted_jobs": submitted_jobs,
+        "artifacts_before": states,
+    }
     print(
-        json.dumps(
-            {"output_dir": str(output), "artifacts_before": states},
-            default=dict,
-            indent=2,
-        )
+        json.dumps(submission_result, default=dict, indent=2)
+        if args.json
+        else _format_submission(output, submitted_jobs, states, dry_run=args.dry_run)
     )
     return 0
 
