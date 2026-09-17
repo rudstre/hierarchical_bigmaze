@@ -18,6 +18,11 @@ from andrew_mlmdp.regression_execution import (
     run_predictor_bundle,
     run_saved_regression_variants,
 )
+from andrew_mlmdp.regression_policy_overlap import (
+    write_all_overlaps,
+    write_overlap_report,
+    write_partition_overlap,
+)
 from andrew_mlmdp.regression_reporting import write_regression_variant_reports
 from andrew_mlmdp.regression_workflow import (
     PredictorPartition,
@@ -40,6 +45,7 @@ _COMMANDS = (
     "predictor-bundle",
     "feature-generation",
     "regression",
+    "policy-overlap",
     "aggregation",
     "plotting",
     "regression-variants",
@@ -199,6 +205,7 @@ def _status(config, output_dir, table):
         ("predictor_bundle", "predictor.json"),
         ("features", "features.json"),
         ("regression", "regression.json"),
+        ("policy_overlap", "policy_overlap.json"),
     )
     rows = []
     for partition in partitions:
@@ -225,6 +232,13 @@ def main(argv=None):
     elif command == "complete":
         table = _table(config)
         result = run_local_workflow(config, args.output_dir, table)
+        result["policy_overlap"] = write_all_overlaps(
+            config,
+            args.output_dir,
+            _manifest(args.output_dir),
+            force=args.force,
+            plot=True,
+        )
     elif command == "status":
         table = _table(config)
         result = _status(config, args.output_dir, table)
@@ -240,6 +254,31 @@ def main(argv=None):
             manifest,
             plot=True,
         )
+        result["policy_overlap"] = write_all_overlaps(
+            config, args.output_dir, manifest, force=args.force, plot=True
+        )
+    elif command == "policy-overlap":
+        manifest = _manifest(args.output_dir)
+        if args.partition_digest is None:
+            result = write_all_overlaps(
+                config, args.output_dir, manifest, force=args.force, plot=True
+            )
+        else:
+            expected = next(
+                (
+                    record for record in manifest["partitions"]
+                    if record["partition_digest"] == args.partition_digest
+                ),
+                None,
+            )
+            if expected is None:
+                raise ValueError("--partition-digest is not in the workflow manifest")
+            result = write_partition_overlap(
+                config,
+                args.output_dir,
+                PredictorPartition(**expected["partition"]),
+                force=args.force,
+            )
     elif command in {"aggregation", "plotting"}:
         manifest = _manifest(args.output_dir)
         variants = (
@@ -257,6 +296,12 @@ def main(argv=None):
             config,
             args.output_dir,
             records_by_variant,
+            manifest,
+            plot=command == "plotting",
+        )
+        result["policy_overlap"] = write_overlap_report(
+            config,
+            args.output_dir,
             manifest,
             plot=command == "plotting",
         )
@@ -332,7 +377,9 @@ def _format_result(command, result, output_dir):
     if command == "status":
         rows = result["partitions"]
         lines = [f"Workflow status: {len(rows)} partitions"]
-        for stage in ("selection", "predictor_bundle", "features", "regression"):
+        for stage in (
+            "selection", "predictor_bundle", "features", "regression", "policy_overlap"
+        ):
             counts = {}
             for row in rows:
                 state = row[stage]
@@ -358,21 +405,32 @@ def _format_result(command, result, output_dir):
         partitions = result.get("partitions", [])
         successful = sum(item.get("status") == "success" for item in partitions)
         report = result.get("report", {})
+        overlap = result.get("policy_overlap", {})
+        overlap_path = overlap.get(
+            "result", output / "report" / "policy_overlap_results.json"
+        )
         return "\n".join(
             (
                 f"complete: {result.get('summary', {}).get('status', 'unknown')}",
                 f"Regression partitions: {successful}/{len(partitions)} successful",
                 f"Report: {report.get('result', output / 'report')}",
+                f"Policy overlap: {overlap_path}",
             )
         )
 
-    if command in {"aggregation", "plotting", "regression-variants"}:
+    if command in {"aggregation", "plotting", "regression-variants"} or (
+        command == "policy-overlap" and "result" in result
+    ):
         lines = [f"{command}: {result.get('status', 'unknown')}"]
         if "variants" in result:
             for variant, report in result["variants"].items():
                 lines.append(f"  {variant}: {report.get('status', 'unknown')}")
                 if report.get("result") is not None:
                     lines.append(f"    Results: {report['result']}")
+            overlap = result.get("policy_overlap", {})
+            if overlap:
+                lines.append(f"  policy overlap: {overlap.get('status', 'unknown')}")
+                lines.append(f"    Results: {overlap.get('result')}")
         else:
             if result.get("result") is not None:
                 lines.append(f"Results: {result['result']}")

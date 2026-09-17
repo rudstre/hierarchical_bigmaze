@@ -53,12 +53,14 @@ def test_cli_status_summary_counts_partition_states(tmp_path):
                     "predictor_bundle": "success",
                     "features": "success",
                     "regression": "success",
+                    "policy_overlap": "success",
                 },
                 {
                     "selection": "missing",
                     "predictor_bundle": "missing",
                     "features": "missing",
                     "regression": "missing",
+                    "policy_overlap": "missing",
                 },
             ],
             "unavailable_partitions": {"m3": "too few trials"},
@@ -68,4 +70,5 @@ def test_cli_status_summary_counts_partition_states(tmp_path):
 
     assert "Workflow status: 2 partitions" in rendered
     assert "regression: 1 missing, 1 success" in rendered
+    assert "policy_overlap: 1 missing, 1 success" in rendered
     assert "Unavailable partitions: 1" in rendered

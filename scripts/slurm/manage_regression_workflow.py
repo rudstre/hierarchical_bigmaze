@@ -141,6 +141,7 @@ def _stage_tasks(config, workflow_manifest):
         "predictor-bundle": [],
         "feature-generation": [],
         "regression": [],
+        "policy-overlap": [],
         "aggregation": [{"stage": "aggregation"}],
         "plotting": [{"stage": "plotting"}],
     }
@@ -158,7 +159,9 @@ def _stage_tasks(config, workflow_manifest):
         tasks["selection"].append({"stage": "selection", **identity})
         if config.subgoal_selection.method == "session_cv":
             tasks["selected-refit"].append({"stage": "selected-refit", **identity})
-        for stage in ("predictor-bundle", "feature-generation", "regression"):
+        for stage in (
+            "predictor-bundle", "feature-generation", "regression", "policy-overlap"
+        ):
             tasks[stage].append({"stage": stage, **identity})
     return tasks
 
@@ -354,17 +357,21 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
                     partition_dir / "regression_mlmdp_only.json",
                 ]
             )
+    elif stage == "policy-overlap":
+        path = partition_dir / "policy_overlap.json"
     elif stage == "aggregation":
         paths = [
             run_dir / "report" / f"{report_stem(config, variant)}_results.json"
             for variant in report_variants
         ]
+        paths.append(run_dir / "report" / "policy_overlap_results.json")
     else:
         paths = [
             run_dir / "report" / f"{report_stem(config, variant)}{suffix}.html"
             for variant in report_variants
             for suffix in ("", "_accuracy")
         ]
+        paths.append(run_dir / "report" / "policy_overlap.html")
     if paths is not None:
         if any(not candidate.is_file() for candidate in paths):
             return "missing"
@@ -662,6 +669,7 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
         "predictor-bundle",
         "feature-generation",
         "regression",
+        "policy-overlap",
         "aggregation",
         "plotting",
     ):

@@ -199,3 +199,51 @@ likelihood and accuracy curve appears in a separate panel and has separate
 applicable and have no likelihood or accuracy value.
 Training still uses every eligible decision. Reconstruction must reproduce the
 stored all-decision fold likelihood before junction scores are accepted.
+
+## Observed-decision policy overlap
+
+The `policy-overlap` stage compares the eight configured regression predictors
+on the same held-out movements used to generate their feature tensor. It reads
+the four-action values and impossible-action mask from `features.json`; it does
+not refit predictors or infer Qin routes a second time. The saved hierarchy
+predictor is checked against the selected candidate's held-out predictions,
+whose fit excludes this session. Route and habit predictors come from that
+partition's complementary training sessions, and route history in the feature
+tensor is causal.
+
+For each navigation movement starting at a location with three or four valid
+actions, the stage constructs action distributions from the saved vectors.
+Nonnegative vectors are normalized across valid actions. The vector predictor
+instead puts equal mass on the valid directions tied for its highest stored
+directional score. In particular, the optimal predictor's existing tie weights
+are retained by normalizing its stored vector. A movement enters the primary
+analysis only if all eight policies are defined. Zero-support predictors,
+trial-start forward/reverse predictors, and blocked forward/reverse preferences
+exclude that movement; no uniform distribution is substituted. Artifacts
+record eligible and included movement counts, exclusions by reason, and the
+percentage retained. Reason counts can overlap when a movement has more than
+one undefined predictor; the distinct excluded count is recorded separately.
+Projection uses float64 arithmetic: negative roundoff no smaller than `-1e-12`
+and invalid-action mass no larger than `1e-10` are set to zero. Larger
+violations raise an error.
+
+For action distributions `p` and `q`, observed-decision policy overlap is
+`sum_a min(p_a, q_a) = 1 - TV(p, q)`, from zero (disjoint) to one (identical).
+Each session's 8×8 matrix averages this value across its included movements.
+The pooled matrix divides the sum of the session overlap numerators by the
+total included movement count, so repeated visits and longer sessions have
+proportionally more weight. Session artifacts are saved as
+`partitions/<digest>/policy_overlap.json`; pooled JSON, CSV, and a Plotly heatmap
+are saved in `report/`. A null matrix means no common-valid movement was
+available. The pooled matrix is withheld when a session artifact is missing.
+
+Run `python scripts/run_regression_workflow.py policy-overlap --config CONFIG
+--output-dir OUTPUT` to backfill a completed run without refitting. Add
+`--partition-digest DIGEST` to generate just one session artifact. The
+`complete` and SLURM workflows generate overlap artifacts automatically.
+
+These eight policies are explicit projections of the regression's saved action
+**values**; several predictors are not native probability distributions.
+Overlap describes their similarity on observed behavioral decisions. It does
+not measure regression-coefficient similarity and does not by itself establish
+predictor redundancy or unique variance.

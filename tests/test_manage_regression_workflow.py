@@ -280,6 +280,7 @@ def test_dry_run_builds_complete_dependency_graph_without_writing(
         "predictor-bundle",
         "feature-generation",
         "regression",
+        "policy-overlap",
         "aggregation",
         "plotting",
     ]

@@ -1,0 +1,463 @@
+"""Observed-decision overlap of the action vectors used by Qin regression.
+
+The regression feature artifact is the source of the eight predictor vectors.
+Some are scores rather than policies, so the projection to action probabilities
+is explicit here and never changes regression fitting or its saved features.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+
+from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
+
+_NEGATIVE_ATOL = 1e-12
+_MASS_ATOL = 1e-10
+_ACTION_COLUMNS = tuple(f"action_{index}" for index in range(4))
+_KEY_COLUMNS = ("subject_id", "session_id", "trial_id", "decision_order")
+_ARTIFACT_TYPE = "observed_decision_policy_overlap"
+
+
+def _verified_json(path: Path, artifact_type: str) -> dict[str, object]:
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        artifact.get("schema_version") != 1
+        or artifact.get("artifact_type") != artifact_type
+    ):
+        raise ValueError(f"Incompatible artifact type or schema: {path}")
+    unsigned = {
+        key: value for key, value in artifact.items() if key != "artifact_digest"
+    }
+    if artifact.get("artifact_digest") != _payload_digest(unsigned):
+        raise ValueError(f"Artifact digest does not match contents: {path}")
+    return artifact
+
+
+def _source_identity() -> dict[str, str]:
+    path = Path(__file__)
+    return {
+        "path": "src/andrew_mlmdp/regression_policy_overlap.py",
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _check_inputs(config, partition, features, bundle) -> None:
+    from andrew_mlmdp.regression_workflow import compatibility_signatures
+
+    identity = _json_value(partition.metadata())
+    training = _json_value(list(partition.training_session_ids))
+    heldout = _json_value(partition.heldout_session_id)
+    for artifact, name in ((features, "feature"), (bundle, "predictor")):
+        if (
+            artifact.get("status") != "success"
+            or artifact.get("partition_digest") != partition.digest
+            or artifact.get("partition") != identity
+        ):
+            raise ValueError(f"{name} artifact belongs to a different partition")
+    if features.get("predictor_artifact_digest") != bundle["artifact_digest"]:
+        raise ValueError("Feature and predictor artifacts do not match")
+    if (
+        bundle.get("compatibility", {}).get("predictor_signature")
+        != compatibility_signatures(config)["predictor"]
+        or features.get("compatibility", {}).get("predictor_artifact_digest")
+        != bundle["artifact_digest"]
+    ):
+        raise ValueError("Feature or predictor configuration is incompatible")
+    if tuple(features.get("predictor_names", ())) != tuple(config.predictors.names):
+        raise ValueError("Feature predictor order differs from the configuration")
+    keys = features.get("decision_keys", ())
+    if any(
+        len(key) != 4
+        or key[0] != _json_value(partition.subject_id)
+        or key[1] != heldout
+        for key in keys
+    ):
+        raise ValueError("Feature decision keys are outside the held-out session")
+    if (
+        bundle.get("training_session_ids") != training
+        or bundle.get("heldout_session_id") != heldout
+        or bundle.get("compatibility", {}).get("training_session_ids") != training
+        or bundle.get("compatibility", {}).get("heldout_session_id") != heldout
+    ):
+        raise ValueError("Predictor training/held-out sessions do not match")
+    candidate = bundle.get("mlmdp_candidate", {})
+    candidate_compatibility = candidate.get("compatibility", {})
+    if (
+        candidate.get("status") != "success"
+        or candidate.get("validation_session_id") is not None
+        or candidate_compatibility.get("partition") != identity
+        or candidate_compatibility.get("partition_digest") != partition.digest
+        or candidate_compatibility.get("training_session_ids") != training
+        or candidate_compatibility.get("candidate_role") != "all_training"
+        or heldout in training
+    ):
+        raise ValueError("Hierarchy predictions do not come from this held-out fit")
+    if bundle.get("route", {}).get("family") != config.predictors.route_family:
+        raise ValueError("Route family differs from the configuration")
+    if np.asarray(bundle.get("habit_counts")).shape != (196,):
+        raise ValueError("Habit counts do not have Qin's state-action shape")
+
+
+def _check_hierarchy_vectors(features, bundle, names, values) -> None:
+    """Audit the one external predictor against its fitted held-out table."""
+    candidate = bundle["mlmdp_candidate"]
+    columns = candidate.get("prediction_columns")
+    rows = candidate.get("heldout_predictions")
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        raise ValueError("Hierarchy candidate lacks held-out predictions")
+    if not set((*_KEY_COLUMNS, *_ACTION_COLUMNS)).issubset(columns):
+        raise ValueError("Hierarchy prediction table lacks decision/action columns")
+    predictions = {}
+    for row in rows:
+        key = tuple(row[name] for name in _KEY_COLUMNS)
+        if key in predictions:
+            raise ValueError("Hierarchy candidate repeats a decision key")
+        predictions[key] = [row[name] for name in _ACTION_COLUMNS]
+    keys = [tuple(key) for key in features["decision_keys"]]
+    if len(keys) != len(set(keys)) or set(keys) != set(predictions):
+        raise ValueError("Hierarchy decision keys do not match regression features")
+    expected = np.asarray([predictions[key] for key in keys], dtype=np.float32)
+    actual = values[:, :, names.index("hierarchical_mlmdp")]
+    # Qin's external regressor is explicitly cast to float32 before stacking.
+    if not np.array_equal(actual, expected.astype(np.float64)):
+        raise ValueError("Hierarchy action vectors differ from regression features")
+
+
+def _project_policies(values, valid, names):
+    """Project saved four-action predictors, returning common validity reasons."""
+    n_rows, n_actions, n_policies = values.shape
+    probabilities = np.zeros((n_rows, n_policies, n_actions), dtype=np.float64)
+    reasons: list[set[str]] = [set() for _ in range(n_rows)]
+    for policy_index, name in enumerate(names):
+        for row in range(n_rows):
+            if valid[row].sum() <= 2:
+                continue
+            raw = values[row, :, policy_index]
+            if not np.isfinite(raw).all():
+                raise ValueError(f"Nonfinite {name} predictor at decision {row}")
+            if name == "vector":
+                highest = raw[valid[row]].max()
+                preferred = valid[row] & (raw == highest)
+                probabilities[row, policy_index, preferred] = 1.0 / preferred.sum()
+                continue
+            if np.any(raw < -_NEGATIVE_ATOL):
+                raise ValueError(f"Negative {name} predictor at decision {row}")
+            positive = np.maximum(raw, 0.0)
+            invalid_mass = float(positive[~valid[row]].sum())
+            if name in {"forward", "reverse"} and invalid_mass > _MASS_ATOL:
+                reasons[row].add(f"blocked_{name}")
+                continue
+            if invalid_mass > _MASS_ATOL:
+                raise ValueError(
+                    f"{name} assigns mass to invalid actions at decision {row}"
+                )
+            usable = positive.copy()
+            usable[~valid[row]] = 0.0
+            total = float(usable.sum())
+            if total == 0.0:
+                reason = (
+                    "missing_previous_action"
+                    if name in {"forward", "reverse"}
+                    else f"zero_support_{name}"
+                )
+                reasons[row].add(reason)
+                continue
+            probabilities[row, policy_index] = usable / total
+            if not np.isclose(
+                probabilities[row, policy_index].sum(), 1.0, atol=_MASS_ATOL, rtol=0.0
+            ):
+                raise ValueError(f"{name} projection failed to normalize")
+    return probabilities, reasons
+
+
+def compute_overlap(features, bundle, predictor_names):
+    """Compute one 8x8 matrix on the same observed junction movements."""
+    names = tuple(predictor_names)
+    if len(names) != 8 or "vector" not in names or "hierarchical_mlmdp" not in names:
+        raise ValueError("Overlap requires the eight configured regression predictors")
+    values = np.asarray(features["predictor_action_values"], dtype=np.float64)
+    mask = np.asarray(features["impossible_action_mask"], dtype=np.float64)
+    actions = np.asarray(features["responses"], dtype=np.int64)
+    keys = features["decision_keys"]
+    if (
+        values.ndim != 3
+        or values.shape[1:] != (4, 8)
+        or mask.shape != values.shape[:2]
+        or actions.shape != (len(values),)
+        or len(keys) != len(values)
+        or not np.isin(mask, (0.0, -1e10)).all()
+        or np.any((actions < 0) | (actions >= 4))
+        or np.any(mask[np.arange(len(actions)), actions] != 0)
+    ):
+        raise ValueError("Regression feature arrays are invalid or misaligned")
+    if not np.isfinite(values).all():
+        raise ValueError("Regression features contain nonfinite action values")
+    _check_hierarchy_vectors(features, bundle, names, values)
+    valid = mask == 0
+    eligible = valid.sum(axis=1) > 2
+    projected, reasons = _project_policies(values, valid, names)
+    included = eligible & np.asarray([not row_reasons for row_reasons in reasons])
+    n_eligible = int(eligible.sum())
+    n_included = int(included.sum())
+    reason_counts = Counter(
+        reason
+        for eligible_row, row_reasons in zip(eligible, reasons, strict=True)
+        if eligible_row
+        for reason in row_reasons
+    )
+    numerator = np.zeros((8, 8), dtype=np.float64)
+    for row_policies in projected[included]:
+        numerator += np.minimum(row_policies[:, None, :], row_policies[None, :, :]).sum(
+            axis=-1
+        )
+    matrix = numerator / n_included if n_included else None
+    return {
+        "predictor_names": list(names),
+        "n_eligible_branch_movements": n_eligible,
+        "n_included_common_valid": n_included,
+        "n_excluded": n_eligible - n_included,
+        "excluded_by_reason": dict(sorted(reason_counts.items())),
+        "percentage_retained": 100.0 * n_included / n_eligible if n_eligible else None,
+        "overlap_numerator": numerator.tolist(),
+        "overlap_matrix": None if matrix is None else matrix.tolist(),
+    }
+
+
+def write_partition_overlap(config, output_dir, partition, *, force=False):
+    """Write one cache-safe overlap artifact without refitting any predictors."""
+    root = Path(output_dir).resolve()
+    directory = root / "partitions" / partition.digest
+    feature_path = directory / "features.json"
+    predictor_path = directory / "predictor.json"
+    features = _verified_json(feature_path, "heldout_feature_tensor")
+    bundle = _verified_json(predictor_path, "heldout_predictor_bundle")
+    _check_inputs(config, partition, features, bundle)
+    compatibility = {
+        "partition": _json_value(partition.metadata()),
+        "partition_digest": partition.digest,
+        "training_session_ids": _json_value(list(partition.training_session_ids)),
+        "heldout_session_id": _json_value(partition.heldout_session_id),
+        "feature_artifact_digest": features["artifact_digest"],
+        "predictor_artifact_digest": bundle["artifact_digest"],
+        "predictor_names": list(config.predictors.names),
+        "source": _source_identity(),
+    }
+    destination = directory / "policy_overlap.json"
+    if destination.is_file() and not force:
+        cached = _verified_json(destination, _ARTIFACT_TYPE)
+        if cached.get("compatibility") != compatibility:
+            raise ValueError(
+                f"Refusing incompatible cached overlap artifact {destination}"
+            )
+        return cached
+    result = compute_overlap(features, bundle, config.predictors.names)
+    payload = {
+        "schema_version": 1,
+        "artifact_type": _ARTIFACT_TYPE,
+        "status": "success",
+        "partition": _json_value(partition.metadata()),
+        "partition_digest": partition.digest,
+        "compatibility": compatibility,
+        **result,
+    }
+    payload["artifact_digest"] = _payload_digest(payload)
+    _atomic_write_json(destination, payload)
+    return payload
+
+
+def write_overlap_report(config, output_dir, manifest, *, plot=False):
+    """Pool complete session numerators with movement-count weighting."""
+    from andrew_mlmdp.regression_reporting import _write_csv
+    from andrew_mlmdp.regression_workflow import PredictorPartition
+
+    root = Path(output_dir).resolve()
+    if manifest.get("configuration_signature") != config.signature:
+        raise ValueError("Workflow manifest does not match the overlap configuration")
+    names = list(config.predictors.names)
+    numerator = np.zeros((8, 8), dtype=np.float64)
+    counts = Counter()
+    reasons = Counter()
+    sessions = []
+    missing = []
+    for expected in manifest["partitions"]:
+        partition = PredictorPartition(**expected["partition"])
+        directory = root / "partitions" / partition.digest
+        path = directory / "policy_overlap.json"
+        if not path.is_file():
+            missing.append(partition.digest)
+            continue
+        record = _verified_json(path, _ARTIFACT_TYPE)
+        feature_path = directory / "features.json"
+        predictor_path = directory / "predictor.json"
+        if not feature_path.is_file() or not predictor_path.is_file():
+            raise ValueError(f"Overlap artifact lacks its source artifacts: {path}")
+        features = _verified_json(feature_path, "heldout_feature_tensor")
+        bundle = _verified_json(predictor_path, "heldout_predictor_bundle")
+        _check_inputs(config, partition, features, bundle)
+        compatibility = record.get("compatibility", {})
+        if (
+            record.get("status") != "success"
+            or record.get("partition") != _json_value(partition.metadata())
+            or record.get("partition_digest") != partition.digest
+            or record.get("predictor_names") != names
+            or compatibility.get("source") != _source_identity()
+            or compatibility.get("partition") != _json_value(partition.metadata())
+            or compatibility.get("training_session_ids")
+            != _json_value(list(partition.training_session_ids))
+            or compatibility.get("heldout_session_id")
+            != _json_value(partition.heldout_session_id)
+            or compatibility.get("feature_artifact_digest")
+            != features["artifact_digest"]
+            or compatibility.get("predictor_artifact_digest")
+            != bundle["artifact_digest"]
+        ):
+            raise ValueError(f"Incompatible policy overlap artifact {path}")
+        count = int(record["n_included_common_valid"])
+        eligible_count = int(record["n_eligible_branch_movements"])
+        excluded_count = int(record["n_excluded"])
+        if (
+            count < 0
+            or eligible_count < count
+            or excluded_count != eligible_count - count
+        ):
+            raise ValueError(f"Invalid included movement count in {path}")
+        session_numerator = np.asarray(record["overlap_numerator"], dtype=np.float64)
+        session_matrix = record["overlap_matrix"]
+        mass_tolerance = _MASS_ATOL * max(1, count)
+        if (
+            session_numerator.shape != (8, 8)
+            or not np.isfinite(session_numerator).all()
+            or np.any(session_numerator < -mass_tolerance)
+            or np.any(session_numerator > count + mass_tolerance)
+            or not np.allclose(
+                session_numerator,
+                session_numerator.T,
+                rtol=0.0,
+                atol=mass_tolerance,
+            )
+            or not np.allclose(
+                np.diag(session_numerator), count, rtol=0.0, atol=mass_tolerance
+            )
+            or (count == 0 and session_matrix is not None)
+            or (
+                count > 0
+                and not np.allclose(
+                    np.asarray(session_matrix, dtype=np.float64),
+                    session_numerator / count,
+                    rtol=0.0,
+                    atol=_MASS_ATOL,
+                )
+            )
+        ):
+            raise ValueError(f"Invalid overlap matrix in {path}")
+        numerator += session_numerator
+        counts["eligible"] += int(record["n_eligible_branch_movements"])
+        counts["included"] += count
+        counts["excluded"] += int(record["n_excluded"])
+        reasons.update(record["excluded_by_reason"])
+        sessions.append(
+            {
+                "partition_digest": partition.digest,
+                "subject_id": _json_value(partition.subject_id),
+                "heldout_session_id": _json_value(partition.heldout_session_id),
+                "n_eligible_branch_movements": record["n_eligible_branch_movements"],
+                "n_included_common_valid": count,
+                "n_excluded": record["n_excluded"],
+                "percentage_retained": record["percentage_retained"],
+                "artifact_digest": record["artifact_digest"],
+            }
+        )
+    complete = not missing and counts["included"] > 0
+    matrix = numerator / counts["included"] if complete else None
+    report = {
+        "schema_version": 1,
+        "artifact_type": "observed_decision_policy_overlap_report",
+        "status": "complete" if not missing else "incomplete",
+        "configuration_signature": config.signature,
+        "manifest_signature": manifest["configuration_signature"],
+        "definition": "sum_a min(p_a, q_a) = 1 - total_variation(p, q)",
+        "predictor_names": names,
+        "n_eligible_branch_movements": counts["eligible"],
+        "n_included_common_valid": counts["included"],
+        "n_excluded": counts["excluded"],
+        "excluded_by_reason": dict(sorted(reasons.items())),
+        "percentage_retained": (
+            100.0 * counts["included"] / counts["eligible"]
+            if counts["eligible"]
+            else None
+        ),
+        "overlap_numerator": numerator.tolist() if not missing else None,
+        "overlap_matrix": None if matrix is None else matrix.tolist(),
+        "missing_partitions": missing,
+        "unavailable_partitions": manifest.get("unavailable_partitions", {}),
+        "sessions": sessions,
+    }
+    report["artifact_digest"] = _payload_digest(report)
+    destination = root / "report"
+    _atomic_write_json(destination / "policy_overlap_results.json", report)
+    csv_path = destination / "policy_overlap.csv"
+    csv_rows = [
+        {
+            "policy": name,
+            **{
+                other: None if matrix is None else float(matrix[index, column])
+                for column, other in enumerate(names)
+            },
+        }
+        for index, name in enumerate(names)
+    ]
+    _write_csv(csv_path, csv_rows, ("policy", *names))
+    paths = {}
+    if plot:
+        import plotly.graph_objects as go
+
+        from andrew_mlmdp.regression_reporting import write_plotly_outputs
+
+        figure = go.Figure(
+            go.Heatmap(
+                z=(matrix if matrix is not None else np.full((8, 8), np.nan)),
+                x=names,
+                y=names,
+                zmin=0,
+                zmax=1,
+                colorscale="Viridis",
+                colorbar={"title": "Overlap"},
+                hovertemplate="%{y} vs %{x}: %{z:.3f}<extra></extra>",
+            )
+        )
+        figure.update_layout(
+            title="Observed-decision policy probability overlap",
+            xaxis_title="Policy",
+            yaxis_title="Policy",
+            width=1050,
+            height=850,
+        )
+        if matrix is None:
+            figure.add_annotation(text="No complete pooled matrix", showarrow=False)
+        paths = write_plotly_outputs(figure, destination, "policy_overlap")
+    return {
+        "status": report["status"],
+        "result": destination / "policy_overlap_results.json",
+        "csv": csv_path,
+        "plots": paths,
+    }
+
+
+def write_all_overlaps(config, output_dir, manifest, *, force=False, plot=False):
+    """Backfill available partition artifacts, then write the pooled report."""
+    from andrew_mlmdp.regression_workflow import PredictorPartition
+
+    root = Path(output_dir).resolve()
+    for expected in manifest["partitions"]:
+        partition = PredictorPartition(**expected["partition"])
+        directory = root / "partitions" / partition.digest
+        if (directory / "features.json").is_file() and (
+            directory / "predictor.json"
+        ).is_file():
+            write_partition_overlap(config, root, partition, force=force)
+    return write_overlap_report(config, root, manifest, plot=plot)
