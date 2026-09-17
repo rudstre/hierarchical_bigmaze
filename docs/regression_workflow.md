@@ -120,6 +120,10 @@ python scripts/slurm/manage_regression_workflow.py \
 python scripts/slurm/manage_regression_workflow.py \
   --config configs/regression_workflow.json \
   --run-id example --retry-missing
+
+python scripts/slurm/manage_regression_workflow.py \
+  --config configs/regression_workflow.json \
+  --run-id example --cancel
 ```
 
 The manager writes immutable task lists, chunks arrays, assigns inclusive rank
@@ -128,6 +132,10 @@ both `squeue` and `sacct`. Status output reports artifact completion and array
 task counts for the latest attempt of each stage; prior submissions remain in
 `slurm_manager.json`. Pass `--json` with `--status` for machine-readable status.
 Retries contain exact scalar tasks. No production job is submitted by tests.
+`--cancel` stops only active SLURM arrays recorded for the selected run,
+including pending downstream stages. It leaves completed artifacts and the
+manager record in place. Add `--dry-run` to preview the job IDs; use
+`--retry-missing` later if you want to resume.
 
 ## Artifacts and reuse
 

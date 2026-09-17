@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ def parser():
     result.add_argument("--max-array-size", type=int, default=1000)
     result.add_argument("--retry-missing", action="store_true")
     result.add_argument("--status", action="store_true")
+    result.add_argument("--cancel", action="store_true")
     result.add_argument("--json", action="store_true")
     result.add_argument("--dry-run", action="store_true")
     return result
@@ -202,6 +204,42 @@ def _job_id(output):
     if not value.isdigit():
         raise ValueError(f"sbatch returned invalid job id {output!r}")
     return value
+
+
+def _active_submission_ids(manager):
+    """Find live array jobs belonging to this run's recorded submissions."""
+    ids = list(dict.fromkeys(item["job_id"] for item in manager["submissions"]))
+    if any(not isinstance(job_id, str) or not job_id.isdigit() for job_id in ids):
+        raise ValueError("Run manager contains an invalid SLURM job ID")
+    if not ids:
+        return []
+    queue = subprocess.run(
+        ["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    active = set(queue.stdout.split())
+    return [job_id for job_id in ids if job_id in active]
+
+
+def _cancel_run(manager, *, dry_run):
+    ids = _active_submission_ids(manager)
+    if ids and not dry_run:
+        subprocess.run(
+            ["scancel", *ids],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    return {
+        "run_id": manager["run_id"],
+        "output_dir": manager["output_dir"],
+        "job_ids": ids,
+        "action": "would_cancel" if dry_run else "cancelled",
+    }
 
 
 def _submit_group(
@@ -688,16 +726,39 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.cancel and (args.status or args.retry_missing):
+        raise ValueError("--cancel cannot be combined with --status or --retry-missing")
     root = args.project_root.resolve()
     config_path = args.config.resolve()
-    config = load_regression_workflow_config(config_path)
-    raw = _read(config_path)
     output = (
         args.output_dir.resolve()
         if args.output_dir
         else root / "output" / "regression_workflow" / args.run_id
     )
     manager_path = output / "slurm_manager.json"
+
+    if args.cancel:
+        if not manager_path.is_file():
+            raise ValueError(f"No workflow run at {output}")
+        manager = _read(manager_path)
+        if (
+            manager.get("artifact_type") != "regression_workflow_slurm_manager"
+            or manager.get("run_id") != args.run_id
+            or manager.get("output_dir") != str(output)
+            or manager.get("config_path") != str(config_path)
+        ):
+            raise ValueError("Run manager does not match the selected run and config")
+        result = _cancel_run(manager, dry_run=args.dry_run)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            action = "Would cancel" if args.dry_run else "Cancelled"
+            jobs = ", ".join(result["job_ids"]) or "none"
+            print(f"{action} active jobs for {args.run_id}: {jobs}")
+        return 0
+
+    config = load_regression_workflow_config(config_path)
+    raw = _read(config_path)
 
     if manager_path.is_file():
         manager = _read(manager_path)

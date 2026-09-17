@@ -283,7 +283,9 @@ python scripts/slurm/manage_regression_workflow.py \
 
 Use `--status` to combine artifact states with `squeue`/`sacct`, and
 `--retry-missing` to submit exact missing, pending, or operationally failed task
-identities. Scientific fit failures are terminal. Existing runs are immutable
+identities. Use `--cancel` to stop active jobs recorded for the run, or
+`--cancel --dry-run` to preview them. Scientific fit failures are terminal.
+Existing runs are immutable
 with respect to predictor-affecting configuration; changing only regression
 folds locally rebuilds the split manifest while reusing compatible predictor
 and feature artifacts.

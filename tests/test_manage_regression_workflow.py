@@ -1,4 +1,7 @@
+import getpass
 import importlib.util
+import json
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -152,6 +155,116 @@ def test_submission_output_is_concise_by_default(tmp_path):
         "Existing artifacts: 2/6 successful",
         "  regression: job 123, 6 tasks, dependency 122",
     ]
+
+
+def test_cancel_only_live_jobs_recorded_for_selected_run(monkeypatch, tmp_path, capsys):
+    output = tmp_path / "run"
+    output.mkdir()
+    config_path = tmp_path / "config.json"
+    config_path.write_text("changed since submission", encoding="utf-8")
+    state = {
+        "artifact_type": "regression_workflow_slurm_manager",
+        "run_id": "example",
+        "output_dir": str(output),
+        "config_path": str(config_path),
+        "submissions": [
+            {"job_id": "101"},
+            {"job_id": "102"},
+            {"job_id": "103"},
+            {"job_id": "102"},
+        ],
+    }
+    manager_path = output / "slurm_manager.json"
+    manager_path.write_text(json.dumps(state), encoding="utf-8")
+    before = manager_path.read_bytes()
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["check"] is True
+        if command[0] == "squeue":
+            return subprocess.CompletedProcess(command, 0, "102\n103\n", "")
+        assert command[0] == "scancel"
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(manager.subprocess, "run", fake_run)
+    assert manager.main(
+        [
+            "--config", str(config_path),
+            "--output-dir", str(output),
+            "--run-id", "example",
+            "--cancel", "--json",
+        ]
+    ) == 0
+
+    assert commands == [
+        ["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
+        ["scancel", "102", "103"],
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "run_id": "example",
+        "output_dir": str(output),
+        "job_ids": ["102", "103"],
+        "action": "cancelled",
+    }
+    assert manager_path.read_bytes() == before
+
+
+def test_cancel_preview_and_mismatched_run_never_call_scancel(
+    monkeypatch, tmp_path, capsys
+):
+    output = tmp_path / "run"
+    output.mkdir()
+    config_path = tmp_path / "config.json"
+    state = {
+        "artifact_type": "regression_workflow_slurm_manager",
+        "run_id": "example",
+        "output_dir": str(output),
+        "config_path": str(config_path),
+        "submissions": [{"job_id": "123"}],
+    }
+    (output / "slurm_manager.json").write_text(json.dumps(state), encoding="utf-8")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "123\n", "")
+
+    monkeypatch.setattr(manager.subprocess, "run", fake_run)
+    args = [
+        "--config", str(config_path),
+        "--output-dir", str(output),
+        "--run-id", "example",
+    ]
+    assert manager.main([*args, "--cancel", "--dry-run"]) == 0
+    assert capsys.readouterr().out == "Would cancel active jobs for example: 123\n"
+    assert len(commands) == 1 and commands[0][0] == "squeue"
+
+    with pytest.raises(ValueError, match="does not match"):
+        manager.main([*args[:-1], "other", "--cancel"])
+    with pytest.raises(ValueError, match="cannot be combined"):
+        manager.main([*args, "--cancel", "--retry-missing"])
+    assert len(commands) == 1
+
+
+def test_cancel_fails_closed_if_squeue_fails(monkeypatch):
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        raise subprocess.CalledProcessError(1, command, stderr="scheduler unavailable")
+
+    monkeypatch.setattr(manager.subprocess, "run", fake_run)
+    with pytest.raises(subprocess.CalledProcessError):
+        manager._cancel_run(
+            {
+                "run_id": "example",
+                "output_dir": "/tmp/run",
+                "submissions": [{"job_id": "123"}],
+            },
+            dry_run=False,
+        )
+    assert len(commands) == 1 and commands[0][0] == "squeue"
 
 
 def test_array_task_states_combine_expanded_and_compact_slurm_records():
