@@ -44,6 +44,7 @@ def _config(method):
         heldout_sessions="last",
         subgoal_selection=workflow.SubgoalSelectionConfig(method, (3, 3)),
         regression_cv=workflow.RegressionCVConfig(n_splits=2),
+        predictors=workflow.PredictorConfig(pca={"n_components": "auto"}),
         project_root=Path(__file__).parents[1],
     )
 
@@ -106,14 +107,15 @@ def test_synthetic_workflow_reuses_predictors_across_regression_folds(
         training = table.loc[table["session_id"].isin(partition.training_session_ids)]
         return table, training.reset_index(drop=True)
 
-    def fit_route_habit(config, partition, rows):
+    def fit_route_habit(config, partition, rows, route_settings):
         counts["route_habit"] += 1
+        n_components = route_settings["n_components"]
         return {
             "route": {
                 "family": "pca",
-                "settings": {"n_components": 3},
-                "components": [[0.0] * 3] * 196,
-                "explained_variance": [1.0, 0.0, 0.0],
+                "settings": dict(route_settings),
+                "components": [[0.0] * n_components] * 196,
+                "explained_variance": [1.0] + [0.0] * (n_components - 1),
                 "seed": None,
             },
             "habit_counts": [0.0] * 196,
@@ -137,12 +139,13 @@ def test_synthetic_workflow_reuses_predictors_across_regression_folds(
     class Finder:
         def get_unique_predictability(self, *args):
             counts["regression"] += 1
-            n_models = len(config.predictors.names) + 2
+            n_predictors = args[0].shape[-1] - 1
+            n_models = n_predictors + 2
             losses = torch.linspace(1.2, 1.0, n_models)
             return {
                 "neg_log_likelihoods": losses,
                 "accuracies": torch.full((n_models,), 0.5),
-                "coefs": torch.zeros((n_models, len(config.predictors.names) + 1)),
+                "coefs": torch.zeros((n_models, n_predictors + 1)),
                 "optimizer_iterations": torch.ones(n_models, dtype=torch.int64),
             }
 
@@ -168,10 +171,15 @@ def test_synthetic_workflow_reuses_predictors_across_regression_folds(
         lambda root: {"finder": lambda *args: Finder()},
     )
     write_report = reporting.write_regression_report
+
+    def write_report_without_plots(*args, **kwargs):
+        kwargs["plot"] = False
+        return write_report(*args, **kwargs)
+
     monkeypatch.setattr(
         reporting,
         "write_regression_report",
-        lambda *args, **kwargs: write_report(*args, **kwargs, plot=False),
+        write_report_without_plots,
     )
 
     result = workflow.run_local_workflow(
@@ -183,5 +191,15 @@ def test_synthetic_workflow_reuses_predictors_across_regression_folds(
         "mlmdp": expected_mlmdp_fits,
         "route_habit": 1,
         "features": 1,
-        "regression": 2,
+        "regression": 6,
     }
+    partition_dir = next((tmp_path / method / "partitions").iterdir())
+    assert (partition_dir / "regression_route_only.json").is_file()
+    assert (partition_dir / "regression_mlmdp_only.json").is_file()
+    predictor_path = next((tmp_path / method / "partitions").glob("*/predictor.json"))
+    predictor = workflow._read_json(predictor_path)
+    assert predictor["compatibility"]["route_settings_specification"] == {
+        "n_components": "auto"
+    }
+    assert predictor["compatibility"]["route_settings"] == {"n_components": 2}
+    assert predictor["route"]["settings"] == {"n_components": 2}

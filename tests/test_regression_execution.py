@@ -8,14 +8,18 @@ import andrew_mlmdp.regression_workflow as workflow
 from andrew_mlmdp.validation import AdamValidationConfig
 
 
-def _config(route_family="pca"):
+def _config(route_family="pca", *, predictors=None):
     return workflow.RegressionWorkflowConfig(
         dataset=workflow.RegressionDatasetConfig("unused", (10,), "maze_1"),
         discovery_config="unused.json",
         adam=AdamValidationConfig(),
         subgoal_selection=workflow.SubgoalSelectionConfig("fixed", (3, 3)),
         regression_cv=workflow.RegressionCVConfig(n_splits=2),
-        predictors=workflow.PredictorConfig(route_family=route_family),
+        predictors=(
+            workflow.PredictorConfig(route_family=route_family)
+            if predictors is None
+            else predictors
+        ),
         project_root=workflow._find_project_root(workflow.Path.cwd()),
     )
 
@@ -75,6 +79,10 @@ def test_blocked_regression_runs_every_qin_reduced_model(monkeypatch, tmp_path):
     def fixed_features(*args, **kwargs):
         nonlocal calls
         calls += 1
+        destination = (
+            tmp_path / "partitions" / partition.digest / "features.json"
+        )
+        workflow._atomic_write_json(destination, features)
         return features
 
     monkeypatch.setattr(execution, "write_feature_artifact", fixed_features)
@@ -95,6 +103,29 @@ def test_blocked_regression_runs_every_qin_reduced_model(monkeypatch, tmp_path):
         for model in fold["models"].values():
             assert np.isfinite(model["mean_negative_log_likelihood"])
             assert len(model["coefficients"]) == len(config.predictors.names) + 1
+    for variant in ("route_only", "mlmdp_only"):
+        artifact = workflow._read_json(
+            execution.regression_variant_path(tmp_path, partition.digest, variant)
+        )
+        assert artifact["regression_variant"] == variant
+        assert artifact["predictor_names"] == list(
+            execution.regression_variant_predictors(
+                config.predictors.names, variant
+            )
+        )
+
+
+def test_regression_variant_predictor_sets_keep_shared_controls():
+    names = _config().predictors.names
+
+    assert execution.regression_variant_predictors(names, "route_only") == tuple(
+        name for name in names if name != "hierarchical_mlmdp"
+    )
+    assert execution.regression_variant_predictors(names, "mlmdp_only") == tuple(
+        name
+        for name in names
+        if name not in {"pca_route", "pca_route_planning"}
+    )
 
 
 def test_learning_curve_fits_only_full_model_for_every_size_and_block(
@@ -317,6 +348,7 @@ def test_pca_and_hmm_route_bundles_record_expected_state_and_seed(monkeypatch):
     partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
     route_rows = pd.DataFrame({"value": [1, 2]})
     observed_seeds = []
+    observed_settings = []
 
     class Model:
         def state_dict(self):
@@ -325,12 +357,16 @@ def test_pca_and_hmm_route_bundles_record_expected_state_and_seed(monkeypatch):
     def imports(root):
         return {
             "habit": lambda rows: torch.arange(196, dtype=torch.float32),
-            "normalize_pca": lambda settings: {**settings, "n_components": 3},
+            "normalize_pca": lambda settings: (
+                observed_settings.append(dict(settings)) or dict(settings)
+            ),
             "generate_pcs": lambda rows, settings: (
                 torch.arange(196 * 4, dtype=torch.float32).reshape(196, 4),
                 torch.tensor([0.4, 0.3, 0.2, 0.1]),
             ),
-            "normalize_hmm": lambda settings: dict(settings),
+            "normalize_hmm": lambda settings: (
+                observed_settings.append(dict(settings)) or dict(settings)
+            ),
             "fit_hmm": lambda rows, **kwargs: (
                 observed_seeds.append(kwargs["random_seed"]) or Model(),
                 {
@@ -342,17 +378,38 @@ def test_pca_and_hmm_route_bundles_record_expected_state_and_seed(monkeypatch):
         }
 
     monkeypatch.setattr(execution, "_qin_route_imports", imports)
-    pca = execution._fit_route_and_habit(_config("pca"), partition, route_rows)
-    hmm_config = _config("hmm")
-    hmm = execution._fit_route_and_habit(hmm_config, partition, route_rows)
+    pca_config = _config(
+        predictors=workflow.PredictorConfig(
+            route_family="pca", pca={"n_components": "auto"}
+        )
+    )
+    pca_settings = pca_config.predictors.resolved_route_settings(5)
+    pca = execution._fit_route_and_habit(
+        pca_config, partition, route_rows, pca_settings
+    )
+    hmm_config = _config(
+        predictors=workflow.PredictorConfig(
+            route_family="hmm", hmm={"n_routes": "auto"}
+        )
+    )
+    hmm_settings = hmm_config.predictors.resolved_route_settings(4)
+    hmm = execution._fit_route_and_habit(
+        hmm_config, partition, route_rows, hmm_settings
+    )
 
     assert pca["route"]["family"] == "pca"
     assert len(pca["route"]["components"][0]) == 3
+    assert pca["route"]["settings"]["n_components"] == 3
     assert pca["route"]["seed"] is None
     assert hmm["route"]["family"] == "hmm"
+    assert hmm["route"]["settings"]["n_routes"] == 5
     assert hmm["route"]["state_dict"]["R"]["dtype"] == "torch.float64"
     assert "state_dict" not in hmm["route"]["diagnostics"]
     assert observed_seeds == [execution._route_seed(hmm_config, partition)]
+    assert observed_settings == [
+        {"n_components": 3},
+        {"n_routes": 5},
+    ]
     assert execution._route_seed(hmm_config, partition) == execution._route_seed(
         hmm_config, partition
     )

@@ -345,6 +345,55 @@ def test_predictor_route_family_has_fixed_complete_order():
     assert hmm.names[5:] == pca.names[5:]
 
 
+def test_rank_aware_route_counts_resolve_from_selected_mlmdp_rank():
+    pca = workflow.PredictorConfig(
+        route_family="pca", pca={"n_components": "auto"}
+    )
+    hmm = workflow.PredictorConfig(route_family="hmm", hmm={"n_routes": "auto"})
+
+    assert pca.resolved_route_settings(4)["n_components"] == 2
+    assert pca.resolved_route_settings(5)["n_components"] == 3
+    assert hmm.resolved_route_settings(4)["n_routes"] == 5
+    assert pca.selected_route_settings["n_components"] == "auto"
+    assert hmm.selected_route_settings["n_routes"] == "auto"
+
+
+def test_fixed_route_counts_do_not_depend_on_selected_mlmdp_rank():
+    pca = workflow.PredictorConfig(pca={"n_components": 6})
+    hmm = workflow.PredictorConfig(route_family="hmm", hmm={"n_routes": 9})
+
+    assert pca.resolved_route_settings(3)["n_components"] == 6
+    assert hmm.resolved_route_settings(3)["n_routes"] == 9
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 197, "AUTO", "3", None])
+def test_invalid_pca_component_specification_is_rejected(value):
+    with pytest.raises(ValueError, match="n_components"):
+        workflow.PredictorConfig(pca={"n_components": value})
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, "AUTO", "7", None])
+def test_invalid_hmm_route_specification_is_rejected(value):
+    with pytest.raises(ValueError, match="n_routes"):
+        workflow.PredictorConfig(hmm={"n_routes": value})
+
+
+def test_auto_and_equivalent_fixed_route_counts_have_distinct_cache_identity():
+    automatic = _config(
+        predictors=workflow.PredictorConfig(pca={"n_components": "auto"})
+    )
+    fixed = _config(predictors=workflow.PredictorConfig(pca={"n_components": 2}))
+
+    assert automatic.predictors.resolved_route_settings(4) == {
+        "n_components": 2
+    }
+    assert fixed.predictors.resolved_route_settings(4) == {"n_components": 2}
+    assert (
+        workflow.compatibility_signatures(automatic)["predictor"]
+        != workflow.compatibility_signatures(fixed)["predictor"]
+    )
+
+
 def test_explicit_heldout_records_preserve_typed_subject_and_session_ids():
     config = _config(heldout_sessions=[{"subject_id": 10, "session_id": "1"}])
 

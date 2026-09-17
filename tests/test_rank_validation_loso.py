@@ -517,3 +517,31 @@ def test_rank_config_requires_inclusive_range_and_rejects_rank_lists(tmp_path):
     obsolete.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="Obsolete ranks list"):
         validation.load_validation_config(obsolete)
+
+
+def test_rank_config_omitted_model_sections_use_recorded_defaults(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    payload = {
+        "schema_version": validation.SCHEMA_VERSION,
+        "dataset": {
+            "data_root": "unused",
+            "subject_ids": ["m2"],
+            "maze_name": "maze_1",
+            "start_date": "2022-06-30",
+            "end_date": "2022-07-05",
+            "validation_mode": "leave_one_session_out",
+        },
+    }
+    path = tmp_path / "compact.json"
+    path.write_text(json.dumps(payload))
+
+    loaded = validation.load_validation_config(path)
+
+    assert loaded.discovery == validation.DiscoveryValidationConfig()
+    assert loaded.adam == validation.AdamValidationConfig()
+    assert loaded.dataset.expected_session_trial_counts == {}
+    normalized = loaded.normalized_payload()
+    assert normalized["discovery"]["restart_seeds"] == list(range(50))
+    assert normalized["adam"]["fitted_names"] == list(
+        validation.FITTED_PARAMETER_NAMES
+    )

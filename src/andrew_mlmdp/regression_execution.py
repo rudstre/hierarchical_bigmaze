@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -115,14 +116,16 @@ def _tensor_lists(state_dict) -> dict[str, object]:
     }
 
 
-def _fit_route_and_habit(config, partition, route_rows) -> dict[str, object]:
+def _fit_route_and_habit(
+    config, partition, route_rows, route_settings
+) -> dict[str, object]:
     qin = _qin_route_imports(config.project_root)
     import torch
 
     seed = _route_seed(config, partition)
     habit = qin["habit"](route_rows)
     if config.predictors.route_family == "pca":
-        settings = qin["normalize_pca"](config.predictors.pca)
+        settings = qin["normalize_pca"](route_settings)
         pcs, explained_variance = qin["generate_pcs"](route_rows, settings)
         n_components = settings["n_components"]
         route = {
@@ -135,7 +138,7 @@ def _fit_route_and_habit(config, partition, route_rows) -> dict[str, object]:
             "seed": None,
         }
     else:
-        settings = qin["normalize_hmm"](config.predictors.hmm)
+        settings = qin["normalize_hmm"](route_settings)
         model, diagnostics = qin["fit_hmm"](
             route_rows,
             maze_id=partition.maze_id,
@@ -163,7 +166,9 @@ def _fit_route_and_habit(config, partition, route_rows) -> dict[str, object]:
     }
 
 
-def _predictor_compatibility(config, partition, candidate, route_rows):
+def _predictor_compatibility(
+    config, partition, candidate, route_rows, route_settings
+):
     from andrew_mlmdp.regression_workflow import (
         _stage_source,
         compatibility_signatures,
@@ -180,7 +185,8 @@ def _predictor_compatibility(config, partition, candidate, route_rows):
         "discovery_digest": candidate["discovery"]["digest"],
         "predictor_signature": compatibility_signatures(config)["predictor"],
         "route_family": config.predictors.route_family,
-        "route_settings": config.predictors.selected_route_settings,
+        "route_settings_specification": config.predictors.selected_route_settings,
+        "route_settings": route_settings,
         "predictor_names": list(config.predictors.names),
         "route_training_data_digest": _payload_digest(
             _json_value(route_rows.to_dict("records"))
@@ -233,8 +239,11 @@ def run_predictor_bundle(
             "partition_digest": partition.digest,
         }
 
+    route_settings = config.predictors.resolved_route_settings(selected_k)
     _, route_rows = _route_training_table(config, partition)
-    compatibility = _predictor_compatibility(config, partition, candidate, route_rows)
+    compatibility = _predictor_compatibility(
+        config, partition, candidate, route_rows, route_settings
+    )
     if destination.is_file() and not force:
         from andrew_mlmdp.regression_workflow import _read_json
 
@@ -250,7 +259,9 @@ def run_predictor_bundle(
 
     started = time.perf_counter()
     try:
-        fitted_predictors = _fit_route_and_habit(config, partition, route_rows)
+        fitted_predictors = _fit_route_and_habit(
+            config, partition, route_rows, route_settings
+        )
     except (MemoryError, OSError) as error:
         payload = {
             "schema_version": 1,
@@ -589,7 +600,7 @@ def _pool_learning_curve(folds, n_trials):
     return points
 
 
-def run_blocked_regression(
+def _run_combined_regression(
     config,
     output_dir: str | Path,
     partition,
@@ -885,6 +896,370 @@ def run_blocked_regression(
     payload["artifact_digest"] = _payload_digest(payload)
     _atomic_write_json(destination, payload)
     return _json_value(payload)
+
+
+_REGRESSION_VARIANTS = ("combined", "route_only", "mlmdp_only")
+
+
+def regression_variant_predictors(
+    predictor_names: Sequence[str], variant: str
+) -> tuple[str, ...]:
+    """Return the predictors fitted by one prespecified ablation model family."""
+    names = tuple(predictor_names)
+    if variant == "combined":
+        return names
+    if variant == "route_only":
+        return tuple(name for name in names if name != "hierarchical_mlmdp")
+    if variant == "mlmdp_only":
+        route_predictors = {
+            "pca_route",
+            "pca_route_planning",
+            "hmm_route",
+            "hmm_route_planning",
+        }
+        return tuple(
+            name for name in names if name not in route_predictors
+        )
+    raise ValueError(f"Unknown regression variant {variant!r}")
+
+
+def regression_variant_path(
+    root: str | Path, partition_digest: str, variant: str
+) -> Path:
+    if variant not in _REGRESSION_VARIANTS:
+        raise ValueError(f"Unknown regression variant {variant!r}")
+    filename = (
+        "regression.json"
+        if variant == "combined"
+        else f"regression_{variant}.json"
+    )
+    return Path(root).resolve() / "partitions" / partition_digest / filename
+
+
+def _variant_compatibility(
+    config, partition, features, splits, variant, predictor_names
+):
+    compatibility = regression_compatibility(
+        config, partition, features["artifact_digest"], splits
+    )
+    return {
+        **compatibility,
+        "regression_variant": variant,
+        "predictor_names": list(predictor_names),
+    }
+
+
+def _fit_saved_ablation_variant(
+    config,
+    root: str | Path,
+    partition,
+    features,
+    splits,
+    *,
+    variant: str,
+    heldout_session_order: int,
+    force: bool = False,
+):
+    """Fit one predictor subset from an immutable held-out feature artifact."""
+    import torch
+
+    from andrew_mlmdp.regression_workflow import _read_json
+
+    if config.regression_cv.method != "blocked_trial_kfold":
+        raise ValueError("Regression variants require blocked_trial_kfold")
+    all_names = tuple(features["predictor_names"])
+    if all_names != tuple(config.predictors.names):
+        raise ValueError("Feature predictor order does not match the configuration")
+    predictor_names = regression_variant_predictors(all_names, variant)
+    selected_columns = [all_names.index(name) for name in predictor_names]
+    destination = regression_variant_path(root, partition.digest, variant)
+    compatibility = _variant_compatibility(
+        config, partition, features, splits, variant, predictor_names
+    )
+    if destination.is_file() and not force:
+        existing = _validate_cached_artifact(
+            destination,
+            _read_json(destination),
+            artifact_type=regression_artifact_type(config),
+            partition=partition,
+            compatibility=compatibility,
+        )
+        if existing.get("status") in {"success", "scientific_failure"}:
+            return existing
+
+    all_values = np.asarray(features["predictor_action_values"], dtype=np.float64)
+    expected_shape = (len(features["decision_keys"]), 4, len(all_names))
+    if all_values.shape != expected_shape or not np.all(np.isfinite(all_values)):
+        raise ValueError("Feature predictor tensor is invalid")
+    predictor_values = all_values[:, :, selected_columns]
+    design = np.concatenate(
+        [np.ones((*predictor_values.shape[:2], 1)), predictor_values], axis=-1
+    )
+    actions = np.asarray(features["responses"], dtype=np.int64)
+    mask = np.asarray(features["impossible_action_mask"], dtype=np.float64)
+    if actions.shape != (len(design),) or np.any((actions < 0) | (actions >= 4)):
+        raise ValueError("Feature responses are invalid")
+    if mask.shape != design.shape[:2] or not np.isin(mask, (0.0, -1e10)).all():
+        raise ValueError("Feature impossible-action mask is invalid")
+    if np.any(mask[np.arange(len(actions)), actions] != 0):
+        raise ValueError("An observed action is marked impossible")
+    decision_keys = [tuple(key) for key in features["decision_keys"]]
+    if len(decision_keys) != len(set(decision_keys)):
+        raise ValueError("Feature artifact repeats decision keys")
+    trial_to_rows: dict[tuple[Any, ...], list[int]] = {}
+    for index, key in enumerate(decision_keys):
+        trial_to_rows.setdefault(tuple(key[:3]), []).append(index)
+
+    finder = _qin_regression_imports(config.project_root)["finder"](
+        list(predictor_names), config.random_seed
+    )
+    names = _model_names(predictor_names)
+    fold_records = []
+    tested_trials = []
+    for split in splits:
+        try:
+            train_indices = [
+                row for key in split.training_trial_keys for row in trial_to_rows[key]
+            ]
+            test_indices = [
+                row for key in split.test_trial_keys for row in trial_to_rows[key]
+            ]
+        except KeyError as error:
+            raise ValueError(
+                f"Regression split references an unknown trial {error}"
+            ) from error
+        train_design, test_design, mean, scale = _standardize_design(
+            design[train_indices], design[test_indices]
+        )
+        y_train = torch.nn.functional.one_hot(torch.tensor(actions[train_indices]), 4)
+        y_test = torch.nn.functional.one_hot(torch.tensor(actions[test_indices]), 4)
+        fit_args = (
+            torch.tensor(train_design, dtype=torch.float32),
+            y_train,
+            torch.tensor(mask[train_indices, :, None], dtype=torch.float32),
+            torch.tensor(test_design, dtype=torch.float32),
+            y_test,
+            torch.tensor(mask[test_indices, :, None], dtype=torch.float32),
+        )
+        try:
+            fit = finder.get_unique_predictability(*fit_args)
+        except RuntimeError as error:
+            if not str(error).startswith("Regression optimizer failed for model"):
+                raise
+            failure = {
+                "schema_version": 1,
+                "artifact_type": regression_artifact_type(config),
+                "status": "scientific_failure",
+                "partition": _json_value(partition.metadata()),
+                "partition_digest": partition.digest,
+                "regression_variant": variant,
+                "predictor_names": list(predictor_names),
+                "compatibility": compatibility,
+                "stage": "regression_optimizer",
+                "fold_index": split.fold_index,
+                "failure": {"type": type(error).__name__, "message": str(error)},
+            }
+            _atomic_write_json(destination, failure)
+            return failure
+        n_test = len(test_indices)
+        losses = fit["neg_log_likelihoods"].detach().cpu().numpy()
+        accuracies = fit["accuracies"].detach().cpu().numpy()
+        coefficients = fit["coefs"].detach().cpu().numpy()
+        iterations = fit["optimizer_iterations"].detach().cpu().numpy()
+        model_results = {}
+        for model_index, name in enumerate(names):
+            mean_nll = float(losses[model_index])
+            model_results[name] = {
+                "mean_negative_log_likelihood": mean_nll,
+                "total_log_likelihood": -mean_nll * n_test,
+                "accuracy": float(accuracies[model_index]),
+                "coefficients": coefficients[model_index].tolist(),
+                "optimizer_iterations": int(iterations[model_index]),
+            }
+        full_nll = model_results["full"]["mean_negative_log_likelihood"]
+        fold_records.append(
+            {
+                **split.metadata(),
+                "split_digest": split.digest,
+                "status": "success",
+                "n_training_decisions": len(train_indices),
+                "n_test_decisions": n_test,
+                "training_feature_mean": mean,
+                "training_feature_scale": scale,
+                "models": model_results,
+                "unique_predictability": {
+                    predictor: model_results[f"without_{predictor}"][
+                        "mean_negative_log_likelihood"
+                    ]
+                    - full_nll
+                    for predictor in predictor_names
+                },
+            }
+        )
+        tested_trials.extend(split.test_trial_keys)
+
+    expected_trials = [key for split in splits for key in split.test_trial_keys]
+    if len(tested_trials) != len(set(tested_trials)) or set(tested_trials) != set(
+        expected_trials
+    ):
+        raise AssertionError("Blocked CV must test each eligible trial exactly once")
+    total_decisions = sum(record["n_test_decisions"] for record in fold_records)
+    pooled_models = {}
+    for name in names:
+        total_ll = sum(
+            record["models"][name]["total_log_likelihood"] for record in fold_records
+        )
+        correct = sum(
+            record["models"][name]["accuracy"] * record["n_test_decisions"]
+            for record in fold_records
+        )
+        pooled_models[name] = {
+            "total_log_likelihood": total_ll,
+            "mean_negative_log_likelihood": -total_ll / total_decisions,
+            "accuracy": correct / total_decisions,
+        }
+    full_nll = pooled_models["full"]["mean_negative_log_likelihood"]
+    payload = {
+        "schema_version": 1,
+        "artifact_type": regression_artifact_type(config),
+        "status": "success",
+        "partition": _json_value(partition.metadata()),
+        "partition_digest": partition.digest,
+        "heldout_session_order": int(heldout_session_order),
+        "selection_method": config.subgoal_selection.method,
+        "route_family": config.predictors.route_family,
+        "regression_variant": variant,
+        "predictor_names": list(predictor_names),
+        "feature_artifact_digest": features["artifact_digest"],
+        "compatibility": compatibility,
+        "folds": fold_records,
+        "pooled": {
+            "n_decisions": total_decisions,
+            "models": pooled_models,
+            "unique_predictability": {
+                predictor: pooled_models[f"without_{predictor}"][
+                    "mean_negative_log_likelihood"
+                ]
+                - full_nll
+                for predictor in predictor_names
+            },
+        },
+    }
+    payload["artifact_digest"] = _payload_digest(payload)
+    _atomic_write_json(destination, payload)
+    return _json_value(payload)
+
+
+def run_blocked_regression(
+    config,
+    output_dir: str | Path,
+    partition,
+    table,
+    *,
+    force: bool = False,
+) -> dict[str, object]:
+    """Fit the combined regression and both prespecified reduced predictor sets."""
+    combined = _run_combined_regression(
+        config, output_dir, partition, table, force=force
+    )
+    if (
+        combined.get("status") != "success"
+        or config.regression_cv.method != "blocked_trial_kfold"
+    ):
+        return combined
+    from andrew_mlmdp.regression_workflow import regression_splits
+
+    root = Path(output_dir).resolve()
+    features = json.loads(
+        (root / "partitions" / partition.digest / "features.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    rows = _heldout_rows(config, partition, table)
+    splits = regression_splits(rows, partition, config)
+    for variant in ("route_only", "mlmdp_only"):
+        _fit_saved_ablation_variant(
+            config,
+            root,
+            partition,
+            features,
+            splits,
+            variant=variant,
+            heldout_session_order=combined["heldout_session_order"],
+            force=force,
+        )
+    return combined
+
+
+def run_saved_regression_variants(
+    config,
+    output_dir: str | Path,
+    manifest: Mapping[str, object],
+    *,
+    force: bool = False,
+) -> dict[str, list[dict[str, object]]]:
+    """Fit all missing ablation variants from a completed run's saved features."""
+    from andrew_mlmdp.regression_workflow import PredictorPartition, RegressionSplit
+
+    if config.regression_cv.method != "blocked_trial_kfold":
+        raise ValueError("Regression variants require blocked_trial_kfold")
+    root = Path(output_dir).resolve()
+    records = {variant: [] for variant in _REGRESSION_VARIANTS}
+    for expected in manifest["partitions"]:
+        partition = PredictorPartition(**expected["partition"])
+        partition_dir = root / "partitions" / partition.digest
+        feature_path = partition_dir / "features.json"
+        combined_path = partition_dir / "regression.json"
+        if not feature_path.is_file() or not combined_path.is_file():
+            raise ValueError(
+                f"Partition {partition.digest} needs completed feature and "
+                "regression artifacts"
+            )
+        features = json.loads(feature_path.read_text(encoding="utf-8"))
+        combined = json.loads(combined_path.read_text(encoding="utf-8"))
+        for path, artifact in ((feature_path, features), (combined_path, combined)):
+            recorded_digest = artifact.get("artifact_digest")
+            unsigned = {
+                key: value
+                for key, value in artifact.items()
+                if key != "artifact_digest"
+            }
+            if recorded_digest != _payload_digest(unsigned):
+                raise ValueError(f"Artifact digest does not match contents: {path}")
+        if (
+            features.get("artifact_type") != "heldout_feature_tensor"
+            or features.get("status") != "success"
+            or features.get("partition_digest") != partition.digest
+            or tuple(features.get("predictor_names", ()))
+            != tuple(config.predictors.names)
+        ):
+            raise ValueError(f"Feature artifact identity mismatch: {feature_path}")
+        if (
+            combined.get("artifact_type") != regression_artifact_type(config)
+            or combined.get("status") != "success"
+            or combined.get("partition_digest") != partition.digest
+            or combined.get("feature_artifact_digest")
+            != features.get("artifact_digest")
+            or tuple(combined.get("predictor_names", ()))
+            != tuple(config.predictors.names)
+        ):
+            raise ValueError(f"Combined regression identity mismatch: {combined_path}")
+        splits = [RegressionSplit(**split) for split in expected["regression_splits"]]
+        records["combined"].append(combined)
+        for variant in ("route_only", "mlmdp_only"):
+            records[variant].append(
+                _fit_saved_ablation_variant(
+                    config,
+                    root,
+                    partition,
+                    features,
+                    splits,
+                    variant=variant,
+                    heldout_session_order=combined["heldout_session_order"],
+                    force=force,
+                )
+            )
+    return records
 
 
 def _session_rows(records: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:

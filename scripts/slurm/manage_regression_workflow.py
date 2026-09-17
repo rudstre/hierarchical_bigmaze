@@ -291,6 +291,12 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
     stage = task["stage"]
     digest = task.get("partition_digest")
     partition_dir = run_dir / "partitions" / digest if digest else None
+    paths = None
+    report_variants = (
+        ("combined",)
+        if config.regression_cv.method == "blocked_trial_learning_curve"
+        else ("combined", "route_only", "mlmdp_only")
+    )
     if stage == "discovery":
         directory = (
             config.resolve_path(config.discovery_dir)
@@ -340,13 +346,41 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
     elif stage == "feature-generation":
         path = partition_dir / "features.json"
     elif stage == "regression":
-        path = partition_dir / "regression.json"
+        paths = [partition_dir / "regression.json"]
+        if len(report_variants) > 1:
+            paths.extend(
+                [
+                    partition_dir / "regression_route_only.json",
+                    partition_dir / "regression_mlmdp_only.json",
+                ]
+            )
     elif stage == "aggregation":
-        stem = report_stem(config)
-        path = run_dir / "report" / f"{stem}_results.json"
+        paths = [
+            run_dir / "report" / f"{report_stem(config, variant)}_results.json"
+            for variant in report_variants
+        ]
     else:
-        stem = report_stem(config)
-        path = run_dir / "report" / f"{stem}.html"
+        paths = [
+            run_dir / "report" / f"{report_stem(config, variant)}{suffix}.html"
+            for variant in report_variants
+            for suffix in ("", "_accuracy")
+        ]
+    if paths is not None:
+        if any(not candidate.is_file() for candidate in paths):
+            return "missing"
+        if all(candidate.suffix == ".html" for candidate in paths):
+            return "success"
+        statuses = [_read(candidate).get("status") for candidate in paths]
+        if any(status == "operational_failure" for status in statuses):
+            return "retry"
+        if any(status in {"scientific_failure", "unavailable"} for status in statuses):
+            return "terminal"
+        if all(
+            status in {"success", "selected", "complete", "incomplete"}
+            for status in statuses
+        ):
+            return "success"
+        return "pending"
     if not path.is_file():
         return "missing"
     if path.suffix == ".html":

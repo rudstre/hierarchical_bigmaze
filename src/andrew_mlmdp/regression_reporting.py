@@ -14,10 +14,12 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from andrew_mlmdp.regression_execution import (
+    _REGRESSION_VARIANTS,
     _pool_learning_curve,
     _prepare_qin_imports,
     aggregate_learning_curve_results,
     aggregate_regression_results,
+    regression_variant_predictors,
 )
 from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
 
@@ -524,17 +526,21 @@ def _session_profile(summary, predictor_names, value_key):
     return result
 
 
-def make_regression_figure(summary, predictor_names):
+def make_regression_figure(summary, predictor_names, *, title=None):
     """Create held-out unique-predictability panels."""
-    return _make_regression_figure(summary, predictor_names, accuracy=False)
+    return _make_regression_figure(
+        summary, predictor_names, accuracy=False, title=title
+    )
 
 
-def make_regression_accuracy_figure(summary, predictor_names):
+def make_regression_accuracy_figure(summary, predictor_names, *, title=None):
     """Create held-out full-minus-reduced accuracy panels."""
-    return _make_regression_figure(summary, predictor_names, accuracy=True)
+    return _make_regression_figure(
+        summary, predictor_names, accuracy=True, title=title
+    )
 
 
-def _make_regression_figure(summary, predictor_names, *, accuracy):
+def _make_regression_figure(summary, predictor_names, *, accuracy, title):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -732,6 +738,7 @@ def _make_regression_figure(summary, predictor_names, *, accuracy):
         },
         hovermode="closest",
         font={"family": "Arial, sans-serif", "size": 13},
+        title=title,
     )
     if summary["status"] != "complete":
         figure.add_annotation(
@@ -959,7 +966,9 @@ def _make_learning_curve_figure(summary, *, accuracy):
     return figure
 
 
-def report_stem(config):
+def report_stem(config, variant="combined"):
+    if variant not in _REGRESSION_VARIANTS:
+        raise ValueError(f"Unknown regression variant {variant!r}")
     selection = config.subgoal_selection.method.replace("_", "-")
     heldout = (
         config.heldout_sessions
@@ -967,11 +976,16 @@ def report_stem(config):
         else "explicit"
     )
     base = f"regression_{config.predictors.route_family}_{selection}_heldout-{heldout}"
-    return (
+    stem = (
         f"{base}_learning-curve"
         if config.regression_cv.method == "blocked_trial_learning_curve"
         else base
     )
+    if variant != "combined":
+        if config.regression_cv.method == "blocked_trial_learning_curve":
+            raise ValueError("Learning-curve reports only support the combined model")
+        stem = f"{stem}_{variant.replace('_', '-')}"
+    return stem
 
 
 def write_plotly_outputs(figure, output_dir, stem):
@@ -1086,11 +1100,16 @@ def write_regression_report(
     manifest: Mapping[str, object],
     *,
     plot: bool = True,
+    variant: str = "combined",
+    predictor_names: Sequence[str] | None = None,
 ):
     """Write numerical artifacts, four CSV levels, provenance, and Plotly."""
     destination = Path(output_dir).resolve() / "report"
     expected = manifest["partitions"]
     learning_curve = config.regression_cv.method == "blocked_trial_learning_curve"
+    if learning_curve and variant != "combined":
+        raise ValueError("Learning-curve reports only support the combined model")
+    predictor_order = tuple(predictor_names or config.predictors.names)
     aggregator = (
         aggregate_learning_curve_results
         if learning_curve
@@ -1109,7 +1128,7 @@ def write_regression_report(
         }
     else:
         _add_regression_accuracy(summary, records)
-    stem = report_stem(config)
+    stem = report_stem(config, variant)
     numerical = {
         "schema_version": 4 if learning_curve else 2,
         "artifact_type": (
@@ -1118,6 +1137,8 @@ def write_regression_report(
             else "heldout_regression_report"
         ),
         "status": summary["status"],
+        "regression_variant": variant,
+        "predictor_names": list(predictor_order),
         "summary": summary,
         "records": list(records),
     }
@@ -1204,7 +1225,8 @@ def write_regression_report(
             else "explicit"
         ),
         "route_family": config.predictors.route_family,
-        "predictor_order": list(config.predictors.names),
+        "regression_variant": variant,
+        "predictor_order": list(predictor_order),
         "aggregation": (
             "split LL pooled by decisions within training size; sessions equal "
             "within subject; split accuracy pooled by decisions within training size; "
@@ -1259,16 +1281,29 @@ def write_regression_report(
     plot_paths = {}
     accuracy_plot_paths = {}
     if plot:
+        variant_labels = {
+            "combined": "Combined route and hierarchical MLMDP model",
+            "route_only": "Route model with shared controls",
+            "mlmdp_only": "Hierarchical MLMDP model with shared controls",
+        }
         figure = (
             make_learning_curve_figure(summary)
             if learning_curve
-            else make_regression_figure(summary, config.predictors.names)
+            else make_regression_figure(
+                summary,
+                predictor_order,
+                title=f"{variant_labels[variant]}: unique held-out predictability",
+            )
         )
         plot_paths = write_plotly_outputs(figure, destination, stem)
         accuracy_figure = (
             make_learning_curve_accuracy_figure(summary)
             if learning_curve
-            else make_regression_accuracy_figure(summary, config.predictors.names)
+            else make_regression_accuracy_figure(
+                summary,
+                predictor_order,
+                title=f"{variant_labels[variant]}: held-out accuracy contribution",
+            )
         )
         accuracy_plot_paths = write_plotly_outputs(
             accuracy_figure, destination, f"{stem}_accuracy"
@@ -1282,3 +1317,41 @@ def write_regression_report(
         "plots": plot_paths,
         "accuracy_plots": accuracy_plot_paths,
     }
+
+
+def write_regression_variant_reports(
+    config,
+    output_dir: str | Path,
+    records_by_variant: Mapping[str, Sequence[Mapping[str, object]]],
+    manifest: Mapping[str, object],
+    *,
+    plot: bool = True,
+):
+    """Write the combined, route-only, and MLMDP-only ablation reports."""
+    if config.regression_cv.method == "blocked_trial_learning_curve":
+        combined = write_regression_report(
+            config,
+            output_dir,
+            records_by_variant["combined"],
+            manifest,
+            plot=plot,
+        )
+        return {"status": combined["status"], "variants": {"combined": combined}}
+
+    reports = {}
+    for variant in _REGRESSION_VARIANTS:
+        predictor_names = regression_variant_predictors(
+            config.predictors.names, variant
+        )
+        reports[variant] = write_regression_report(
+            config,
+            output_dir,
+            records_by_variant[variant],
+            manifest,
+            plot=plot,
+            variant=variant,
+            predictor_names=predictor_names,
+        )
+    statuses = {report["status"] for report in reports.values()}
+    status = "complete" if statuses == {"complete"} else "incomplete"
+    return {"status": status, "variants": reports}

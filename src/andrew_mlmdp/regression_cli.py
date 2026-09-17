@@ -9,11 +9,16 @@ from pathlib import Path
 from andrew_mlmdp.doohan_canonical import doohan_to_canonical_decisions
 from andrew_mlmdp.doohan_dataset import DoohanDataset
 from andrew_mlmdp.regression_execution import (
+    _REGRESSION_VARIANTS,
+    _variant_compatibility,
     regression_artifact_type,
     regression_compatibility,
+    regression_variant_path,
+    regression_variant_predictors,
     run_predictor_bundle,
+    run_saved_regression_variants,
 )
-from andrew_mlmdp.regression_reporting import write_regression_report
+from andrew_mlmdp.regression_reporting import write_regression_variant_reports
 from andrew_mlmdp.regression_workflow import (
     PredictorPartition,
     aggregate_partition,
@@ -37,6 +42,7 @@ _COMMANDS = (
     "regression",
     "aggregation",
     "plotting",
+    "regression-variants",
     "status",
     "complete",
 )
@@ -99,13 +105,13 @@ def _content_digest(artifact):
     return _payload_digest(unsigned)
 
 
-def _regression_records(config, output_dir, manifest):
+def _regression_records(config, output_dir, manifest, variant="combined"):
     root = Path(output_dir).resolve()
     records = []
     for expected in manifest["partitions"]:
         digest = expected["partition_digest"]
         partition_dir = root / "partitions" / digest
-        path = partition_dir / "regression.json"
+        path = regression_variant_path(root, digest, variant)
         if not path.is_file():
             records.append(
                 {
@@ -135,17 +141,29 @@ def _regression_records(config, output_dir, manifest):
             or feature.get("artifact_digest") != _content_digest(feature)
         ):
             raise ValueError(f"Feature artifact is invalid: {feature_path}")
-        compatibility = regression_compatibility(
-            config,
-            PredictorPartition(**expected["partition"]),
-            feature["artifact_digest"],
-            expected["regression_splits"],
-        )
+        partition = PredictorPartition(**expected["partition"])
+        if variant == "combined":
+            compatibility = regression_compatibility(
+                config,
+                partition,
+                feature["artifact_digest"],
+                expected["regression_splits"],
+            )
+        else:
+            compatibility = _variant_compatibility(
+                config,
+                partition,
+                feature,
+                expected["regression_splits"],
+                variant,
+                regression_variant_predictors(config.predictors.names, variant),
+            )
         if record.get("compatibility") != compatibility:
             raise ValueError(f"Regression artifact is incompatible: {path}")
         if record.get("status") == "success" and (
             record.get("artifact_digest") != _content_digest(record)
-            or record.get("predictor_names") != list(config.predictors.names)
+            or record.get("predictor_names")
+            != list(regression_variant_predictors(config.predictors.names, variant))
         ):
             raise ValueError(f"Regression artifact contents are invalid: {path}")
         records.append(record)
@@ -200,27 +218,52 @@ def main(argv=None):
     args = parser().parse_args(argv)
     command = args.command
     config = load_regression_workflow_config(args.config)
-    table = _table(config)
 
     if command == "prepare":
+        table = _table(config)
         result = write_manifest(config, args.output_dir, table, force=args.force)
     elif command == "complete":
+        table = _table(config)
         result = run_local_workflow(config, args.output_dir, table)
     elif command == "status":
+        table = _table(config)
         result = _status(config, args.output_dir, table)
-    elif command in {"aggregation", "plotting"}:
+    elif command == "regression-variants":
         manifest = _manifest(args.output_dir)
-        records = _regression_records(config, args.output_dir, manifest)
-        result = write_regression_report(
+        records_by_variant = run_saved_regression_variants(
+            config, args.output_dir, manifest, force=args.force
+        )
+        result = write_regression_variant_reports(
             config,
             args.output_dir,
-            records,
+            records_by_variant,
+            manifest,
+            plot=True,
+        )
+    elif command in {"aggregation", "plotting"}:
+        manifest = _manifest(args.output_dir)
+        variants = (
+            ("combined",)
+            if config.regression_cv.method == "blocked_trial_learning_curve"
+            else _REGRESSION_VARIANTS
+        )
+        records_by_variant = {
+            variant: _regression_records(
+                config, args.output_dir, manifest, variant=variant
+            )
+            for variant in variants
+        }
+        result = write_regression_variant_reports(
+            config,
+            args.output_dir,
+            records_by_variant,
             manifest,
             plot=command == "plotting",
         )
     else:
         if args.partition_digest is None:
             raise ValueError(f"{command} requires --partition-digest")
+        table = _table(config)
         partition = _partition(config, table, args.partition_digest)
         if command == "candidate":
             if args.k is None:
@@ -323,13 +366,19 @@ def _format_result(command, result, output_dir):
             )
         )
 
-    if command in {"aggregation", "plotting"}:
+    if command in {"aggregation", "plotting", "regression-variants"}:
         lines = [f"{command}: {result.get('status', 'unknown')}"]
-        if result.get("result") is not None:
-            lines.append(f"Results: {result['result']}")
-        if result.get("provenance") is not None:
-            lines.append(f"Provenance: {result['provenance']}")
-        if command == "plotting":
+        if "variants" in result:
+            for variant, report in result["variants"].items():
+                lines.append(f"  {variant}: {report.get('status', 'unknown')}")
+                if report.get("result") is not None:
+                    lines.append(f"    Results: {report['result']}")
+        else:
+            if result.get("result") is not None:
+                lines.append(f"Results: {result['result']}")
+            if result.get("provenance") is not None:
+                lines.append(f"Provenance: {result['provenance']}")
+        if command in {"plotting", "regression-variants"}:
             lines.append(f"Figures: {output / 'report'}")
         return "\n".join(lines)
 

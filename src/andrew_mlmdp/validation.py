@@ -310,28 +310,25 @@ class RankValidationConfig:
             )
         _require_keys(
             payload,
-            {"schema_version", "rank_range", "dataset", "discovery", "adam"},
+            {"schema_version", "dataset"},
+            optional={"rank_range", "discovery", "adam"},
         )
         if payload["schema_version"] != SCHEMA_VERSION:
             raise ValueError(
                 f"Unsupported validation schema version {payload['schema_version']!r}"
             )
         project_root = _find_project_root(config_path.parent)
+        discovery = dict(payload.get("discovery", {}))
+        if "restart_seeds" in discovery:
+            discovery["restart_seeds"] = tuple(discovery["restart_seeds"])
+        adam = dict(payload.get("adam", {}))
+        if "fitted_names" in adam:
+            adam["fitted_names"] = tuple(adam["fitted_names"])
         return cls(
-            rank_range=tuple(payload["rank_range"]),
+            rank_range=tuple(payload.get("rank_range", PRODUCTION_RANK_RANGE)),
             dataset=DatasetValidationConfig(**payload["dataset"]),
-            discovery=DiscoveryValidationConfig(
-                **{
-                    **payload["discovery"],
-                    "restart_seeds": tuple(payload["discovery"]["restart_seeds"]),
-                }
-            ),
-            adam=AdamValidationConfig(
-                **{
-                    **payload["adam"],
-                    "fitted_names": tuple(payload["adam"]["fitted_names"]),
-                }
-            ),
+            discovery=DiscoveryValidationConfig(**discovery),
+            adam=AdamValidationConfig(**adam),
             project_root=project_root,
             source_path=config_path,
         )
@@ -1564,14 +1561,17 @@ def _find_project_root(start: Path) -> Path:
     raise FileNotFoundError(f"Could not find pyproject.toml above {start}")
 
 
-def _require_keys(payload: object, expected: set[str]) -> None:
+def _require_keys(
+    payload: object, required: set[str], *, optional: set[str] | None = None
+) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Validation configuration must contain a JSON object")
+    allowed = required | (set() if optional is None else optional)
     actual = set(payload)
-    if actual != expected:
+    if not required <= actual or not actual <= allowed:
         raise ValueError(
             "Validation configuration keys do not match; "
-            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+            f"missing={sorted(required - actual)}, extra={sorted(actual - allowed)}"
         )
 
 

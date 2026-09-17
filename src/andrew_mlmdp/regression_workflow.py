@@ -188,8 +188,35 @@ class PredictorConfig:
     def __post_init__(self) -> None:
         if self.route_family not in {"pca", "hmm"}:
             raise ValueError("predictors.route_family must be 'pca' or 'hmm'")
-        object.__setattr__(self, "pca", dict(self.pca))
-        object.__setattr__(self, "hmm", dict(self.hmm))
+        pca = dict(self.pca)
+        hmm = dict(self.hmm)
+        self._validate_route_count(pca, "n_components", maximum=196)
+        self._validate_route_count(hmm, "n_routes")
+        object.__setattr__(self, "pca", pca)
+        object.__setattr__(self, "hmm", hmm)
+
+    @staticmethod
+    def _validate_route_count(
+        settings: Mapping[str, object], name: str, *, maximum: int | None = None
+    ) -> None:
+        if name not in settings:
+            return
+        value = settings[name]
+        valid_integer = (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value >= 1
+            and (maximum is None or value <= maximum)
+        )
+        if value != "auto" and not valid_integer:
+            range_description = (
+                "a positive integer"
+                if maximum is None
+                else f"an integer from 1 through {maximum}"
+            )
+            raise ValueError(
+                f"predictors.{name} must be {range_description} or 'auto'"
+            )
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -198,6 +225,21 @@ class PredictorConfig:
     @property
     def selected_route_settings(self) -> dict[str, object]:
         return dict(self.pca if self.route_family == "pca" else self.hmm)
+
+    def resolved_route_settings(self, selected_k: int) -> dict[str, object]:
+        """Resolve a rank-aware route count for one selected MLMDP rank."""
+        if (
+            isinstance(selected_k, bool)
+            or not isinstance(selected_k, int)
+            or selected_k < 1
+        ):
+            raise ValueError("selected_k must be a positive integer")
+        settings = self.selected_route_settings
+        if self.route_family == "pca" and settings.get("n_components") == "auto":
+            settings["n_components"] = (selected_k + 1) // 2
+        elif self.route_family == "hmm" and settings.get("n_routes") == "auto":
+            settings["n_routes"] = selected_k + 1
+        return settings
 
 
 @dataclass(frozen=True)
@@ -1330,17 +1372,25 @@ def run_local_workflow(
             )
         run_selected_predictor(config, output_dir, partition)
         results.append(run_blocked_regression(config, output_dir, partition, table))
-    from andrew_mlmdp.regression_reporting import write_regression_report
+    from andrew_mlmdp.regression_reporting import write_regression_variant_reports
 
     summary = aggregate_regression_results(
         results, manifest["partitions"], manifest["unavailable_partitions"]
     )
-    report = write_regression_report(config, output_dir, results, manifest)
+    records_by_variant = (
+        {"combined": results}
+        if config.regression_cv.method == "blocked_trial_learning_curve"
+        else run_saved_regression_variants(config, output_dir, manifest)
+    )
+    reports = write_regression_variant_reports(
+        config, output_dir, records_by_variant, manifest
+    )
     return {
         "partitions": results,
         "unavailable_partitions": unavailable,
         "summary": summary,
-        "report": _json_value(report),
+        "report": _json_value(reports["variants"]["combined"]),
+        "variant_reports": _json_value(reports),
     }
 
 
@@ -1351,6 +1401,7 @@ from andrew_mlmdp.regression_execution import (  # noqa: E402, F401, F811
     aggregate_regression_results,
     run_blocked_regression,
     run_predictor_bundle,
+    run_saved_regression_variants,
     write_feature_artifact,
 )
 
