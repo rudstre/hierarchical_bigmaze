@@ -264,10 +264,13 @@ python scripts/run_regression_workflow.py complete \
 
 The same CLI exposes `prepare`, `candidate`, `selection`, `selected-refit`,
 `predictor-bundle`, `feature-generation`, `regression`, `aggregation`,
-`plotting`, and `status` for inspection or manual execution. Plotting reads
-completed numerical artifacts and never initiates fitting. Commands print a
-short status summary by default; pass `--json` to print the complete result for
-machine processing.
+`plotting`, `regression-variants`, and `status` for inspection or manual
+execution. Plotting reads completed numerical artifacts and never initiates
+fitting. `regression-variants` is the one-off migration command for a completed
+run: it fits the two additional model sets from saved `features.json` artifacts
+and writes all reports without rebuilding MLMDP, PCA, or HMM predictors.
+Commands print a short status summary by default; pass `--json` to print the
+complete result for machine processing.
 
 Preview the idempotent SLURM graph without submitting jobs:
 
@@ -294,11 +297,12 @@ predictor-training sessions in partition `p`, task counts are:
 - selection, predictor bundle, feature generation, and regression: `P` each;
 - aggregation and plotting: one each.
 
-Each regression task internally fits the full Qin model plus the
-intercept-omitted model and all eight leave-one-predictor-out models in every
-blocked fold. The fixed predictor order is vector, optimal, hierarchical
-MLMDP, route, route planning, habit, forward, and reverse; route names are PCA
-or HMM according to `predictors.route_family`.
+Each k-fold regression task runs three ablation sets: combined, route-only
+(hierarchical MLMDP removed), and MLMDP-only (route and route-planning removed).
+Vector, optimal, habit, forward, and reverse controls remain in every set. Each
+set fits the full Qin model, the intercept-omitted model, and every
+leave-one-predictor-out model. Route names are PCA or HMM according to
+`predictors.route_family`.
 
 Run artifacts are organized as:
 
@@ -311,8 +315,12 @@ partitions/<partition-digest>/
   predictor.json
   features.json
   regression.json
+  regression_route_only.json
+  regression_mlmdp_only.json
 report/
   regression_<route>_<selection>_heldout-<scheme>_results.json
+  ..._route-only_results.json
+  ..._mlmdp-only_results.json
   ..._folds.csv, ..._sessions.csv, ..._subjects.csv, ..._group.csv
   ..._provenance.json, .html, .png, .svg, .pdf
 ```
@@ -321,10 +329,11 @@ Reports pool fold likelihoods by decision count, average held-out sessions
 equally within subject, and average subjects equally at group level. The
 headline group estimate is omitted unless the complete expected partition grid
 is present; partial tables and Plotly figures retain available observations and
-sample sizes. Each likelihood figure is accompanied by an `_accuracy` figure:
-learning curves show the percentage of held-out actions predicted correctly,
-while predictor-ablation figures show the percentage-point accuracy loss when
-each predictor is removed. Learning curves include a dashed, data-derived
+sample sizes. Each of the three k-fold model sets has a likelihood figure and
+an `_accuracy` figure, giving six figures. Learning curves show the percentage
+of held-out actions predicted correctly, while predictor-ablation figures show
+the percentage-point accuracy loss when each predictor is removed. Learning
+curves include a dashed, data-derived
 uniform-over-valid-actions reference line. See
 [`docs/regression_workflow.md`](docs/regression_workflow.md) for stage and
 resume details.

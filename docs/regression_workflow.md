@@ -18,6 +18,13 @@ each predictor. Unique predictability is reduced minus full held-out mean NLL
 in nats/decision. In learning-curve mode, each split fits only the full model
 and reports test log likelihood in nats/decision.
 
+K-fold mode runs the same ablation procedure for three prespecified predictor
+sets. The combined set contains every predictor. The route-only set removes the
+hierarchical MLMDP predictor while retaining the selected PCA or HMM route and
+route-planning predictors. The MLMDP-only set removes both route predictors
+while retaining hierarchical MLMDP. Vector, optimal, habit, forward, and
+reverse controls remain in all three sets.
+
 ## Configuration
 
 The versioned examples are
@@ -34,6 +41,13 @@ for the full-model learning curve.
 - `subgoal_selection.rank_range` is always inclusive `[lower, higher]`.
 - `predictors.route_family` is `pca` or `hmm`; the unused family's settings do
   not affect predictor compatibility.
+- `predictors.pca.n_components` accepts a fixed positive integer or `"auto"`.
+  For a partition whose selected MLMDP rank is `K`, `"auto"` retains
+  `ceil(K / 2)` signed PCA components, which become twice as many nonnegative
+  PCA routes after positive/negative splitting.
+- `predictors.hmm.n_routes` accepts a fixed positive integer or `"auto"`.
+  Here `"auto"` fits `K + 1` HMM routes. The resolved numeric route settings
+  are recorded in each predictor artifact.
 - `regression_cv.method: "blocked_trial_kfold"` runs the original full/reduced
   ablation analysis; `n_splits` changes only regression splits and results.
 - `regression_cv.method: "blocked_trial_learning_curve"` fits only the full
@@ -73,6 +87,19 @@ python scripts/run_regression_workflow.py status \
   --output-dir output/regression_workflow/example
 ```
 
+To add the three k-fold model sets and their reports to a completed historical
+run, use its saved feature tensors:
+
+```bash
+python scripts/run_regression_workflow.py regression-variants \
+  --config configs/regression_workflow.json \
+  --output-dir output/regression_workflow/example
+```
+
+This command reads `features.json`, preserves the existing combined
+`regression.json`, fits only missing route-only and MLMDP-only regressions, and
+writes all six likelihood and accuracy figures. It does not refit predictors.
+
 Partition stages additionally require `--partition-digest`. Candidate tasks
 also require scalar `--k` and, for an inner candidate, a typed JSON value in
 `--validation-session-json`. Scalar task identities are not configured rank
@@ -110,7 +137,10 @@ compatibility binds data selection, typed partition identity, rank method and
 range, fitting settings/code, discovery artifact, route settings, and seeds.
 Feature compatibility adds predictor digest, held-out canonical data, predictor
 order, and feature code. Regression compatibility adds exact trial blocks,
-regression settings, and regression code.
+regression settings, regression code, the model-set identity, and its predictor
+order. A successful k-fold partition contains `regression.json`,
+`regression_route_only.json`, and `regression_mlmdp_only.json`. The saved feature
+tensor remains the common input to all three fits.
 
 Atomic JSON writes distinguish missing, operational failure, scientific
 failure, unavailable, and successful states. I/O and scheduler failures remain
@@ -125,13 +155,14 @@ Historical output directories are never removed by the workflow.
 
 ## Reporting
 
-Aggregation writes complete fold, session, subject, and group CSV tables, a
-numerical result JSON, and provenance JSON. Plotly is the only reporting
-backend. The predictor and session-profile panels show individual observations,
-mean and SEM, a zero reference, units, sample counts, stable colors, and hover
-metadata. Output includes self-contained HTML plus PNG, SVG, and PDF through
-Kaleido. Incomplete grids retain partial diagnostics but have no headline group
-estimate.
+Aggregation writes separate fold, session, subject, and group CSV tables,
+numerical result JSON, and provenance JSON for the combined, route-only, and
+MLMDP-only model sets. Each set has one likelihood figure and one companion
+accuracy figure, for six figures total. Plotly is the only reporting backend.
+The predictor and session-profile panels show individual observations, mean and
+SEM, a zero reference, units, sample counts, stable colors, and hover metadata.
+Output includes self-contained HTML plus PNG, SVG, and PDF through Kaleido.
+Incomplete grids retain partial diagnostics but have no headline group estimate.
 
 Each likelihood figure has a companion `_accuracy` figure generated from the
 same held-out folds. Accuracy is the fraction of individual actions for which

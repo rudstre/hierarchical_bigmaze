@@ -68,6 +68,10 @@ The default configuration is
 `HIERARCHY_SWEEP_CONFIG`, and `HIERARCHY_SWEEP_OUTPUT` environment
 overrides remain available.
 
+The JSON only needs to state values that differ from the production defaults.
+Omitted `rank_range`, `discovery`, and `adam` settings are expanded by the
+configuration loader and recorded in the normalized artifact provenance.
+
 Each new submission writes an atomic manifest under
 `OUTPUT_DIR/slurm_runs/RUN_ID.json`. If node launch failures leave array
 elements in `JobHeldAdmin`, preview recovery with:

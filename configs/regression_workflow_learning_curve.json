@@ -18,24 +18,10 @@
   "predictors": {
     "route_family": "pca",
     "pca": {
-      "history": true,
-      "future": true,
-      "combine": "sum",
-      "normalize": true,
-      "alpha": 0.1,
-      "n_components": 3
+      "n_components": 5
     },
     "hmm": {
-      "n_routes": 7,
-      "cognitive_constant": 20.0,
-      "action_cost": 0.15,
-      "reward_value": 1.0,
-      "route_entropy_param": 0.0,
-      "action_entropy_param": 0.0,
-      "noise": 0.0,
-      "noise_decay": 0.0,
-      "learning_rate": 0.05,
-      "epochs": 500
+      "n_routes": 10
     }
   },
   "regression_cv": {
@@ -45,7 +31,6 @@
   "random_seed": 123,
   "slurm": {
     "partition": "cpu",
-    "account": null,
     "max_concurrent": 48,
     "default_memory": "4G",
     "default_time": "02:00:00",
