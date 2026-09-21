@@ -157,6 +157,40 @@ def test_plotly_report_has_points_intervals_zero_line_and_units():
     assert all(trace.type == "scatter" for trace in figure.data)
 
 
+def test_one_heldout_session_per_subject_has_no_session_sequence_panel():
+    summary = _summary()
+    summary["sessions"][1]["heldout_session_order"] = 1
+
+    figure = make_regression_figure(summary, ("vector",))
+
+    assert len(figure.data) == 2
+    assert "xaxis2" not in figure.layout
+    assert [row[0] for row in figure.data[0].customdata] == ["m2", "m3"]
+
+
+def test_session_profile_numbers_sessions_within_each_subject():
+    summary = _summary()
+    summary["sessions"] = [
+        {
+            **summary["sessions"][index // 2],
+            "heldout_session_id": f"s{index % 2 + 1}",
+            "heldout_session_order": index,
+        }
+        for index in range(4)
+    ]
+
+    order = reporting._session_plot_order(summary)
+    profile = reporting._session_profile(
+        summary, ("vector",), "unique_predictability", order
+    )
+    figure = make_regression_figure(summary, ("vector",))
+
+    assert [row["session_order"] for row in profile] == [0, 1]
+    assert [row["n_subjects"] for row in profile] == [2, 2]
+    assert list(figure.data[2].x) == [1, 2]
+    assert figure.layout.xaxis2.title.text == "Held-out session number within subject"
+
+
 def test_plotly_report_displays_incomplete_grid():
     figure = make_regression_figure(_summary(complete=False), ("vector",))
 

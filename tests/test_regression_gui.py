@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -135,3 +136,43 @@ def test_launch_surfaces_partial_submission_job_ids(tmp_path, monkeypatch):
     monkeypatch.setattr(access.subprocess, "Popen", lambda *_a, **_k: FailedManager())
     with pytest.raises(RuntimeError, match="12345"):
         access._manager_process(output, output / "config.json", "run", [])
+
+
+def test_gui_submits_lattice_backfill_through_existing_cli(tmp_path, monkeypatch):
+    partition = {"partition_digest": "saved-partition"}
+    features = tmp_path / "partitions/saved-partition/features.json"
+    features.parent.mkdir(parents=True)
+    features.write_text("{}")
+    config = SimpleNamespace(
+        regression_cv=SimpleNamespace(method="blocked_trial_kfold")
+    )
+    monkeypatch.setattr(
+        access, "open_run", lambda _root: (config, {"partitions": [partition]})
+    )
+    commands = []
+
+    def submit(command, **kwargs):
+        commands.append((command, kwargs))
+        record = tmp_path / "analyses/jobs_lattice_initial.json"
+        record.parent.mkdir()
+        record.write_text(json.dumps({"submissions": [{"job_id": "12345"}]}))
+        return SimpleNamespace(returncode=0, stdout="submitted", stderr="")
+
+    monkeypatch.setattr(access.subprocess, "run", submit)
+    assert access.submit_lattice_backfill(tmp_path) == ["12345"]
+    command, options = commands[0]
+    assert command[2:] == ["lattice", "--output-dir", str(tmp_path)]
+    assert options["cwd"] == access.ROOT
+
+
+def test_gui_backfill_requires_saved_features(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        regression_cv=SimpleNamespace(method="blocked_trial_kfold")
+    )
+    monkeypatch.setattr(
+        access,
+        "open_run",
+        lambda _root: (config, {"partitions": [{"partition_digest": "missing"}]}),
+    )
+    with pytest.raises(ValueError, match="Saved features are missing"):
+        access.submit_lattice_backfill(tmp_path)

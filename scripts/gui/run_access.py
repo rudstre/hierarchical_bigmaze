@@ -10,7 +10,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from andrew_mlmdp.regression_analysis import open_run, read_json  # noqa: E402
+from andrew_mlmdp.doohan_dataset import _load_session_catalog  # noqa: E402
+from andrew_mlmdp.regression_analysis import (  # noqa: E402
+    open_run,
+    read_json,
+    summarize_records,
+    verify_artifact,
+)
 from andrew_mlmdp.regression_workflow import (  # noqa: E402
     build_manifest,
     regression_config_from_payload,
@@ -40,6 +46,153 @@ def list_runs(base=None):
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+
+
+def dataset_selection_options(payload):
+    """Read session metadata for the configured dataset and maze, without trials."""
+    config = regression_config_from_payload(payload, ROOT)
+    catalog = _load_session_catalog(config.resolve_path(config.dataset.data_root))
+    dates_by_subject = {}
+    for session in catalog:
+        if session.maze_name == config.dataset.maze_name:
+            dates_by_subject.setdefault(session.subject_id, set()).add(
+                session.session_date.isoformat()
+            )
+    if not dates_by_subject:
+        raise ValueError(
+            f"No sessions for maze {config.dataset.maze_name!r} in the dataset"
+        )
+    return {
+        subject: tuple(sorted(dates))
+        for subject, dates in sorted(dates_by_subject.items())
+    }
+
+
+def subset_summary(root, expected, predictor_names, scope, attempt="initial"):
+    """Load one saved subset across selected partitions and report missing work."""
+    root = Path(root)
+    records = []
+    missing = []
+    failed = []
+    missing_scope = []
+    for item in expected:
+        digest = item["partition_digest"]
+        index = root / "analyses" / f"lattice_{digest}_{attempt}.json"
+        if not index.is_file():
+            missing.append(digest)
+            continue
+        registry = read_json(index)
+        if registry["partition_digest"] != digest:
+            raise ValueError(f"Lattice index does not match partition {digest}")
+        entry = next(
+            (
+                candidate
+                for candidate in registry["entries"]
+                if candidate["predictor_names"] == list(predictor_names)
+            ),
+            None,
+        )
+        if entry is None:
+            missing.append(digest)
+            continue
+        if entry["status"] != "success":
+            failed.append(digest)
+            continue
+        destination = root / entry["path"]
+        scores = sorted(
+            destination.glob(f"scores_{scope}_*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not scores:
+            missing_scope.append(digest)
+            continue
+        records.append(verify_artifact(read_json(scores[0])))
+    return {
+        "summary": summarize_records(records, expected) if records else None,
+        "records": records,
+        "missing": missing,
+        "failed": failed,
+        "missing_scope": missing_scope,
+    }
+
+
+def lattice_progress(root, manifest):
+    """Read small lattice indexes and the recorded analysis job, without data."""
+    root = Path(root)
+    completed = successful = failed = 0
+    for item in manifest["partitions"]:
+        path = root / "analyses" / f"lattice_{item['partition_digest']}_initial.json"
+        if path.is_file():
+            index = read_json(path)
+            completed += index["completed"]
+            successful += index["successful"]
+            failed += index["failed"]
+    record_path = root / "analyses/jobs_lattice_initial.json"
+    record = read_json(record_path) if record_path.is_file() else None
+    job_ids = [job["job_id"] for job in record["submissions"]] if record else []
+    active = []
+    if job_ids:
+        cache_key = ("analysis", str(root.resolve()), tuple(job_ids))
+        cached = _SCHEDULER_CACHE.get(cache_key)
+        if cached is None or time.monotonic() - cached[0] >= 30:
+            cached = (time.monotonic(), manager_module()._active_submission_ids(record))
+            _SCHEDULER_CACHE[cache_key] = cached
+        active = cached[1]
+    return {
+        "completed": completed,
+        "successful": successful,
+        "failed": failed,
+        "total": 255 * len(manifest["partitions"]),
+        "missing_features": sum(
+            not (
+                root / "partitions" / item["partition_digest"] / "features.json"
+            ).is_file()
+            for item in manifest["partitions"]
+        ),
+        "job_ids": job_ids,
+        "active_job_ids": active,
+    }
+
+
+def submit_lattice_backfill(root):
+    """Submit the existing resumable SLURM backfill for an older k-fold run."""
+    root = Path(root).resolve()
+    config, manifest = open_run(root)
+    if config.regression_cv.method != "blocked_trial_kfold":
+        raise ValueError("Predictor combinations require a k-fold workflow")
+    missing_features = [
+        item["partition_digest"]
+        for item in manifest["partitions"]
+        if not (
+            root / "partitions" / item["partition_digest"] / "features.json"
+        ).is_file()
+    ]
+    if missing_features:
+        raise ValueError(
+            f"Saved features are missing for {len(missing_features)} partitions; "
+            "wait for feature generation before backfilling combinations"
+        )
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/run_regression_analysis.py"),
+        "lattice",
+        "--output-dir",
+        str(root),
+    ]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    record_path = root / "analyses/jobs_lattice_initial.json"
+    job_ids = (
+        [job["job_id"] for job in read_json(record_path)["submissions"]]
+        if record_path.is_file()
+        else []
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"{result.stderr or result.stdout}\nRecorded job IDs: "
+            f"{job_ids or 'none'}"
+        )
+    return job_ids
 
 
 def status(root):

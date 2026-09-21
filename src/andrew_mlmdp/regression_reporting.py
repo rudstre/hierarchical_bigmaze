@@ -483,12 +483,30 @@ def _subject_points(summary, predictor_names):
     return by_predictor
 
 
-def _session_profile(summary, predictor_names, value_key):
+def _session_plot_order(summary):
+    """Number observed held-out sessions within each subject for plotting."""
+    by_subject = {}
+    for row in summary["sessions"]:
+        if row["heldout_session_order"] is not None:
+            key = (row["subject_id"], row["heldout_session_id"])
+            by_subject.setdefault(row["subject_id"], {})[key] = row[
+                "heldout_session_order"
+            ]
+    return {
+        key: index
+        for sessions in by_subject.values()
+        for index, (key, _) in enumerate(
+            sorted(sessions.items(), key=lambda item: (item[1], str(item[0][1])))
+        )
+    }
+
+
+def _session_profile(summary, predictor_names, value_key, plot_order):
     grouped = {}
     for row in summary["sessions"]:
-        grouped.setdefault((row["predictor"], row["heldout_session_order"]), []).append(
-            row
-        )
+        key = (row["subject_id"], row["heldout_session_id"])
+        if key in plot_order:
+            grouped.setdefault((row["predictor"], plot_order[key]), []).append(row)
     result = []
     for predictor in predictor_names:
         orders = sorted(
@@ -555,14 +573,20 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
     def scaled(value):
         return None if value is None else scale * value
 
+    plot_order = _session_plot_order(summary)
+    sessions_per_subject = {}
+    for subject, _ in plot_order:
+        sessions_per_subject[subject] = sessions_per_subject.get(subject, 0) + 1
+    has_session_profile = any(count > 1 for count in sessions_per_subject.values())
     figure = make_subplots(
         rows=1,
-        cols=2,
+        cols=2 if has_session_profile else 1,
         subplot_titles=(
-            left_title,
-            "Held-out session profile",
+            (left_title, "Held-out session profile")
+            if has_session_profile
+            else (f"{left_title} (one held-out session per subject)",)
         ),
-        horizontal_spacing=0.13,
+        horizontal_spacing=0.13 if has_session_profile else 0.0,
     )
     subject_points = _subject_points(summary, predictor_names)
     display_names = [_PREDICTOR_STYLE[name][0] for name in predictor_names]
@@ -638,82 +662,95 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
         col=1,
     )
 
-    profiles = _session_profile(summary, predictor_names, value_key)
-    for predictor in predictor_names:
-        display, colour = _PREDICTOR_STYLE[predictor]
-        values = [row for row in profiles if row["predictor"] == predictor]
-        figure.add_trace(
-            go.Scatter(
-                x=[row["session_order"] + 1 for row in values],
-                y=[scaled(row["mean"]) for row in values],
-                mode="lines+markers",
-                name=display,
-                legendgroup=predictor,
-                line={"color": colour, "width": 2},
-                marker={"color": colour, "size": 7},
-                error_y={
-                    "type": "data",
-                    "array": [
-                        0 if row["sem"] is None else scale * row["sem"]
-                        for row in values
+    if has_session_profile:
+        profiles = _session_profile(summary, predictor_names, value_key, plot_order)
+        for predictor in predictor_names:
+            display, colour = _PREDICTOR_STYLE[predictor]
+            values = [row for row in profiles if row["predictor"] == predictor]
+            figure.add_trace(
+                go.Scatter(
+                    x=[row["session_order"] + 1 for row in values],
+                    y=[scaled(row["mean"]) for row in values],
+                    mode="lines+markers",
+                    name=display,
+                    legendgroup=predictor,
+                    line={"color": colour, "width": 2},
+                    marker={"color": colour, "size": 7},
+                    error_y={
+                        "type": "data",
+                        "array": [
+                            0 if row["sem"] is None else scale * row["sem"]
+                            for row in values
+                        ],
+                        "visible": True,
+                        "thickness": 1.1,
+                        "width": 3,
+                    },
+                    customdata=[[row["n_subjects"]] for row in values],
+                    hovertemplate=(
+                        "Predictor: %{fullData.name}<br>Session number: %{x}"
+                        f"<br>Mean: %{{y:{value_format}}} {unit}"
+                        "<br>Subjects: %{customdata[0]}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=2,
+            )
+            subject_rows = [
+                row
+                for row in summary["sessions"]
+                if row["predictor"] == predictor
+                and (row["subject_id"], row["heldout_session_id"])
+                in plot_order
+            ]
+            figure.add_trace(
+                go.Scatter(
+                    x=[
+                        plot_order[(row["subject_id"], row["heldout_session_id"])]
+                        + 1
+                        for row in subject_rows
                     ],
-                    "visible": True,
-                    "thickness": 1.1,
-                    "width": 3,
-                },
-                customdata=[[row["n_subjects"]] for row in values],
-                hovertemplate=(
-                    "Predictor: %{fullData.name}<br>Session order: %{x}"
-                    f"<br>Mean: %{{y:{value_format}}} {unit}"
-                    "<br>Subjects: %{customdata[0]}<extra></extra>"
+                    y=[scaled(row[value_key]) for row in subject_rows],
+                    mode="markers",
+                    name=f"{display} subjects",
+                    legendgroup=predictor,
+                    showlegend=False,
+                    marker={"color": colour, "size": 5, "opacity": 0.25},
+                    customdata=[
+                        [
+                            row["subject_id"],
+                            row["heldout_session_id"],
+                            row["n_decisions"],
+                        ]
+                        for row in subject_rows
+                    ],
+                    hovertemplate=(
+                        "Predictor: " + display + "<br>Subject: %{customdata[0]}"
+                        "<br>Session: %{customdata[1]}"
+                        "<br>Decisions: %{customdata[2]}"
+                        f"<br>{value_label}: %{{y:{value_format}}} {unit}"
+                        "<extra></extra>"
+                    ),
                 ),
-            ),
-            row=1,
-            col=2,
-        )
-        subject_rows = [
-            row
-            for row in summary["sessions"]
-            if row["predictor"] == predictor
-            and row["heldout_session_order"] is not None
-        ]
-        figure.add_trace(
-            go.Scatter(
-                x=[row["heldout_session_order"] + 1 for row in subject_rows],
-                y=[scaled(row[value_key]) for row in subject_rows],
-                mode="markers",
-                name=f"{display} subjects",
-                legendgroup=predictor,
-                showlegend=False,
-                marker={"color": colour, "size": 5, "opacity": 0.25},
-                customdata=[
-                    [
-                        row["subject_id"],
-                        row["heldout_session_id"],
-                        row["n_decisions"],
-                    ]
-                    for row in subject_rows
-                ],
-                hovertemplate=(
-                    "Predictor: " + display + "<br>Subject: %{customdata[0]}"
-                    "<br>Session: %{customdata[1]}"
-                    "<br>Decisions: %{customdata[2]}"
-                    f"<br>{value_label}: %{{y:{value_format}}} {unit}"
-                    "<extra></extra>"
-                ),
-            ),
-            row=1,
-            col=2,
-        )
+                row=1,
+                col=2,
+            )
 
     figure.add_hline(y=0, line={"color": "#555555", "width": 1, "dash": "dot"})
     figure.update_xaxes(title_text="Predictor", tickangle=-30, row=1, col=1)
-    figure.update_xaxes(title_text="Held-out session order", dtick=1, row=1, col=2)
+    if has_session_profile:
+        figure.update_xaxes(
+            title_text="Held-out session number within subject",
+            dtick=1,
+            row=1,
+            col=2,
+        )
     figure.update_yaxes(title_text=y_title, row=1, col=1)
-    figure.update_yaxes(title_text=y_title, row=1, col=2)
+    if has_session_profile:
+        figure.update_yaxes(title_text=y_title, row=1, col=2)
     figure.update_layout(
         template="plotly_white",
-        width=1250,
+        width=1250 if has_session_profile else 900,
         height=620,
         margin={"l": 80, "r": 30, "t": 75, "b": 145},
         legend={

@@ -303,7 +303,10 @@ historical run. Reading results does not require its original configuration file
 A new GUI run snapshots its regression and referenced discovery configurations
 under `inputs/`. The original discovery directory remains shared. Configuration
 changes after launch create a new run; the submitted config is immutable. The
-manager records content hashes for the snapshotted regression configuration,
+new-workflow form reads session metadata to offer subject checkboxes and start/end
+date choices for the selected subjects; applying them updates the configuration
+JSON without changing its schema. The manager records content hashes for the
+snapshotted regression configuration,
 referenced discovery configuration, and workflow manifest. Queued workers verify
 these inputs before calculating, so editing one in place stops new work rather
 than silently changing the experiment. The
@@ -335,8 +338,14 @@ includes the full model, its intercept-omitted model, and one model omitting
 each selected predictor. Existing combined, route-only, and MLMDP-only artifacts
 keep their original paths and report names.
 
-The Results GUI reads these analyses without submitting jobs. If a calculation
-is missing, it shows the corresponding backfill command. Add `--cancel` to an
+In Predictor combinations, check the predictors and click Generate plots to
+render both likelihood and accuracy figures in the browser. Change the checks
+or optional session/location filters and click again to regenerate the figures
+from saved scores. For an older k-fold run with saved features, the Results GUI
+can submit the existing lattice backfill to SLURM and show its progress; this
+computes all 255 combinations per partition, then the plot button reads the
+saved numerical results. Missing scope or overlap calculations still show their
+CLI backfill commands. Add `--cancel` to an
 analysis command to cancel only the recorded active jobs for that kind and
 attempt. The workflow Progress page offers retry and cancellation for jobs
 recorded by the workflow manager.

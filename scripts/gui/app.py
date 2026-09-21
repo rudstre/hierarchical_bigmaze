@@ -18,7 +18,6 @@ import run_access as access  # noqa: E402
 from andrew_mlmdp.regression_analysis import (  # noqa: E402
     open_run,
     read_json,
-    summarize_records,
     verify_artifact,
 )
 from andrew_mlmdp.regression_policy_overlap import pool_overlap  # noqa: E402
@@ -41,11 +40,22 @@ def show_error(function, *args, **kwargs):
         return None
 
 
+def recent_run_label(value):
+    if value == "New workflow":
+        return value
+    name = Path(value).name
+    return name if len(name) <= 32 else f"{name[:21]}…{name[-10:]}"
+
+
 runs = access.list_runs()
 choices = [str(p.parent) for p in runs]
 with st.sidebar:
     st.subheader("Open workflow")
-    selected = st.selectbox("Recent workflows", ["New workflow", *choices])
+    selected = st.selectbox(
+        "Recent workflows", ["New workflow", *choices], format_func=recent_run_label
+    )
+    if selected != "New workflow":
+        st.caption(Path(selected).name)
     entered = st.text_input("Or enter a workflow directory")
     root = (
         Path(entered or selected).resolve()
@@ -76,12 +86,62 @@ if root is None:
         st.error(str(error))
         st.stop()
     with st.expander("Common settings", expanded=True):
+        available = show_error(access.dataset_selection_options, payload)
         c1, c2, c3 = st.columns(3)
-        subjects = c1.text_input(
-            "Subjects (comma separated)", ", ".join(payload["dataset"]["subject_ids"])
-        )
-        start = c2.text_input("Start date", payload["dataset"].get("start_date") or "")
-        end = c3.text_input("End date", payload["dataset"].get("end_date") or "")
+        subjects = None
+        start = payload["dataset"].get("start_date")
+        end = payload["dataset"].get("end_date")
+        valid_selection = True
+        if available is not None:
+            st.markdown("**Subjects**")
+            subject_columns = st.columns(min(3, len(available)))
+            selected = {
+                subject
+                for index, subject in enumerate(available)
+                if subject_columns[index % len(subject_columns)].checkbox(
+                    subject, value=subject in payload["dataset"]["subject_ids"]
+                )
+            }
+            original = payload["dataset"]["subject_ids"]
+            subjects = [subject for subject in original if subject in selected]
+            subjects.extend(
+                subject
+                for subject in available
+                if subject in selected and subject not in subjects
+            )
+            dates = sorted(
+                {date for subject in subjects for date in available[subject]}
+            )
+
+            def date_selector(label, current, column, empty_label):
+                date_choices = set(dates) | ({current} if current else set())
+                choices = [None, *sorted(date_choices)]
+                return column.selectbox(
+                    label,
+                    choices,
+                    index=choices.index(current),
+                    format_func=lambda value: (
+                        empty_label
+                        if value is None
+                        else f"{value} (from JSON; no selected session on this date)"
+                        if value not in dates
+                        else value
+                    ),
+                )
+
+            start = date_selector("Start date", start, c2, "No lower bound")
+            end = date_selector("End date", end, c3, "No upper bound")
+            if not subjects:
+                st.error("Select at least one subject.")
+                valid_selection = False
+            if start and end and start > end:
+                st.error("Start date must be on or before end date.")
+                valid_selection = False
+        else:
+            st.info(
+                "Edit dataset selection in the JSON while session metadata "
+                "is unavailable."
+            )
         heldout = c1.selectbox(
             "Held-out sessions",
             ["all", "last", "explicit in JSON"],
@@ -121,13 +181,12 @@ if root is None:
         discovery_dir = st.text_input(
             "Shared discovery directory", payload.get("discovery_dir") or ""
         )
-        if st.button("Apply common settings to JSON"):
+        if st.button("Apply common settings to JSON", disabled=not valid_selection):
             updated = json.loads(raw)
-            updated["dataset"].update(
-                subject_ids=[x.strip() for x in subjects.split(",") if x.strip()],
-                start_date=start or None,
-                end_date=end or None,
-            )
+            if subjects is not None:
+                updated["dataset"].update(
+                    subject_ids=subjects, start_date=start, end_date=end
+                )
             if heldout != "explicit in JSON":
                 updated["heldout_sessions"] = heldout
             updated["subgoal_selection"]["rank_range"] = [int(low), int(high)]
@@ -276,131 +335,223 @@ if page == "Results":
         f"{p['partition']['heldout_session_id']}"
         for p in partitions
     }
-    selected_digests = st.multiselect(
-        "Subjects and sessions",
-        list(labels),
-        default=list(labels),
-        format_func=lambda d: labels[d],
+    analysis_view = st.segmented_control(
+        "View results",
+        ["Predictor combinations", "Policy overlap", "Original reports"],
+        default="Predictor combinations",
     )
+    with st.expander("Sessions and evaluation locations", expanded=False):
+        selected_digests = st.multiselect(
+            "Subjects and sessions",
+            list(labels),
+            default=list(labels),
+            format_func=lambda d: labels[d],
+        )
+        scope = st.radio(
+            "Evaluation locations",
+            ["All decision locations", "3–4 valid actions"],
+            horizontal=True,
+        )
     selected_expected = [
         p for p in partitions if p["partition_digest"] in selected_digests
     ]
-    scope = st.radio(
-        "Evaluation locations",
-        ["All decision locations", "3–4 valid actions"],
-        horizontal=True,
-    )
     scope_key = (
         "all_decisions" if scope.startswith("All") else "three_or_four_valid_actions"
-    )
-    analysis_view = st.segmented_control(
-        "Analysis view",
-        ["Predictor combinations", "Policy overlap", "Original reports"],
-        default="Predictor combinations",
     )
     if analysis_view == "Predictor combinations":
         if config.regression_cv.method != "blocked_trial_kfold":
             st.info("Predictor combinations require a k-fold workflow.")
         else:
             names = list(config.predictors.names)
-            selected_names = st.multiselect(
-                "Predictors in the fitted model", names, default=names
+            st.subheader("Choose predictors for the model")
+            predictor_columns = st.columns(4)
+            selected_names = [
+                name
+                for index, name in enumerate(names)
+                if predictor_columns[index % 4].checkbox(
+                    name, value=True, key=f"predictor_{root}_{name}"
+                )
+            ]
+            st.caption(
+                "Plots use saved fits for this combination. Generate again after "
+                "changing the choices to refresh the figures."
             )
             attempts = set()
             for item in selected_expected:
                 prefix = f"lattice_{item['partition_digest']}_"
                 for index_path in (root / "analyses").glob(f"{prefix}*.json"):
                     attempts.add(index_path.stem.removeprefix(prefix))
-            attempt = st.selectbox(
-                "Saved analysis attempt",
-                sorted(attempts, key=lambda value: (value != "initial", value))
-                or ["initial"],
-            )
-            if selected_names:
-                records = []
-                available = []
-                for item in selected_expected:
-                    index = (
-                        root
-                        / "analyses"
-                        / f"lattice_{item['partition_digest']}_{attempt}.json"
+            progress = show_error(access.lattice_progress, root, manifest)
+            if progress:
+
+                @st.fragment(run_every="5s")
+                def live_lattice_progress():
+                    current = show_error(access.lattice_progress, root, manifest)
+                    if current and (
+                        current["job_ids"] or current["completed"]
+                    ):
+                        st.progress(
+                            current["completed"] / current["total"],
+                            text=(
+                                f"Saved combinations: {current['completed']}/"
+                                f"{current['total']} attempted; "
+                                f"{current['successful']} succeeded, "
+                                f"{current['failed']} failed"
+                            ),
+                        )
+                        if current["job_ids"]:
+                            active = current["active_job_ids"]
+                            st.caption(
+                                "Backfill SLURM jobs: "
+                                + ", ".join(current["job_ids"])
+                                + (f" · active: {', '.join(active)}" if active else "")
+                            )
+
+                live_lattice_progress()
+                if progress["missing_features"]:
+                    st.info(
+                        f"Saved features are still missing for "
+                        f"{progress['missing_features']} partitions; wait for "
+                        "feature generation before computing combinations."
                     )
-                    if not index.exists():
-                        continue
-                    entry = next(
-                        (
-                            e
-                            for e in read_json(index)["entries"]
-                            if e["predictor_names"]
-                            == [n for n in names if n in selected_names]
-                        ),
-                        None,
-                    )
-                    if not entry:
-                        continue
-                    target = root / entry["path"]
-                    candidates = sorted(
-                        target.glob(f"scores_{scope_key}_*.json"),
-                        key=lambda p: p.stat().st_mtime,
-                        reverse=True,
-                    )
-                    if candidates:
-                        records.append(verify_artifact(read_json(candidates[0])))
-                        available.append(item["partition_digest"])
-                st.caption(
-                    f"Available: {len(available)}/{len(selected_expected)} "
-                    "selected sessions"
+                elif progress["completed"] < progress["total"]:
+                    if progress["active_job_ids"]:
+                        st.info(
+                            "The cluster is computing the missing predictor "
+                            "combinations. Saved results can be plotted as they finish."
+                        )
+                    else:
+                        if not progress["job_ids"]:
+                            st.info(
+                                "This workflow has no saved combination fits yet. "
+                                "Compute them here before generating plots."
+                            )
+                        if st.button("Compute missing predictor combinations"):
+                            submitted = show_error(access.submit_lattice_backfill, root)
+                            if submitted is not None:
+                                st.success(
+                                    "Submitted SLURM jobs: "
+                                    + ", ".join(submitted)
+                                )
+                                st.rerun()
+            with st.expander("Saved fit attempt"):
+                attempt = st.selectbox(
+                    "Attempt",
+                    sorted(attempts, key=lambda value: (value != "initial", value))
+                    or ["initial"],
                 )
-                if records:
-                    summary = show_error(summarize_records, records, selected_expected)
+            if not selected_names:
+                st.warning("Check at least one predictor to generate plots.")
+            if not selected_digests:
+                st.warning("Select at least one subject/session to generate plots.")
+            if st.button(
+                "Generate plots",
+                type="primary",
+                disabled=not selected_names or not selected_digests,
+            ):
+                st.session_state.pop("generated_subset_plots", None)
+                with st.spinner("Loading saved fits and generating plots..."):
+                    result = show_error(
+                        access.subset_summary,
+                        root,
+                        selected_expected,
+                        selected_names,
+                        scope_key,
+                        attempt,
+                    )
+                    if result is not None:
+                        request = {
+                            "run": str(root),
+                            "predictor_names": selected_names,
+                            "evaluation_scope": scope_key,
+                            "selected_partitions": selected_digests,
+                            "attempt": attempt,
+                        }
+                        figures = {}
+                        summary = result["summary"]
+                        if summary and summary.get("group"):
+                            for metric, maker in (
+                                ("Likelihood", make_regression_figure),
+                                ("Accuracy", make_regression_accuracy_figure),
+                            ):
+                                figure = maker(summary, selected_names)
+                                figure.update_layout(
+                                    meta={
+                                        **request,
+                                        "source_regression_digests": [
+                                            record["source_regression_digest"]
+                                            for record in result["records"]
+                                        ],
+                                    }
+                                )
+                                figures[metric] = figure
+                        st.session_state.generated_subset_plots = {
+                            "request": request,
+                            "result": result,
+                            "figures": figures,
+                        }
+            generated = st.session_state.get("generated_subset_plots")
+            if generated and generated["request"]["run"] == str(root):
+                request = generated["request"]
+                result = generated["result"]
+                summary = result["summary"]
+                current = {
+                    "run": str(root),
+                    "predictor_names": selected_names,
+                    "evaluation_scope": scope_key,
+                    "selected_partitions": selected_digests,
+                    "attempt": attempt,
+                }
+                if request != current:
+                    st.info("Selections changed. Click Generate plots to update them.")
+                st.caption(
+                    f"Showing {', '.join(request['predictor_names'])} · "
+                    f"{len(result['records'])}/{len(request['selected_partitions'])} "
+                    "selected sessions have saved scores"
+                )
+                if summary:
+                    st.write("Scientific coverage:", summary["status"])
+                if generated["figures"]:
+                    for metric, figure in generated["figures"].items():
+                        st.subheader(metric)
+                        st.plotly_chart(figure, width="stretch")
+                        st.download_button(
+                            f"Download {metric.lower()} plot",
+                            figure.to_html(),
+                            file_name=f"ablation_{metric.lower()}.html",
+                        )
+                else:
+                    st.info(
+                        "No plot is available for this combination and evaluation "
+                        "scope yet. The saved numerical fits or scores may be missing."
+                    )
+                    st.code(
+                        "python scripts/run_regression_analysis.py lattice "
+                        f"--output-dir {root}"
+                    )
+                with st.expander("Coverage, numerical results, and provenance"):
+                    for label, key in (
+                        ("Missing fits", "missing"),
+                        ("Failed fits", "failed"),
+                        ("Missing evaluation scores", "missing_scope"),
+                    ):
+                        if result[key]:
+                            st.write(
+                                f"{label}: "
+                                + ", ".join(
+                                    labels.get(digest, digest) for digest in result[key]
+                                )
+                            )
                     if summary:
-                        st.write("Scientific coverage:", summary["status"])
                         st.dataframe(summary["sessions"], hide_index=True)
-                        if summary.get("group"):
-                            metric = st.radio(
-                                "Metric", ["Likelihood", "Accuracy"], horizontal=True
-                            )
-                            maker = (
-                                make_regression_figure
-                                if metric == "Likelihood"
-                                else make_regression_accuracy_figure
-                            )
-                            figure = maker(
-                                summary, [n for n in names if n in selected_names]
-                            )
-                            figure.update_layout(
-                                meta={
-                                    "evaluation_scope": scope_key,
-                                    "selected_partitions": selected_digests,
-                                    "predictor_names": [
-                                        n for n in names if n in selected_names
-                                    ],
-                                    "source_regression_digests": [
-                                        r["source_regression_digest"]
-                                        for r in records
-                                    ],
-                                }
-                            )
-                            st.plotly_chart(figure, width="stretch")
-                            st.download_button(
-                                "Download figure HTML",
-                                figure.to_html(),
-                                file_name="ablation.html",
-                            )
                         st.download_button(
                             "Download numerical summary",
                             json.dumps(
                                 {
-                                    "view": {
-                                        "predictor_names": [
-                                            n for n in names if n in selected_names
-                                        ],
-                                        "evaluation_scope": scope_key,
-                                        "selected_partitions": selected_digests,
-                                    },
+                                    "view": request,
                                     "source_regression_digests": [
-                                        r["source_regression_digest"]
-                                        for r in records
+                                        record["source_regression_digest"]
+                                        for record in result["records"]
                                     ],
                                     "summary": summary,
                                 },
@@ -408,14 +559,8 @@ if page == "Results":
                             ),
                             file_name="ablation_summary.json",
                         )
-                else:
-                    st.info(
-                        "This combination and evaluation scope has no saved result yet."
-                    )
-                    st.code(
-                        "python scripts/run_regression_analysis.py lattice "
-                        f"--output-dir {root}"
-                    )
+            else:
+                st.info("Check predictors and click Generate plots to view them here.")
     if analysis_view == "Policy overlap":
         rows = []
         for item in selected_expected:
