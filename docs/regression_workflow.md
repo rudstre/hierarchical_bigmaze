@@ -221,14 +221,18 @@ tensor is causal.
 
 For each navigation movement starting at a location with three or four valid
 actions, the stage constructs action distributions from the saved vectors.
-Nonnegative vectors are normalized across valid actions. The vector predictor
-instead puts equal mass on the valid directions tied for its highest stored
-directional score. In particular, the optimal predictor's existing tie weights
-are retained by normalizing its stored vector. A movement enters the primary
-analysis only if all eight policies are defined. Zero-support predictors,
-trial-start forward/reverse predictors, and blocked forward/reverse preferences
-exclude that movement; no uniform distribution is substituted. Artifacts
-record eligible and included movement counts, exclusions by reason, and the
+Nonnegative vectors are normalized across valid actions. The saved `reverse`
+vector marks the action that would undo the previous move; overlap reports its
+complement as `dont_reverse`, with equal probability on every other valid
+action. The regression feature and fitted coefficient remain unchanged. The
+vector predictor instead puts equal mass on the valid directions tied for its
+highest stored directional score. In particular, the optimal predictor's
+existing tie weights are retained by normalizing its stored vector. A movement
+enters the primary analysis only if all eight policies are defined.
+Zero-support predictors, trial-start forward/reverse predictors, and blocked
+forward/reverse preferences exclude that movement; no uniform distribution is
+substituted. Artifacts record eligible and included movement counts, exclusions
+by reason, and the
 percentage retained. Reason counts can overlap when a movement has more than
 one undefined predictor; the distinct excluded count is recorded separately.
 Projection uses float64 arithmetic: negative roundoff no smaller than `-1e-12`
@@ -237,7 +241,13 @@ violations raise an error.
 
 For action distributions `p` and `q`, observed-decision policy overlap is
 `sum_a min(p_a, q_a) = 1 - TV(p, q)`, from zero (disjoint) to one (identical).
-Each session's 8×8 matrix averages this value across its included movements.
+The observed action on each included movement is added as the one-hot
+`observed_behavior` distribution. Its overlap with policy `p` is therefore
+`p(observed action)`. This is fractional for probabilistic or tied policies; it
+is not argmax percentage-correct accuracy, and it is not an estimated
+stationary behavioral policy. Each session's 9×9 matrix averages overlap among
+the eight projected predictors and observed behavior across its included
+movements.
 The pooled matrix divides the sum of the session overlap numerators by the
 total included movement count, so repeated visits and longer sessions have
 proportionally more weight. Session artifacts are saved as
@@ -249,9 +259,13 @@ Run `python scripts/run_regression_workflow.py policy-overlap --config CONFIG
 --output-dir OUTPUT` to backfill a completed run without refitting. Add
 `--partition-digest DIGEST` to generate just one session artifact. The
 `complete` and SLURM workflows generate overlap artifacts automatically.
+After changing an overlap projection or upgrading an existing 8×8 run, add
+`--force` once to regenerate only its overlap artifacts and report. Existing
+9×9 artifacts with the original `reverse` projection use the prior schema and
+are not reused.
 
-These eight policies are explicit projections of the regression's saved action
-**values**; several predictors are not native probability distributions.
+The eight model policies are explicit projections of the regression's saved
+action **values**; several predictors are not native probability distributions.
 Overlap describes their similarity on observed behavioral decisions. It does
 not measure regression-coefficient similarity and does not by itself establish
 predictor redundancy or unique variance.

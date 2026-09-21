@@ -21,12 +21,17 @@ _MASS_ATOL = 1e-10
 _ACTION_COLUMNS = tuple(f"action_{index}" for index in range(4))
 _KEY_COLUMNS = ("subject_id", "session_id", "trial_id", "decision_order")
 _ARTIFACT_TYPE = "observed_decision_policy_overlap"
+_OVERLAP_SCHEMA_VERSION = 3
+_OBSERVED_BEHAVIOR = "observed_behavior"
+_DONT_REVERSE = "dont_reverse"
 
 
-def _verified_json(path: Path, artifact_type: str) -> dict[str, object]:
+def _verified_json(
+    path: Path, artifact_type: str, *, schema_version: int = 1
+) -> dict[str, object]:
     artifact = json.loads(path.read_text(encoding="utf-8"))
     if (
-        artifact.get("schema_version") != 1
+        artifact.get("schema_version") != schema_version
         or artifact.get("artifact_type") != artifact_type
     ):
         raise ValueError(f"Incompatible artifact type or schema: {path}")
@@ -167,7 +172,14 @@ def _project_policies(values, valid, names):
                 )
                 reasons[row].add(reason)
                 continue
-            probabilities[row, policy_index] = usable / total
+            normalized = usable / total
+            if name == "reverse":
+                # The saved regressor points to the reversal action; its
+                # negative coefficient motivates the complementary policy.
+                nonreverse = valid[row].astype(np.float64) - normalized
+                probabilities[row, policy_index] = nonreverse / nonreverse.sum()
+            else:
+                probabilities[row, policy_index] = normalized
             if not np.isclose(
                 probabilities[row, policy_index].sum(), 1.0, atol=_MASS_ATOL, rtol=0.0
             ):
@@ -176,7 +188,7 @@ def _project_policies(values, valid, names):
 
 
 def compute_overlap(features, bundle, predictor_names):
-    """Compute one 8x8 matrix on the same observed junction movements."""
+    """Compute policy and observed-behavior overlap on common-valid movements."""
     names = tuple(predictor_names)
     if len(names) != 8 or "vector" not in names or "hierarchical_mlmdp" not in names:
         raise ValueError("Overlap requires the eight configured regression predictors")
@@ -210,14 +222,23 @@ def compute_overlap(features, bundle, predictor_names):
         if eligible_row
         for reason in row_reasons
     )
-    numerator = np.zeros((8, 8), dtype=np.float64)
-    for row_policies in projected[included]:
-        numerator += np.minimum(row_policies[:, None, :], row_policies[None, :, :]).sum(
-            axis=-1
-        )
+    overlap_labels = (
+        *(_DONT_REVERSE if name == "reverse" else name for name in names),
+        _OBSERVED_BEHAVIOR,
+    )
+    numerator = np.zeros((len(overlap_labels), len(overlap_labels)), dtype=np.float64)
+    observed_behavior = np.eye(4, dtype=np.float64)[actions[included]]
+    distributions = np.concatenate(
+        (projected[included], observed_behavior[:, None, :]), axis=1
+    )
+    for row_distributions in distributions:
+        numerator += np.minimum(
+            row_distributions[:, None, :], row_distributions[None, :, :]
+        ).sum(axis=-1)
     matrix = numerator / n_included if n_included else None
     return {
         "predictor_names": list(names),
+        "overlap_labels": list(overlap_labels),
         "n_eligible_branch_movements": n_eligible,
         "n_included_common_valid": n_included,
         "n_excluded": n_eligible - n_included,
@@ -249,7 +270,9 @@ def write_partition_overlap(config, output_dir, partition, *, force=False):
     }
     destination = directory / "policy_overlap.json"
     if destination.is_file() and not force:
-        cached = _verified_json(destination, _ARTIFACT_TYPE)
+        cached = _verified_json(
+            destination, _ARTIFACT_TYPE, schema_version=_OVERLAP_SCHEMA_VERSION
+        )
         if cached.get("compatibility") != compatibility:
             raise ValueError(
                 f"Refusing incompatible cached overlap artifact {destination}"
@@ -257,7 +280,7 @@ def write_partition_overlap(config, output_dir, partition, *, force=False):
         return cached
     result = compute_overlap(features, bundle, config.predictors.names)
     payload = {
-        "schema_version": 1,
+        "schema_version": _OVERLAP_SCHEMA_VERSION,
         "artifact_type": _ARTIFACT_TYPE,
         "status": "success",
         "partition": _json_value(partition.metadata()),
@@ -279,7 +302,12 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
     if manifest.get("configuration_signature") != config.signature:
         raise ValueError("Workflow manifest does not match the overlap configuration")
     names = list(config.predictors.names)
-    numerator = np.zeros((8, 8), dtype=np.float64)
+    overlap_labels = [
+        *(_DONT_REVERSE if name == "reverse" else name for name in names),
+        _OBSERVED_BEHAVIOR,
+    ]
+    matrix_size = len(overlap_labels)
+    numerator = np.zeros((matrix_size, matrix_size), dtype=np.float64)
     counts = Counter()
     reasons = Counter()
     sessions = []
@@ -291,7 +319,9 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
         if not path.is_file():
             missing.append(partition.digest)
             continue
-        record = _verified_json(path, _ARTIFACT_TYPE)
+        record = _verified_json(
+            path, _ARTIFACT_TYPE, schema_version=_OVERLAP_SCHEMA_VERSION
+        )
         feature_path = directory / "features.json"
         predictor_path = directory / "predictor.json"
         if not feature_path.is_file() or not predictor_path.is_file():
@@ -305,6 +335,7 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
             or record.get("partition") != _json_value(partition.metadata())
             or record.get("partition_digest") != partition.digest
             or record.get("predictor_names") != names
+            or record.get("overlap_labels") != overlap_labels
             or compatibility.get("source") != _source_identity()
             or compatibility.get("partition") != _json_value(partition.metadata())
             or compatibility.get("training_session_ids")
@@ -330,7 +361,7 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
         session_matrix = record["overlap_matrix"]
         mass_tolerance = _MASS_ATOL * max(1, count)
         if (
-            session_numerator.shape != (8, 8)
+            session_numerator.shape != (matrix_size, matrix_size)
             or not np.isfinite(session_numerator).all()
             or np.any(session_numerator < -mass_tolerance)
             or np.any(session_numerator > count + mass_tolerance)
@@ -375,13 +406,23 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
     complete = not missing and counts["included"] > 0
     matrix = numerator / counts["included"] if complete else None
     report = {
-        "schema_version": 1,
+        "schema_version": _OVERLAP_SCHEMA_VERSION,
         "artifact_type": "observed_decision_policy_overlap_report",
         "status": "complete" if not missing else "incomplete",
         "configuration_signature": config.signature,
         "manifest_signature": manifest["configuration_signature"],
         "definition": "sum_a min(p_a, q_a) = 1 - total_variation(p, q)",
+        "observed_behavior_definition": (
+            "Per-decision one-hot distribution at the action recorded in "
+            "features.json; overlap with policy p equals p(observed action)."
+        ),
+        "dont_reverse_definition": (
+            "Complement of the normalized saved reverse action vector over "
+            "valid actions, normalized to sum to one; undefined when the "
+            "reverse vector has no support or points to a blocked action."
+        ),
         "predictor_names": names,
+        "overlap_labels": overlap_labels,
         "n_eligible_branch_movements": counts["eligible"],
         "n_included_common_valid": counts["included"],
         "n_excluded": counts["excluded"],
@@ -406,12 +447,12 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
             "policy": name,
             **{
                 other: None if matrix is None else float(matrix[index, column])
-                for column, other in enumerate(names)
+                for column, other in enumerate(overlap_labels)
             },
         }
-        for index, name in enumerate(names)
+        for index, name in enumerate(overlap_labels)
     ]
-    _write_csv(csv_path, csv_rows, ("policy", *names))
+    _write_csv(csv_path, csv_rows, ("policy", *overlap_labels))
     paths = {}
     if plot:
         import plotly.graph_objects as go
@@ -420,9 +461,13 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
 
         figure = go.Figure(
             go.Heatmap(
-                z=(matrix if matrix is not None else np.full((8, 8), np.nan)),
-                x=names,
-                y=names,
+                z=(
+                    matrix
+                    if matrix is not None
+                    else np.full((matrix_size, matrix_size), np.nan)
+                ),
+                x=overlap_labels,
+                y=overlap_labels,
                 zmin=0,
                 zmax=1,
                 colorscale="Viridis",
@@ -434,6 +479,7 @@ def write_overlap_report(config, output_dir, manifest, *, plot=False):
             title="Observed-decision policy probability overlap",
             xaxis_title="Policy",
             yaxis_title="Policy",
+            yaxis_autorange="reversed",
             width=1050,
             height=850,
         )

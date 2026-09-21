@@ -1,5 +1,6 @@
 """Scientific and workflow checks for observed-decision policy overlap."""
 
+import csv
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -199,10 +200,75 @@ def test_common_rows_ties_and_movement_weighting():
         "zero_support_habit": 1,
     }
     matrix = np.asarray(result["overlap_matrix"])
+    behavior = result["overlap_labels"].index("observed_behavior")
+    assert result["predictor_names"] == list(config.predictors.names)
+    assert result["overlap_labels"] == [
+        *(
+            "dont_reverse" if name == "reverse" else name
+            for name in config.predictors.names
+        ),
+        "observed_behavior",
+    ]
+    assert matrix.shape == (9, 9)
     assert matrix[vector, optimal] == pytest.approx(0.5)
+    assert matrix[vector, behavior] == pytest.approx(0.25)
+    assert matrix[optimal, behavior] == pytest.approx(0.75)
+    dont_reverse = result["overlap_labels"].index("dont_reverse")
+    assert matrix[dont_reverse, behavior] == pytest.approx(0.5)
     assert np.allclose(matrix, matrix.T, atol=1e-10, rtol=0)
     assert np.allclose(np.diag(matrix), 1.0, atol=1e-10, rtol=0)
     assert np.all((0 <= matrix) & (matrix <= 1))
+
+    values = np.asarray(features["predictor_action_values"], dtype=np.float64)
+    valid = np.asarray(features["impossible_action_mask"]) == 0
+    projected, reasons = _project_policies(values, valid, config.predictors.names)
+    included = (valid.sum(axis=1) > 2) & np.asarray([not reason for reason in reasons])
+    expected_policy_block = np.minimum(
+        projected[included, :, None, :], projected[included, None, :, :]
+    ).sum(axis=(0, -1)) / included.sum()
+    assert matrix[:8, :8] == pytest.approx(expected_policy_block)
+    expected_behavior_overlap = projected[included][
+        np.arange(included.sum()), :, np.asarray(features["responses"])[included]
+    ].mean(axis=0)
+    assert matrix[:8, behavior] == pytest.approx(expected_behavior_overlap)
+
+
+def test_dont_reverse_projection_is_uniform_over_other_valid_actions():
+    names = _config().predictors.names
+    reverse = names.index("reverse")
+    values = np.stack(
+        [
+            _vectors(names, vector=[1, 0, 0, 0], optimal=[1, 0, 0, 0]),
+            _vectors(names, vector=[1, 0, 0, 0], optimal=[1, 0, 0, 0]),
+            _vectors(
+                names,
+                vector=[1, 0, 0, 0],
+                optimal=[1, 0, 0, 0],
+                reverse=[0, 0, 0, 1],
+            ),
+            _vectors(
+                names,
+                vector=[1, 0, 0, 0],
+                optimal=[1, 0, 0, 0],
+                reverse=[0, 0, 0, 0],
+            ),
+        ]
+    )
+    valid = np.asarray(
+        [
+            [True, True, True, False],
+            [True, True, True, True],
+            [True, True, True, False],
+            [True, True, True, True],
+        ]
+    )
+
+    probabilities, reasons = _project_policies(values, valid, names)
+
+    assert reasons == [set(), set(), {"blocked_reverse"}, {"missing_previous_action"}]
+    assert probabilities[0, reverse] == pytest.approx([0.5, 0.5, 0.0, 0.0])
+    assert probabilities[1, reverse] == pytest.approx([1 / 3, 1 / 3, 0, 1 / 3])
+    assert np.all(probabilities[2:, reverse] == 0)
 
 
 def test_projection_uses_explicit_float64_tolerances():
@@ -291,9 +357,17 @@ def test_partition_cache_pooling_and_missing_session(tmp_path, monkeypatch):
     pooled = json.loads(Path(report["result"]).read_text())
     vector = config.predictors.names.index("vector")
     optimal = config.predictors.names.index("optimal")
+    behavior = pooled["overlap_labels"].index("observed_behavior")
+    assert pooled["schema_version"] == 3
+    assert np.asarray(pooled["overlap_matrix"]).shape == (9, 9)
     assert pooled["n_included_common_valid"] == 3
     assert pooled["overlap_matrix"][vector][optimal] == pytest.approx(2 / 3)
+    assert pooled["overlap_matrix"][vector][behavior] == pytest.approx(1 / 3)
     assert len(pooled["sessions"]) == 2
+    with Path(report["csv"]).open(newline="", encoding="utf-8") as input_file:
+        csv_rows = list(csv.DictReader(input_file))
+    assert [row["policy"] for row in csv_rows] == pooled["overlap_labels"]
+    assert list(csv_rows[0]) == ["policy", *pooled["overlap_labels"]]
     figures = []
     monkeypatch.setattr(
         regression_reporting,
@@ -302,7 +376,10 @@ def test_partition_cache_pooling_and_missing_session(tmp_path, monkeypatch):
     )
     plotted = write_overlap_report(config, tmp_path, manifest, plot=True)
     assert plotted["plots"] == {"html": "plot"}
-    assert np.asarray(figures[0].data[0].z).shape == (8, 8)
+    assert np.asarray(figures[0].data[0].z).shape == (9, 9)
+    assert list(figures[0].data[0].x) == pooled["overlap_labels"]
+    assert list(figures[0].data[0].y) == pooled["overlap_labels"]
+    assert figures[0].layout.yaxis.autorange == "reversed"
     (tmp_path / "partitions" / second.digest / "policy_overlap.json").unlink()
     incomplete = write_overlap_report(config, tmp_path, manifest)
     assert incomplete["status"] == "incomplete"
@@ -338,6 +415,26 @@ def test_rejects_partition_swap_and_incompatible_cached_features(tmp_path):
     _write_artifacts(tmp_path, partition, features, bundle)
     with pytest.raises(ValueError, match="incompatible cached"):
         write_partition_overlap(config, tmp_path, partition)
+
+
+def test_old_overlap_schema_requires_forced_regeneration(tmp_path):
+    config = _config()
+    partition = PredictorPartition(1, "m2", "s1", ("train",))
+    features, bundle = _artifacts(config, partition)
+    _write_artifacts(tmp_path, partition, features, bundle)
+    record = write_partition_overlap(config, tmp_path, partition)
+    path = tmp_path / "partitions" / partition.digest / "policy_overlap.json"
+    old = {**record, "schema_version": 2}
+    old["artifact_digest"] = _payload_digest(
+        {key: value for key, value in old.items() if key != "artifact_digest"}
+    )
+    _atomic_write_json(path, old)
+
+    with pytest.raises(ValueError, match="Incompatible artifact type or schema"):
+        write_partition_overlap(config, tmp_path, partition)
+    regenerated = write_partition_overlap(config, tmp_path, partition, force=True)
+    assert regenerated["schema_version"] == 3
+    assert np.asarray(regenerated["overlap_matrix"]).shape == (9, 9)
 
 
 def test_cli_partition_command_writes_overlap_artifact(tmp_path, monkeypatch, capsys):
