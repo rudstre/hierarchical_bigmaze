@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -781,6 +782,15 @@ def run_rank_discovery(
 ) -> dict[str, object]:
     """Fit and atomically store the split-independent NMF result for one rank."""
 
+    directory = Path(output_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    # Different workflows may share this cache. Lock the rank, not the run.
+    with (directory / f"k_{k:02d}.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _run_rank_discovery_locked(config, k, directory, force)
+
+
+def _run_rank_discovery_locked(config, k, output_dir, force):
     from andrew_mlmdp.discovery import (
         NMFConfig,
         NMFConnectivityConfig,
@@ -858,7 +868,14 @@ def run_rank_discovery(
             "message": str(error),
         }
         payload["timings_seconds"] = {"total": time.perf_counter() - started}
-        _atomic_write_json(shard_path, payload)
+        # A failed attempt must never destroy a reusable basis, even under
+        # force=True. Successful replacement is the only overwrite operation.
+        if shard_path.exists():
+            failure_dir = shard_path.parent / "failed_attempts"
+            failure_path = failure_dir / f"k_{k:02d}_{time.time_ns()}.json"
+            _atomic_write_json(failure_path, payload)
+        else:
+            _atomic_write_json(shard_path, payload)
         if isinstance(error, RankValidationError):
             raise
         raise RankValidationError(

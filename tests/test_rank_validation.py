@@ -409,3 +409,76 @@ def test_presentation_aggregation_accepts_a_stored_source_fingerprint(
 
     result = aggregate_rank_results(config, shards, tmp_path / "aggregate")
     assert result["worker_compatibility"]["source"] == incompatible["source"]
+
+
+@pytest.mark.parametrize("failure", ["incompatible", "prepare", "replace"])
+def test_discovery_failure_preserves_existing_basis(tmp_path, monkeypatch, failure):
+    directory = tmp_path / "discovery"
+    directory.mkdir()
+    shard = directory / "k_02.json"
+    original = {
+        "artifact_type": "rank_discovery", "k": 2, "status": "success",
+        "compatibility": {"identity": "original"},
+        "discovery": {"profiles": [[1.0, 2.0]]},
+    }
+    shard.write_text(json.dumps(original))
+    before = shard.read_bytes()
+
+    def load(_):
+        if failure == "prepare":
+            raise OSError("cannot load data")
+        return SimpleNamespace(environment=object())
+
+    def fit(*args, **kwargs):
+        raise RuntimeError("replacement failed")
+
+    monkeypatch.setattr(validation, "_load_dataset_context", load)
+    monkeypatch.setattr(validation, "_discovery_compatibility", lambda *a: {})
+    monkeypatch.setattr(discovery, "discover_subgoals", fit)
+    with pytest.raises(RankValidationError):
+        run_rank_discovery(_config(tmp_path), 2, directory, force=failure == "replace")
+    assert shard.read_bytes() == before
+    failures = list((directory / "failed_attempts").glob("*.json"))
+    assert len(failures) == 1
+    assert json.loads(failures[0].read_text())["status"] == "failure"
+
+
+def test_discovery_shared_rank_lock_and_successful_replacement(tmp_path, monkeypatch):
+    import fcntl
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    directory = tmp_path / "discovery"
+    entered, release = Event(), Event()
+    calls = []
+
+    def load(_):
+        # An independently opened descriptor cannot acquire this rank's lock.
+        with (directory / "k_02.lock").open("a") as contender:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return SimpleNamespace(environment=object())
+
+    def fit(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(10)
+        return SimpleNamespace(
+            rank_result=lambda k: SimpleNamespace(discovery=object())
+        )
+
+    monkeypatch.setattr(validation, "_load_dataset_context", load)
+    monkeypatch.setattr(validation, "_discovery_compatibility", lambda *a: {})
+    monkeypatch.setattr(discovery, "discover_subgoals", fit)
+    monkeypatch.setattr(validation, "_rank_result_payload", lambda _: {"basis": calls[:]})
+    config = _config(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run_rank_discovery, config, 2, directory)
+        assert entered.wait(10)
+        second = pool.submit(run_rank_discovery, config, 2, directory)
+        release.set()
+        assert first.result() == second.result()
+    assert len(calls) == 1
+    replacement = run_rank_discovery(config, 2, directory, force=True)
+    assert replacement["status"] == "success"
+    assert replacement["discovery"]["basis"] == [1, 1]
