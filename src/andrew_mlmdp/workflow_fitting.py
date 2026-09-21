@@ -32,8 +32,11 @@ def fit_explicit_split(
     )
     initial_score = _strict_score(initial, training_trials)
     adam = config.adam
+    from andrew_mlmdp.workflow_progress import report_fit_step
+
     fit_result = initial.fit(
         training_trials,
+        callback=report_fit_step,
         names=adam.fitted_names,
         lr=adam.learning_rate,
         max_steps=adam.max_steps,

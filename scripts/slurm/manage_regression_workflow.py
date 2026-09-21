@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import hashlib
 import json
@@ -29,7 +30,10 @@ from andrew_mlmdp.regression_workflow import (  # noqa: E402
     load_regression_workflow_config,
     write_manifest,
 )
-from andrew_mlmdp.validation import _payload_digest  # noqa: E402
+from andrew_mlmdp.validation import (  # noqa: E402
+    _payload_digest,
+    source_code_fingerprint,
+)
 
 MANAGER_SCHEMA_VERSION = 1
 DEFAULT_PYTHON = "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python"
@@ -44,6 +48,9 @@ def parser():
     result.add_argument("--python", default=DEFAULT_PYTHON)
     result.add_argument("--max-array-size", type=int, default=1000)
     result.add_argument("--retry-missing", action="store_true")
+    result.add_argument("--no-precompute-lattice", action="store_true")
+    result.add_argument("--lattice-memory", default="2G")
+    result.add_argument("--lattice-time", default="00:30:00")
     result.add_argument("--status", action="store_true")
     result.add_argument("--cancel", action="store_true")
     result.add_argument("--json", action="store_true")
@@ -133,7 +140,7 @@ def _resource_bands(raw, rank_range):
     ]
 
 
-def _stage_tasks(config, workflow_manifest):
+def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
     partitions = [_partition(record) for record in workflow_manifest["partitions"]]
     tasks = {
         "discovery": [{"stage": "discovery", "k": rank} for rank in config.ranks],
@@ -147,6 +154,11 @@ def _stage_tasks(config, workflow_manifest):
         "aggregation": [{"stage": "aggregation"}],
         "plotting": [{"stage": "plotting"}],
     }
+    if include_lattice and config.regression_cv.method == "blocked_trial_kfold":
+        tasks["lattice-precompute"] = [
+            {"stage": "lattice-precompute", "partition_digest": p.digest}
+            for p in partitions
+        ]
     for partition in partitions:
         identity = {"partition_digest": partition.digest}
         tasks["candidate"].extend(
@@ -162,7 +174,10 @@ def _stage_tasks(config, workflow_manifest):
         if config.subgoal_selection.method == "session_cv":
             tasks["selected-refit"].append({"stage": "selected-refit", **identity})
         for stage in (
-            "predictor-bundle", "feature-generation", "regression", "policy-overlap"
+            "predictor-bundle",
+            "feature-generation",
+            "regression",
+            "policy-overlap",
         ):
             tasks[stage].append({"stage": stage, **identity})
     return tasks
@@ -273,6 +288,17 @@ def _submit_group(
             attempt,
         )
         if not dry_run:
+            chunk = [
+                dict(
+                    task,
+                    worker_source=manager.get("worker_source"),
+                    config_sha256=manager.get("config_digest"),
+                    discovery_config_path=manager.get("discovery_config_path"),
+                    discovery_config_sha256=manager.get("discovery_config_sha256"),
+                    manifest_sha256=manager.get("manifest_sha256"),
+                )
+                for task in chunk
+            ]
             _write_task_list(task_path, stage, chunk)
         export = ",".join(
             (
@@ -290,6 +316,7 @@ def _submit_group(
             "sbatch",
             "--parsable",
             f"--partition={resources['partition']}",
+            "--cpus-per-task=1",
             f"--mem={resources['memory']}",
             f"--time={resources['time']}",
             f"--array=0-{len(chunk) - 1}%{array_limit}",
@@ -338,6 +365,20 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
         if config.regression_cv.method == "blocked_trial_learning_curve"
         else ("combined", "route_only", "mlmdp_only")
     )
+    if stage == "lattice-precompute":
+        path = run_dir / "analyses" / f"lattice_{digest}_initial.json"
+        if not path.exists():
+            return "missing"
+        index = _read(path)
+        entries = index.get("entries", [])
+        complete = (
+            index.get("all_attempted")
+            and index.get("expected") == 255
+            and index.get("completed") == 255
+            and len(entries) == 255
+            and len({tuple(e["predictor_names"]) for e in entries}) == 255
+        )
+        return "success" if complete else "pending"
     if stage == "discovery":
         directory = (
             config.resolve_path(config.discovery_dir)
@@ -507,9 +548,7 @@ def _submission_task_states(submission, records):
         if "_[" not in logical_id and logical_id != job_id
     }
     states = Counter(individual.values())
-    compact = [
-        state for logical_id, state in job_records.items() if "_[" in logical_id
-    ]
+    compact = [state for logical_id, state in job_records.items() if "_[" in logical_id]
     remaining = task_count - len(individual)
     if compact and remaining > 0:
         states[compact[-1]] += remaining
@@ -529,9 +568,7 @@ def _stage_state(artifacts, scheduler, submissions):
     if any(scheduler.get(state, 0) for state in ("PENDING", "CONFIGURING")):
         has_dependency = any(item["dependency"] for item in submissions)
         return "WAITING" if has_dependency else "PENDING"
-    if any(
-        scheduler.get(state, 0) for state in ("FAILED", "TIMEOUT", "OUT_OF_MEMORY")
-    ):
+    if any(scheduler.get(state, 0) for state in ("FAILED", "TIMEOUT", "OUT_OF_MEMORY")):
         return "FAILED"
     if scheduler.get("CANCELLED", 0):
         return "CANCELLED"
@@ -540,8 +577,12 @@ def _stage_state(artifacts, scheduler, submissions):
     return "NOT_SUBMITTED"
 
 
-def _status_report(states, manager):
-    records = _scheduler_records(manager)
+def _status_report(states, manager, *, scheduler_records=None):
+    records = (
+        _scheduler_records(manager)
+        if scheduler_records is None
+        else scheduler_records
+    )
     stages = {}
     for stage, artifact_counter in states.items():
         submissions = [
@@ -722,10 +763,48 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
         )
         if jobs:
             dependency = jobs
+        if stage == "feature-generation" and tasks.get("lattice-precompute"):
+            _submit_group(
+                manager,
+                manager_path,
+                "lattice-precompute",
+                tasks["lattice-precompute"],
+                {
+                    **common,
+                    **manager.get(
+                        "lattice_resources", {"memory": "2G", "time": "00:30:00"}
+                    ),
+                },
+                dependency,
+                dry_run=dry_run,
+            )
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.status or args.dry_run:
+        return _main(args)
+    output = (
+        args.output_dir.resolve()
+        if args.output_dir
+        else args.project_root.resolve() / "output/regression_workflow" / args.run_id
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / ".submission.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record = output / "slurm_manager.json"
+        if (
+            not args.cancel
+            and record.exists()
+            and _active_submission_ids(_read(record))
+        ):
+            raise ValueError(
+                "Recorded jobs are still active; inspect --status before retrying"
+            )
+        return _main(args)
+
+
+def _main(args):
     if args.cancel and (args.status or args.retry_missing):
         raise ValueError("--cancel cannot be combined with --status or --retry-missing")
     root = args.project_root.resolve()
@@ -769,6 +848,16 @@ def main(argv=None):
             != hashlib.sha256(config_path.read_bytes()).hexdigest()
         ):
             raise ValueError("Current config differs from the submitted config")
+        if manager.get("discovery_config_sha256") and (
+            manager["discovery_config_sha256"]
+            != hashlib.sha256(config.discovery_config_path.read_bytes()).hexdigest()
+        ):
+            raise ValueError("Discovery config differs from the submitted input")
+        if manager.get("manifest_sha256") and (
+            manager["manifest_sha256"]
+            != hashlib.sha256((output / "manifest.json").read_bytes()).hexdigest()
+        ):
+            raise ValueError("Workflow manifest differs from the submitted input")
         workflow_manifest = _read(output / "manifest.json")
     else:
         if args.retry_missing or args.status:
@@ -799,18 +888,38 @@ def main(argv=None):
             "python_executable": args.python,
             "config_path": str(config_path),
             "config_digest": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "discovery_config_path": str(config.discovery_config_path),
+            "discovery_config_sha256": hashlib.sha256(
+                config.discovery_config_path.read_bytes()
+            ).hexdigest(),
             "output_dir": str(output),
             "max_array_size": args.max_array_size,
             "rank_range": list(config.subgoal_selection.rank_range),
             "submissions": [],
+            "precompute_lattice": (
+                not args.no_precompute_lattice
+                and config.regression_cv.method == "blocked_trial_kfold"
+            ),
+            "lattice_resources": {
+                "memory": args.lattice_memory,
+                "time": args.lattice_time,
+            },
+            "worker_source": source_code_fingerprint(root)["content_sha256"],
         }
         if not args.dry_run:
             output.mkdir(parents=True, exist_ok=True)
             (output / "logs").mkdir(exist_ok=True)
             write_manifest(config, output, table)
+            manager["manifest_sha256"] = hashlib.sha256(
+                (output / "manifest.json").read_bytes()
+            ).hexdigest()
             _atomic_json(manager_path, manager)
 
-    tasks = _stage_tasks(config, workflow_manifest)
+    tasks = _stage_tasks(
+        config,
+        workflow_manifest,
+        include_lattice=manager.get("precompute_lattice", False),
+    )
     states = {
         stage: Counter(
             _artifact_state(config, output, task, workflow_manifest)

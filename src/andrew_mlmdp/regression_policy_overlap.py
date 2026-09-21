@@ -187,7 +187,9 @@ def _project_policies(values, valid, names):
     return probabilities, reasons
 
 
-def compute_overlap(features, bundle, predictor_names):
+def compute_overlap(
+    features, bundle, predictor_names, *, scope="three_or_four_valid_actions"
+):
     """Compute policy and observed-behavior overlap on common-valid movements."""
     names = tuple(predictor_names)
     if len(names) != 8 or "vector" not in names or "hierarchical_mlmdp" not in names:
@@ -211,7 +213,13 @@ def compute_overlap(features, bundle, predictor_names):
         raise ValueError("Regression features contain nonfinite action values")
     _check_hierarchy_vectors(features, bundle, names, values)
     valid = mask == 0
-    eligible = valid.sum(axis=1) > 2
+    if scope not in {"all_decisions", "three_or_four_valid_actions"}:
+        raise ValueError(f"Unknown evaluation scope: {scope}")
+    eligible = (
+        valid.sum(axis=1) > 2
+        if scope == "three_or_four_valid_actions"
+        else np.ones(len(valid), dtype=bool)
+    )
     projected, reasons = _project_policies(values, valid, names)
     included = eligible & np.asarray([not row_reasons for row_reasons in reasons])
     n_eligible = int(eligible.sum())
@@ -507,3 +515,52 @@ def write_all_overlaps(config, output_dir, manifest, *, force=False, plot=False)
         ).is_file():
             write_partition_overlap(config, root, partition, force=force)
     return write_overlap_report(config, root, manifest, plot=plot)
+
+
+def pool_overlap(records, expected_partitions):
+    """Pool saved numerators on a fixed population without loading model inputs."""
+    expected = {e["partition_digest"] for e in expected_partitions}
+    selected = [r for r in records if r["partition_digest"] in expected]
+    ids = [r["partition_digest"] for r in selected]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate overlap partition")
+    missing = sorted(expected - set(ids))
+    if not selected:
+        return {
+            "status": "incomplete",
+            "missing_partitions": missing,
+            "overlap_matrix": None,
+            "n_included_common_valid": 0,
+        }
+    labels = selected[0]["overlap_labels"]
+    scope = selected[0].get("evaluation_scope", "three_or_four_valid_actions")
+    if any(
+        r["overlap_labels"] != labels
+        or r.get("evaluation_scope", "three_or_four_valid_actions") != scope
+        for r in selected
+    ):
+        raise ValueError("Overlap labels or populations differ")
+    count = sum(r["n_included_common_valid"] for r in selected)
+    eligible = sum(r["n_eligible_branch_movements"] for r in selected)
+    numerator = sum(
+        (np.asarray(r["overlap_numerator"], dtype=np.float64) for r in selected),
+        np.zeros((len(labels), len(labels))),
+    )
+    reasons = Counter()
+    for r in selected:
+        reasons.update(r["excluded_by_reason"])
+    failed = [r["partition_digest"] for r in selected if r.get("status") != "success"]
+    return {
+        "status": "incomplete" if missing or failed else "complete",
+        "missing_partitions": missing,
+        "failed_partitions": failed,
+        "overlap_labels": labels,
+        "evaluation_scope": scope,
+        "n_included_common_valid": count,
+        "n_eligible_branch_movements": eligible,
+        "percentage_retained": 100 * count / eligible if eligible else None,
+        "excluded_by_reason": dict(reasons),
+        "overlap_matrix": (numerator / count).tolist()
+        if count and not missing and not failed
+        else None,
+    }

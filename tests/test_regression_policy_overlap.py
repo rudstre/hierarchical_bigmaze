@@ -223,9 +223,12 @@ def test_common_rows_ties_and_movement_weighting():
     valid = np.asarray(features["impossible_action_mask"]) == 0
     projected, reasons = _project_policies(values, valid, config.predictors.names)
     included = (valid.sum(axis=1) > 2) & np.asarray([not reason for reason in reasons])
-    expected_policy_block = np.minimum(
-        projected[included, :, None, :], projected[included, None, :, :]
-    ).sum(axis=(0, -1)) / included.sum()
+    expected_policy_block = (
+        np.minimum(
+            projected[included, :, None, :], projected[included, None, :, :]
+        ).sum(axis=(0, -1))
+        / included.sum()
+    )
     assert matrix[:8, :8] == pytest.approx(expected_policy_block)
     expected_behavior_overlap = projected[included][
         np.arange(included.sum()), :, np.asarray(features["responses"])[included]
@@ -579,3 +582,38 @@ def test_overlap_uses_qin_regression_vectors_and_causal_route_beliefs(
     assert projected[1, names.index(planning_name)] == pytest.approx(expected_planning)
     assert "missing_previous_action" in reasons[0]
     assert "missing_previous_action" in reasons[3]
+
+
+def test_all_location_overlap_has_a_distinct_population():
+    from andrew_mlmdp.regression_policy_overlap import pool_overlap
+
+    config = _config()
+    partition = PredictorPartition(1, "m2", "heldout", ("s1", "s2"))
+    features, bundle = _artifacts(config, partition)
+    junction = compute_overlap(features, bundle, config.predictors.names)
+    all_locations = compute_overlap(
+        features, bundle, config.predictors.names, scope="all_decisions"
+    )
+    assert (
+        all_locations["n_eligible_branch_movements"]
+        > junction["n_eligible_branch_movements"]
+    )
+    selected = [{"partition_digest": partition.digest}]
+    pooled = pool_overlap(
+        [{**junction, "partition_digest": partition.digest, "status": "success"}],
+        selected,
+    )
+    assert pooled["n_included_common_valid"] == junction["n_included_common_valid"]
+    assert pooled["overlap_matrix"] == junction["overlap_matrix"]
+    with pytest.raises(ValueError, match="populations"):
+        pool_overlap(
+            [
+                {**junction, "partition_digest": partition.digest},
+                {
+                    **all_locations,
+                    "partition_digest": "other",
+                    "evaluation_scope": "all_decisions",
+                },
+            ],
+            [*selected, {"partition_digest": "other"}],
+        )

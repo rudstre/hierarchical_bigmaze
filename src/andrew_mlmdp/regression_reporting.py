@@ -14,7 +14,6 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from andrew_mlmdp.regression_execution import (
-    _REGRESSION_VARIANTS,
     _pool_learning_curve,
     _prepare_qin_imports,
     aggregate_learning_curve_results,
@@ -67,9 +66,7 @@ def _junction_scored_record(record, features, nll_function, accuracy_function):
     """Rescore one learning-curve artifact at locations with 3–4 valid actions."""
     if features.get("artifact_digest") != record.get("feature_artifact_digest"):
         raise ValueError("Feature artifact does not match regression artifact")
-    predictor_values = np.asarray(
-        features["predictor_action_values"], dtype=np.float64
-    )
+    predictor_values = np.asarray(features["predictor_action_values"], dtype=np.float64)
     design = np.concatenate(
         [np.ones((*predictor_values.shape[:2], 1)), predictor_values], axis=-1
     )
@@ -236,9 +233,7 @@ def _add_uniform_policy_baseline(
         ):
             group_row[key] = (
                 float(
-                    np.mean(
-                        [subject_baselines[subject][key] for subject in subjects]
-                    )
+                    np.mean([subject_baselines[subject][key] for subject in subjects])
                 )
                 if subjects
                 else None
@@ -274,9 +269,7 @@ def _junction_learning_curve_summary(config, records, manifest, features):
     )
     _add_learning_curve_accuracy(summary, rescored)
     _use_complete_subject_group_estimates(summary)
-    _add_uniform_policy_baseline(
-        summary, records, features, valid_action_counts=(3, 4)
-    )
+    _add_uniform_policy_baseline(summary, records, features, valid_action_counts=(3, 4))
     for row in summary["split_rows"]:
         if row["status"] == "success" and row["n_test_decisions"] == 0:
             row["status"] = "not_applicable"
@@ -431,12 +424,8 @@ def _use_complete_subject_group_estimates(summary):
                 "training_percentage": (
                     float(np.mean(percentages)) if percentages else None
                 ),
-                "training_percentage_min": (
-                    min(percentages) if percentages else None
-                ),
-                "training_percentage_max": (
-                    max(percentages) if percentages else None
-                ),
+                "training_percentage_min": (min(percentages) if percentages else None),
+                "training_percentage_max": (max(percentages) if percentages else None),
                 "mean_test_log_likelihood": (
                     available_mean if group_row["complete"] else None
                 ),
@@ -535,9 +524,7 @@ def make_regression_figure(summary, predictor_names, *, title=None):
 
 def make_regression_accuracy_figure(summary, predictor_names, *, title=None):
     """Create held-out full-minus-reduced accuracy panels."""
-    return _make_regression_figure(
-        summary, predictor_names, accuracy=True, title=title
-    )
+    return _make_regression_figure(summary, predictor_names, accuracy=True, title=title)
 
 
 def _make_regression_figure(summary, predictor_names, *, accuracy, title):
@@ -820,11 +807,7 @@ def _make_learning_curve_figure(summary, *, accuracy):
     for column, (scope, panel) in enumerate(panels, start=1):
         for subject in subjects:
             rows = sorted(
-                (
-                    row
-                    for row in panel["subjects"]
-                    if row["subject_id"] == subject
-                ),
+                (row for row in panel["subjects"] if row["subject_id"] == subject),
                 key=lambda row: row["subdivision_index"],
             )
             figure.add_trace(
@@ -883,8 +866,7 @@ def _make_learning_curve_figure(summary, *, accuracy):
                 error_y={
                     "type": "data",
                     "array": [
-                        0.0 if value is None else scale * value
-                        for value in group_sems
+                        0.0 if value is None else scale * value for value in group_sems
                     ],
                     "visible": any(value is not None for value in group_sems),
                     "thickness": 1.4,
@@ -929,8 +911,7 @@ def _make_learning_curve_figure(summary, *, accuracy):
                     connectgaps=False,
                     line={"color": "#666666", "width": 2, "dash": "dash"},
                     hovertemplate=(
-                        "Scope: " + scope + "<br>" + baseline_hover
-                        + "<extra></extra>"
+                        "Scope: " + scope + "<br>" + baseline_hover + "<extra></extra>"
                     ),
                 ),
                 row=1,
@@ -967,8 +948,10 @@ def _make_learning_curve_figure(summary, *, accuracy):
 
 
 def report_stem(config, variant="combined"):
-    if variant not in _REGRESSION_VARIANTS:
-        raise ValueError(f"Unknown regression variant {variant!r}")
+    if not variant or any(
+        c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in variant
+    ):
+        raise ValueError(f"Invalid regression variant {variant!r}")
     selection = config.subgoal_selection.method.replace("_", "-")
     heldout = (
         config.heldout_sessions
@@ -1292,7 +1275,10 @@ def write_regression_report(
             else make_regression_figure(
                 summary,
                 predictor_order,
-                title=f"{variant_labels[variant]}: unique held-out predictability",
+                title=(
+                    f"{variant_labels.get(variant, variant)}: "
+                    "unique held-out predictability"
+                ),
             )
         )
         plot_paths = write_plotly_outputs(figure, destination, stem)
@@ -1302,7 +1288,10 @@ def write_regression_report(
             else make_regression_accuracy_figure(
                 summary,
                 predictor_order,
-                title=f"{variant_labels[variant]}: held-out accuracy contribution",
+                title=(
+                    f"{variant_labels.get(variant, variant)}: "
+                    "held-out accuracy contribution"
+                ),
             )
         )
         accuracy_plot_paths = write_plotly_outputs(
@@ -1339,9 +1328,11 @@ def write_regression_variant_reports(
         return {"status": combined["status"], "variants": {"combined": combined}}
 
     reports = {}
-    for variant in _REGRESSION_VARIANTS:
-        predictor_names = regression_variant_predictors(
-            config.predictors.names, variant
+    for variant, records in records_by_variant.items():
+        predictor_names = (
+            records[0]["predictor_names"]
+            if records
+            else regression_variant_predictors(config.predictors.names, variant)
         )
         reports[variant] = write_regression_report(
             config,

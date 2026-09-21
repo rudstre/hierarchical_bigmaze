@@ -269,3 +269,89 @@ action **values**; several predictors are not native probability distributions.
 Overlap describes their similarity on observed behavioral decisions. It does
 not measure regression-coefficient similarity and does not by itself establish
 predictor redundancy or unique variance.
+
+## Cluster GUI and saved-feature analyses
+
+Install the optional GUI dependency in the same Python environment as the
+workflow. In the current `srun-7day` setup, start Streamlit on the allocated
+compute node that runs the VS Code tunnel:
+
+```bash
+python -m pip install -r requirements-gui.txt
+python -m streamlit run scripts/gui/app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+On your laptop, use the SWC compute-node forwarding route (external SSH host,
+then HPC gateway, then the allocated compute node):
+
+```bash
+ssh -N -J USER@ssh.swc.ucl.ac.uk,USER@hpc-gw2 -L 8501:127.0.0.1:8501 USER@COMPUTE_NODE
+```
+
+Then open `http://localhost:8501` in your laptop browser. Replace
+`COMPUTE_NODE` with the node reported by `hostname` inside your allocation;
+the port forward must end at that node. A tunnel ending on a login node would
+forward the login node's localhost instead. The VS Code integrated browser may
+also reach `http://localhost:8501` from the remote workspace, but its Ports
+view can fail to forward ports through a code tunnel. Streamlit reads artifacts
+and launches the existing manager; scientific SLURM jobs continue after the
+browser or GUI closes. If the
+`srun-7day` allocation ends, start the GUI again on a new allocated node and
+forward its port. Select a directory containing `manifest.json` to inspect a
+historical run. Reading results does not require its original configuration file.
+
+A new GUI run snapshots its regression and referenced discovery configurations
+under `inputs/`. The original discovery directory remains shared. Configuration
+changes after launch create a new run; the submitted config is immutable. The
+manager records content hashes for the snapshotted regression configuration,
+referenced discovery configuration, and workflow manifest. Queued workers verify
+these inputs before calculating, so editing one in place stops new work rather
+than silently changing the experiment. The
+configuration preview resolves subjects, dates, predictor-training sessions, and
+held-out sessions before launch. The default k-fold manager run also submits a
+lattice stage: all 255 nonempty combinations of the eight predictors, one worker
+per held-out partition. Disable this with `--no-precompute-lattice` when invoking
+the manager directly, or the equivalent GUI checkbox. Lattice tasks initially
+request one CPU, 2 GB, and thirty minutes; override with `--lattice-memory` and
+`--lattice-time` after measuring a different workload. Existing manager records
+keep their original task set on retry.
+
+Backfill existing runs without refitting predictors:
+
+```bash
+python scripts/run_regression_analysis.py lattice \
+  --output-dir output/regression_workflow/RUN_ID
+python scripts/run_regression_analysis.py scopes \
+  --output-dir output/regression_workflow/RUN_ID
+python scripts/run_regression_analysis.py overlap \
+  --output-dir output/regression_workflow/RUN_ID
+```
+
+`--partition-digest DIGEST` narrows a backfill. Each analysis writes immutable
+specifications under `analyses/<digest>/`, with distinct execution attempts and
+per-partition progress. `--attempt NAME` requests a separate rerun. Scientific
+failures remain visible and are not silently retried. A subset fit always
+includes the full model, its intercept-omitted model, and one model omitting
+each selected predictor. Existing combined, route-only, and MLMDP-only artifacts
+keep their original paths and report names.
+
+The Results GUI reads these analyses without submitting jobs. If a calculation
+is missing, it shows the corresponding backfill command. Add `--cancel` to an
+analysis command to cancel only the recorded active jobs for that kind and
+attempt. The workflow Progress page offers retry and cancellation for jobs
+recorded by the workflow manager.
+
+The location switch changes held-out **evaluation**, not fitting. Both the
+all-decision and three-or-four-valid-action regression scores reconstruct the
+saved fold before scoring selected decisions. A fold with no selected decisions
+is not applicable. Policy overlap uses its own projection: rows with undefined
+policies remain excluded, and selecting matrix columns does not change the
+common-valid row population. Existing overlap artifacts use the three-or-four
+valid-action population. Any newly requested all-location overlap is saved as a
+separate analysis.
+
+Progress has an execution state and a scientific completeness state. Finished
+jobs may still leave a partial scientific grid, in which case group estimates
+remain withheld by the existing reporting rules. On an ambiguous submission
+failure, inspect the recorded job IDs in the run manager and check them with
+`squeue` or `manage_regression_workflow.py --status` before retrying.

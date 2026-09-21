@@ -214,9 +214,7 @@ class PredictorConfig:
                 if maximum is None
                 else f"an integer from 1 through {maximum}"
             )
-            raise ValueError(
-                f"predictors.{name} must be {range_description} or 'auto'"
-            )
+            raise ValueError(f"predictors.{name} must be {range_description} or 'auto'")
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -346,6 +344,19 @@ def load_regression_workflow_config(path: str | Path) -> RegressionWorkflowConfi
     """Load the versioned new schema; old adjacent schemas are never inferred."""
     path = Path(path).resolve()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    config = regression_config_from_payload(
+        payload, _find_project_root(path.parent), source_path=path
+    )
+    discovery = load_validation_config(config.discovery_config_path)
+    if discovery.dataset.maze_name != config.dataset.maze_name:
+        raise ValueError(
+            "discovery_config dataset.maze_name must match dataset.maze_name"
+        )
+    return config
+
+
+def regression_config_from_payload(payload, project_root, *, source_path=None):
+    """Restore recorded settings without requiring external discovery inputs."""
     required = {
         "schema_version",
         "dataset",
@@ -370,7 +381,6 @@ def load_regression_workflow_config(path: str | Path) -> RegressionWorkflowConfi
         raise ValueError(
             "Unsupported regression-workflow schema version; migrate the configuration"
         )
-    root = _find_project_root(path.parent)
     config = RegressionWorkflowConfig(
         dataset=RegressionDatasetConfig(
             **{
@@ -400,14 +410,9 @@ def load_regression_workflow_config(path: str | Path) -> RegressionWorkflowConfi
         regression_cv=RegressionCVConfig(**payload["regression_cv"]),
         predictors=PredictorConfig(**payload["predictors"]),
         random_seed=payload["random_seed"],
-        project_root=root,
-        source_path=path,
+        project_root=project_root,
+        source_path=source_path,
     )
-    discovery = load_validation_config(config.discovery_config_path)
-    if discovery.dataset.maze_name != config.dataset.maze_name:
-        raise ValueError(
-            "discovery_config dataset.maze_name must match dataset.maze_name"
-        )
     return config
 
 

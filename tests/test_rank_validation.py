@@ -209,9 +209,7 @@ def test_adam_config_validates_commitment_mode_and_radius_together():
             commitment_mode="radius", commitment_radius=None
         )
     with pytest.raises(ValueError, match="non-negative integer"):
-        validation.AdamValidationConfig(
-            commitment_mode="radius", commitment_radius=-1
-        )
+        validation.AdamValidationConfig(commitment_mode="radius", commitment_radius=-1)
 
     default = validation.AdamValidationConfig()
     assert default.commitment_mode == "termination"
@@ -417,7 +415,9 @@ def test_discovery_failure_preserves_existing_basis(tmp_path, monkeypatch, failu
     directory.mkdir()
     shard = directory / "k_02.json"
     original = {
-        "artifact_type": "rank_discovery", "k": 2, "status": "success",
+        "artifact_type": "rank_discovery",
+        "k": 2,
+        "status": "success",
         "compatibility": {"identity": "original"},
         "discovery": {"profiles": [[1.0, 2.0]]},
     }
@@ -470,7 +470,9 @@ def test_discovery_shared_rank_lock_and_successful_replacement(tmp_path, monkeyp
     monkeypatch.setattr(validation, "_load_dataset_context", load)
     monkeypatch.setattr(validation, "_discovery_compatibility", lambda *a: {})
     monkeypatch.setattr(discovery, "discover_subgoals", fit)
-    monkeypatch.setattr(validation, "_rank_result_payload", lambda _: {"basis": calls[:]})
+    monkeypatch.setattr(
+        validation, "_rank_result_payload", lambda _: {"basis": calls[:]}
+    )
     config = _config(tmp_path)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_rank_discovery, config, 2, directory)

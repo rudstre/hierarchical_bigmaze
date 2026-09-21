@@ -166,9 +166,7 @@ def _fit_route_and_habit(
     }
 
 
-def _predictor_compatibility(
-    config, partition, candidate, route_rows, route_settings
-):
+def _predictor_compatibility(config, partition, candidate, route_rows, route_settings):
     from andrew_mlmdp.regression_workflow import (
         _stage_source,
         compatibility_signatures,
@@ -807,6 +805,13 @@ def _run_combined_regression(
             }
         )
         tested_trials.extend(split.test_trial_keys)
+        from andrew_mlmdp.workflow_progress import report_progress
+
+        report_progress(
+            phase="regression",
+            folds_complete=len(fold_records),
+            folds_total=len(splits),
+        )
         if learning_curve:
             _write_regression_checkpoint(
                 destination,
@@ -917,9 +922,7 @@ def regression_variant_predictors(
             "hmm_route",
             "hmm_route_planning",
         }
-        return tuple(
-            name for name in names if name not in route_predictors
-        )
+        return tuple(name for name in names if name not in route_predictors)
     raise ValueError(f"Unknown regression variant {variant!r}")
 
 
@@ -929,9 +932,7 @@ def regression_variant_path(
     if variant not in _REGRESSION_VARIANTS:
         raise ValueError(f"Unknown regression variant {variant!r}")
     filename = (
-        "regression.json"
-        if variant == "combined"
-        else f"regression_{variant}.json"
+        "regression.json" if variant == "combined" else f"regression_{variant}.json"
     )
     return Path(root).resolve() / "partitions" / partition_digest / filename
 
@@ -961,6 +962,33 @@ def _fit_saved_ablation_variant(
     force: bool = False,
 ):
     """Fit one predictor subset from an immutable held-out feature artifact."""
+    names = regression_variant_predictors(features["predictor_names"], variant)
+    return fit_predictor_subset(
+        config,
+        partition,
+        features,
+        splits,
+        names,
+        regression_variant_path(root, partition.digest, variant),
+        variant=variant,
+        heldout_session_order=heldout_session_order,
+        force=force,
+    )
+
+
+def fit_predictor_subset(
+    config,
+    partition,
+    features,
+    splits,
+    predictor_names,
+    destination,
+    *,
+    heldout_session_order=0,
+    variant=None,
+    force=False,
+):
+    """Fit full/leave-one-out models from validated immutable feature inputs."""
     import torch
 
     from andrew_mlmdp.regression_workflow import _read_json
@@ -970,9 +998,15 @@ def _fit_saved_ablation_variant(
     all_names = tuple(features["predictor_names"])
     if all_names != tuple(config.predictors.names):
         raise ValueError("Feature predictor order does not match the configuration")
-    predictor_names = regression_variant_predictors(all_names, variant)
+    requested = tuple(predictor_names)
+    if not requested or len(set(requested)) != len(requested):
+        raise ValueError("Predictor subset must be nonempty and unique")
+    if not set(requested) <= set(all_names):
+        raise ValueError("Predictor subset contains unknown names")
+    predictor_names = tuple(name for name in all_names if name in requested)
+    variant = variant or "subset_" + _payload_digest(list(predictor_names))
     selected_columns = [all_names.index(name) for name in predictor_names]
-    destination = regression_variant_path(root, partition.digest, variant)
+    destination = Path(destination)
     compatibility = _variant_compatibility(
         config, partition, features, splits, variant, predictor_names
     )
@@ -1016,6 +1050,8 @@ def _fit_saved_ablation_variant(
     names = _model_names(predictor_names)
     fold_records = []
     tested_trials = []
+    from andrew_mlmdp.workflow_progress import report_progress
+
     for split in splits:
         try:
             train_indices = [
@@ -1097,6 +1133,12 @@ def _fit_saved_ablation_variant(
             }
         )
         tested_trials.extend(split.test_trial_keys)
+        report_progress(
+            phase="regression",
+            folds_complete=len(fold_records),
+            folds_total=len(splits),
+            predictors=list(predictor_names),
+        )
 
     expected_trials = [key for split in splits for key in split.test_trial_keys]
     if len(tested_trials) != len(set(tested_trials)) or set(tested_trials) != set(
@@ -1210,14 +1252,17 @@ def run_saved_regression_variants(
         partition_dir = root / "partitions" / partition.digest
         feature_path = partition_dir / "features.json"
         combined_path = partition_dir / "regression.json"
-        if not feature_path.is_file() or not combined_path.is_file():
+        if not feature_path.is_file():
             raise ValueError(
-                f"Partition {partition.digest} needs completed feature and "
-                "regression artifacts"
+                f"Partition {partition.digest} needs completed feature artifacts"
             )
         features = json.loads(feature_path.read_text(encoding="utf-8"))
-        combined = json.loads(combined_path.read_text(encoding="utf-8"))
-        for path, artifact in ((feature_path, features), (combined_path, combined)):
+        combined = (
+            json.loads(combined_path.read_text(encoding="utf-8"))
+            if combined_path.is_file()
+            else None
+        )
+        for path, artifact in ((feature_path, features),):
             recorded_digest = artifact.get("artifact_digest")
             unsigned = {
                 key: value
@@ -1234,7 +1279,7 @@ def run_saved_regression_variants(
             != tuple(config.predictors.names)
         ):
             raise ValueError(f"Feature artifact identity mismatch: {feature_path}")
-        if (
+        if combined is not None and (
             combined.get("artifact_type") != regression_artifact_type(config)
             or combined.get("status") != "success"
             or combined.get("partition_digest") != partition.digest
@@ -1245,7 +1290,8 @@ def run_saved_regression_variants(
         ):
             raise ValueError(f"Combined regression identity mismatch: {combined_path}")
         splits = [RegressionSplit(**split) for split in expected["regression_splits"]]
-        records["combined"].append(combined)
+        if combined is not None:
+            records["combined"].append(combined)
         for variant in ("route_only", "mlmdp_only"):
             records[variant].append(
                 _fit_saved_ablation_variant(
@@ -1255,7 +1301,11 @@ def run_saved_regression_variants(
                     features,
                     splits,
                     variant=variant,
-                    heldout_session_order=combined["heldout_session_order"],
+                    heldout_session_order=(
+                        combined["heldout_session_order"]
+                        if combined
+                        else manifest["partitions"].index(expected)
+                    ),
                     force=force,
                 )
             )

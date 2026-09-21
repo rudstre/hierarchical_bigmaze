@@ -419,6 +419,7 @@ def source_code_fingerprint(
             and path.suffix in {".py", ".sh", ".sbatch"}
             and path not in aggregation_only
             and scripts_root / "slurm" not in path.parents
+            and scripts_root / "gui" not in path.parents
         )
     if config_path is not None:
         candidates.append(Path(config_path).resolve())
@@ -801,6 +802,9 @@ def _run_rank_discovery_locked(config, k, output_dir, force):
     if isinstance(k, bool) or not isinstance(k, int) or k not in resolved.ranks:
         raise ValueError("k must be an integer in the configured range 2..49")
     shard_path = Path(output_dir).resolve() / f"k_{k:02d}.json"
+    from andrew_mlmdp.workflow_progress import report_progress
+
+    report_progress(phase="load_discovery_inputs", rank=k)
     started = time.perf_counter()
     stage = "load_data"
     payload: dict[str, object] = {
@@ -831,6 +835,7 @@ def _run_rank_discovery_locked(config, k, output_dir, force):
             )
 
         stage = "discover_subgoals"
+        report_progress(phase=stage, rank=k)
         discovery_config = resolved.discovery
         rank_result = discover_subgoals(
             dataset.environment,

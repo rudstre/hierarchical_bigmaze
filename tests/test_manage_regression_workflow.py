@@ -1,4 +1,5 @@
 import getpass
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -399,3 +400,186 @@ def test_dry_run_builds_complete_dependency_graph_without_writing(
     ]
     assert all(dry_run for _, dry_run in commands)
     assert not (tmp_path / "run").exists()
+
+
+def test_lattice_starts_after_features_without_waiting_for_regression(
+    monkeypatch, tmp_path
+):
+    config = _config("session_cv")
+    tasks = manager._stage_tasks(
+        config, _workflow_manifest(), include_lattice=True
+    )
+    assert len(tasks["lattice-precompute"]) == 2
+    raw = {
+        "slurm": {
+            "partition": "cpu",
+            "account": None,
+            "max_concurrent": 4,
+            "default_memory": "2G",
+            "default_time": "01:00:00",
+            "resource_bands": [
+                {"rank_range": [4, 6], "memory": "3G", "time": "02:00:00"}
+            ],
+        }
+    }
+    state = {
+        "project_root": str(ROOT),
+        "python_executable": "python",
+        "config_path": str(tmp_path / "config.json"),
+        "output_dir": str(tmp_path / "run"),
+        "max_array_size": 100,
+        "submissions": [],
+        "lattice_resources": {"memory": "2G", "time": "00:30:00"},
+    }
+    commands = []
+
+    def fake_run(command, dry_run):
+        commands.append(command)
+        return ""
+
+    monkeypatch.setattr(manager, "_run", fake_run)
+    manager._submit_pipeline(
+        state, tmp_path / "manager.json", config, raw, tasks, dry_run=True
+    )
+    exports = {
+        next(
+            part.split("REGRESSION_STAGE=", 1)[1].split(",", 1)[0]
+            for part in command
+            if part.startswith("--export=")
+        ): command
+        for command in commands
+    }
+    lattice = exports["lattice-precompute"]
+    assert "--mem=2G" in lattice
+    assert "--time=00:30:00" in lattice
+    assert "--array=0-1%2" in lattice
+    assert any(
+        "--dependency=afterok:dry-feature-generation-0" == part for part in lattice
+    )
+    assert not any("dry-regression" in part for part in lattice)
+
+
+@pytest.mark.parametrize(
+    ("changed", "message"),
+    [
+        ("config", "configuration changed"),
+        ("discovery", "discovery configuration changed"),
+        ("manifest", "workflow manifest changed"),
+    ],
+)
+def test_worker_refuses_changed_queued_inputs(tmp_path, changed, message):
+    worker_spec = importlib.util.spec_from_file_location(
+        "regression_worker", ROOT / "scripts/run_regression_workflow_task.py"
+    )
+    worker = importlib.util.module_from_spec(worker_spec)
+    worker_spec.loader.exec_module(worker)
+    paths = {
+        "config": tmp_path / "config.json",
+        "discovery": tmp_path / "discovery.json",
+        "manifest": tmp_path / "manifest.json",
+    }
+    for path in paths.values():
+        path.write_text("original")
+    task = {
+        "stage": "feature-generation",
+        "config_sha256": hashlib.sha256(paths["config"].read_bytes()).hexdigest(),
+        "discovery_config_path": str(paths["discovery"]),
+        "discovery_config_sha256": hashlib.sha256(
+            paths["discovery"].read_bytes()
+        ).hexdigest(),
+        "manifest_sha256": hashlib.sha256(paths["manifest"].read_bytes()).hexdigest(),
+    }
+    task_list = tmp_path / "tasks.json"
+    task_list.write_text(
+        json.dumps(
+            {"artifact_type": "regression_workflow_task_list", "tasks": [task]}
+        )
+    )
+    paths[changed].write_text("changed")
+    with pytest.raises(ValueError, match=message):
+        worker._main(
+            [
+                "--config", str(paths["config"]),
+                "--output-dir", str(tmp_path),
+                "--stage", "feature-generation",
+                "--task-list", str(task_list),
+                "--task-id", "0",
+            ]
+        )
+
+
+def test_submission_task_records_frozen_input_hashes(tmp_path, monkeypatch):
+    state = {
+        "project_root": str(ROOT),
+        "python_executable": "python",
+        "config_path": str(tmp_path / "config.json"),
+        "config_digest": "config-hash",
+        "discovery_config_path": str(tmp_path / "discovery.json"),
+        "discovery_config_sha256": "discovery-hash",
+        "manifest_sha256": "manifest-hash",
+        "worker_source": "source-hash",
+        "output_dir": str(tmp_path / "run"),
+        "max_array_size": 10,
+        "submissions": [],
+    }
+    monkeypatch.setattr(manager, "_run", lambda command, dry_run: "12345")
+    manager._submit_group(
+        state,
+        tmp_path / "manager.json",
+        "regression",
+        [{"stage": "regression", "partition_digest": "partition"}],
+        {"partition": "cpu", "memory": "2G", "time": "00:30:00", "max_concurrent": 1},
+        [],
+    )
+    saved = manager._read(Path(state["submissions"][0]["task_list"]))
+    task = saved["tasks"][0]
+    assert task["config_sha256"] == "config-hash"
+    assert task["discovery_config_sha256"] == "discovery-hash"
+    assert task["manifest_sha256"] == "manifest-hash"
+    assert task["worker_source"] == "source-hash"
+
+
+def test_retry_submits_only_missing_tasks(tmp_path, monkeypatch):
+    config_path = ROOT / "configs/regression_workflow.json"
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "manifest.json").write_text(json.dumps({"partitions": []}))
+    state = {
+        "config_digest": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "output_dir": str(output),
+        "project_root": str(ROOT),
+        "python_executable": "python",
+        "config_path": str(config_path),
+        "max_array_size": 100,
+        "submissions": [],
+        "precompute_lattice": False,
+    }
+    manager._atomic_json(output / "slurm_manager.json", state)
+    captured = []
+    monkeypatch.setattr(
+        manager,
+        "_artifact_state",
+        lambda _config, _root, task, _manifest: (
+            "success" if task["stage"] == "discovery" else "missing"
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_submit_pipeline",
+        lambda _state, _path, _config, _raw, tasks, **_kwargs: captured.append(
+            tasks
+        ),
+    )
+    args = manager.parser().parse_args(
+        [
+            "--config", str(config_path),
+            "--output-dir", str(output),
+            "--run-id", "retry_test",
+            "--retry-missing", "--dry-run",
+        ]
+    )
+
+    assert manager._main(args) == 0
+    assert captured[0]["discovery"] == []
+    assert captured[0]["aggregation"] == [{"stage": "aggregation"}]
+    assert captured[0]["plotting"] == [{"stage": "plotting"}]
