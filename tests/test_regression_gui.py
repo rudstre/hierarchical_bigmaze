@@ -89,6 +89,46 @@ def test_streamlit_reopens_historical_run_without_original_config(tmp_path):
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
 
 
+def test_new_workflow_json_survives_switching_to_a_saved_run(tmp_path):
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    payload = json.loads((ROOT / "configs/regression_workflow.json").read_text())
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_type": "regression_workflow_manifest",
+                "configuration": payload,
+                "partitions": [],
+            }
+        )
+    )
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=30
+    ).run()
+    next(w for w in app.selectbox if w.label == "Held-out sessions").select(
+        "last"
+    ).run()
+    next(
+        w for w in app.button if w.label == "Apply common settings to JSON"
+    ).click().run()
+    draft = next(w for w in app.text_area if w.label == "Configuration JSON").value
+    assert json.loads(draft)["heldout_sessions"] == "last"
+
+    directory = next(
+        w for w in app.text_input if w.label == "Or enter a workflow directory"
+    )
+    directory.set_value(str(tmp_path)).run()
+    directory = next(
+        w for w in app.text_input if w.label == "Or enter a workflow directory"
+    )
+    directory.set_value("").run()
+
+    restored = next(
+        w for w in app.text_area if w.label == "Configuration JSON"
+    ).value
+    assert restored == draft
+    assert not any("Expecting value" in error.value for error in app.error)
+
+
 def test_monitoring_caches_scheduler_queries_between_artifact_refreshes(
     tmp_path, monkeypatch
 ):

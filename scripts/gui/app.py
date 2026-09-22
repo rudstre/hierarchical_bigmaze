@@ -47,6 +47,9 @@ def recent_run_label(value):
     return name if len(name) <= 32 else f"{name[:21]}…{name[-10:]}"
 
 
+if "new_config_text" in st.session_state:
+    st.session_state.new_config_draft = st.session_state.new_config_text
+
 runs = access.list_runs()
 choices = [str(p.parent) for p in runs]
 with st.sidebar:
@@ -76,9 +79,16 @@ if root is None:
         data = show_error(read_json, template)
         if data is not None:
             st.session_state.new_config_text = json.dumps(data, indent=2)
+            st.session_state.new_config_draft = st.session_state.new_config_text
             st.session_state.new_config_source = template
     if "pending_config_text" in st.session_state:
         st.session_state.new_config_text = st.session_state.pop("pending_config_text")
+        st.session_state.new_config_draft = st.session_state.new_config_text
+    if (
+        "new_config_text" not in st.session_state
+        and "new_config_draft" in st.session_state
+    ):
+        st.session_state.new_config_text = st.session_state.new_config_draft
     raw = st.text_area("Configuration JSON", key="new_config_text", height=360)
     try:
         payload = json.loads(raw)
@@ -248,6 +258,7 @@ if page == "Configuration":
         cloned = dict(manifest["configuration"])
         cloned["slurm"] = access.saved_slurm(root)
         st.session_state.new_config_text = json.dumps(cloned, indent=2)
+        st.session_state.new_config_draft = st.session_state.new_config_text
         st.session_state.new_config_source = str(
             ROOT / "configs/regression_workflow.json"
         )
