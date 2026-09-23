@@ -13,8 +13,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from andrew_mlmdp.doohan_dataset import _load_session_catalog  # noqa: E402
 from andrew_mlmdp.regression_analysis import (  # noqa: E402
+    load_features,
     open_run,
     read_json,
+    summarize_absolute_performance,
     summarize_records,
     verify_artifact,
 )
@@ -108,8 +110,8 @@ def dataset_selection_options(payload):
     }
 
 
-def subset_summary(root, expected, predictor_names, scope, attempt="initial"):
-    """Load one saved subset across selected partitions and report missing work."""
+def _subset_scope_records(root, expected, predictor_names, scope, attempt):
+    """Load one saved subset's scope scores without aggregating them."""
     root = Path(root)
     records = []
     missing = []
@@ -149,11 +151,120 @@ def subset_summary(root, expected, predictor_names, scope, attempt="initial"):
             continue
         records.append(verify_artifact(read_json(scores[0])))
     return {
-        "summary": summarize_records(records, expected) if records else None,
         "records": records,
         "missing": missing,
         "failed": failed,
         "missing_scope": missing_scope,
+    }
+
+
+def subset_summary(root, expected, predictor_names, scope, attempt="initial"):
+    """Load one saved subset across selected partitions and report missing work."""
+    result = _subset_scope_records(
+        root, expected, predictor_names, scope, attempt
+    )
+    result["summary"] = (
+        summarize_records(result["records"], expected) if result["records"] else None
+    )
+    return result
+
+
+def absolute_performance_summary(
+    root, expected, predictor_names, scope, attempt="initial"
+):
+    """Load full-model scores for selected singleton and combined regressions."""
+    predictor_names = list(predictor_names)
+    if not predictor_names:
+        raise ValueError("Absolute performance requires at least one predictor")
+    root = Path(root)
+    features = {
+        item["partition_digest"]: load_features(root, item) for item in expected
+    }
+    loaded = {}
+
+    def scores(names):
+        key = tuple(names)
+        if key not in loaded:
+            loaded[key] = _subset_scope_records(
+                root, expected, list(names), scope, attempt
+            )
+        return loaded[key]
+
+    isolated_specs = []
+    isolated_coverage = []
+    for name in predictor_names:
+        result = scores((name,))
+        isolated_specs.append(
+            {
+                "model_id": name,
+                "kind": "singleton",
+                "predictor_names": [name],
+                "records": [
+                    *result["records"],
+                    *(
+                        {"partition_digest": digest, "status": "scientific_failure"}
+                        for digest in result["failed"]
+                    ),
+                ],
+            }
+        )
+        isolated_coverage.append(
+            {
+                "model_id": name,
+                "predictor_names": [name],
+                **{key: result[key] for key in ("missing", "failed", "missing_scope")},
+            }
+        )
+
+    combined_result = scores(tuple(predictor_names))
+    combined_spec = {
+        "model_id": "selected_combination",
+        "kind": "combination",
+        "predictor_names": predictor_names,
+        "records": [
+            *combined_result["records"],
+            *(
+                {"partition_digest": digest, "status": "scientific_failure"}
+                for digest in combined_result["failed"]
+            ),
+        ],
+    }
+    isolated = summarize_absolute_performance(
+        isolated_specs, expected, features, scope
+    )
+    combined = summarize_absolute_performance(
+        [combined_spec], expected, features, scope
+    )
+    comparison_specs = isolated_specs + (
+        [combined_spec] if len(predictor_names) > 1 else []
+    )
+    comparison = summarize_absolute_performance(
+        comparison_specs, expected, features, scope
+    )
+    source_digests = sorted(
+        {
+            row["source_regression_digest"]
+            for summary in (isolated, combined)
+            for row in summary["sessions"]
+            if row["source_regression_digest"] is not None
+        }
+    )
+    return {
+        "isolated": isolated,
+        "combined": combined,
+        "comparison": comparison,
+        "coverage": {
+            "isolated": isolated_coverage,
+            "combined": {
+                "model_id": "selected_combination",
+                "predictor_names": predictor_names,
+                **{
+                    key: combined_result[key]
+                    for key in ("missing", "failed", "missing_scope")
+                },
+            },
+        },
+        "source_regression_digests": source_digests,
     }
 
 

@@ -782,6 +782,377 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
     return figure
 
 
+def make_absolute_log_likelihood_figure(summary, *, title=None):
+    """Plot absolute held-out full-model log likelihood."""
+    return _make_absolute_performance_figure(summary, accuracy=False, title=title)
+
+
+def make_absolute_accuracy_figure(summary, *, title=None):
+    """Plot absolute held-out full-model action accuracy."""
+    return _make_absolute_performance_figure(summary, accuracy=True, title=title)
+
+
+def _absolute_model_style(model):
+    names = model["predictor_names"]
+    if model["kind"] == "singleton" and len(names) == 1:
+        display, colour = _PREDICTOR_STYLE[names[0]]
+        return display, colour
+    return "COMBINED", "#4B176D"
+
+
+def _absolute_session_profile(rows, model_id, value_key, plot_order):
+    grouped = {}
+    for row in rows:
+        key = (row["subject_id"], row["heldout_session_id"])
+        if row["model_id"] == model_id and key in plot_order:
+            grouped.setdefault(plot_order[key], []).append(row)
+    profile = []
+    for order, values in sorted(grouped.items()):
+        array = np.asarray([row[value_key] for row in values], dtype=float)
+        profile.append(
+            {
+                "session_order": order,
+                "mean": float(array.mean()),
+                "sem": (
+                    float(array.std(ddof=1) / math.sqrt(len(array)))
+                    if len(array) > 1
+                    else None
+                ),
+                "n_subjects": len(array),
+            }
+        )
+    return profile
+
+
+def _make_absolute_performance_figure(summary, *, accuracy, title):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    value_key = "accuracy" if accuracy else "mean_log_likelihood"
+    sem_key = (
+        "accuracy_sem_across_subjects"
+        if accuracy
+        else "log_likelihood_sem_across_subjects"
+    )
+    scale = 100.0 if accuracy else 1.0
+    unit = "%" if accuracy else "nats/decision"
+    value_format = ".2f" if accuracy else ".4f"
+    y_title = (
+        "Held-out actions predicted correctly (%)"
+        if accuracy
+        else "Mean held-out log likelihood (nats/decision; higher is better)"
+    )
+    left_title = (
+        "Absolute held-out accuracy"
+        if accuracy
+        else "Absolute held-out log likelihood"
+    )
+
+    def scaled(value):
+        return None if value is None else scale * value
+
+    models = summary["models"]
+    plot_order = _session_plot_order(summary)
+    sessions_per_subject = {}
+    for subject, _ in plot_order:
+        sessions_per_subject[subject] = sessions_per_subject.get(subject, 0) + 1
+    has_session_profile = any(count > 1 for count in sessions_per_subject.values())
+    figure = make_subplots(
+        rows=1,
+        cols=2 if has_session_profile else 1,
+        subplot_titles=(
+            (left_title, "Held-out session profile")
+            if has_session_profile
+            else (f"{left_title} (one held-out session per subject)",)
+        ),
+        horizontal_spacing=0.13 if has_session_profile else 0.0,
+    )
+    display_names = []
+    colours = []
+    for position, model in enumerate(models):
+        model_id = model["model_id"]
+        display, colour = _absolute_model_style(model)
+        is_combined = model["kind"] == "combination"
+        display_names.append(display)
+        colours.append(colour)
+        points = [
+            row for row in summary["subjects"] if row["model_id"] == model_id
+        ]
+        figure.add_trace(
+            go.Scatter(
+                x=[display] * len(points),
+                y=[scaled(row[value_key]) for row in points],
+                mode="markers",
+                name="Subjects",
+                legendgroup="subjects",
+                showlegend=position == 0,
+                marker={
+                    "size": 9 if is_combined else 7,
+                    "color": colour,
+                    "opacity": 0.7 if is_combined else 0.45,
+                    "symbol": "star" if is_combined else "circle",
+                    "line": {
+                        "color": "black" if is_combined else "white",
+                        "width": 1.2 if is_combined else 0.5,
+                    },
+                },
+                customdata=[
+                    [
+                        row["subject_id"],
+                        row["n_sessions"],
+                        ", ".join(model["predictor_names"]),
+                    ]
+                    for row in points
+                ],
+                hovertemplate=(
+                    "Model: %{x}<br>Subject: %{customdata[0]}"
+                    "<br>Held-out sessions: %{customdata[1]}"
+                    "<br>Predictors: %{customdata[2]}"
+                    f"<br>Value: %{{y:{value_format}}} {unit}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if summary["group"] is not None:
+        group = {row["model_id"]: row for row in summary["group"]}
+        means = [scaled(group[model["model_id"]][value_key]) for model in models]
+        sems = [scaled(group[model["model_id"]][sem_key]) for model in models]
+        sample_sizes = [group[model["model_id"]]["n_subjects"] for model in models]
+        combined_flags = [model["kind"] == "combination" for model in models]
+        figure.add_trace(
+            go.Scatter(
+                x=display_names,
+                y=means,
+                mode="markers",
+                name="Mean +/- SEM",
+                marker={
+                    "size": [16 if combined else 11 for combined in combined_flags],
+                    "symbol": [
+                        "star" if combined else "diamond"
+                        for combined in combined_flags
+                    ],
+                    "color": colours,
+                    "line": {
+                        "color": "black",
+                        "width": [
+                            2.0 if combined else 0.8 for combined in combined_flags
+                        ],
+                    },
+                },
+                error_y={
+                    "type": "data",
+                    "array": [0 if value is None else value for value in sems],
+                    "visible": True,
+                    "thickness": 1.4,
+                    "width": 5,
+                },
+                customdata=[
+                    [size, ", ".join(model["predictor_names"])]
+                    for size, model in zip(sample_sizes, models, strict=True)
+                ],
+                hovertemplate=(
+                    f"Mean: %{{y:{value_format}}} {unit}"
+                    "<br>Subjects: %{customdata[0]}"
+                    "<br>Predictors: %{customdata[1]}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+    baseline = summary["uniform_policy_baseline"]
+    baseline_group = baseline["group"]
+    if baseline_group is not None:
+        figure.add_hline(
+            y=scaled(baseline_group[value_key]),
+            line={"color": "#555555", "width": 1.5, "dash": "dash"},
+            annotation_text="Uniform valid-action policy",
+            annotation_position="bottom right",
+            row=1,
+            col=1,
+        )
+
+    if has_session_profile:
+        for model in models:
+            model_id = model["model_id"]
+            display, colour = _absolute_model_style(model)
+            is_combined = model["kind"] == "combination"
+            profile = _absolute_session_profile(
+                summary["sessions"], model_id, value_key, plot_order
+            )
+            figure.add_trace(
+                go.Scatter(
+                    x=[row["session_order"] + 1 for row in profile],
+                    y=[scaled(row["mean"]) for row in profile],
+                    mode="lines+markers",
+                    name=display,
+                    legendgroup=model_id,
+                    line={"color": colour, "width": 3.5 if is_combined else 2},
+                    marker={
+                        "color": colour,
+                        "size": 10 if is_combined else 7,
+                        "symbol": "star" if is_combined else "circle",
+                        "line": {
+                            "color": "black" if is_combined else colour,
+                            "width": 1.2 if is_combined else 0,
+                        },
+                    },
+                    error_y={
+                        "type": "data",
+                        "array": [
+                            0 if row["sem"] is None else scale * row["sem"]
+                            for row in profile
+                        ],
+                        "visible": True,
+                        "thickness": 1.1,
+                        "width": 3,
+                    },
+                    customdata=[[row["n_subjects"]] for row in profile],
+                    hovertemplate=(
+                        "Model: %{fullData.name}<br>Session number: %{x}"
+                        f"<br>Mean: %{{y:{value_format}}} {unit}"
+                        "<br>Subjects: %{customdata[0]}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=2,
+            )
+            session_points = [
+                row
+                for row in summary["sessions"]
+                if row["model_id"] == model_id
+                and (row["subject_id"], row["heldout_session_id"]) in plot_order
+            ]
+            figure.add_trace(
+                go.Scatter(
+                    x=[
+                        plot_order[(row["subject_id"], row["heldout_session_id"])]
+                        + 1
+                        for row in session_points
+                    ],
+                    y=[scaled(row[value_key]) for row in session_points],
+                    mode="markers",
+                    name=f"{display} subjects",
+                    legendgroup=model_id,
+                    showlegend=False,
+                    marker={
+                        "color": colour,
+                        "size": 7 if is_combined else 5,
+                        "opacity": 0.55 if is_combined else 0.25,
+                        "symbol": "star" if is_combined else "circle",
+                    },
+                    customdata=[
+                        [
+                            row["subject_id"],
+                            row["heldout_session_id"],
+                            row["n_decisions"],
+                        ]
+                        for row in session_points
+                    ],
+                    hovertemplate=(
+                        "Model: " + display + "<br>Subject: %{customdata[0]}"
+                        "<br>Session: %{customdata[1]}"
+                        "<br>Decisions: %{customdata[2]}"
+                        f"<br>Value: %{{y:{value_format}}} {unit}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=2,
+            )
+        baseline_profile = _absolute_session_profile(
+            [
+                {**row, "model_id": "uniform"}
+                for row in baseline["sessions"]
+            ],
+            "uniform",
+            value_key,
+            plot_order,
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=[row["session_order"] + 1 for row in baseline_profile],
+                y=[scaled(row["mean"]) for row in baseline_profile],
+                mode="lines",
+                name="Uniform valid-action policy",
+                legendgroup="uniform",
+                line={"color": "#555555", "width": 1.5, "dash": "dash"},
+                hovertemplate=(
+                    "Uniform policy<br>Session number: %{x}"
+                    f"<br>Mean: %{{y:{value_format}}} {unit}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=2,
+        )
+
+    if models and models[-1]["kind"] == "combination" and len(models) > 1:
+        combined_position = len(models) - 1
+        figure.add_vrect(
+            x0=combined_position - 0.5,
+            x1=combined_position + 0.5,
+            fillcolor="#4B176D",
+            opacity=0.08,
+            line_width=0,
+            layer="below",
+            row=1,
+            col=1,
+        )
+        figure.add_vline(
+            x=combined_position - 0.5,
+            line={"color": "#4B176D", "width": 1.5, "dash": "dot"},
+            row=1,
+            col=1,
+        )
+
+    figure.update_xaxes(title_text="Model", tickangle=-30, row=1, col=1)
+    figure.update_yaxes(title_text=y_title, row=1, col=1)
+    if accuracy:
+        figure.update_yaxes(range=[0, 100], row=1, col=1)
+    if has_session_profile:
+        figure.update_xaxes(
+            title_text="Held-out session number within subject",
+            dtick=1,
+            row=1,
+            col=2,
+        )
+        figure.update_yaxes(title_text=y_title, row=1, col=2)
+        if accuracy:
+            figure.update_yaxes(range=[0, 100], row=1, col=2)
+    figure.update_layout(
+        template="plotly_white",
+        width=1250 if has_session_profile else 900,
+        height=620,
+        margin={"l": 80, "r": 30, "t": 75, "b": 145},
+        legend={
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.29,
+            "xanchor": "center",
+            "x": 0.5,
+        },
+        hovermode="closest",
+        font={"family": "Arial, sans-serif", "size": 13},
+        title=title,
+    )
+    if summary["status"] != "complete":
+        figure.add_annotation(
+            x=0.5,
+            y=1.13,
+            xref="paper",
+            yref="paper",
+            text=(
+                f"{summary['status'].replace('_', ' ').title()} result: "
+                f"{len(summary['missing_partitions'])} missing and "
+                f"{len(summary['failed_partitions'])} failed model-partitions"
+            ),
+            showarrow=False,
+            font={"color": "#B22222", "size": 13},
+        )
+    return figure
+
+
 def make_learning_curve_figure(summary):
     """Plot overall and junction-only learning curves on separate panels."""
     return _make_learning_curve_figure(summary, accuracy=False)

@@ -350,6 +350,23 @@ analysis command to cancel only the recorded active jobs for that kind and
 attempt. The workflow Progress page offers retry and cancellation for jobs
 recorded by the workflow manager.
 
+The same action also renders two absolute held-out-performance figures below
+the ablation figures: mean log likelihood in nats/decision and action accuracy.
+Each shows the selected predictors' singleton regressions followed by a
+visually emphasized **COMBINED** point for the regression containing the full
+selected set. A one-predictor selection omits this duplicate combined point. A
+singleton retains Qin's standard intercept and impossible-action mask. These
+figures read the saved full-model scores and do not use
+full-minus-reduced contrasts. Each includes the uniform-over-valid-actions
+reference computed on the same evaluation locations. Folds are pooled by test
+decision count, sessions are averaged equally within subjects, and subjects are
+averaged equally for the displayed group mean and SEM. No new fitting is run.
+
+The absolute figures are an unbiased held-out evaluation only when the
+predictor combination was specified independently of these scores. Choosing a
+combination after inspecting its absolute or ablation plots makes the resulting
+comparison exploratory/model-selective rather than a final untouched test.
+
 The location switch changes held-out **evaluation**, not fitting. Both the
 all-decision and three-or-four-valid-action regression scores reconstruct the
 saved fold before scoring selected decisions. A fold with no selected decisions

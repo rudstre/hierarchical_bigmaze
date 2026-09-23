@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from andrew_mlmdp.regression_analysis import write_artifact
 from andrew_mlmdp.regression_workflow import load_regression_workflow_config
 from andrew_mlmdp.validation import source_code_fingerprint
 
@@ -250,3 +251,96 @@ def test_gui_backfill_requires_saved_features(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="Saved features are missing"):
         access.submit_lattice_backfill(tmp_path)
+
+
+def test_absolute_performance_loader_uses_singletons_combination_and_scope(
+    tmp_path, monkeypatch
+):
+    digest = "partition"
+    expected = [
+        {
+            "partition_digest": digest,
+            "partition": {"subject_id": "m1", "heldout_session_id": "s1"},
+        }
+    ]
+    entries = []
+    for key, names, mean_ll in (
+        ("vector", ["vector"], -1.0),
+        ("optimal", ["optimal"], -2.0),
+        ("combined", ["vector", "optimal"], -0.5),
+    ):
+        destination = tmp_path / "analyses" / key
+        destination.mkdir(parents=True)
+        record = {
+            "status": "success",
+            "partition_digest": digest,
+            "partition": expected[0]["partition"],
+            "heldout_session_order": 0,
+            "predictor_names": names,
+            "source_regression_digest": f"source-{key}",
+            "pooled": {
+                "n_decisions": 2,
+                "models": {
+                    "full": {
+                        "total_log_likelihood": 2 * mean_ll,
+                        "mean_negative_log_likelihood": -mean_ll,
+                        "accuracy": 0.5,
+                    }
+                },
+            },
+        }
+        write_artifact(destination / "scores_all_decisions_test.json", record)
+        write_artifact(
+            destination / "scores_three_or_four_valid_actions_test.json",
+            {**record, "pooled": {**record["pooled"], "n_decisions": 999}},
+        )
+        entries.append(
+            {
+                "predictor_names": names,
+                "status": "success",
+                "path": str(destination.relative_to(tmp_path)),
+            }
+        )
+    index = tmp_path / "analyses" / f"lattice_{digest}_initial.json"
+    index.write_text(json.dumps({"partition_digest": digest, "entries": entries}))
+    monkeypatch.setattr(
+        access,
+        "load_features",
+        lambda _root, _item: {
+            "impossible_action_mask": [[0.0, 0.0, 0.0, 0.0]] * 2
+        },
+    )
+
+    result = access.absolute_performance_summary(
+        tmp_path,
+        expected,
+        ["vector", "optimal"],
+        "all_decisions",
+    )
+
+    assert [row["model_id"] for row in result["isolated"]["models"]] == [
+        "vector",
+        "optimal",
+    ]
+    assert result["combined"]["models"][0]["predictor_names"] == [
+        "vector",
+        "optimal",
+    ]
+    assert [row["model_id"] for row in result["comparison"]["models"]] == [
+        "vector",
+        "optimal",
+        "selected_combination",
+    ]
+    assert result["combined"]["group"][0]["mean_log_likelihood"] == -0.5
+    assert result["source_regression_digests"] == [
+        "source-combined",
+        "source-optimal",
+        "source-vector",
+    ]
+
+    one_predictor = access.absolute_performance_summary(
+        tmp_path, expected, ["vector"], "all_decisions"
+    )
+    assert [
+        row["model_id"] for row in one_predictor["comparison"]["models"]
+    ] == ["vector"]

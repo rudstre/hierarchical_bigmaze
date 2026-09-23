@@ -12,6 +12,7 @@ from andrew_mlmdp.regression_analysis import (
     open_run,
     predictor_subsets,
     score_regression,
+    summarize_absolute_performance,
     write_artifact,
 )
 from andrew_mlmdp.regression_workflow import PredictorConfig
@@ -101,6 +102,135 @@ def test_empty_junction_scope_is_not_a_zero_score():
     assert result["evaluation_status"] == "no_matching_decisions"
     assert result["folds"][0]["models"]["full"]["mean_negative_log_likelihood"] is None
     assert result["pooled"]["unique_predictability"]["vector"] is None
+
+
+def _absolute_record(digest, subject, session, count, mean_ll, accuracy, order):
+    return {
+        "status": "success",
+        "artifact_digest": f"fit-{digest}",
+        "source_regression_digest": f"source-{digest}",
+        "partition_digest": digest,
+        "partition": {
+            "subject_id": subject,
+            "heldout_session_id": session,
+        },
+        "heldout_session_order": order,
+        "predictor_names": ["vector"],
+        "pooled": {
+            "n_decisions": count,
+            "models": {
+                "full": {
+                    "total_log_likelihood": count * mean_ll,
+                    "mean_negative_log_likelihood": -mean_ll,
+                    "accuracy": accuracy,
+                }
+            },
+        },
+    }
+
+
+def test_absolute_performance_preserves_scientific_weighting_and_baseline():
+    identities = [
+        ("a1", "m1", "s1", 2, 2),
+        ("a2", "m1", "s2", 8, 4),
+        ("b1", "m2", "s1", 4, 3),
+    ]
+    expected = [
+        {
+            "partition_digest": digest,
+            "partition": {"subject_id": subject, "heldout_session_id": session},
+        }
+        for digest, subject, session, _, _ in identities
+    ]
+    features = {
+        digest: {
+            "impossible_action_mask": [
+                [0.0] * valid_actions + [-1e10] * (4 - valid_actions)
+                for _ in range(count)
+            ]
+        }
+        for digest, _, _, count, valid_actions in identities
+    }
+    records = [
+        _absolute_record("a1", "m1", "s1", 2, -1.0, 0.25, 0),
+        _absolute_record("a2", "m1", "s2", 8, -3.0, 0.75, 1),
+        _absolute_record("b1", "m2", "s1", 4, -4.0, 0.25, 2),
+    ]
+
+    summary = summarize_absolute_performance(
+        [
+            {
+                "model_id": "vector",
+                "kind": "singleton",
+                "predictor_names": ["vector"],
+                "records": records,
+            }
+        ],
+        expected,
+        features,
+        "all_decisions",
+    )
+
+    assert summary["status"] == "complete"
+    subject = {row["subject_id"]: row for row in summary["subjects"]}
+    assert subject["m1"]["mean_log_likelihood"] == pytest.approx(-2.0)
+    assert subject["m1"]["accuracy"] == pytest.approx(0.5)
+    assert summary["group"][0]["mean_log_likelihood"] == pytest.approx(-3.0)
+    assert summary["group"][0]["log_likelihood_sem_across_subjects"] == pytest.approx(
+        1.0
+    )
+    assert summary["group"][0]["accuracy"] == pytest.approx(0.375)
+    assert summary["group"][0]["accuracy_sem_across_subjects"] == pytest.approx(
+        0.125
+    )
+    baseline = summary["uniform_policy_baseline"]["group"]
+    assert baseline["mean_log_likelihood"] == pytest.approx(
+        ((-np.log(2) - np.log(4)) / 2 - np.log(3)) / 2
+    )
+    assert baseline["accuracy"] == pytest.approx(((1 / 2 + 1 / 4) / 2 + 1 / 3) / 2)
+
+
+def test_absolute_performance_withholds_group_and_marks_empty_scope():
+    expected = [
+        {
+            "partition_digest": "present",
+            "partition": {"subject_id": "m1", "heldout_session_id": "s1"},
+        },
+        {
+            "partition_digest": "missing",
+            "partition": {"subject_id": "m2", "heldout_session_id": "s1"},
+        },
+    ]
+    features = {
+        digest: {
+            "impossible_action_mask": [[0.0, 0.0, -1e10, -1e10]] * 2
+        }
+        for digest in ("present", "missing")
+    }
+    spec = {
+        "model_id": "vector",
+        "kind": "singleton",
+        "predictor_names": ["vector"],
+        "records": [_absolute_record("present", "m1", "s1", 2, -1.0, 0.5, 0)],
+    }
+
+    incomplete = summarize_absolute_performance(
+        [spec], expected, features, "all_decisions"
+    )
+    assert incomplete["status"] == "incomplete"
+    assert incomplete["group"] is None
+    assert incomplete["missing_partitions"] == [
+        {"model_id": "vector", "partition_digest": "missing"}
+    ]
+
+    empty = summarize_absolute_performance(
+        [{**spec, "records": []}],
+        expected,
+        features,
+        "three_or_four_valid_actions",
+    )
+    assert empty["status"] == "not_applicable"
+    assert empty["not_applicable_partitions"] == ["missing", "present"]
 
 
 def test_artifact_integrity_and_historical_manifest_without_source_config(tmp_path):

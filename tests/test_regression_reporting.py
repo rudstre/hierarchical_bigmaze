@@ -12,6 +12,8 @@ import andrew_mlmdp.regression_reporting as reporting
 from andrew_mlmdp.regression_reporting import (
     _junction_scored_record,
     _use_complete_subject_group_estimates,
+    make_absolute_accuracy_figure,
+    make_absolute_log_likelihood_figure,
     make_learning_curve_accuracy_figure,
     make_learning_curve_figure,
     make_regression_accuracy_figure,
@@ -210,6 +212,146 @@ def test_accuracy_report_uses_percentage_point_contribution():
     assert list(mean.error_y.array) == pytest.approx([1.0])
     assert "percentage points" in figure.layout.yaxis.title.text
     assert any(shape.y0 == 0 and shape.y1 == 0 for shape in figure.layout.shapes)
+
+
+def _absolute_summary(*, complete=True):
+    models = [
+        {"model_id": "vector", "kind": "singleton", "predictor_names": ["vector"]},
+        {
+            "model_id": "optimal",
+            "kind": "singleton",
+            "predictor_names": ["optimal"],
+        },
+        {
+            "model_id": "selected_combination",
+            "kind": "combination",
+            "predictor_names": ["vector", "optimal"],
+        },
+    ]
+    subjects = [
+        {
+            "model_id": model["model_id"],
+            "subject_id": subject,
+            "n_sessions": 1,
+            "mean_log_likelihood": likelihood,
+            "accuracy": accuracy,
+        }
+        for model, likelihoods, accuracies in (
+            (models[0], (-1.0, -2.0), (0.5, 0.6)),
+            (models[1], (-1.5, -2.5), (0.4, 0.5)),
+            (models[2], (-0.7, -0.9), (0.7, 0.8)),
+        )
+        for subject, likelihood, accuracy in zip(
+            ("m1", "m2"), likelihoods, accuracies, strict=True
+        )
+    ]
+    sessions = [
+        {
+            **row,
+            "heldout_session_id": "s1",
+            "heldout_session_order": 0,
+            "n_decisions": 10,
+        }
+        for row in subjects
+    ]
+    groups = [
+        {
+            "model_id": "vector",
+            "mean_log_likelihood": -1.5,
+            "log_likelihood_sem_across_subjects": 0.5,
+            "accuracy": 0.55,
+            "accuracy_sem_across_subjects": 0.05,
+            "n_subjects": 2,
+            "complete": complete,
+        },
+        {
+            "model_id": "optimal",
+            "mean_log_likelihood": -2.0,
+            "log_likelihood_sem_across_subjects": 0.5,
+            "accuracy": 0.45,
+            "accuracy_sem_across_subjects": 0.05,
+            "n_subjects": 2,
+            "complete": complete,
+        },
+        {
+            "model_id": "selected_combination",
+            "mean_log_likelihood": -0.8,
+            "log_likelihood_sem_across_subjects": 0.1,
+            "accuracy": 0.75,
+            "accuracy_sem_across_subjects": 0.05,
+            "n_subjects": 2,
+            "complete": complete,
+        },
+    ]
+    return {
+        "status": "complete" if complete else "incomplete",
+        "models": models,
+        "subjects": subjects,
+        "sessions": sessions,
+        "group": groups if complete else None,
+        "partial_group": {"rows": groups, "n_subjects": 2},
+        "uniform_policy_baseline": {
+            "group": {
+                "mean_log_likelihood": -np.log(4),
+                "accuracy": 0.25,
+                "n_subjects": 2,
+            },
+            "sessions": [
+                {
+                    "subject_id": subject,
+                    "heldout_session_id": "s1",
+                    "heldout_session_order": 0,
+                    "mean_log_likelihood": -np.log(4),
+                    "accuracy": 0.25,
+                }
+                for subject in ("m1", "m2")
+            ],
+        },
+        "missing_partitions": [] if complete else [{"model_id": "optimal"}],
+        "failed_partitions": [],
+    }
+
+
+def test_absolute_figures_show_full_model_values_and_uniform_baseline():
+    summary = _absolute_summary()
+    likelihood = make_absolute_log_likelihood_figure(summary)
+    accuracy = make_absolute_accuracy_figure(summary)
+
+    ll_mean = next(trace for trace in likelihood.data if trace.name == "Mean +/- SEM")
+    accuracy_mean = next(
+        trace for trace in accuracy.data if trace.name == "Mean +/- SEM"
+    )
+    assert list(ll_mean.y) == pytest.approx([-1.5, -2.0, -0.8])
+    assert list(ll_mean.error_y.array) == pytest.approx([0.5, 0.5, 0.1])
+    assert list(accuracy_mean.y) == pytest.approx([55.0, 45.0, 75.0])
+    assert list(accuracy_mean.error_y.array) == pytest.approx([5.0, 5.0, 5.0])
+    assert list(ll_mean.x)[-1] == "COMBINED"
+    assert list(ll_mean.marker.symbol)[-1] == "star"
+    assert list(ll_mean.marker.size)[-1] > list(ll_mean.marker.size)[0]
+    assert list(ll_mean.marker.line.width)[-1] > list(
+        ll_mean.marker.line.width
+    )[0]
+    assert "nats/decision" in likelihood.layout.yaxis.title.text
+    assert accuracy.layout.yaxis.range == (0, 100)
+    assert any(
+        shape.y0 == pytest.approx(-np.log(4))
+        and shape.line.dash == "dash"
+        for shape in likelihood.layout.shapes
+    )
+    assert any(
+        shape.y0 == pytest.approx(25.0) and shape.line.dash == "dash"
+        for shape in accuracy.layout.shapes
+    )
+
+
+def test_absolute_incomplete_figure_withholds_headline_mean():
+    figure = make_absolute_log_likelihood_figure(_absolute_summary(complete=False))
+
+    assert not any(trace.name == "Mean +/- SEM" for trace in figure.data)
+    assert any(
+        "Incomplete result" in annotation.text
+        for annotation in figure.layout.annotations
+    )
 
 
 def test_learning_curve_junction_score_uses_only_three_or_four_action_rows():

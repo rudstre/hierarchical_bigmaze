@@ -22,6 +22,8 @@ from andrew_mlmdp.regression_analysis import (  # noqa: E402
 )
 from andrew_mlmdp.regression_policy_overlap import pool_overlap  # noqa: E402
 from andrew_mlmdp.regression_reporting import (  # noqa: E402
+    make_absolute_accuracy_figure,
+    make_absolute_log_likelihood_figure,
     make_learning_curve_accuracy_figure,
     make_learning_curve_figure,
     make_regression_accuracy_figure,
@@ -470,6 +472,14 @@ if page == "Results":
                         scope_key,
                         attempt,
                     )
+                    performance = show_error(
+                        access.absolute_performance_summary,
+                        root,
+                        selected_expected,
+                        selected_names,
+                        scope_key,
+                        attempt,
+                    )
                     if result is not None:
                         request = {
                             "run": str(root),
@@ -496,10 +506,43 @@ if page == "Results":
                                     }
                                 )
                                 figures[metric] = figure
+                        absolute_figures = {}
+                        if performance is not None:
+                            performance_summary = performance["comparison"]
+                            if performance_summary["sessions"]:
+                                for metric, maker in (
+                                    (
+                                        "Log likelihood",
+                                        make_absolute_log_likelihood_figure,
+                                    ),
+                                    ("Accuracy", make_absolute_accuracy_figure),
+                                ):
+                                    figure = maker(
+                                        performance_summary,
+                                        title=f"Absolute held-out {metric.lower()}",
+                                    )
+                                    figure.update_layout(
+                                        meta={
+                                            **request,
+                                            "analysis": (
+                                                "absolute_full_model_performance"
+                                            ),
+                                            "source_regression_digests": performance[
+                                                "source_regression_digests"
+                                            ],
+                                        }
+                                    )
+                                    figure_key = metric.lower().replace(" ", "_")
+                                    absolute_figures[figure_key] = {
+                                        "heading": metric,
+                                        "figure": figure,
+                                    }
                         st.session_state.generated_subset_plots = {
                             "request": request,
                             "result": result,
                             "figures": figures,
+                            "performance": performance,
+                            "absolute_figures": absolute_figures,
                         }
             generated = st.session_state.get("generated_subset_plots")
             if generated and generated["request"]["run"] == str(root):
@@ -540,6 +583,74 @@ if page == "Results":
                         "python scripts/run_regression_analysis.py lattice "
                         f"--output-dir {root}"
                     )
+                performance = generated.get("performance")
+                st.subheader("Absolute held-out performance")
+                st.caption(
+                    "Each plot compares the full singleton regressions with the "
+                    "full selected combination; these are not ablation scores."
+                )
+                if len(request["predictor_names"]) == 1:
+                    st.info(
+                        "With one selected predictor, the isolated and combined "
+                        "regressions are the same saved fit, so no duplicate "
+                        "combined point is shown."
+                    )
+                absolute_figures = generated.get("absolute_figures", {})
+                if absolute_figures:
+                    for key, item in absolute_figures.items():
+                        st.markdown(f"#### {item['heading']}")
+                        st.plotly_chart(item["figure"], width="stretch")
+                        st.download_button(
+                            f"Download {item['heading'].lower()} plot",
+                            item["figure"].to_html(),
+                            file_name=f"absolute_{key}.html",
+                            key=f"download_absolute_{key}_{root}",
+                        )
+                else:
+                    st.info(
+                        "No absolute-performance plots are available for this "
+                        "selection and evaluation scope yet."
+                    )
+                    st.code(
+                        "python scripts/run_regression_analysis.py lattice "
+                        f"--output-dir {root}"
+                    )
+                if performance is not None:
+                    st.write(
+                        "Scientific coverage:",
+                        {
+                            "isolated": performance["isolated"]["status"],
+                            "combined": performance["combined"]["status"],
+                        },
+                    )
+                    with st.expander(
+                        "Absolute performance coverage, numerical results, "
+                        "and provenance"
+                    ):
+                        st.json(performance["coverage"])
+                        st.dataframe(
+                            performance["isolated"]["subjects"], hide_index=True
+                        )
+                        st.dataframe(
+                            performance["combined"]["subjects"], hide_index=True
+                        )
+                        st.download_button(
+                            "Download absolute performance summary",
+                            json.dumps(
+                                {
+                                    "view": request,
+                                    "source_regression_digests": performance[
+                                        "source_regression_digests"
+                                    ],
+                                    "isolated": performance["isolated"],
+                                    "combined": performance["combined"],
+                                    "comparison": performance["comparison"],
+                                    "coverage": performance["coverage"],
+                                },
+                                indent=2,
+                            ),
+                            file_name="absolute_performance_summary.json",
+                        )
                 with st.expander("Coverage, numerical results, and provenance"):
                     for label, key in (
                         ("Missing fits", "missing"),

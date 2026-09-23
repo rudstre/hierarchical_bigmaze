@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 from copy import deepcopy
 from pathlib import Path
 
@@ -298,6 +299,275 @@ def summarize_records(records, expected, unavailable=None):
         _add_regression_accuracy(summary, included)
     summary["not_applicable_partitions"] = sorted(na)
     return summary
+
+
+def summarize_absolute_performance(model_specs, expected, features, scope):
+    """Aggregate held-out full-model scores without using ablation contrasts.
+
+    Fold scores have already been pooled by decision count in each regression
+    artifact. This function preserves the reporting hierarchy by averaging
+    sessions equally within subjects and subjects equally at group level.
+    """
+    if scope not in SCOPES:
+        raise ValueError(f"Unknown evaluation scope: {scope}")
+    expected = list(expected)
+    expected_by_digest = {item["partition_digest"]: item for item in expected}
+    if len(expected_by_digest) != len(expected):
+        raise ValueError("Duplicate expected predictor partitions")
+    model_ids = [spec["model_id"] for spec in model_specs]
+    if len(set(model_ids)) != len(model_ids):
+        raise ValueError("Duplicate absolute-performance model identities")
+
+    baseline_sessions = []
+    not_applicable = []
+    for order, item in enumerate(expected):
+        digest = item["partition_digest"]
+        feature = features.get(digest)
+        if feature is None:
+            raise ValueError(f"Missing features for partition {digest}")
+        mask = np.asarray(feature["impossible_action_mask"], dtype=float)
+        counts = np.count_nonzero(mask == 0, axis=1)
+        if np.any((counts < 1) | (counts > mask.shape[1])):
+            raise ValueError("Feature artifact has an invalid valid-action count")
+        selected = (
+            np.ones(len(counts), dtype=bool)
+            if scope == SCOPES[0]
+            else np.isin(counts, (3, 4))
+        )
+        selected_counts = counts[selected]
+        if not len(selected_counts):
+            not_applicable.append(digest)
+            continue
+        partition = item["partition"]
+        baseline_sessions.append(
+            {
+                "partition_digest": digest,
+                "subject_id": partition["subject_id"],
+                "heldout_session_id": partition["heldout_session_id"],
+                "heldout_session_order": order,
+                "n_decisions": int(len(selected_counts)),
+                "mean_log_likelihood": float(-np.log(selected_counts).mean()),
+                "accuracy": float(np.mean(1.0 / selected_counts)),
+            }
+        )
+
+    applicable = set(expected_by_digest) - set(not_applicable)
+    baseline_subjects = []
+    for subject in dict.fromkeys(row["subject_id"] for row in baseline_sessions):
+        rows = [row for row in baseline_sessions if row["subject_id"] == subject]
+        baseline_subjects.append(
+            {
+                "subject_id": subject,
+                "n_sessions": len(rows),
+                "mean_log_likelihood": float(
+                    np.mean([row["mean_log_likelihood"] for row in rows])
+                ),
+                "accuracy": float(np.mean([row["accuracy"] for row in rows])),
+            }
+        )
+    baseline_group = None
+    if baseline_subjects:
+        baseline_group = {
+            "mean_log_likelihood": float(
+                np.mean([row["mean_log_likelihood"] for row in baseline_subjects])
+            ),
+            "accuracy": float(
+                np.mean([row["accuracy"] for row in baseline_subjects])
+            ),
+            "n_subjects": len(baseline_subjects),
+        }
+
+    session_rows = []
+    subject_rows = []
+    group_rows = []
+    missing = []
+    failed = []
+    model_metadata = []
+    for spec in model_specs:
+        model_id = spec["model_id"]
+        predictor_names = list(spec["predictor_names"])
+        model_metadata.append(
+            {
+                "model_id": model_id,
+                "kind": spec["kind"],
+                "predictor_names": predictor_names,
+            }
+        )
+        records = spec["records"]
+        records_by_digest = {
+            record["partition_digest"]: record for record in records
+        }
+        if len(records_by_digest) != len(records):
+            raise ValueError(f"Duplicate records for model {model_id}")
+        unexpected = set(records_by_digest) - set(expected_by_digest)
+        if unexpected:
+            raise ValueError(f"Unexpected partitions for model {model_id}")
+        model_missing = sorted(applicable - set(records_by_digest))
+        model_failed = sorted(
+            digest
+            for digest in applicable & set(records_by_digest)
+            if records_by_digest[digest].get("status") != "success"
+        )
+        missing.extend(
+            {"model_id": model_id, "partition_digest": digest}
+            for digest in model_missing
+        )
+        failed.extend(
+            {"model_id": model_id, "partition_digest": digest}
+            for digest in model_failed
+        )
+        for digest in sorted(applicable & set(records_by_digest)):
+            record = records_by_digest[digest]
+            if record.get("status") != "success":
+                continue
+            if record.get("evaluation_status") == "no_matching_decisions":
+                raise ValueError(
+                    f"Score scope disagrees with features for partition {digest}"
+                )
+            if record.get("evaluation_scope", scope) != scope:
+                raise ValueError(f"Evaluation scope mismatch for model {model_id}")
+            if record.get("predictor_names") != predictor_names:
+                raise ValueError(f"Predictor identity mismatch for model {model_id}")
+            if record.get("partition") != expected_by_digest[digest]["partition"]:
+                raise ValueError(f"Partition metadata mismatch for model {model_id}")
+            feature_digest = features[digest].get("artifact_digest")
+            if feature_digest is not None and record.get(
+                "feature_artifact_digest"
+            ) != feature_digest:
+                raise ValueError(f"Feature artifact mismatch for model {model_id}")
+            pooled = record["pooled"]
+            count = int(pooled["n_decisions"])
+            baseline = next(
+                row
+                for row in baseline_sessions
+                if row["partition_digest"] == digest
+            )
+            if count != baseline["n_decisions"]:
+                raise ValueError(
+                    f"Held-out decision count mismatch for partition {digest}"
+                )
+            full = pooled["models"]["full"]
+            total = float(full["total_log_likelihood"])
+            mean_log_likelihood = total / count
+            if not np.isclose(
+                mean_log_likelihood,
+                -float(full["mean_negative_log_likelihood"]),
+                rtol=1e-9,
+                atol=1e-12,
+            ):
+                raise ValueError(f"Pooled likelihood mismatch for model {model_id}")
+            partition = record["partition"]
+            session_rows.append(
+                {
+                    "model_id": model_id,
+                    "kind": spec["kind"],
+                    "predictor_names": predictor_names,
+                    "partition_digest": digest,
+                    "subject_id": partition["subject_id"],
+                    "heldout_session_id": partition["heldout_session_id"],
+                    "heldout_session_order": record.get(
+                        "heldout_session_order",
+                        list(expected_by_digest).index(digest),
+                    ),
+                    "n_decisions": count,
+                    "mean_log_likelihood": mean_log_likelihood,
+                    "accuracy": float(full["accuracy"]),
+                    "source_regression_digest": record.get(
+                        "source_regression_digest", record.get("artifact_digest")
+                    ),
+                }
+            )
+
+        expected_subject_sessions = {}
+        for row in baseline_sessions:
+            expected_subject_sessions.setdefault(row["subject_id"], 0)
+            expected_subject_sessions[row["subject_id"]] += 1
+        for subject, n_expected_sessions in expected_subject_sessions.items():
+            rows = [
+                row
+                for row in session_rows
+                if row["model_id"] == model_id and row["subject_id"] == subject
+            ]
+            if not rows:
+                continue
+            subject_rows.append(
+                {
+                    "model_id": model_id,
+                    "kind": spec["kind"],
+                    "predictor_names": predictor_names,
+                    "subject_id": subject,
+                    "n_sessions": len(rows),
+                    "complete": len(rows) == n_expected_sessions,
+                    "mean_log_likelihood": float(
+                        np.mean([row["mean_log_likelihood"] for row in rows])
+                    ),
+                    "accuracy": float(np.mean([row["accuracy"] for row in rows])),
+                }
+            )
+        subjects = [row for row in subject_rows if row["model_id"] == model_id]
+        likelihoods = np.asarray(
+            [row["mean_log_likelihood"] for row in subjects], dtype=float
+        )
+        accuracies = np.asarray([row["accuracy"] for row in subjects], dtype=float)
+        complete = (
+            not model_missing
+            and not model_failed
+            and len(subjects) == len(expected_subject_sessions)
+            and all(row["complete"] for row in subjects)
+            and bool(applicable)
+        )
+        group_rows.append(
+            {
+                "model_id": model_id,
+                "kind": spec["kind"],
+                "predictor_names": predictor_names,
+                "mean_log_likelihood": (
+                    float(likelihoods.mean()) if len(likelihoods) else None
+                ),
+                "log_likelihood_sem_across_subjects": (
+                    float(likelihoods.std(ddof=1) / math.sqrt(len(likelihoods)))
+                    if len(likelihoods) > 1
+                    else None
+                ),
+                "accuracy": float(accuracies.mean()) if len(accuracies) else None,
+                "accuracy_sem_across_subjects": (
+                    float(accuracies.std(ddof=1) / math.sqrt(len(accuracies)))
+                    if len(accuracies) > 1
+                    else None
+                ),
+                "n_subjects": len(subjects),
+                "complete": complete,
+            }
+        )
+
+    complete = bool(group_rows) and all(row["complete"] for row in group_rows)
+    status = (
+        "not_applicable"
+        if not applicable
+        else "complete"
+        if complete
+        else "incomplete"
+    )
+    return {
+        "analysis": "absolute_full_model_performance",
+        "evaluation_scope": scope,
+        "status": status,
+        "models": model_metadata,
+        "sessions": session_rows,
+        "subjects": subject_rows,
+        "group": group_rows if complete else None,
+        "partial_group": {"rows": group_rows, "n_subjects": len(baseline_subjects)},
+        "uniform_policy_baseline": {
+            "policy": "uniform_over_valid_actions",
+            "sessions": baseline_sessions,
+            "subjects": baseline_subjects,
+            "group": baseline_group,
+            "aggregation": "sessions equal within subject; subjects equal",
+        },
+        "missing_partitions": missing,
+        "failed_partitions": failed,
+        "not_applicable_partitions": sorted(not_applicable),
+    }
 
 
 def _analysis_directory(root, spec, attempt):
