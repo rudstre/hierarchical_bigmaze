@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 import time
@@ -28,6 +29,45 @@ from andrew_mlmdp.validation import (  # noqa: E402
 )
 
 _SCHEDULER_CACHE = {}
+_ARTIFACT_STATUS_CACHE = {}
+
+
+def _read_artifact_status(path):
+    """Read one top-level status without decoding a potentially large artifact."""
+    path = Path(path)
+    stat = path.stat()
+    fingerprint = (stat.st_mtime_ns, stat.st_size)
+    cached = _ARTIFACT_STATUS_CACHE.get(path)
+    if cached is not None and cached[:2] == fingerprint:
+        return {"status": cached[2]}
+
+    # Scientific artifacts are atomically written as sorted, indented JSON.  A
+    # top-level key therefore has exactly two leading spaces.  Fall back to the
+    # ordinary reader for older or differently formatted artifacts.
+    content = path.read_bytes()
+    marker = b'\n  "status": '
+    start = content.find(marker)
+    if (
+        content.startswith(b"{")
+        and content.rstrip().endswith(b"}")
+        and start >= 0
+        and content.find(marker, start + len(marker)) < 0
+    ):
+        start += len(marker)
+        end = content.find(b"\n", start)
+        encoded = content[start:end].rstrip(b",") if end >= 0 else b""
+        try:
+            status = json.loads(encoded)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            status = None
+        if isinstance(status, str):
+            _ARTIFACT_STATUS_CACHE[path] = (*fingerprint, status)
+            return {"status": status}
+
+    artifact = read_json(path)
+    status = artifact.get("status")
+    _ARTIFACT_STATUS_CACHE[path] = (*fingerprint, status)
+    return {"status": status}
 
 
 def manager_module():
@@ -210,7 +250,14 @@ def status(root):
 
     states = {
         stage: Counter(
-            manager._artifact_state(config, root, task, manifest) for task in group
+            manager._artifact_state(
+                config,
+                root,
+                task,
+                manifest,
+                artifact_reader=_read_artifact_status,
+            )
+            for task in group
         )
         for stage, group in tasks.items()
     }

@@ -355,7 +355,14 @@ def _submit_group(
     return jobs
 
 
-def _artifact_state(config, run_dir, task, workflow_manifest=None):
+def _artifact_state(
+    config,
+    run_dir,
+    task,
+    workflow_manifest=None,
+    *,
+    artifact_reader=_read,
+):
     stage = task["stage"]
     digest = task.get("partition_digest")
     partition_dir = run_dir / "partitions" / digest if digest else None
@@ -456,7 +463,7 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
             return "missing"
         if all(candidate.suffix == ".html" for candidate in paths):
             return "success"
-        statuses = [_read(candidate).get("status") for candidate in paths]
+        statuses = [artifact_reader(candidate).get("status") for candidate in paths]
         if any(status == "operational_failure" for status in statuses):
             return "retry"
         if any(status in {"scientific_failure", "unavailable"} for status in statuses):
@@ -471,7 +478,7 @@ def _artifact_state(config, run_dir, task, workflow_manifest=None):
         return "missing"
     if path.suffix == ".html":
         return "success"
-    artifact = _read(path)
+    artifact = artifact_reader(path)
     status = artifact.get("status")
     if status in {"success", "selected", "complete", "incomplete"}:
         return "success"

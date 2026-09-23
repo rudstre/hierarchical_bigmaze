@@ -160,6 +160,40 @@ def test_monitoring_caches_scheduler_queries_between_artifact_refreshes(
     assert scheduler_calls == [1]
 
 
+def test_monitoring_reads_and_caches_only_top_level_artifact_status(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "large.json"
+    artifact.write_text(
+        '{\n  "payload": {\n    "status": "nested"\n  },\n'
+        '  "status": "success"\n}\n'
+    )
+    monkeypatch.setattr(
+        access,
+        "read_json",
+        lambda _path: pytest.fail("formatted artifact should use the fast reader"),
+    )
+    access._ARTIFACT_STATUS_CACHE.clear()
+
+    assert access._read_artifact_status(artifact) == {"status": "success"}
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: pytest.fail("unchanged artifact should use the status cache"),
+    )
+    assert access._read_artifact_status(artifact) == {"status": "success"}
+
+
+def test_monitoring_status_reader_falls_back_for_compact_json(tmp_path):
+    artifact = tmp_path / "compact.json"
+    artifact.write_text('{"status": "scientific_failure"}')
+    access._ARTIFACT_STATUS_CACHE.clear()
+
+    assert access._read_artifact_status(artifact) == {
+        "status": "scientific_failure"
+    }
+
+
 def test_launch_surfaces_partial_submission_job_ids(tmp_path, monkeypatch):
     output = tmp_path / "run"
     output.mkdir()
