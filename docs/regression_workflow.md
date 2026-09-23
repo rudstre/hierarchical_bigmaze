@@ -353,10 +353,11 @@ recorded by the workflow manager.
 The same action also renders two absolute held-out-performance figures below
 the ablation figures: mean log likelihood in nats/decision and action accuracy.
 Each shows the selected predictors' singleton regressions followed by a
-visually emphasized **COMBINED** point for the regression containing the full
-selected set. A one-predictor selection omits this duplicate combined point. A
-singleton retains Qin's standard intercept and impossible-action mask. These
-figures read the saved full-model scores and do not use
+dark-purple **Combined** category for the regression containing the full
+selected set. It uses the same subject circles and mean diamond as the
+singletons, with a bold axis label. A one-predictor selection omits this
+duplicate combined point. A singleton retains Qin's standard intercept and
+impossible-action mask. These figures read the saved full-model scores and do not use
 full-minus-reduced contrasts. Each includes the uniform-over-valid-actions
 reference computed on the same evaluation locations. Folds are pooled by test
 decision count, sessions are averaged equally within subjects, and subjects are

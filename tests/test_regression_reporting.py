@@ -325,12 +325,16 @@ def test_absolute_figures_show_full_model_values_and_uniform_baseline():
     assert list(ll_mean.error_y.array) == pytest.approx([0.5, 0.5, 0.1])
     assert list(accuracy_mean.y) == pytest.approx([55.0, 45.0, 75.0])
     assert list(accuracy_mean.error_y.array) == pytest.approx([5.0, 5.0, 5.0])
-    assert list(ll_mean.x)[-1] == "COMBINED"
-    assert list(ll_mean.marker.symbol)[-1] == "star"
-    assert list(ll_mean.marker.size)[-1] > list(ll_mean.marker.size)[0]
-    assert list(ll_mean.marker.line.width)[-1] > list(
-        ll_mean.marker.line.width
-    )[0]
+    assert list(ll_mean.x)[-1] == "Combined"
+    assert ll_mean.marker.symbol == "diamond"
+    assert ll_mean.marker.size == 11
+    assert ll_mean.marker.line.width == 0.8
+    assert list(ll_mean.marker.color)[-1] == "#4B176D"
+    assert likelihood.layout.xaxis.ticktext[-1] == "<b>Combined</b>"
+    assert len(likelihood.layout.shapes) == 1
+    combined_subjects = likelihood.data[2]
+    assert combined_subjects.marker.symbol == "circle"
+    assert combined_subjects.marker.size == 7
     assert "nats/decision" in likelihood.layout.yaxis.title.text
     assert accuracy.layout.yaxis.range == (0, 100)
     assert any(

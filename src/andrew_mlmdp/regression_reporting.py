@@ -797,7 +797,7 @@ def _absolute_model_style(model):
     if model["kind"] == "singleton" and len(names) == 1:
         display, colour = _PREDICTOR_STYLE[names[0]]
         return display, colour
-    return "COMBINED", "#4B176D"
+    return "Combined", "#4B176D"
 
 
 def _absolute_session_profile(rows, model_id, value_key, plot_order):
@@ -872,7 +872,6 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
     for position, model in enumerate(models):
         model_id = model["model_id"]
         display, colour = _absolute_model_style(model)
-        is_combined = model["kind"] == "combination"
         display_names.append(display)
         colours.append(colour)
         points = [
@@ -887,14 +886,11 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
                 legendgroup="subjects",
                 showlegend=position == 0,
                 marker={
-                    "size": 9 if is_combined else 7,
+                    "size": 7,
                     "color": colour,
-                    "opacity": 0.7 if is_combined else 0.45,
-                    "symbol": "star" if is_combined else "circle",
-                    "line": {
-                        "color": "black" if is_combined else "white",
-                        "width": 1.2 if is_combined else 0.5,
-                    },
+                    "opacity": 0.45,
+                    "symbol": "circle",
+                    "line": {"color": "white", "width": 0.5},
                 },
                 customdata=[
                     [
@@ -920,7 +916,6 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
         means = [scaled(group[model["model_id"]][value_key]) for model in models]
         sems = [scaled(group[model["model_id"]][sem_key]) for model in models]
         sample_sizes = [group[model["model_id"]]["n_subjects"] for model in models]
-        combined_flags = [model["kind"] == "combination" for model in models]
         figure.add_trace(
             go.Scatter(
                 x=display_names,
@@ -928,18 +923,10 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
                 mode="markers",
                 name="Mean +/- SEM",
                 marker={
-                    "size": [16 if combined else 11 for combined in combined_flags],
-                    "symbol": [
-                        "star" if combined else "diamond"
-                        for combined in combined_flags
-                    ],
+                    "size": 11,
+                    "symbol": "diamond",
                     "color": colours,
-                    "line": {
-                        "color": "black",
-                        "width": [
-                            2.0 if combined else 0.8 for combined in combined_flags
-                        ],
-                    },
+                    "line": {"color": "black", "width": 0.8},
                 },
                 error_y={
                     "type": "data",
@@ -978,7 +965,6 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
         for model in models:
             model_id = model["model_id"]
             display, colour = _absolute_model_style(model)
-            is_combined = model["kind"] == "combination"
             profile = _absolute_session_profile(
                 summary["sessions"], model_id, value_key, plot_order
             )
@@ -989,15 +975,11 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
                     mode="lines+markers",
                     name=display,
                     legendgroup=model_id,
-                    line={"color": colour, "width": 3.5 if is_combined else 2},
+                    line={"color": colour, "width": 2},
                     marker={
                         "color": colour,
-                        "size": 10 if is_combined else 7,
-                        "symbol": "star" if is_combined else "circle",
-                        "line": {
-                            "color": "black" if is_combined else colour,
-                            "width": 1.2 if is_combined else 0,
-                        },
+                        "size": 7,
+                        "symbol": "circle",
                     },
                     error_y={
                         "type": "data",
@@ -1039,9 +1021,9 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
                     showlegend=False,
                     marker={
                         "color": colour,
-                        "size": 7 if is_combined else 5,
-                        "opacity": 0.55 if is_combined else 0.25,
-                        "symbol": "star" if is_combined else "circle",
+                        "size": 5,
+                        "opacity": 0.25,
+                        "symbol": "circle",
                     },
                     customdata=[
                         [
@@ -1087,26 +1069,19 @@ def _make_absolute_performance_figure(summary, *, accuracy, title):
             col=2,
         )
 
-    if models and models[-1]["kind"] == "combination" and len(models) > 1:
-        combined_position = len(models) - 1
-        figure.add_vrect(
-            x0=combined_position - 0.5,
-            x1=combined_position + 0.5,
-            fillcolor="#4B176D",
-            opacity=0.08,
-            line_width=0,
-            layer="below",
-            row=1,
-            col=1,
-        )
-        figure.add_vline(
-            x=combined_position - 0.5,
-            line={"color": "#4B176D", "width": 1.5, "dash": "dot"},
-            row=1,
-            col=1,
-        )
-
-    figure.update_xaxes(title_text="Model", tickangle=-30, row=1, col=1)
+    tick_text = [
+        f"<b>{display}</b>" if model["kind"] == "combination" else display
+        for model, display in zip(models, display_names, strict=True)
+    ]
+    figure.update_xaxes(
+        title_text="Model",
+        tickangle=-30,
+        tickmode="array",
+        tickvals=display_names,
+        ticktext=tick_text,
+        row=1,
+        col=1,
+    )
     figure.update_yaxes(title_text=y_title, row=1, col=1)
     if accuracy:
         figure.update_yaxes(range=[0, 100], row=1, col=1)
