@@ -208,6 +208,17 @@ SEM, a zero reference, units, sample counts, stable colors, and hover metadata.
 Output includes self-contained HTML plus PNG, SVG, and PDF through Kaleido.
 Incomplete grids retain partial diagnostics but have no headline group estimate.
 
+In the Streamlit Results interface, unique-predictability and unique-accuracy
+group panels can add significance stars directly from the saved subject table. Each displayed
+predictor is tested against zero with a one-sided one-sample t-test for a
+positive contribution, and p-values are Holm-corrected across the predictors in
+that figure; the likelihood and accuracy figures are separate Holm families. Subjects are the independent observations; held-out sessions have
+already been averaged equally within subject. Stars denote adjusted `p < .05`,
+`p < .01`, and `p < .001`. Significance is withheld for incomplete results or
+when the displayed predictors lack at least two matching, finite subject values
+with nonzero between-subject variance. Rendering these annotations does not
+refit models or modify historical result artifacts.
+
 Each likelihood figure has a companion `_accuracy` figure generated from the
 same held-out folds. Accuracy is the fraction of individual actions for which
 the model's highest-probability action matches the observed action; JSON and CSV

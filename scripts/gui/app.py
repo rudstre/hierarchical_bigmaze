@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -14,6 +16,19 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import run_access as access  # noqa: E402
+
+import andrew_mlmdp.regression_reporting as regression_reporting  # noqa: E402
+
+# Streamlit can rerun this file while retaining an older imported reporting
+# module. Reload only when the app and cached module disagree on this API.
+if any(
+    "show_significance" not in inspect.signature(maker).parameters
+    for maker in (
+        regression_reporting.make_regression_figure,
+        regression_reporting.make_regression_accuracy_figure,
+    )
+):
+    importlib.reload(regression_reporting)
 
 from andrew_mlmdp.regression_analysis import (  # noqa: E402
     open_run,
@@ -559,9 +574,14 @@ if page == "Results":
                                 ("Likelihood", make_regression_figure),
                                 ("Accuracy", make_regression_accuracy_figure),
                             ):
-                                figure = maker(summary, selected_names)
+                                figure = maker(
+                                    summary,
+                                    selected_names,
+                                    show_significance=True,
+                                )
                                 figure.update_layout(
                                     meta={
+                                        **(figure.layout.meta or {}),
                                         **request,
                                         "source_regression_digests": [
                                             record["source_regression_digest"]
@@ -862,13 +882,20 @@ if page == "Results":
                     figure = make_learning_curve_figure(summary)
                     accuracy_figure = make_learning_curve_accuracy_figure(summary)
                 else:
-                    figure = make_regression_figure(summary, report["predictor_names"])
+                    figure = make_regression_figure(
+                        summary,
+                        report["predictor_names"],
+                        show_significance=True,
+                    )
                     accuracy_figure = make_regression_accuracy_figure(
-                        summary, report["predictor_names"]
+                        summary,
+                        report["predictor_names"],
+                        show_significance=True,
                     )
                 for exported in (figure, accuracy_figure):
                     exported.update_layout(
                         meta={
+                            **(exported.layout.meta or {}),
                             "source_report_digest": report.get("artifact_digest"),
                             "selected_report": chosen.name,
                             "evaluation_scope": (

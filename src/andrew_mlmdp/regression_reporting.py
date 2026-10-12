@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
+from scipy.stats import ttest_1samp
 
 from andrew_mlmdp.regression_execution import (
     _pool_learning_curve,
@@ -483,6 +484,99 @@ def _subject_points(summary, predictor_names):
     return by_predictor
 
 
+def _unique_predictability_significance(
+    summary, predictor_names, value_key="unique_predictability"
+):
+    """Test positive subject-level contributions with one Holm family.
+
+    ``value_key`` selects the subject-level contribution being tested
+    (``unique_predictability`` or ``unique_accuracy``); each figure is its own
+    Holm family.
+    """
+    unavailable = {
+        "available": False,
+        "method": "one-sided one-sample t-test against zero; Holm correction",
+        "alternative": "greater",
+        "correction": "Holm",
+        "thresholds": {"*": 0.05, "**": 0.01, "***": 0.001},
+        "tests": [],
+    }
+    if summary["status"] != "complete":
+        return {**unavailable, "reason": "the selected result is incomplete"}
+
+    points = _subject_points(summary, predictor_names)
+    subject_ids = []
+    values_by_predictor = {}
+    for predictor in predictor_names:
+        rows = points[predictor]
+        ids = [row["subject_id"] for row in rows]
+        if len(ids) != len(set(ids)):
+            return {
+                **unavailable,
+                "reason": f"{predictor} has duplicate subject observations",
+            }
+        if len(ids) < 2:
+            return {
+                **unavailable,
+                "reason": "at least two subjects are required for every predictor",
+            }
+        values = np.asarray(
+            [row[value_key] for row in rows], dtype=float
+        )
+        if not np.all(np.isfinite(values)):
+            return {
+                **unavailable,
+                "reason": "all subject-level contributions must be finite",
+            }
+        if values.var(ddof=1) == 0:
+            return {
+                **unavailable,
+                "reason": "every predictor must have nonzero between-subject variance",
+            }
+        subject_ids.append(set(ids))
+        values_by_predictor[predictor] = values
+
+    if any(ids != subject_ids[0] for ids in subject_ids[1:]):
+        return {
+            **unavailable,
+            "reason": "displayed predictors do not have matching subject membership",
+        }
+
+    tests = []
+    for predictor in predictor_names:
+        result = ttest_1samp(
+            values_by_predictor[predictor], 0.0, alternative="greater"
+        )
+        tests.append(
+            {
+                "predictor": predictor,
+                "n_subjects": len(values_by_predictor[predictor]),
+                "t_statistic": float(result.statistic),
+                "raw_p_value": float(result.pvalue),
+            }
+        )
+
+    order = sorted(range(len(tests)), key=lambda index: tests[index]["raw_p_value"])
+    running_max = 0.0
+    family_size = len(tests)
+    for rank, index in enumerate(order):
+        adjusted = min(1.0, (family_size - rank) * tests[index]["raw_p_value"])
+        running_max = max(running_max, adjusted)
+        tests[index]["holm_adjusted_p_value"] = running_max
+    for test in tests:
+        adjusted = test["holm_adjusted_p_value"]
+        test["stars"] = (
+            "***"
+            if adjusted < 0.001
+            else "**"
+            if adjusted < 0.01
+            else "*"
+            if adjusted < 0.05
+            else ""
+        )
+    return {**unavailable, "available": True, "reason": None, "tests": tests}
+
+
 def _session_plot_order(summary):
     """Number observed held-out sessions within each subject for plotting."""
     by_subject = {}
@@ -533,19 +627,35 @@ def _session_profile(summary, predictor_names, value_key, plot_order):
     return result
 
 
-def make_regression_figure(summary, predictor_names, *, title=None):
+def make_regression_figure(
+    summary, predictor_names, *, title=None, show_significance=False
+):
     """Create held-out unique-predictability panels."""
     return _make_regression_figure(
-        summary, predictor_names, accuracy=False, title=title
+        summary,
+        predictor_names,
+        accuracy=False,
+        title=title,
+        show_significance=show_significance,
     )
 
 
-def make_regression_accuracy_figure(summary, predictor_names, *, title=None):
+def make_regression_accuracy_figure(
+    summary, predictor_names, *, title=None, show_significance=False
+):
     """Create held-out full-minus-reduced accuracy panels."""
-    return _make_regression_figure(summary, predictor_names, accuracy=True, title=title)
+    return _make_regression_figure(
+        summary,
+        predictor_names,
+        accuracy=True,
+        title=title,
+        show_significance=show_significance,
+    )
 
 
-def _make_regression_figure(summary, predictor_names, *, accuracy, title):
+def _make_regression_figure(
+    summary, predictor_names, *, accuracy, title, show_significance
+):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -633,6 +743,32 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
         group_by_predictor.get(name, {}).get("n_subjects", 0)
         for name in predictor_names
     ]
+    significance = (
+        _unique_predictability_significance(summary, predictor_names, value_key)
+        if show_significance
+        else None
+    )
+    tests_by_predictor = {
+        row["predictor"]: row for row in (significance or {}).get("tests", [])
+    }
+    group_customdata = []
+    for predictor, sample_size in zip(predictor_names, sample_sizes, strict=True):
+        test = tests_by_predictor.get(predictor)
+        group_customdata.append(
+            [
+                sample_size if test is None else test["n_subjects"],
+                None if test is None else test["t_statistic"],
+                None if test is None else test["raw_p_value"],
+                None if test is None else test["holm_adjusted_p_value"],
+            ]
+        )
+    significance_hover = (
+        "<br>t: %{customdata[1]:.4f}"
+        "<br>Raw one-sided p: %{customdata[2]:.4g}"
+        "<br>Holm-adjusted p: %{customdata[3]:.4g}"
+        if significance and significance["available"]
+        else ""
+    )
     figure.add_trace(
         go.Scatter(
             x=display_names,
@@ -652,15 +788,68 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
                 "thickness": 1.4,
                 "width": 5,
             },
-            customdata=np.asarray(sample_sizes)[:, None],
+            customdata=group_customdata,
             hovertemplate=(
                 f"Predictor: %{{x}}<br>Mean: %{{y:{value_format}}} {unit}"
-                "<br>Subjects: %{customdata[0]}<extra></extra>"
+                "<br>Subjects: %{customdata[0]}"
+                + significance_hover
+                + "<extra></extra>"
             ),
         ),
         row=1,
         col=1,
     )
+
+    if significance and significance["available"]:
+        finite_plot_values = [
+            value
+            for value in [
+                *(
+                    scaled(row[value_key])
+                    for rows in subject_points.values()
+                    for row in rows
+                ),
+                *(mean for mean in means if mean is not None),
+            ]
+            if value is not None and np.isfinite(value)
+        ]
+        span = max(finite_plot_values) - min(finite_plot_values)
+        offset = 0.07 * (span if span > 0 else 1.0)
+        star_x = []
+        star_y = []
+        star_text = []
+        for predictor, display, mean, sem in zip(
+            predictor_names, display_names, means, sems, strict=True
+        ):
+            stars = tests_by_predictor[predictor]["stars"]
+            if stars:
+                # Clear both the error bar and every subject point so the
+                # stars never sit on top of an observation.
+                top = max(
+                    mean + (0 if sem is None else sem),
+                    *(
+                        scaled(row[value_key])
+                        for row in subject_points.get(predictor, [])
+                    ),
+                )
+                star_x.append(display)
+                star_y.append(top + offset)
+                star_text.append(stars)
+        if star_text:
+            figure.add_trace(
+                go.Scatter(
+                    x=star_x,
+                    y=star_y,
+                    mode="text",
+                    text=star_text,
+                    textfont={"size": 17, "color": "black"},
+                    name="Significance",
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=1,
+            )
 
     if has_session_profile:
         profiles = _session_profile(summary, predictor_names, value_key, plot_order)
@@ -752,7 +941,7 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
         template="plotly_white",
         width=1250 if has_session_profile else 900,
         height=620,
-        margin={"l": 80, "r": 30, "t": 75, "b": 145},
+        margin={"l": 80, "r": 30, "t": 75, "b": 190 if significance else 145},
         legend={
             "orientation": "h",
             "yanchor": "top",
@@ -763,7 +952,27 @@ def _make_regression_figure(summary, predictor_names, *, accuracy, title):
         hovermode="closest",
         font={"family": "Arial, sans-serif", "size": 13},
         title=title,
+        meta={"significance": significance} if significance else None,
     )
+    if significance:
+        caption = (
+            "Stars show one-sided subject-level t-tests for positive unique "
+            f"{'accuracy' if accuracy else 'predictability'}, Holm-corrected "
+            "across predictors in this figure "
+            "(* p<.05, ** p<.01, *** p<.001)."
+            if significance["available"]
+            else f"Significance unavailable: {significance['reason']}."
+        )
+        figure.add_annotation(
+            x=0.5,
+            y=-0.38,
+            xref="paper",
+            yref="paper",
+            text=caption,
+            showarrow=False,
+            align="center",
+            font={"color": "#555555", "size": 11},
+        )
     if summary["status"] != "complete":
         figure.add_annotation(
             x=0.5,

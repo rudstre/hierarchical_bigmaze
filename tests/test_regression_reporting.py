@@ -7,6 +7,7 @@ import numpy as np
 import plotly.graph_objects as go
 import pytest
 from scipy.special import softmax
+from scipy.stats import ttest_1samp
 
 import andrew_mlmdp.regression_reporting as reporting
 from andrew_mlmdp.regression_reporting import (
@@ -147,6 +148,46 @@ def _summary(*, complete=True):
     }
 
 
+def _significance_summary(values_by_predictor, *, complete=True):
+    subjects = [
+        {
+            "subject_id": subject,
+            "predictor": predictor,
+            "n_sessions": 1,
+            "unique_predictability": value,
+            "unique_accuracy": 0.0,
+        }
+        for predictor, values in values_by_predictor.items()
+        for subject, value in values.items()
+    ]
+    group_rows = []
+    for predictor, values in values_by_predictor.items():
+        array = np.asarray(list(values.values()), dtype=float)
+        group_rows.append(
+            {
+                "predictor": predictor,
+                "mean_unique_predictability": float(array.mean()),
+                "sem_across_subjects": (
+                    float(array.std(ddof=1) / np.sqrt(len(array)))
+                    if len(array) > 1
+                    else None
+                ),
+                "mean_unique_accuracy": 0.0,
+                "accuracy_sem_across_subjects": 0.0,
+                "n_subjects": len(array),
+            }
+        )
+    return {
+        "status": "complete" if complete else "incomplete",
+        "subjects": subjects,
+        "sessions": [],
+        "partial_group": {"rows": group_rows},
+        "missing_partitions": [] if complete else ["missing"],
+        "failed_partitions": [],
+        "unavailable_partitions": {},
+    }
+
+
 def test_plotly_report_has_points_intervals_zero_line_and_units():
     figure = make_regression_figure(_summary(), ("vector",))
 
@@ -157,6 +198,196 @@ def test_plotly_report_has_points_intervals_zero_line_and_units():
     assert figure.layout.yaxis.title.text.endswith("(nats/decision)")
     assert any(shape.y0 == 0 and shape.y1 == 0 for shape in figure.layout.shapes)
     assert all(trace.type == "scatter" for trace in figure.data)
+
+
+def test_unique_predictability_significance_is_one_sided_and_holm_corrected():
+    values = {
+        "vector": {"m1": 1.0, "m2": 2.0, "m3": 3.0},
+        "optimal": {"m1": 1.0, "m2": 2.0, "m3": 3.0},
+        "habit": {"m1": -1.0, "m2": -2.0, "m3": -3.0},
+    }
+    summary = _significance_summary(values)
+
+    forward = reporting._unique_predictability_significance(
+        summary, ("vector", "optimal", "habit")
+    )
+    reversed_result = reporting._unique_predictability_significance(
+        summary, ("habit", "optimal", "vector")
+    )
+
+    assert forward["available"]
+    by_predictor = {row["predictor"]: row for row in forward["tests"]}
+    assert by_predictor["vector"]["t_statistic"] == pytest.approx(np.sqrt(12))
+    assert by_predictor["vector"]["raw_p_value"] == pytest.approx(
+        0.03708995011372426
+    )
+    raw = sorted(row["raw_p_value"] for row in forward["tests"])
+    expected_sorted = []
+    running_max = 0.0
+    for index, p_value in enumerate(raw):
+        running_max = max(running_max, min(1.0, (len(raw) - index) * p_value))
+        expected_sorted.append(running_max)
+    assert sorted(row["holm_adjusted_p_value"] for row in forward["tests"]) == (
+        pytest.approx(expected_sorted)
+    )
+    assert by_predictor["vector"]["holm_adjusted_p_value"] == pytest.approx(
+        by_predictor["optimal"]["holm_adjusted_p_value"]
+    )
+    assert by_predictor["habit"]["stars"] == ""
+    assert {
+        row["predictor"]: row["holm_adjusted_p_value"]
+        for row in reversed_result["tests"]
+    } == pytest.approx(
+        {
+            row["predictor"]: row["holm_adjusted_p_value"]
+            for row in forward["tests"]
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("adjusted_p", "stars"),
+    [(0.04, "*"), (0.004, "**"), (0.0004, "***"), (0.05, "")],
+)
+def test_significance_star_thresholds(monkeypatch, adjusted_p, stars):
+    monkeypatch.setattr(
+        reporting,
+        "ttest_1samp",
+        lambda *_args, **_kwargs: SimpleNamespace(statistic=2.0, pvalue=adjusted_p),
+    )
+    summary = _significance_summary(
+        {"vector": {"m1": 0.1, "m2": 0.2, "m3": 0.4}}
+    )
+
+    result = reporting._unique_predictability_significance(summary, ("vector",))
+
+    assert result["tests"][0]["stars"] == stars
+
+
+def test_significance_requires_a_complete_matched_finite_subject_family():
+    valid = {
+        "vector": {"m1": 0.1, "m2": 0.2},
+        "optimal": {"m1": 0.2, "m2": 0.4},
+    }
+    cases = [
+        _significance_summary(valid, complete=False),
+        _significance_summary({"vector": {"m1": 0.1}}),
+        _significance_summary({"vector": {"m1": np.nan, "m2": 0.2}}),
+        _significance_summary({"vector": {"m1": 0.1, "m2": 0.1}}),
+        _significance_summary(
+            {
+                "vector": {"m1": 0.1, "m2": 0.2},
+                "optimal": {"m1": 0.2, "m3": 0.4},
+            }
+        ),
+    ]
+
+    for summary in cases:
+        predictors = tuple(row["predictor"] for row in summary["partial_group"]["rows"])
+        result = reporting._unique_predictability_significance(summary, predictors)
+        assert not result["available"]
+        assert result["tests"] == []
+        assert result["reason"]
+
+
+def test_significance_is_rendered_and_retained_in_export_metadata():
+    summary = _significance_summary(
+        {
+            "vector": {
+                "m1": 0.8,
+                "m2": 0.9,
+                "m3": 1.0,
+                "m4": 1.1,
+                "m5": 1.2,
+            }
+        }
+    )
+
+    figure = make_regression_figure(
+        summary, ("vector",), show_significance=True
+    )
+
+    star_trace = next(trace for trace in figure.data if trace.name == "Significance")
+    mean_trace = next(trace for trace in figure.data if trace.name == "Mean +/- SEM")
+    assert list(star_trace.text) == ["***"]
+    assert star_trace.y[0] > mean_trace.y[0] + mean_trace.error_y.array[0]
+    # The highest subject (1.2) lies above mean + SEM; stars must clear it.
+    assert star_trace.y[0] > 1.2
+    assert "Raw one-sided p" in mean_trace.hovertemplate
+    assert figure.layout.meta["significance"]["available"]
+    assert "holm_adjusted_p_value" in figure.to_html(include_plotlyjs=False)
+    assert any("Holm-corrected" in row.text for row in figure.layout.annotations)
+
+
+def test_accuracy_significance_tests_unique_accuracy_not_predictability():
+    # Predictability is uninformative here; only accuracy should drive stars.
+    summary = _significance_summary(
+        {"vector": {"m1": 0.1, "m2": -0.1, "m3": 0.2, "m4": -0.2, "m5": 0.0}}
+    )
+    accuracy = {"m1": 0.08, "m2": 0.09, "m3": 0.10, "m4": 0.11, "m5": 0.12}
+    for row in summary["subjects"]:
+        row["unique_accuracy"] = accuracy[row["subject_id"]]
+    values = np.asarray(list(accuracy.values()))
+    summary["partial_group"]["rows"][0].update(
+        mean_unique_accuracy=float(values.mean()),
+        accuracy_sem_across_subjects=float(
+            values.std(ddof=1) / np.sqrt(len(values))
+        ),
+    )
+
+    result = reporting._unique_predictability_significance(
+        summary, ("vector",), "unique_accuracy"
+    )
+    expected = ttest_1samp(values, 0.0, alternative="greater")
+    assert result["tests"][0]["raw_p_value"] == pytest.approx(expected.pvalue)
+
+    figure = make_regression_accuracy_figure(
+        summary, ("vector",), show_significance=True
+    )
+    star_trace = next(trace for trace in figure.data if trace.name == "Significance")
+    mean_trace = next(trace for trace in figure.data if trace.name == "Mean +/- SEM")
+    assert list(star_trace.text) == ["***"]
+    # Stars sit above the error bar in the displayed percentage-point scale.
+    assert star_trace.y[0] > mean_trace.y[0] + mean_trace.error_y.array[0]
+    assert figure.layout.meta["significance"]["tests"][0]["stars"] == "***"
+    assert any("unique accuracy" in row.text for row in figure.layout.annotations)
+    assert not any(
+        trace.name == "Significance"
+        for trace in make_regression_accuracy_figure(summary, ("vector",)).data
+    )
+
+
+def test_significance_uses_subject_averages_regardless_of_session_counts():
+    summary = _significance_summary(
+        {"vector": {"m1": 0.2, "m2": 0.4, "m3": 0.8}}
+    )
+    for row, n_sessions in zip(summary["subjects"], (1, 3, 7), strict=True):
+        row["n_sessions"] = n_sessions
+
+    result = reporting._unique_predictability_significance(summary, ("vector",))
+
+    expected = reporting.ttest_1samp(
+        np.asarray([0.2, 0.4, 0.8]), 0.0, alternative="greater"
+    )
+    assert result["tests"][0]["n_subjects"] == 3
+    assert result["tests"][0]["t_statistic"] == pytest.approx(expected.statistic)
+    assert result["tests"][0]["raw_p_value"] == pytest.approx(expected.pvalue)
+
+
+def test_incomplete_significance_figure_explains_why_stars_are_withheld():
+    summary = _significance_summary(
+        {"vector": {"m1": 0.1, "m2": 0.2}}, complete=False
+    )
+
+    figure = make_regression_figure(
+        summary, ("vector",), show_significance=True
+    )
+
+    assert not any(trace.name == "Significance" for trace in figure.data)
+    assert any(
+        "Significance unavailable" in annotation.text
+        for annotation in figure.layout.annotations
+    )
 
 
 def test_one_heldout_session_per_subject_has_no_session_sequence_panel():
@@ -212,6 +443,8 @@ def test_accuracy_report_uses_percentage_point_contribution():
     assert list(mean.error_y.array) == pytest.approx([1.0])
     assert "percentage points" in figure.layout.yaxis.title.text
     assert any(shape.y0 == 0 and shape.y1 == 0 for shape in figure.layout.shapes)
+    assert figure.layout.meta is None
+    assert not any(trace.name == "Significance" for trace in figure.data)
 
 
 def _absolute_summary(*, complete=True):
