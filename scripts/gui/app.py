@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import io
 import json
 import sys
 from pathlib import Path
 
-import plotly.graph_objects as go
-import streamlit as st
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import plotly.graph_objects as go  # noqa: E402
+import streamlit as st  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -30,6 +35,10 @@ if any(
 ):
     importlib.reload(regression_reporting)
 
+from andrew_mlmdp.hmm_route_plots import (  # noqa: E402
+    hmm_route_maps,
+    make_hmm_route_figure,
+)
 from andrew_mlmdp.regression_analysis import (  # noqa: E402
     open_run,
     read_json,
@@ -427,10 +436,11 @@ if page == "Results":
         f"{p['partition']['heldout_session_id']}"
         for p in partitions
     }
+    views = ["Predictor combinations", "Policy overlap", "Original reports"]
+    if config.predictors.route_family == "hmm":
+        views.append("HMM routes")
     analysis_view = st.segmented_control(
-        "View results",
-        ["Predictor combinations", "Policy overlap", "Original reports"],
-        default="Predictor combinations",
+        "View results", views, default="Predictor combinations"
     )
     with st.expander("Sessions and evaluation locations", expanded=False):
         selected_digests = st.multiselect(
@@ -913,3 +923,78 @@ if page == "Results":
                     figure.to_html(),
                     file_name=chosen.stem + ".html",
                 )
+    if analysis_view == "HMM routes":
+        digest = st.selectbox(
+            "Subject / held-out session", list(labels), format_func=lambda d: labels[d]
+        )
+        bundle_path = root / "partitions" / str(digest) / "predictor.json"
+        if digest is None:
+            st.info("This workflow has no partitions.")
+        elif not bundle_path.exists():
+            st.info("The HMM route model for this partition has not been fitted yet.")
+        else:
+            bundle = show_error(read_json, bundle_path)
+            if bundle and bundle.get("status") != "success":
+                st.warning(
+                    f"Route fit {bundle.get('status')} at stage "
+                    f"{bundle.get('stage')}: "
+                    f"{bundle.get('failure', {}).get('message')}"
+                )
+            elif bundle:
+                bundle = show_error(
+                    verify_artifact, bundle, artifact_type="heldout_predictor_bundle"
+                )
+                maps = bundle and show_error(
+                    hmm_route_maps, bundle, config.project_root
+                )
+                if maps:
+                    weights = maps["route_weights"]
+                    # Display threshold only: a route's weight multiplies every
+                    # transition into it, so near-zero routes cannot be entered.
+                    active = [r for r, w in enumerate(weights) if w >= 0.01]
+                    inactive = [r for r in range(len(weights)) if r not in active]
+                    show_inactive = st.checkbox(
+                        f"Show {len(inactive)} routes with weight < 0.01",
+                        value=False,
+                        disabled=not inactive,
+                    )
+                    routes = list(range(len(weights))) if show_inactive else active
+                    if not routes:
+                        st.warning("Every fitted route has weight < 0.01.")
+                        st.stop()
+                    figure = make_hmm_route_figure(
+                        maps, config.project_root, routes=routes
+                    )
+                    st.pyplot(figure)
+                    st.caption(
+                        "Arrows: the route's preference among the actions at each "
+                        "location, p(action | location, route); this is what shapes "
+                        "action choice within the route, before it is combined with "
+                        "the goal-directed value. Colour: the location's total mass "
+                        "under the route, on a scale shared by the panels; it only "
+                        "matters when routes are compared (route inference and "
+                        "switching). Routes with weight < 0.01 can effectively never "
+                        "be entered, so their maps do not affect the likelihood. "
+                        "Route indices are arbitrary and not aligned across "
+                        "partitions (separate fits). "
+                        f"Uniform-route weight: {maps['uniform_route_weight']:.3f}."
+                    )
+                    st.write(
+                        {
+                            "artifact_digest": maps["artifact_digest"],
+                            "seed": maps["seed"],
+                            "settings": maps["settings"],
+                            "route_weights": [round(float(w), 4) for w in weights],
+                            "route_logits": [
+                                round(float(v), 2) for v in maps["route_logits"]
+                            ],
+                        }
+                    )
+                    image = io.BytesIO()
+                    figure.savefig(image, format="png", dpi=200)
+                    plt.close(figure)
+                    st.download_button(
+                        "Download route maps (PNG)",
+                        image.getvalue(),
+                        file_name=f"hmm_routes_{digest[:12]}.png",
+                    )
