@@ -522,13 +522,24 @@ def test_submission_task_records_frozen_input_hashes(tmp_path, monkeypatch):
         "max_array_size": 10,
         "submissions": [],
     }
-    monkeypatch.setattr(manager, "_run", lambda command, dry_run: "12345")
+    commands = []
+    monkeypatch.setattr(
+        manager,
+        "_run",
+        lambda command, dry_run: commands.append(command) or "12345",
+    )
     manager._submit_group(
         state,
         tmp_path / "manager.json",
         "regression",
         [{"stage": "regression", "partition_digest": "partition"}],
-        {"partition": "cpu", "memory": "2G", "time": "00:30:00", "max_concurrent": 1},
+        {
+            "partition": "cpu",
+            "cpus_per_task": 8,
+            "memory": "16G",
+            "time": "04:00:00",
+            "max_concurrent": 1,
+        },
         [],
     )
     saved = manager._read(Path(state["submissions"][0]["task_list"]))
@@ -537,6 +548,54 @@ def test_submission_task_records_frozen_input_hashes(tmp_path, monkeypatch):
     assert task["discovery_config_sha256"] == "discovery-hash"
     assert task["manifest_sha256"] == "manifest-hash"
     assert task["worker_source"] == "source-hash"
+    assert "--cpus-per-task=8" in commands[0]
+    assert state["submissions"][0]["resources"]["memory"] == "16G"
+
+
+def test_submission_reuses_frozen_resource_plan():
+    config = _config()
+    frozen = {
+        "profile": "saved",
+        "launchable": True,
+        "stages": {"predictor-bundle": {"cpus_per_task": 8}},
+        "candidate_bands": [],
+    }
+    state = {"schema_version": 2, "resolved_resources": frozen}
+    raw = {
+        "slurm": {
+            "partition": "changed",
+            "max_concurrent": 1,
+            "resource_bands": [],
+        }
+    }
+
+    assert manager._resource_plan_for_submission(state, config, raw) is frozen
+
+
+def test_scheduler_records_include_sacct_resource_evidence(monkeypatch):
+    outputs = iter(
+        [
+            "123_0|COMPLETED|00:12:03||8|16G\n"
+            "123_0.batch|COMPLETED|00:12:01|7812M|8|16G\n",
+            "",
+        ]
+    )
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, next(outputs), "")
+
+    monkeypatch.setattr(manager.subprocess, "run", fake_run)
+    records = manager._scheduler_records(
+        {"submissions": [{"job_id": "123"}]}
+    )
+
+    assert records["123"]["123_0"] == {
+        "state": "COMPLETED",
+        "elapsed": "00:12:01",
+        "max_rss": "7812M",
+        "allocated_cpus": "8",
+        "requested_memory": "16G",
+    }
 
 
 def test_retry_submits_only_missing_tasks(tmp_path, monkeypatch):

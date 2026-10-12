@@ -130,6 +130,75 @@ def test_new_workflow_json_survives_switching_to_a_saved_run(tmp_path):
     assert not any("Expecting value" in error.value for error in app.error)
 
 
+def test_streamlit_rank_range_form_updates_configuration_json_together():
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=30
+    ).run()
+
+    next(w for w in app.number_input if w.label == "Minimum rank").set_value(4)
+    next(w for w in app.number_input if w.label == "Maximum rank").set_value(9)
+    next(
+        w for w in app.button if w.label == "Apply common settings to JSON"
+    ).click().run()
+
+    raw = next(
+        widget for widget in app.text_area if widget.label == "Configuration JSON"
+    ).value
+    assert json.loads(raw)["subgoal_selection"]["rank_range"] == [4, 9]
+
+
+def test_resource_preview_tracks_route_family_and_advanced_overrides():
+    payload = json.loads((ROOT / "configs/regression_workflow.json").read_text())
+    payload["predictors"]["route_family"] = "hmm"
+    payload["predictors"]["hmm"] = {"n_routes": 10, "epochs": 500}
+    payload["slurm"]["stage_overrides"] = {
+        "feature-generation": {
+            "cpus_per_task": 6,
+            "memory": "20G",
+            "time": "02:00:00",
+            "max_concurrent": 3,
+        }
+    }
+
+    plan = access.resource_preview(payload)
+
+    assert plan["route_family"] == "hmm"
+    assert plan["stages"]["predictor-bundle"]["cpus_per_task"] == 8
+    assert plan["stages"]["feature-generation"]["cpus_per_task"] == 6
+    assert any(row["stage"] == "candidate" for row in plan["rows"])
+
+
+def test_streamlit_advanced_overrides_update_configuration_json():
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=30
+    ).run()
+    override = {
+        "predictor-bundle": {
+            "cpus_per_task": 8,
+            "memory": "16G",
+            "time": "04:00:00",
+            "max_concurrent": 8,
+        }
+    }
+    next(
+        widget
+        for widget in app.text_area
+        if widget.label == "Stage resource overrides (JSON)"
+    ).set_value(json.dumps(override)).run()
+    next(
+        widget
+        for widget in app.button
+        if widget.label == "Apply resource overrides to JSON"
+    ).click().run()
+
+    raw = next(
+        widget for widget in app.text_area if widget.label == "Configuration JSON"
+    ).value
+    assert json.loads(raw)["slurm"]["stage_overrides"] == override
+
+
 def test_monitoring_caches_scheduler_queries_between_artifact_refreshes(
     tmp_path, monkeypatch
 ):

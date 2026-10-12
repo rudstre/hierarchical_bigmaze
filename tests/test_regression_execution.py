@@ -415,6 +415,97 @@ def test_pca_and_hmm_route_bundles_record_expected_state_and_seed(monkeypatch):
     )
 
 
+def _prepare_predictor_failure_test(monkeypatch, partition):
+    candidate = {"status": "success", "k": 3}
+    monkeypatch.setattr(
+        workflow,
+        "aggregate_partition",
+        lambda *_args, **_kwargs: {
+            "status": "selected",
+            "selection": {"selected_k": 3},
+        },
+    )
+    monkeypatch.setattr(
+        workflow,
+        "load_candidate_records",
+        lambda *_args, **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(
+        execution,
+        "_route_training_table",
+        lambda *_args: (None, pd.DataFrame({"decision": [1]})),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_predictor_compatibility",
+        lambda *_args: {"partition_digest": partition.digest},
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "stage", "failure_type"),
+    [
+        (
+            execution.HMMScientificFitError(
+                "optimizer_gradient", FloatingPointError("nonfinite gradient")
+            ),
+            "scientific_failure",
+            "optimizer_gradient",
+            "FloatingPointError",
+        ),
+        (
+            execution.HMMOperationalFitError(
+                "policy_solve", RuntimeError("backend failed")
+            ),
+            "operational_failure",
+            "policy_solve",
+            "RuntimeError",
+        ),
+        (
+            torch.OutOfMemoryError("allocation failed"),
+            "operational_failure",
+            "predictor_fit",
+            "OutOfMemoryError",
+        ),
+    ],
+)
+def test_predictor_fit_failures_are_classified(
+    monkeypatch, tmp_path, failure, status, stage, failure_type
+):
+    config = _config(route_family="hmm")
+    partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
+    _prepare_predictor_failure_test(monkeypatch, partition)
+    monkeypatch.setattr(
+        execution,
+        "_fit_route_and_habit",
+        lambda *_args: (_ for _ in ()).throw(failure),
+    )
+
+    result = execution.run_predictor_bundle(config, tmp_path, partition)
+
+    assert result["status"] == status
+    assert result["stage"] == stage
+    assert result["failure"]["type"] == failure_type
+    saved = workflow._read_json(
+        tmp_path / "partitions" / partition.digest / "predictor.json"
+    )
+    assert saved["status"] == status
+
+
+def test_unexpected_predictor_runtime_error_propagates(monkeypatch, tmp_path):
+    config = _config(route_family="hmm")
+    partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
+    _prepare_predictor_failure_test(monkeypatch, partition)
+    monkeypatch.setattr(
+        execution,
+        "_fit_route_and_habit",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("implementation bug")),
+    )
+
+    with pytest.raises(RuntimeError, match="implementation bug"):
+        execution.run_predictor_bundle(config, tmp_path, partition)
+
+
 def test_qin_history_predictors_reset_at_every_trial_boundary():
     from types import SimpleNamespace
 

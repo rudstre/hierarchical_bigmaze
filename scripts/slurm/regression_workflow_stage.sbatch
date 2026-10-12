@@ -20,6 +20,7 @@ task_cpus="${SLURM_CPUS_PER_TASK:-1}"
 export OMP_NUM_THREADS="${task_cpus}"
 export MKL_NUM_THREADS="${task_cpus}"
 export OPENBLAS_NUM_THREADS="${task_cpus}"
+export CUDA_VISIBLE_DEVICES=""
 
 cd "${project_root}"
 "${python_executable}" scripts/run_regression_workflow_task.py \

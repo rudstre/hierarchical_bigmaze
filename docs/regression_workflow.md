@@ -53,6 +53,37 @@ for the full-model learning curve.
 - `regression_cv.method: "blocked_trial_learning_curve"` fits only the full
   regression model. Its sole parameter, `n_subdivisions`, sets the number of
   equal intervals between train-on-one-trial and leave-one-trial-out.
+- `slurm.resource_profile: "auto"` derives CPU, memory, time, and array
+  concurrency from the active route family and regression method. Optional
+  `slurm.stage_overrides` entries may set `cpus_per_task`, `memory`, `time`, and
+  `max_concurrent` for a named stage. Resource settings are execution
+  provenance and do not enter the scientific configuration signature.
+
+The calibrated HMM CPU profile requests 8 CPUs, 16 GB, and four hours for
+predictor fitting. The default `cpu_backfill` profile permits 96 concurrent HMM
+tasks and 256 concurrent one-CPU tasks; selecting the protected `cpu` partition
+reduces the automatic HMM cap to eight. It covers at most 10 routes and 500
+epochs. For `n_routes: "auto"`, the manager uses
+`max_rank + 1` as the pre-submission bound. A larger route or epoch setting is
+blocked until both `predictor-bundle` and `feature-generation` have complete
+stage overrides. The workers hide CUDA devices, so backfill jobs remain CPU-only
+on GPU-equipped nodes. No GPU profile is defined.
+
+HMM fitting remains float32. Predictor diagnostics record dtype, device,
+thread counts, seed, data counts, completed epochs, the pre-update likelihood
+trace, and a deterministic likelihood recomputed after the final update.
+Finite-value checks cover the optimizer and the returned policy/state
+distributions. Float32 parity against float64 is tested for likelihood,
+gradients, policies, and solve residuals; float16 is unsupported by the model's
+linear solve and numerical constants.
+
+The precision audit used the production 10-route solve and 3,921 observed
+decisions. Float32 versus float64 changed mean observed log likelihood by
+`1.49e-7`, the objective by `1.36e-7`, and the gradient by `8.62e-7` in relative
+norm; the float32 solve residual was `2.72e-7`. Float32 used 7.74 GB peak memory
+versus 14.69 GB for float64, and five matched Adam epochs ended within `2.26e-8`
+mean log likelihood. These measurements justify the documented lower-precision
+exception while the automated parity test protects the same model equations.
 
 Learning-curve percentages refer to regression-coefficient fitting within the
 reserved session. The MLMDP, route, and habit predictors remain fitted from the
@@ -127,10 +158,15 @@ python scripts/slurm/manage_regression_workflow.py \
 ```
 
 The manager writes immutable task lists, chunks arrays, assigns inclusive rank
-resource bands, records job dependencies and task-list digests, and consults
-both `squeue` and `sacct`. Status output reports artifact completion and array
-task counts for the latest attempt of each stage; prior submissions remain in
-`slurm_manager.json`. Pass `--json` with `--status` for machine-readable status.
+resource bands, and freezes the complete resolved resource table before any
+job is submitted. Every submission records its CPU, memory, time, and
+concurrency request; retries reuse that table. Historical schema-v1 managers
+retain their one-CPU retry behavior. The manager records job dependencies and
+task-list digests and consults both `squeue` and `sacct`. Status output reports
+artifact completion and array task counts for the latest attempt of each stage,
+plus allocated CPUs, requested memory, elapsed time, and peak RSS when Slurm
+provides them. Prior submissions remain in `slurm_manager.json`. Pass `--json`
+with `--status` for machine-readable status.
 Retries contain exact scalar tasks. No production job is submitted by tests.
 `--cancel` stops only active SLURM arrays recorded for the selected run,
 including pending downstream stages. It leaves completed artifacts and the

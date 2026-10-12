@@ -22,6 +22,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from andrew_mlmdp.regression_cli import _table  # noqa: E402
 from andrew_mlmdp.regression_reporting import report_stem  # noqa: E402
+from andrew_mlmdp.regression_resources import (  # noqa: E402
+    resolve_resource_plan,
+    resource_bands,
+)
 from andrew_mlmdp.regression_workflow import (  # noqa: E402
     PredictorPartition,
     _candidate_path,
@@ -35,7 +39,7 @@ from andrew_mlmdp.validation import (  # noqa: E402
     source_code_fingerprint,
 )
 
-MANAGER_SCHEMA_VERSION = 1
+MANAGER_SCHEMA_VERSION = 2
 DEFAULT_PYTHON = "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python"
 
 
@@ -49,8 +53,8 @@ def parser():
     result.add_argument("--max-array-size", type=int, default=1000)
     result.add_argument("--retry-missing", action="store_true")
     result.add_argument("--no-precompute-lattice", action="store_true")
-    result.add_argument("--lattice-memory", default="2G")
-    result.add_argument("--lattice-time", default="00:30:00")
+    result.add_argument("--lattice-memory")
+    result.add_argument("--lattice-time")
     result.add_argument("--status", action="store_true")
     result.add_argument("--cancel", action="store_true")
     result.add_argument("--json", action="store_true")
@@ -97,47 +101,7 @@ def _partition(record):
 
 
 def _resource_bands(raw, rank_range):
-    slurm = raw.get("slurm", {})
-    raw_bands = slurm.get("resource_bands")
-    if not isinstance(raw_bands, list) or not raw_bands:
-        raise ValueError("slurm.resource_bands must be a non-empty list")
-    configured = set(range(rank_range[0], rank_range[1] + 1))
-    covered = {}
-    result = []
-    for index, raw_band in enumerate(raw_bands):
-        if set(raw_band) != {"rank_range", "memory", "time"}:
-            raise ValueError("Each resource band needs rank_range, memory, and time")
-        bounds = raw_band["rank_range"]
-        if (
-            not isinstance(bounds, list)
-            or len(bounds) != 2
-            or any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in bounds
-            )
-            or bounds[0] > bounds[1]
-        ):
-            raise ValueError("Resource-band rank_range must be [lower, higher]")
-        ranks = configured & set(range(bounds[0], bounds[1] + 1))
-        for rank in ranks:
-            if rank in covered:
-                raise ValueError(f"Resource-band overlap at rank {rank}")
-            covered[rank] = index
-        result.append(
-            {
-                "rank_range": list(bounds),
-                "memory": raw_band["memory"],
-                "time": raw_band["time"],
-            }
-        )
-    missing = sorted(configured - set(covered))
-    if missing:
-        raise ValueError(f"Resource-band gap for ranks {missing}")
-    return [
-        band
-        for band in result
-        if configured & set(range(band["rank_range"][0], band["rank_range"][1] + 1))
-    ]
+    return resource_bands(raw.get("slurm", {}), rank_range)
 
 
 def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
@@ -316,7 +280,7 @@ def _submit_group(
             "sbatch",
             "--parsable",
             f"--partition={resources['partition']}",
-            "--cpus-per-task=1",
+            f"--cpus-per-task={resources.get('cpus_per_task', 1)}",
             f"--mem={resources['memory']}",
             f"--time={resources['time']}",
             f"--array=0-{len(chunk) - 1}%{array_limit}",
@@ -348,6 +312,7 @@ def _submit_group(
                     "task_list_digest": _read(task_path)["task_list_digest"],
                     "task_count": len(chunk),
                     "dependency": dependency,
+                    "resources": {"cpus_per_task": 1, **resources},
                     "submitted_at": datetime.now(UTC).isoformat(),
                 }
             )
@@ -494,24 +459,49 @@ def _normalized_slurm_state(value):
 
 
 def _scheduler_records(manager):
-    """Return logical array records, with live queue states overriding accounting."""
+    """Return array states and resource evidence from accounting and the live queue."""
     ids = [item["job_id"] for item in manager["submissions"]]
     records = {job_id: {} for job_id in ids}
     if not ids:
         return records
 
-    def incorporate(output):
+    def matching_job(logical_id):
+        for job_id in ids:
+            if logical_id == job_id or logical_id.startswith(f"{job_id}_"):
+                return job_id
+        return None
+
+    def incorporate_accounting(output):
         for line in output.splitlines():
-            fields = line.strip().split("|", 2)
+            fields = line.strip().split("|")
             if len(fields) < 2:
                 continue
-            logical_id, state = fields[:2]
-            if "." in logical_id:
+            raw_id, state = fields[:2]
+            logical_id = raw_id.split(".", 1)[0]
+            job_id = matching_job(logical_id)
+            if job_id is None:
                 continue
-            for job_id in ids:
-                if logical_id == job_id or logical_id.startswith(f"{job_id}_"):
-                    records[job_id][logical_id] = _normalized_slurm_state(state)
-                    break
+            record = records[job_id].setdefault(logical_id, {})
+            if "." not in raw_id or "state" not in record:
+                record["state"] = _normalized_slurm_state(state)
+            for key, value in zip(
+                ("elapsed", "max_rss", "allocated_cpus", "requested_memory"),
+                fields[2:6],
+                strict=False,
+            ):
+                if value and (key not in record or "." in raw_id):
+                    record[key] = value
+
+    def incorporate_queue(output):
+        for line in output.splitlines():
+            fields = line.strip().split("|", 1)
+            if len(fields) != 2:
+                continue
+            logical_id, state = fields
+            job_id = matching_job(logical_id)
+            if job_id is not None:
+                record = records[job_id].setdefault(logical_id, {})
+                record["state"] = _normalized_slurm_state(state)
 
     accounting = subprocess.run(
         [
@@ -520,14 +510,14 @@ def _scheduler_records(manager):
             "--parsable2",
             "--jobs",
             ",".join(ids),
-            "--format=JobID,State",
+            "--format=JobIDRaw,State,Elapsed,MaxRSS,AllocCPUS,ReqMem",
         ],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    incorporate(accounting.stdout)
+    incorporate_accounting(accounting.stdout)
     queue = subprocess.run(
         ["squeue", "--noheader", "--jobs", ",".join(ids), "--format=%i|%T"],
         check=False,
@@ -535,7 +525,7 @@ def _scheduler_records(manager):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    incorporate(queue.stdout)
+    incorporate_queue(queue.stdout)
     return records
 
 
@@ -549,21 +539,56 @@ def _submission_task_states(submission, records):
     job_id = submission["job_id"]
     task_count = submission["task_count"]
     job_records = records.get(job_id, {})
+
+    def state(record):
+        return record.get("state", "UNKNOWN") if isinstance(record, dict) else record
+
     individual = {
-        logical_id: state
-        for logical_id, state in job_records.items()
+        logical_id: state(record)
+        for logical_id, record in job_records.items()
         if "_[" not in logical_id and logical_id != job_id
     }
     states = Counter(individual.values())
-    compact = [state for logical_id, state in job_records.items() if "_[" in logical_id]
+    compact = [
+        state(record)
+        for logical_id, record in job_records.items()
+        if "_[" in logical_id
+    ]
     remaining = task_count - len(individual)
     if compact and remaining > 0:
         states[compact[-1]] += remaining
     elif not individual and job_id in job_records:
-        states[job_records[job_id]] += task_count
+        states[state(job_records[job_id])] += task_count
     elif not job_records:
         states["UNKNOWN"] += task_count
     return states
+
+
+def _submission_resource_usage(submission, records):
+    """Return available sacct evidence for one submission's array records."""
+    result = []
+    for logical_id, record in records.get(submission["job_id"], {}).items():
+        if not isinstance(record, dict) or "_[" in logical_id:
+            continue
+        evidence = {
+            key: record[key]
+            for key in (
+                "elapsed",
+                "max_rss",
+                "allocated_cpus",
+                "requested_memory",
+            )
+            if record.get(key)
+        }
+        if evidence:
+            result.append(
+                {
+                    "job_id": submission["job_id"],
+                    "task_id": logical_id,
+                    **evidence,
+                }
+            )
+    return result
 
 
 def _stage_state(artifacts, scheduler, submissions):
@@ -606,17 +631,27 @@ def _status_report(states, manager, *, scheduler_records=None):
             latest_attempt = None
             latest = []
         scheduler = Counter()
+        resource_usage = []
         for submission in latest:
             scheduler.update(_submission_task_states(submission, records))
+            resource_usage.extend(_submission_resource_usage(submission, records))
         artifacts = dict(artifact_counter)
         artifacts["total"] = sum(artifact_counter.values())
-        stages[stage] = {
+        stage_record = {
             "state": _stage_state(artifact_counter, scheduler, latest),
             "artifacts": artifacts,
             "latest_attempt": latest_attempt,
             "job_ids": [item["job_id"] for item in latest],
             "scheduler_tasks": dict(scheduler),
         }
+        requested_resources = [
+            item["resources"] for item in latest if item.get("resources")
+        ]
+        if requested_resources:
+            stage_record["requested_resources"] = requested_resources
+        if resource_usage:
+            stage_record["resource_usage"] = resource_usage
+        stages[stage] = stage_record
     incomplete = [
         stage for stage, record in stages.items() if record["state"] != "COMPLETE"
     ]
@@ -669,10 +704,12 @@ def _format_status(report):
 
 
 def _resources(raw, bands):
+    """Build the one-CPU plan used by historical schema-v1 managers."""
     slurm = raw["slurm"]
     common = {
         "partition": slurm["partition"],
         "account": slurm.get("account"),
+        "cpus_per_task": 1,
         "memory": slurm["default_memory"],
         "time": slurm["default_time"],
         "max_concurrent": int(slurm["max_concurrent"]),
@@ -680,6 +717,53 @@ def _resources(raw, bands):
     return common, [
         {**common, "memory": band["memory"], "time": band["time"]} for band in bands
     ]
+
+
+def _legacy_resource_plan(manager, config, raw):
+    bands = _resource_bands(raw, config.subgoal_selection.rank_range)
+    common, band_resources = _resources(raw, bands)
+    stages = {
+        stage: dict(common)
+        for stage in (
+            "discovery",
+            "candidate",
+            "selection",
+            "selected-refit",
+            "predictor-bundle",
+            "feature-generation",
+            "regression",
+            "policy-overlap",
+            "lattice-precompute",
+            "aggregation",
+            "plotting",
+        )
+    }
+    stages["lattice-precompute"].update(
+        manager.get("lattice_resources", {"memory": "2G", "time": "00:30:00"})
+    )
+    return {
+        "schema_version": 0,
+        "profile": "legacy-one-cpu",
+        "launchable": True,
+        "stages": stages,
+        "candidate_bands": [
+            {"rank_range": band["rank_range"], **resources}
+            for band, resources in zip(bands, band_resources, strict=True)
+        ],
+    }
+
+
+def _resource_plan_for_submission(manager, config, raw):
+    if "resolved_resources" in manager:
+        return manager["resolved_resources"]
+    if manager.get("schema_version") == 1:
+        return _legacy_resource_plan(manager, config, raw)
+    plan = resolve_resource_plan(config, raw["slurm"])
+    if manager.get("lattice_resources"):
+        plan["stages"]["lattice-precompute"].update(
+            manager["lattice_resources"]
+        )
+    return plan
 
 
 def _submission_summary(submissions):
@@ -714,19 +798,21 @@ def _format_submission(output, submitted_jobs, states, *, dry_run):
 
 
 def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
-    bands = _resource_bands(raw, config.subgoal_selection.rank_range)
-    common, band_resources = _resources(raw, bands)
+    plan = _resource_plan_for_submission(manager, config, raw)
+    if not plan["launchable"]:
+        raise ValueError(plan["launch_block_reason"])
+    stages = plan["stages"]
     dependency = _submit_group(
         manager,
         manager_path,
         "discovery",
         tasks["discovery"],
-        common,
+        stages["discovery"],
         [],
         dry_run=dry_run,
     )
     candidate_jobs = []
-    for band, resources in zip(bands, band_resources, strict=True):
+    for band in plan["candidate_bands"]:
         lower, higher = band["rank_range"]
         selected = [task for task in tasks["candidate"] if lower <= task["k"] <= higher]
         candidate_jobs.extend(
@@ -735,7 +821,7 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
                 manager_path,
                 "candidate",
                 selected,
-                resources,
+                band,
                 dependency,
                 label=f"k{band['rank_range'][0]:02d}-{band['rank_range'][1]:02d}",
                 dry_run=dry_run,
@@ -746,7 +832,7 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
         manager_path,
         "selection",
         tasks["selection"],
-        common,
+        stages["selection"],
         candidate_jobs,
         dry_run=dry_run,
     )
@@ -764,7 +850,7 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
             manager_path,
             stage,
             tasks[stage],
-            common,
+            stages[stage],
             dependency,
             dry_run=dry_run,
         )
@@ -776,12 +862,7 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
                 manager_path,
                 "lattice-precompute",
                 tasks["lattice-precompute"],
-                {
-                    **common,
-                    **manager.get(
-                        "lattice_resources", {"memory": "2G", "time": "00:30:00"}
-                    ),
-                },
+                stages["lattice-precompute"],
                 dependency,
                 dry_run=dry_run,
             )
@@ -869,6 +950,22 @@ def _main(args):
     else:
         if args.retry_missing or args.status:
             raise ValueError(f"No workflow run at {output}")
+        resource_slurm = dict(raw["slurm"])
+        stage_overrides = {
+            stage: dict(values)
+            for stage, values in resource_slurm.get("stage_overrides", {}).items()
+        }
+        lattice_override = dict(stage_overrides.get("lattice-precompute", {}))
+        if args.lattice_memory is not None:
+            lattice_override["memory"] = args.lattice_memory
+        if args.lattice_time is not None:
+            lattice_override["time"] = args.lattice_time
+        if lattice_override:
+            stage_overrides["lattice-precompute"] = lattice_override
+        resource_slurm["stage_overrides"] = stage_overrides
+        resolved_resources = resolve_resource_plan(config, resource_slurm)
+        if not resolved_resources["launchable"]:
+            raise ValueError(resolved_resources["launch_block_reason"])
         print(
             "Loading and canonicalizing selected sessions for the workflow manifest...",
             file=sys.stderr,
@@ -903,14 +1000,11 @@ def _main(args):
             "max_array_size": args.max_array_size,
             "rank_range": list(config.subgoal_selection.rank_range),
             "submissions": [],
+            "resolved_resources": resolved_resources,
             "precompute_lattice": (
                 not args.no_precompute_lattice
                 and config.regression_cv.method == "blocked_trial_kfold"
             ),
-            "lattice_resources": {
-                "memory": args.lattice_memory,
-                "time": args.lattice_time,
-            },
             "worker_source": source_code_fingerprint(root)["content_sha256"],
         }
         if not args.dry_run:

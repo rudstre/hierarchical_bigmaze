@@ -99,7 +99,7 @@ if root is None:
         st.stop()
     with st.expander("Common settings", expanded=True):
         available = show_error(access.dataset_selection_options, payload)
-        c1, c2, c3 = st.columns(3)
+        _, date_start_column, date_end_column = st.columns(3)
         subjects = None
         start = payload["dataset"].get("start_date")
         end = payload["dataset"].get("end_date")
@@ -141,8 +141,10 @@ if root is None:
                     ),
                 )
 
-            start = date_selector("Start date", start, c2, "No lower bound")
-            end = date_selector("End date", end, c3, "No upper bound")
+            start = date_selector(
+                "Start date", start, date_start_column, "No lower bound"
+            )
+            end = date_selector("End date", end, date_end_column, "No upper bound")
             if not subjects:
                 st.error("Select at least one subject.")
                 valid_selection = False
@@ -154,46 +156,55 @@ if root is None:
                 "Edit dataset selection in the JSON while session metadata "
                 "is unavailable."
             )
-        heldout = c1.selectbox(
-            "Held-out sessions",
-            ["all", "last", "explicit in JSON"],
-            index=(
-                0
-                if payload["heldout_sessions"] == "all"
-                else 1
-                if payload["heldout_sessions"] == "last"
-                else 2
-            ),
-        )
-        rank = payload["subgoal_selection"]["rank_range"]
-        low = c2.number_input("Minimum rank", min_value=2, max_value=49, value=rank[0])
-        high = c3.number_input("Maximum rank", min_value=2, max_value=49, value=rank[1])
-        route = c1.selectbox(
-            "Route family",
-            ["pca", "hmm"],
-            index=0 if payload["predictors"]["route_family"] == "pca" else 1,
-        )
-        method = c2.selectbox(
-            "Regression CV",
-            ["blocked_trial_kfold", "blocked_trial_learning_curve"],
-            index=0
-            if payload["regression_cv"]["method"] == "blocked_trial_kfold"
-            else 1,
-        )
-        folds = c3.number_input(
-            "Folds or learning-curve subdivisions",
-            min_value=2,
-            value=payload["regression_cv"].get(
-                "n_splits", payload["regression_cv"].get("n_subdivisions", 5)
-            ),
-        )
-        discovery_config = st.text_input(
-            "Discovery configuration", payload["discovery_config"]
-        )
-        discovery_dir = st.text_input(
-            "Shared discovery directory", payload.get("discovery_dir") or ""
-        )
-        if st.button("Apply common settings to JSON", disabled=not valid_selection):
+        with st.form("common_settings"):
+            c1, c2, c3 = st.columns(3)
+            heldout = c1.selectbox(
+                "Held-out sessions",
+                ["all", "last", "explicit in JSON"],
+                index=(
+                    0
+                    if payload["heldout_sessions"] == "all"
+                    else 1
+                    if payload["heldout_sessions"] == "last"
+                    else 2
+                ),
+            )
+            rank = payload["subgoal_selection"]["rank_range"]
+            low = c2.number_input(
+                "Minimum rank", min_value=2, max_value=49, value=rank[0]
+            )
+            high = c3.number_input(
+                "Maximum rank", min_value=2, max_value=49, value=rank[1]
+            )
+            route = c1.selectbox(
+                "Route family",
+                ["pca", "hmm"],
+                index=0 if payload["predictors"]["route_family"] == "pca" else 1,
+            )
+            method = c2.selectbox(
+                "Regression CV",
+                ["blocked_trial_kfold", "blocked_trial_learning_curve"],
+                index=0
+                if payload["regression_cv"]["method"] == "blocked_trial_kfold"
+                else 1,
+            )
+            folds = c3.number_input(
+                "Folds or learning-curve subdivisions",
+                min_value=2,
+                value=payload["regression_cv"].get(
+                    "n_splits", payload["regression_cv"].get("n_subdivisions", 5)
+                ),
+            )
+            discovery_config = st.text_input(
+                "Discovery configuration", payload["discovery_config"]
+            )
+            discovery_dir = st.text_input(
+                "Shared discovery directory", payload.get("discovery_dir") or ""
+            )
+            apply_common_settings = st.form_submit_button(
+                "Apply common settings to JSON", disabled=not valid_selection
+            )
+        if apply_common_settings:
             updated = json.loads(raw)
             if subjects is not None:
                 updated["dataset"].update(
@@ -213,6 +224,43 @@ if root is None:
             updated["discovery_dir"] = discovery_dir or None
             st.session_state.pending_config_text = json.dumps(updated, indent=2)
             st.rerun()
+    with st.expander("Advanced resource overrides"):
+        configured_overrides = payload.get("slurm", {}).get("stage_overrides", {})
+        override_source = json.dumps(configured_overrides, indent=2, sort_keys=True)
+        if st.session_state.get("stage_overrides_source") != override_source:
+            st.session_state.stage_overrides_text = override_source
+            st.session_state.stage_overrides_source = override_source
+        override_text = st.text_area(
+            "Stage resource overrides (JSON)",
+            key="stage_overrides_text",
+            height=180,
+        )
+        if st.button("Apply resource overrides to JSON"):
+            try:
+                overrides = json.loads(override_text)
+                if not isinstance(overrides, dict):
+                    raise ValueError("Stage resource overrides must be a JSON object")
+                updated = json.loads(raw)
+                updated.setdefault("slurm", {})["resource_profile"] = "auto"
+                updated["slurm"]["stage_overrides"] = overrides
+                st.session_state.pending_config_text = json.dumps(updated, indent=2)
+                st.rerun()
+            except (json.JSONDecodeError, ValueError) as error:
+                st.error(str(error))
+    resource_plan = show_error(access.resource_preview, payload)
+    if resource_plan is not None:
+        st.subheader("Requested CPU resources")
+        st.caption(
+            f"Profile: {resource_plan['profile']} · "
+            + (
+                "calibrated configuration"
+                if resource_plan["calibrated"]
+                else "configuration exceeds the calibrated HMM range"
+            )
+        )
+        st.dataframe(resource_plan["rows"], hide_index=True, width="stretch")
+        if not resource_plan["launchable"]:
+            st.error(resource_plan["launch_block_reason"])
     if st.button("Preview training and evaluation sessions"):
         st.session_state.preview_manifest = show_error(access.preview, payload)
     if st.session_state.get("preview_manifest"):
@@ -225,7 +273,15 @@ if root is None:
         st.json(st.session_state.preview_manifest["unavailable_partitions"])
     run_id = st.text_input("New run ID")
     no_lattice = st.checkbox("Skip the 255-combination lattice", value=False)
-    if st.button("Launch workflow", type="primary"):
+    if st.button(
+        "Launch workflow",
+        type="primary",
+        disabled=(
+            not valid_selection
+            or resource_plan is None
+            or not resource_plan["launchable"]
+        ),
+    ):
         with st.spinner("Preparing the manifest and submitting workflow jobs..."):
             launched = show_error(access.launch, payload, run_id, no_lattice=no_lattice)
         if launched:
@@ -293,6 +349,14 @@ if page == "Progress":
             st.caption(
                 "A produced report can still have incomplete scientific coverage."
             )
+            resource_rows = [
+                {"stage": stage, **usage}
+                for stage, item in report["stages"].items()
+                for usage in item.get("resource_usage", [])
+            ]
+            if resource_rows:
+                with st.expander("SLURM resource usage"):
+                    st.dataframe(resource_rows, hide_index=True, width="stretch")
         report_paths = sorted((root / "report").glob("*_results.json"))
         if report_paths:
             st.subheader("Scientific completeness")

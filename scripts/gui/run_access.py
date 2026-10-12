@@ -20,6 +20,10 @@ from andrew_mlmdp.regression_analysis import (  # noqa: E402
     summarize_records,
     verify_artifact,
 )
+from andrew_mlmdp.regression_resources import (  # noqa: E402
+    resolve_resource_plan,
+    resource_plan_rows,
+)
 from andrew_mlmdp.regression_workflow import (  # noqa: E402
     build_manifest,
     regression_config_from_payload,
@@ -409,6 +413,13 @@ def preview(payload):
     return build_manifest(config, _table(config))
 
 
+def resource_preview(payload):
+    """Resolve the same CPU resource plan that the SLURM manager will freeze."""
+    config = regression_config_from_payload(payload, ROOT)
+    plan = resolve_resource_plan(config, payload.get("slurm", {}))
+    return {**plan, "rows": resource_plan_rows(plan)}
+
+
 def snapshot_config(payload, output):
     """Save execution inputs without changing shared discovery artifacts."""
     output = Path(output).resolve()
@@ -447,6 +458,9 @@ def launch(payload, run_id, *, no_lattice=False):
         for c in run_id
     ):
         raise ValueError("Run ID must contain letters, digits, underscores or hyphens")
+    plan = resource_preview(payload)
+    if not plan["launchable"]:
+        raise ValueError(plan["launch_block_reason"])
     output = ROOT / "output/regression_workflow" / run_id
     config_path = snapshot_config(payload, output)
     return _manager_process(

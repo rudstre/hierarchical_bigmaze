@@ -11,8 +11,27 @@ from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import torch
 
 from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
+
+
+class HMMScientificFitError(RuntimeError):
+    """An explicitly checked HMM scientific quantity was invalid."""
+
+    def __init__(self, phase, error):
+        self.phase = phase
+        self.original_type = type(error).__name__
+        super().__init__(str(error))
+
+
+class HMMOperationalFitError(RuntimeError):
+    """The HMM numerical backend could not complete the requested work."""
+
+    def __init__(self, phase, error):
+        self.phase = phase
+        self.original_type = type(error).__name__
+        super().__init__(str(error))
 
 
 def _prepare_qin_imports(project_root: Path) -> None:
@@ -38,6 +57,8 @@ def _prepare_qin_imports(project_root: Path) -> None:
 def _qin_route_imports(project_root: Path):
     _prepare_qin_imports(project_root)
     from lmdphelper.fitting import (
+        HMMBackendError,
+        HMMNumericalError,
         build_lowrank_lmdp_hmm,
         fit_lowrank_lmdp_hmm,
         normalized_hmm_configuration,
@@ -55,6 +76,8 @@ def _qin_route_imports(project_root: Path):
         "generate_pcs": generate_pcs,
         "normalize_pca": normalized_pca_configuration,
         "habit": generate_habit,
+        "hmm_backend_error": HMMBackendError,
+        "hmm_numerical_error": HMMNumericalError,
     }
 
 
@@ -139,13 +162,20 @@ def _fit_route_and_habit(
         }
     else:
         settings = qin["normalize_hmm"](route_settings)
-        model, diagnostics = qin["fit_hmm"](
-            route_rows,
-            maze_id=partition.maze_id,
-            configuration=settings,
-            random_seed=seed,
-            verbose=False,
-        )
+        numerical_error = qin.get("hmm_numerical_error", ())
+        backend_error = qin.get("hmm_backend_error", ())
+        try:
+            model, diagnostics = qin["fit_hmm"](
+                route_rows,
+                maze_id=partition.maze_id,
+                configuration=settings,
+                random_seed=seed,
+                verbose=False,
+            )
+        except numerical_error as error:
+            raise HMMScientificFitError(error.phase, error) from error
+        except backend_error as error:
+            raise HMMOperationalFitError(error.phase, error) from error
         route = {
             "family": "hmm",
             "settings": settings,
@@ -260,14 +290,39 @@ def run_predictor_bundle(
         fitted_predictors = _fit_route_and_habit(
             config, partition, route_rows, route_settings
         )
-    except (MemoryError, OSError) as error:
+    except HMMScientificFitError as error:
+        payload = {
+            "schema_version": 1,
+            "artifact_type": "heldout_predictor_bundle",
+            "status": "scientific_failure",
+            "stage": error.phase,
+            "partition_digest": partition.digest,
+            "compatibility": compatibility,
+            "failure": {
+                "type": error.original_type,
+                "message": str(error),
+            },
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+        _atomic_write_json(destination, payload)
+        return payload
+    except (
+        HMMOperationalFitError,
+        torch.OutOfMemoryError,
+        MemoryError,
+        OSError,
+    ) as error:
         payload = {
             "schema_version": 1,
             "artifact_type": "heldout_predictor_bundle",
             "status": "operational_failure",
+            "stage": getattr(error, "phase", "predictor_fit"),
             "partition_digest": partition.digest,
             "compatibility": compatibility,
-            "failure": {"type": type(error).__name__, "message": str(error)},
+            "failure": {
+                "type": getattr(error, "original_type", type(error).__name__),
+                "message": str(error),
+            },
             "elapsed_seconds": time.perf_counter() - started,
         }
         _atomic_write_json(destination, payload)
