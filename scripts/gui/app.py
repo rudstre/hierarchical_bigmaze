@@ -39,6 +39,14 @@ from andrew_mlmdp.hmm_route_plots import (  # noqa: E402
     hmm_route_maps,
     make_hmm_route_figure,
 )
+from andrew_mlmdp.regression_execution import _prepare_qin_imports  # noqa: E402
+
+_prepare_qin_imports(ROOT)
+from lmdphelper.fitting import DEFAULT_HMM_CONFIGURATION  # noqa: E402
+
+# Values the HMM fit uses for keys absent from a workflow's hmm settings.
+HMM_GUI_DEFAULTS = dict(DEFAULT_HMM_CONFIGURATION)
+
 from andrew_mlmdp.regression_analysis import (  # noqa: E402
     open_run,
     read_json,
@@ -219,6 +227,51 @@ if root is None:
                     "n_splits", payload["regression_cv"].get("n_subdivisions", 5)
                 ),
             )
+            st.markdown("**HMM route model** (used when the route family is hmm)")
+            hmm = {**HMM_GUI_DEFAULTS, **payload["predictors"].get("hmm", {})}
+            h1, h2, h3 = st.columns(3)
+            n_routes_auto = h1.checkbox(
+                "Routes from selected rank (auto)", value=hmm["n_routes"] == "auto"
+            )
+            n_routes = h1.number_input(
+                "Number of routes",
+                min_value=1,
+                value=6 if hmm["n_routes"] == "auto" else int(hmm["n_routes"]),
+                disabled=n_routes_auto,
+            )
+            learn_costs = h1.checkbox(
+                "Learn action cost and cognitive constant",
+                value=bool(hmm["learn_costs"]),
+                help="Fit a and D by maximum likelihood with Adam, as log(a) and "
+                "log(a * D); the values below are then initial values.",
+            )
+            action_cost = h2.number_input(
+                "Action cost a (initial if learned)",
+                min_value=0.0,
+                value=float(hmm["action_cost"]),
+                step=0.01,
+                format="%.4f",
+            )
+            cognitive_constant = h2.number_input(
+                "Cognitive constant D (initial if learned)",
+                min_value=0.0,
+                value=float(hmm["cognitive_constant"]),
+                step=1.0,
+            )
+            cost_learning_rate = h3.number_input(
+                "Cost learning rate (log space)",
+                min_value=0.0,
+                value=float(hmm["cost_learning_rate"]),
+                step=0.005,
+                format="%.4f",
+                help="Adam learning rate for log(a) and log(a * D); R and pi keep "
+                "their own learning rate.",
+            )
+            cost_freeze_epochs = h3.number_input(
+                "Hold costs fixed for the first N epochs",
+                min_value=0,
+                value=int(hmm["cost_freeze_epochs"]),
+            )
             discovery_config = st.text_input(
                 "Discovery configuration", payload["discovery_config"]
             )
@@ -238,6 +291,20 @@ if root is None:
                 updated["heldout_sessions"] = heldout
             updated["subgoal_selection"]["rank_range"] = [int(low), int(high)]
             updated["predictors"]["route_family"] = route
+            hmm_settings = updated["predictors"].setdefault("hmm", {})
+            for name, value in (
+                ("n_routes", "auto" if n_routes_auto else int(n_routes)),
+                ("learn_costs", learn_costs),
+                ("action_cost", float(action_cost)),
+                ("cognitive_constant", float(cognitive_constant)),
+                ("cost_learning_rate", float(cost_learning_rate)),
+                ("cost_freeze_epochs", int(cost_freeze_epochs)),
+            ):
+                # Keys are written only when already present or changed from
+                # the fitting default, so applying unchanged settings does not
+                # change the workflow signature.
+                if name in hmm_settings or value != HMM_GUI_DEFAULTS[name]:
+                    hmm_settings[name] = value
             updated["regression_cv"] = {
                 "method": method,
                 (
@@ -277,9 +344,9 @@ if root is None:
         st.caption(
             f"Profile: {resource_plan['profile']} · "
             + (
-                "calibrated configuration"
+                "estimated from measured HMM fits"
                 if resource_plan["calibrated"]
-                else "configuration exceeds the calibrated HMM range"
+                else "HMM estimate extrapolated beyond the measured route counts"
             )
         )
         st.dataframe(resource_plan["rows"], hide_index=True, width="stretch")
@@ -1008,6 +1075,7 @@ if page == "Results":
                         {
                             "artifact_digest": maps["artifact_digest"],
                             "seed": maps["seed"],
+                            "costs": maps["costs"],
                             "settings": maps["settings"],
                             "route_weights": [round(float(w), 4) for w in weights],
                             "route_logits": [

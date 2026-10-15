@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 import andrew_mlmdp.regression_workflow as workflow
-from andrew_mlmdp.regression_resources import resolve_resource_plan
+from andrew_mlmdp.regression_resources import (
+    hmm_resource_estimate,
+    resolve_resource_plan,
+)
 from andrew_mlmdp.validation import AdamValidationConfig
 
 ROOT = Path(__file__).parents[1]
@@ -55,7 +58,7 @@ def test_pca_and_learning_curve_profiles_use_stage_specific_resources():
         _config(method="blocked_trial_learning_curve"), _slurm()
     )
 
-    assert ordinary["profile"] == "auto-cpu-v1"
+    assert ordinary["profile"] == "auto-cpu-v2"
     assert ordinary["stages"]["predictor-bundle"]["cpus_per_task"] == 1
     assert ordinary["stages"]["feature-generation"]["time"] == "01:00:00"
     assert ordinary["stages"]["selected-refit"]["memory"] == "4G"
@@ -81,7 +84,7 @@ def test_calibrated_fixed_and_automatic_hmm_profiles_request_eight_cpus():
         "partition": "cpu",
         "account": None,
         "cpus_per_task": 8,
-        "memory": "16G",
+        "memory": "17G",
         "time": "04:00:00",
         "max_concurrent": 8,
     }
@@ -100,9 +103,9 @@ def test_general_backfill_profile_uses_available_cpu_capacity():
     assert plan["stages"]["regression"]["max_concurrent"] == 256
 
 
-def test_uncalibrated_hmm_requires_complete_explicit_stage_overrides():
+def test_hmm_beyond_measured_routes_is_estimated_and_launchable():
     config = _config(route_family="hmm", routes=11, epochs=501)
-    blocked = resolve_resource_plan(config, _slurm())
+    estimated = resolve_resource_plan(config, _slurm())
     overrides = {
         stage: {
             "cpus_per_task": 12,
@@ -112,15 +115,13 @@ def test_uncalibrated_hmm_requires_complete_explicit_stage_overrides():
         }
         for stage in ("predictor-bundle", "feature-generation")
     }
-    explicit = resolve_resource_plan(
-        config, _slurm(stage_overrides=overrides)
-    )
+    explicit = resolve_resource_plan(config, _slurm(stage_overrides=overrides))
 
-    assert not blocked["calibrated"]
-    assert not blocked["launchable"]
-    assert "predictor-bundle" in blocked["launch_block_reason"]
-    assert explicit["launchable"]
+    assert not estimated["calibrated"]
+    assert estimated["launchable"]
+    assert estimated["launch_block_reason"] is None
     assert explicit["stages"]["feature-generation"]["memory"] == "32G"
+    assert explicit["stages"]["predictor-bundle"]["cpus_per_task"] == 12
 
 
 @pytest.mark.parametrize(
@@ -139,21 +140,33 @@ def test_invalid_stage_overrides_are_rejected(overrides, message):
 
 
 @pytest.mark.parametrize(
-    ("routes", "epochs", "calibrated", "time"),
+    ("routes", "epochs", "calibrated", "time", "memory"),
     [
-        (10, 500, True, "04:00:00"),
-        (6, 2000, True, "08:00:00"),
-        (7, 2000, False, "08:00:00"),
-        (10, 501, False, "08:00:00"),
+        # Twice the measured worst fits: 10 x 500 took 1.59 h, 6 x 2000 2.45 h.
+        (10, 500, True, "04:00:00", "17G"),
+        (6, 2000, True, "05:00:00", "16G"),
+        (10, 2000, True, "13:00:00", "17G"),
+        (15, 2000, False, "1-15:00:00", "35G"),
     ],
 )
-def test_hmm_calibration_envelopes_and_predictor_time(routes, epochs, calibrated, time):
+def test_hmm_predictor_resources_scale_from_measured_fits(
+    routes, epochs, calibrated, time, memory
+):
     plan = resolve_resource_plan(
         _config(route_family="hmm", routes=routes, epochs=epochs), _slurm()
     )
 
     assert plan["calibrated"] is calibrated
+    assert plan["launchable"]
     assert plan["stages"]["predictor-bundle"]["time"] == time
+    assert plan["stages"]["predictor-bundle"]["memory"] == memory
+
+
+def test_hmm_estimate_reproduces_measured_seconds_per_epoch():
+    assert hmm_resource_estimate(10, 1)["seconds_per_epoch"] == pytest.approx(11.19)
+    assert hmm_resource_estimate(6, 1)["seconds_per_epoch"] == pytest.approx(4.41)
+    times = [hmm_resource_estimate(n, 1)["seconds_per_epoch"] for n in range(1, 30)]
+    assert times == sorted(times)
 
 
 def test_hmm_resources_use_fitting_defaults_when_unspecified():

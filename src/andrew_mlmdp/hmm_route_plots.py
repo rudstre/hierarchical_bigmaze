@@ -87,8 +87,29 @@ def hmm_route_maps(bundle, project_root: str | Path) -> dict[str, object]:
         out=np.zeros_like(occupancy),
         where=location_mass[..., None] > 0,
     )
+    # Learned costs are stored as log(a) and log(a * D); see learn_costs in
+    # Qin's lmdphelper/fitting.py. Fixed costs are the configured values.
+    if "log_action_cost" in route["state_dict"]:
+        action_cost = float(
+            np.exp(_decode_tensor(route["state_dict"]["log_action_cost"]))
+        )
+        switch_cost = float(
+            np.exp(_decode_tensor(route["state_dict"]["log_switch_cost"]))
+        )
+        costs = {
+            "learned": True,
+            "action_cost": action_cost,
+            "cognitive_constant": switch_cost / action_cost,
+        }
+    else:
+        costs = {
+            "learned": False,
+            "action_cost": float(route["settings"]["action_cost"]),
+            "cognitive_constant": float(route["settings"]["cognitive_constant"]),
+        }
     return {
         "maze_id": maze_id,
+        "costs": costs,
         "occupancy": occupancy,
         "location_mass": location_mass,
         "action_given_location": action_given_location,

@@ -172,7 +172,10 @@ class PredictorConfig:
     )
     hmm: Mapping[str, object] = field(
         default_factory=lambda: {
-            # Mirrors DEFAULT_HMM_CONFIGURATION in Qin's lmdphelper/fitting.py.
+            # Mirrors DEFAULT_HMM_CONFIGURATION in Qin's lmdphelper/fitting.py,
+            # except the cost-learning keys (learn_costs, cost_learning_rate,
+            # cost_freeze_epochs), whose fixed-cost defaults apply there; listing
+            # them here would change the signature of existing workflows.
             "n_routes": 6,
             "cognitive_constant": 30.0,
             "action_cost": 0.13,

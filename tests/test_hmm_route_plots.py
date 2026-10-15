@@ -205,3 +205,24 @@ def test_unknown_arrow_style_is_rejected():
     maps = hmm_route_maps(_bundle(R, pi), ROOT)
     with pytest.raises(ValueError, match="arrows"):
         make_hmm_route_figure(maps, ROOT, arrows="argmax")
+
+
+def test_route_maps_report_fixed_and_learned_costs():
+    R, pi = _random_parameters()
+    fixed = hmm_route_maps(_bundle(R, pi), ROOT)["costs"]
+    assert fixed["learned"] is False
+    assert fixed["action_cost"] == pytest.approx(0.13)
+    assert fixed["cognitive_constant"] == pytest.approx(30.0)
+
+    bundle = _bundle(R, pi)
+    # Learned costs are stored as log(a) and log(a * D).
+    for name, value in (("log_action_cost", 0.2), ("log_switch_cost", 0.2 * 25.0)):
+        bundle["route"]["state_dict"][name] = {
+            "values": float(np.log(value)),
+            "shape": [],
+            "dtype": "torch.float32",
+        }
+    learned = hmm_route_maps(bundle, ROOT)["costs"]
+    assert learned["learned"] is True
+    assert learned["action_cost"] == pytest.approx(0.2)
+    assert learned["cognitive_constant"] == pytest.approx(25.0)

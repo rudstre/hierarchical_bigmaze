@@ -2,12 +2,65 @@
 
 from __future__ import annotations
 
+import math
 import re
 from copy import deepcopy
 from typing import Mapping
 
-RESOURCE_PROFILE_VERSION = 1
-RESOURCE_PROFILE_NAME = "auto-cpu-v1"
+RESOURCE_PROFILE_VERSION = 2
+RESOURCE_PROFILE_NAME = "auto-cpu-v2"
+
+# Measured HMM route fits (8 CPUs, cpu_backfill, 36 partitions each): worst
+# seconds per epoch (elapsed_seconds / epochs) and peak MaxRSS from sacct.
+#   full_hmm2:      10 routes x  500 epochs, 11.19 s/epoch, 8.07 GB
+#   full_hmm_xiao2:  6 routes x 2000 epochs,  4.41 s/epoch, 3.57 GB
+# Every epoch does the same work, so time is linear in epochs. Route
+# dependence enters through the (routes + 1) route-state dimension: the
+# per-epoch time exponent below is fitted to the two worst cases, and memory
+# follows the expected (routes + 1)^2 (measured ratio 2.26 vs 2.47 expected).
+# Beyond 10 routes the time exponent is the dense-solve bound 3 rather than an
+# extrapolated fit, and estimates are reported as uncalibrated.
+_HMM_REFERENCE_ROUTES = 10
+_HMM_REFERENCE_SECONDS_PER_EPOCH = 11.19
+_HMM_REFERENCE_MEMORY_GB = 8.07
+_HMM_TIME_EXPONENT = math.log(11.19 / 4.41) / math.log(11 / 7)
+_HMM_EXTRAPOLATION_TIME_EXPONENT = 3.0
+_HMM_MEASURED_MAX_ROUTES = 10
+_HMM_HEADROOM = 2.0
+
+
+def _slurm_hours(hours):
+    whole = max(1, math.ceil(hours))
+    days, hours = divmod(whole, 24)
+    return f"{days}-{hours:02d}:00:00" if days else f"{hours:02d}:00:00"
+
+
+def hmm_resource_estimate(n_routes, epochs):
+    """Predictor-bundle and feature-generation estimates from measured fits."""
+    scale = (n_routes + 1) / (_HMM_REFERENCE_ROUTES + 1)
+    exponent = (
+        _HMM_TIME_EXPONENT
+        if n_routes <= _HMM_REFERENCE_ROUTES or scale <= 1
+        else _HMM_EXTRAPOLATION_TIME_EXPONENT
+    )
+    seconds_per_epoch = _HMM_REFERENCE_SECONDS_PER_EPOCH * scale**exponent
+    fit_hours = _HMM_HEADROOM * seconds_per_epoch * epochs / 3600
+    memory_gb = _HMM_HEADROOM * _HMM_REFERENCE_MEMORY_GB * scale**2
+    # 16G and 1 h are the requests already used successfully for every
+    # measured configuration; they are kept as floors.
+    memory = f"{max(16, math.ceil(memory_gb))}G"
+    return {
+        "calibrated": n_routes <= _HMM_MEASURED_MAX_ROUTES,
+        "seconds_per_epoch": seconds_per_epoch,
+        "predictor_bundle": {"memory": memory, "time": _slurm_hours(fit_hours)},
+        # Feature generation rebuilds the model and runs no epochs; its cost
+        # is scaled from the 1 h request by the per-epoch route scaling.
+        "feature_generation": {
+            "memory": memory,
+            "time": _slurm_hours(max(1.0, scale**exponent)),
+        },
+    }
+
 
 STAGES = (
     "discovery",
@@ -83,9 +136,7 @@ def resource_bands(raw_slurm: Mapping[str, object], rank_range):
                 "memory": _memory(
                     raw_band["memory"], f"slurm.resource_bands[{index}].memory"
                 ),
-                "time": _time(
-                    raw_band["time"], f"slurm.resource_bands[{index}].time"
-                ),
+                "time": _time(raw_band["time"], f"slurm.resource_bands[{index}].time"),
             }
         )
     missing = sorted(configured - set(covered))
@@ -194,33 +245,19 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
             96 if partition == "cpu_backfill" else 8,
             concurrency,
         )
-        # Two calibrated envelopes. Up to 10 routes x 500 epochs: measured,
-        # slowest full_hmm2 fit 1.6 h. Up to 6 routes x 2000 epochs (Qin's
-        # settings): per-epoch cost measured at 0.53x the 10-route cost on the
-        # same node, giving ~3.3 h for the slowest full_hmm2 partition, so the
-        # limit is doubled for headroom.
-        long_fit = hmm_epochs > 500
+        estimate = hmm_resource_estimate(route_count_bound, hmm_epochs)
         stages["predictor-bundle"].update(
             cpus_per_task=8,
-            memory="16G",
-            time="08:00:00" if long_fit else "04:00:00",
             max_concurrent=hmm_concurrency,
+            **estimate["predictor_bundle"],
         )
         stages["feature-generation"].update(
             cpus_per_task=8,
-            memory="16G",
-            time="01:00:00",
             max_concurrent=hmm_concurrency,
+            **estimate["feature_generation"],
         )
-        calibration_limits = [
-            {"max_routes": 10, "max_epochs": 500},
-            {"max_routes": 6, "max_epochs": 2000},
-        ]
-        calibrated = any(
-            route_count_bound <= limit["max_routes"]
-            and hmm_epochs <= limit["max_epochs"]
-            for limit in calibration_limits
-        )
+        calibration_limits = [{"max_routes": _HMM_MEASURED_MAX_ROUTES}]
+        calibrated = estimate["calibrated"]
 
     overrides = _validated_overrides(raw_slurm)
     for stage, values in overrides.items():
@@ -239,27 +276,10 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
         resource.update(overrides.get("candidate", {}))
         candidate_bands.append({"rank_range": band["rank_range"], **resource})
 
-    required_overrides = []
-    if not calibrated:
-        required_fields = _OVERRIDE_FIELDS
-        required_overrides = [
-            stage
-            for stage in ("predictor-bundle", "feature-generation")
-            if not required_fields.issubset(overrides.get(stage, {}))
-        ]
-    launchable = not required_overrides
+    # Estimates beyond the measured route counts are conservative
+    # extrapolations, reported through ``calibrated`` but not blocking.
+    launchable = True
     reason = None
-    if not calibrated:
-        reason = (
-            "HMM resources are uncalibrated for "
-            f"{route_count_bound} possible routes and {hmm_epochs} epochs."
-        )
-        if required_overrides:
-            reason += (
-                " Supply cpus_per_task, memory, time, and max_concurrent for: "
-                + ", ".join(required_overrides)
-                + "."
-            )
 
     return {
         "schema_version": RESOURCE_PROFILE_VERSION,

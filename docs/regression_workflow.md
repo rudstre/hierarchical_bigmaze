@@ -69,17 +69,22 @@ for the full-model learning curve.
   `max_concurrent` for a named stage. Resource settings are execution
   provenance and do not enter the scientific configuration signature.
 
-The calibrated HMM CPU profile requests 8 CPUs and 16 GB for predictor fitting,
-with four hours for up to 500 epochs and eight hours beyond that. The default
+The HMM CPU profile (`auto-cpu-v2`) requests 8 CPUs and estimates predictor
+fitting time and memory from measured fits on `cpu_backfill`: the slowest of
+36 partitions took 11.19 s/epoch with 10 routes (`full_hmm2`, 500 epochs,
+peak 8.07 GB) and 4.41 s/epoch with 6 routes (`full_hmm_xiao2`, 2000 epochs,
+peak 3.57 GB). Time is linear in epochs; per-epoch time scales as
+`(routes + 1)^2.06`, fitted to those two points, and memory as
+`(routes + 1)^2`. Requests are twice the estimate, rounded up to whole hours,
+with floors of 16 GB and one hour (for example, 6 routes x 2000 epochs requests
+5 h, 10 routes x 2000 epochs 13 h). Above 10 routes the time exponent is the
+dense-solve bound 3 and the plan is reported as an extrapolated estimate; it
+remains launchable, and stage overrides still take precedence. Learned costs
+(`learn_costs`) were not part of the measured fits. The default
 `cpu_backfill` profile permits 96 concurrent HMM tasks and 256 concurrent
 one-CPU tasks; selecting the protected `cpu` partition reduces the automatic HMM
-cap to eight. It covers two envelopes: at most 10 routes and 500 epochs
-(measured: slowest 10-route fit 1.6 h), and at most 6 routes and 2000 epochs
-(extrapolated: 6-route epochs cost 0.53x the 10-route cost on one node, giving
-about 3.3 h for the slowest partition). For `n_routes: "auto"`, the manager uses
-`max_rank + 1` as the pre-submission bound. A larger route or epoch setting is
-blocked until both `predictor-bundle` and `feature-generation` have complete
-stage overrides. The workers hide CUDA devices, so backfill jobs remain CPU-only
+cap to eight. For `n_routes: "auto"`, the manager uses `max_rank + 1` as the
+pre-submission bound. The workers hide CUDA devices, so backfill jobs remain CPU-only
 on GPU-equipped nodes. No GPU profile is defined.
 
 HMM fitting remains float32. Predictor diagnostics record dtype, device,

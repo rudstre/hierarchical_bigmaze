@@ -21,7 +21,10 @@
       "n_components": 5
     },
     "hmm": {
-      "n_routes": 6
+      "n_routes": 6,
+      "learn_costs": true,
+      "cost_learning_rate": 0.01,
+      "cost_freeze_epochs": 0
     }
   },
   "regression_cv": {
