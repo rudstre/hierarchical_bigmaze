@@ -48,6 +48,16 @@ for the full-model learning curve.
 - `predictors.hmm.n_routes` accepts a fixed positive integer or `"auto"`.
   Here `"auto"` fits `K + 1` HMM routes. The resolved numeric route settings
   are recorded in each predictor artifact.
+- Unspecified `predictors.hmm` settings default to Qin's mouse fits: 6 routes,
+  `cognitive_constant` 30, `action_cost` 0.13, `reward_value` 1,
+  `action_entropy_param` 0.2, `route_entropy_param` 0, `noise` 1 decaying by
+  0.997 per policy recalculation, learning rate 0.05, and 2000 epochs. As in her
+  `train_entry.run_once`, `validation_fraction` (0.2) of the partition's
+  route-training trials are held out with the route seed, validation log
+  likelihood is evaluated every `eval_every` (50) epochs, and the parameters at
+  the best mean of the last `smooth_k` (5) evaluations are kept. The held-out
+  session never enters this split. `validation_fraction: 0` fits all trials and
+  keeps the final iterate.
 - `regression_cv.method: "blocked_trial_kfold"` runs the original full/reduced
   ablation analysis; `n_splits` changes only regression splits and results.
 - `regression_cv.method: "blocked_trial_learning_curve"` fits only the full
@@ -59,11 +69,14 @@ for the full-model learning curve.
   `max_concurrent` for a named stage. Resource settings are execution
   provenance and do not enter the scientific configuration signature.
 
-The calibrated HMM CPU profile requests 8 CPUs, 16 GB, and four hours for
-predictor fitting. The default `cpu_backfill` profile permits 96 concurrent HMM
-tasks and 256 concurrent one-CPU tasks; selecting the protected `cpu` partition
-reduces the automatic HMM cap to eight. It covers at most 10 routes and 500
-epochs. For `n_routes: "auto"`, the manager uses
+The calibrated HMM CPU profile requests 8 CPUs and 16 GB for predictor fitting,
+with four hours for up to 500 epochs and eight hours beyond that. The default
+`cpu_backfill` profile permits 96 concurrent HMM tasks and 256 concurrent
+one-CPU tasks; selecting the protected `cpu` partition reduces the automatic HMM
+cap to eight. It covers two envelopes: at most 10 routes and 500 epochs
+(measured: slowest 10-route fit 1.6 h), and at most 6 routes and 2000 epochs
+(extrapolated: 6-route epochs cost 0.53x the 10-route cost on one node, giving
+about 3.3 h for the slowest partition). For `n_routes: "auto"`, the manager uses
 `max_rank + 1` as the pre-submission bound. A larger route or epoch setting is
 blocked until both `predictor-bundle` and `feature-generation` have complete
 stage overrides. The workers hide CUDA devices, so backfill jobs remain CPU-only
@@ -71,7 +84,12 @@ on GPU-equipped nodes. No GPU profile is defined.
 
 HMM fitting remains float32. Predictor diagnostics record dtype, device,
 thread counts, seed, data counts, completed epochs, the pre-update likelihood
-trace, and a deterministic likelihood recomputed after the final update.
+trace, the validation trial keys and evaluation history, the selected epoch,
+and a deterministic likelihood on the fitting trials recomputed with the kept
+parameters. Do not call `torch.set_num_threads` in processes that run the HMM:
+with torch 2.13.0+cpu, batched `torch.linalg.solve` with more than one thread
+then fails (MKL `SLASWP` errors) or hangs on every node type tested; thread
+counts set through `OMP_NUM_THREADS`, as the SLURM stage script does, work.
 Finite-value checks cover the optimizer and the returned policy/state
 distributions. Float32 parity against float64 is tested for likelihood,
 gradients, policies, and solve residuals; float16 is unsupported by the model's

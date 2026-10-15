@@ -172,16 +172,20 @@ class PredictorConfig:
     )
     hmm: Mapping[str, object] = field(
         default_factory=lambda: {
-            "n_routes": 7,
-            "cognitive_constant": 20.0,
-            "action_cost": 0.15,
+            # Mirrors DEFAULT_HMM_CONFIGURATION in Qin's lmdphelper/fitting.py.
+            "n_routes": 6,
+            "cognitive_constant": 30.0,
+            "action_cost": 0.13,
             "reward_value": 1.0,
             "route_entropy_param": 0.0,
-            "action_entropy_param": 0.0,
-            "noise": 0.0,
-            "noise_decay": 0.0,
+            "action_entropy_param": 0.2,
+            "noise": 1.0,
+            "noise_decay": 0.997,
             "learning_rate": 0.05,
-            "epochs": 500,
+            "epochs": 2000,
+            "validation_fraction": 0.2,
+            "eval_every": 50,
+            "smooth_k": 5,
         }
     )
 

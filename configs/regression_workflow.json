@@ -21,7 +21,7 @@
       "n_components": 5
     },
     "hmm": {
-      "n_routes": 10
+      "n_routes": 6
     }
   },
   "regression_cv": {

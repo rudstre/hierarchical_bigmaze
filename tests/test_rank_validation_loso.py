@@ -545,3 +545,40 @@ def test_rank_config_omitted_model_sections_use_recorded_defaults(tmp_path):
     assert normalized["adam"]["fitted_names"] == list(
         validation.FITTED_PARAMETER_NAMES
     )
+
+
+def test_v1_discovery_records_survive_dependency_only_pyproject_changes(tmp_path):
+    for relative in (
+        "src/andrew_mlmdp/discovery.py",
+        "src/andrew_mlmdp/lmdp.py",
+        "src/andrew_mlmdp/maze.py",
+        "src/andrew_mlmdp/profiles.py",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {relative}\n")
+    current_source = validation.discovery_source_fingerprint(tmp_path)
+    assert current_source["scope"] == "nmf_discovery_source_v2"
+    assert "pyproject.toml" not in {r["path"] for r in current_source["files"]}
+
+    rest = {"discovery_signature": "science", "maze_sha256": "maze", "runtime": {}}
+    stored = {
+        **rest,
+        "source": {
+            "scope": "nmf_discovery_source_v1",
+            "content_sha256": "old",
+            "files": [
+                {"path": "pyproject.toml", "sha256": "old-dependency-list"},
+                *current_source["files"],
+            ],
+        },
+    }
+    current = {**rest, "source": current_source}
+    assert validation._discovery_compatibility_matches(stored, current)
+
+    (tmp_path / "src/andrew_mlmdp/lmdp.py").write_text("# changed science\n")
+    changed = {**rest, "source": validation.discovery_source_fingerprint(tmp_path)}
+    assert not validation._discovery_compatibility_matches(stored, changed)
+    assert not validation._discovery_compatibility_matches(
+        {**stored, "runtime": {"numpy": "other"}}, current
+    )

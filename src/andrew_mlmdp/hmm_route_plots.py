@@ -102,25 +102,49 @@ def hmm_route_maps(bundle, project_root: str | Path) -> dict[str, object]:
     }
 
 
+ROUTE_ARROW_STYLES = ("max", "all", "conditional")
+
+
 def make_hmm_route_figure(
-    maps, project_root: str | Path, *, routes: list[int] | None = None, n_columns=5
+    maps,
+    project_root: str | Path,
+    *,
+    routes: list[int] | None = None,
+    n_columns=5,
+    arrows="max",
 ):
     """One maze panel per selected route (default: all), on Qin's maze drawing.
 
-    Arrow length is ``action_given_location``: the route's preference among the
-    actions at each location, which is what shapes action choice within the
-    route. Colour is ``location_mass`` on a scale shared by the plotted panels,
-    so routes can be compared where it matters (route inference and switching).
+    Colour is ``max_a occupancy[r, s, a]``, as in Qin's ``plot_policy_max``
+    (the thesis route figures), so off-route locations are dark and the route
+    reads as a path. ``arrows`` selects what the arrows show:
+
+    - ``"max"`` (Qin's style): one arrow per location in the direction of the
+      largest location-action occupancy, with length proportional to it. A
+      route that uses a location in two directions shows only one of them;
+      exact ties take Qin's action order (right, up, left, down).
+    - ``"all"``: every action, with length proportional to its unconditioned
+      ``occupancy[r, s, a]``, so two-way corridors stay visible.
+    - ``"conditional"``: every action, with length ``action_given_location``,
+      the within-route preference that shapes action choice. Every reachable
+      location gets full-size arrows, however rarely the route visits it.
+
+    As in Qin's figures, colour and the occupancy-scaled arrows are relative to
+    each panel's largest location-action occupancy. A diffuse route therefore
+    looks as saturated as a concentrated one; compare routes by their weights
+    and the raw ``occupancy``, not by panel brightness.
     """
     import matplotlib.pyplot as plt
 
+    if arrows not in ROUTE_ARROW_STYLES:
+        raise ValueError(f"arrows must be one of {ROUTE_ARROW_STYLES}, not {arrows!r}")
     _prepare_qin_imports(Path(project_root))
     from mazehelper.plotting_functions import plot_maze
 
     # Location s sits at (x, y) = (s // 7, s % 7); action unit steps in Qin's
-    # (right, up, left, down) order. Arrows are drawn in one quiver call so all
-    # actions share a length scale (Qin's plot_policy_all autoscales each
-    # direction separately).
+    # (right, up, left, down) order. Arrows are drawn in one quiver call per
+    # panel so all actions share a length scale (Qin's plot_policy_all
+    # autoscales each direction separately).
     x = np.repeat(np.arange(7), 7)
     y = np.tile(np.arange(7), 7)
     step_x = np.array([1, 0, -1, 0])
@@ -130,7 +154,25 @@ def make_hmm_route_figure(
         routes = list(range(maps["occupancy"].shape[0]))
     if not routes:
         raise ValueError("No routes selected for plotting")
-    mass_max = maps["location_mass"][routes].max()
+    occupancy = maps["occupancy"][routes]
+    panel_max = occupancy.max(axis=(1, 2), keepdims=True)
+    relative = occupancy / panel_max
+    location_max = relative.max(axis=-1)
+    if arrows == "max":
+        # One arrow per location: a one-hot direction scaled by the max.
+        best = np.eye(N_ACTIONS)[occupancy.argmax(axis=-1)]
+        lengths = best * location_max[..., None]
+        # The largest arrow spans most of an edge, as in the thesis figures.
+        edge_fraction = 0.8
+    else:
+        if arrows == "all":
+            lengths = relative
+        else:
+            lengths = maps["action_given_location"][routes]
+        # A full-length arrow spans under half an edge, so arrows leaving
+        # neighbouring nodes along the same corridor do not overlap.
+        edge_fraction = 0.45
+
     n_columns = min(n_columns, len(routes))
     n_rows = -(-len(routes) // n_columns)
     fig, axes = plt.subplots(
@@ -142,14 +184,13 @@ def make_hmm_route_figure(
             ax.set_visible(False)
             continue
         route_index = routes[panel]
-        preference = maps["action_given_location"][route_index]
-        # location_mass[s] -> [x, y]; imshow wants rows = y, columns = x.
+        # location_max[s] -> [x, y]; imshow wants rows = y, columns = x.
         image = ax.imshow(
-            maps["location_mass"][route_index].reshape(7, 7).T,
+            location_max[panel].reshape(7, 7).T,
             origin="lower",
             cmap="viridis",
             vmin=0,
-            vmax=mass_max,
+            vmax=1,
         )
         plot_maze(
             maps["maze_id"],
@@ -159,20 +200,17 @@ def make_hmm_route_figure(
             transition_linewidth=3,
             node_width=30,
         )
+        drawn = lengths[panel] > 0
         ax.quiver(
-            np.tile(x, N_ACTIONS),
-            np.tile(y, N_ACTIONS),
-            (preference * step_x).T.ravel(),
-            (preference * step_y).T.ravel(),
-            # p(a | location) = 1 spans half an edge, so arrows leaving
-            # neighbouring nodes along the same corridor do not overlap.
-            color="white",
-            edgecolor="black",
-            linewidth=0.4,
+            np.tile(x[:, None], (1, N_ACTIONS))[drawn],
+            np.tile(y[:, None], (1, N_ACTIONS))[drawn],
+            (lengths[panel] * step_x)[drawn],
+            (lengths[panel] * step_y)[drawn],
+            color="black",
             angles="xy",
             scale_units="xy",
-            scale=2.2,
-            width=0.012,
+            scale=1 / edge_fraction,
+            width=0.018,
             minlength=0,
             zorder=2,
         )
@@ -184,6 +222,9 @@ def make_hmm_route_figure(
         )
     fig.tight_layout()
     fig.colorbar(
-        image, ax=axes.ravel().tolist(), shrink=0.6, label="Location mass under route"
+        image,
+        ax=axes.ravel().tolist(),
+        shrink=0.6,
+        label="Max occupancy (relative to panel)",
     )
     return fig

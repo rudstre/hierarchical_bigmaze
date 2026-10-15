@@ -144,3 +144,64 @@ def test_figure_has_one_panel_per_selected_route():
         if routes:
             assert [t.split(" ")[1] for t in titles] == ["0", "2"]
         plt.close(figure)
+
+
+def _panel_arrows(ax):
+    from matplotlib.quiver import Quiver
+
+    (quiver,) = [c for c in ax.collections if isinstance(c, Quiver)]
+    return quiver.X, quiver.Y, quiver.U, quiver.V
+
+
+def test_max_arrows_follow_qin_plot_policy_max():
+    import matplotlib.pyplot as plt
+
+    R, pi = _random_parameters(seed=5)
+    maps = hmm_route_maps(_bundle(R, pi), ROOT)
+    figure = make_hmm_route_figure(maps, ROOT, routes=[1], arrows="max")
+    x, y, u, v = _panel_arrows(figure.axes[0])
+    occupancy = maps["occupancy"][1]
+    location_max = occupancy.max(axis=-1)
+    reachable = location_max > 0
+    # One arrow per location with any occupancy, in the argmax direction
+    # (right, up, left, down), with length proportional to the max.
+    assert len(x) == reachable.sum()
+    locations = (np.asarray(x) * 7 + np.asarray(y)).astype(int)
+    best = occupancy[locations].argmax(axis=-1)
+    np.testing.assert_array_equal(np.sign(u), np.array([1, 0, -1, 0])[best])
+    np.testing.assert_array_equal(np.sign(v), np.array([0, 1, 0, -1])[best])
+    np.testing.assert_allclose(
+        np.hypot(u, v), location_max[locations] / occupancy.max(), rtol=1e-6
+    )
+    plt.close(figure)
+
+
+def test_all_and_conditional_arrows_scale_by_their_quantity():
+    import matplotlib.pyplot as plt
+
+    R, pi = _random_parameters(seed=6)
+    maps = hmm_route_maps(_bundle(R, pi), ROOT)
+    occupancy = maps["occupancy"][[0, 2]]
+    expected = {
+        "all": occupancy / occupancy.max(axis=(1, 2), keepdims=True),
+        "conditional": maps["action_given_location"][[0, 2]],
+    }
+    for arrows, lengths in expected.items():
+        figure = make_hmm_route_figure(maps, ROOT, routes=[0, 2], arrows=arrows)
+        for panel in range(2):
+            x, y, u, v = _panel_arrows(figure.axes[panel])
+            # Impossible actions keep exact zeros and are not drawn.
+            assert len(x) == (lengths[panel] > 0).sum()
+            np.testing.assert_allclose(
+                np.sort(np.hypot(u, v)),
+                np.sort(lengths[panel][lengths[panel] > 0]),
+                rtol=1e-6,
+            )
+        plt.close(figure)
+
+
+def test_unknown_arrow_style_is_rejected():
+    R, pi = _random_parameters()
+    maps = hmm_route_maps(_bundle(R, pi), ROOT)
+    with pytest.raises(ValueError, match="arrows"):
+        make_hmm_route_figure(maps, ROOT, arrows="argmax")

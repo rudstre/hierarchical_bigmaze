@@ -962,18 +962,43 @@ if page == "Results":
                     if not routes:
                         st.warning("Every fitted route has weight < 0.01.")
                         st.stop()
+                    arrow_labels = {
+                        "max": "Largest action (Qin)",
+                        "all": "All actions",
+                        "conditional": "p(action | location)",
+                    }
+                    arrows = (
+                        st.segmented_control(
+                            "Arrows",
+                            list(arrow_labels),
+                            default="max",
+                            format_func=arrow_labels.get,
+                        )
+                        or "max"
+                    )
                     figure = make_hmm_route_figure(
-                        maps, config.project_root, routes=routes
+                        maps, config.project_root, routes=routes, arrows=arrows
                     )
                     st.pyplot(figure)
+                    arrow_captions = {
+                        "max": "one arrow per location toward its largest "
+                        "location-action occupancy, length proportional to it "
+                        "(Qin's plot_policy_max); a location used in two "
+                        "directions shows only one",
+                        "all": "every action, length proportional to its "
+                        "occupancy under the route",
+                        "conditional": "the route's preference among the actions "
+                        "at each location, p(action | location, route), which "
+                        "shapes action choice within the route; every location "
+                        "gets full-size arrows, however rarely it is visited",
+                    }
                     st.caption(
-                        "Arrows: the route's preference among the actions at each "
-                        "location, p(action | location, route); this is what shapes "
-                        "action choice within the route, before it is combined with "
-                        "the goal-directed value. Colour: the location's total mass "
-                        "under the route, on a scale shared by the panels; it only "
-                        "matters when routes are compared (route inference and "
-                        "switching). Routes with weight < 0.01 can effectively never "
+                        f"Arrows: {arrow_captions[arrows]}. Colour: the largest "
+                        "location-action occupancy at each location. As in Qin's "
+                        "figures, colour and occupancy-scaled arrows are relative "
+                        "to each panel's maximum, so compare routes by weight, "
+                        "not brightness. "
+                        "Routes with weight < 0.01 can effectively never "
                         "be entered, so their maps do not affect the likelihood. "
                         "Route indices are arbitrary and not aligned across "
                         "partitions (separate fits). "

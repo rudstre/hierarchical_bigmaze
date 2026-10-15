@@ -136,3 +136,33 @@ def test_uncalibrated_hmm_requires_complete_explicit_stage_overrides():
 def test_invalid_stage_overrides_are_rejected(overrides, message):
     with pytest.raises(ValueError, match=message):
         resolve_resource_plan(_config(), _slurm(stage_overrides=overrides))
+
+
+@pytest.mark.parametrize(
+    ("routes", "epochs", "calibrated", "time"),
+    [
+        (10, 500, True, "04:00:00"),
+        (6, 2000, True, "08:00:00"),
+        (7, 2000, False, "08:00:00"),
+        (10, 501, False, "08:00:00"),
+    ],
+)
+def test_hmm_calibration_envelopes_and_predictor_time(routes, epochs, calibrated, time):
+    plan = resolve_resource_plan(
+        _config(route_family="hmm", routes=routes, epochs=epochs), _slurm()
+    )
+
+    assert plan["calibrated"] is calibrated
+    assert plan["stages"]["predictor-bundle"]["time"] == time
+
+
+def test_hmm_resources_use_fitting_defaults_when_unspecified():
+    config = _config(route_family="hmm")
+    config = replace(
+        config, predictors=workflow.PredictorConfig(route_family="hmm", hmm={})
+    )
+    plan = resolve_resource_plan(config, _slurm())
+
+    assert plan["route_count_bound"] == 6
+    assert plan["hmm_epochs"] == 2000
+    assert plan["calibrated"]

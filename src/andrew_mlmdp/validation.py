@@ -450,8 +450,10 @@ def discovery_source_fingerprint(project_root: str | Path) -> dict[str, object]:
     """Fingerprint only code that can change split-independent NMF discovery."""
 
     root = Path(project_root).resolve()
+    # pyproject.toml is deliberately excluded (scope v2): its dependency list
+    # changes with unrelated features, and the installed versions that can
+    # affect NMF are already compared through the separate ``runtime`` record.
     relative_paths = (
-        "pyproject.toml",
         "src/andrew_mlmdp/discovery.py",
         "src/andrew_mlmdp/lmdp.py",
         "src/andrew_mlmdp/maze.py",
@@ -471,7 +473,7 @@ def discovery_source_fingerprint(project_root: str | Path) -> dict[str, object]:
         digest.update(b"\0")
         records.append({"path": relative, "sha256": content_digest})
     return {
-        "scope": "nmf_discovery_source_v1",
+        "scope": "nmf_discovery_source_v2",
         "git_head": _git_head(root),
         "content_sha256": digest.hexdigest(),
         "files": records,
@@ -513,10 +515,13 @@ def _discovery_compatibility_matches(
     if stored_files is None or current_files is None:
         return False
     current_source = current.get("source")
-    if (
-        isinstance(current_source, dict)
-        and current_source.get("scope") == "nmf_discovery_source_v1"
-    ):
+    # Narrow scopes: every currently fingerprinted file must match the stored
+    # record. Stored files outside the current scope (e.g. pyproject.toml in
+    # v1 records, or the former broad scope) are ignored.
+    if isinstance(current_source, dict) and current_source.get("scope") in {
+        "nmf_discovery_source_v1",
+        "nmf_discovery_source_v2",
+    }:
         return all(
             stored_files.get(path) == digest for path, digest in current_files.items()
         )

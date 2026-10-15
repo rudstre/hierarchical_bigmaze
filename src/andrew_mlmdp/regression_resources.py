@@ -183,21 +183,27 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
         stages["predictor-bundle"]["time"] = "02:00:00"
     else:
         hmm = config.predictors.selected_route_settings
-        configured_routes = hmm.get("n_routes", 7)
+        configured_routes = hmm.get("n_routes", 6)  # fitting default
         route_count_bound = (
             config.subgoal_selection.rank_range[1] + 1
             if configured_routes == "auto"
             else int(configured_routes)
         )
-        hmm_epochs = int(hmm.get("epochs", 500))
+        hmm_epochs = int(hmm.get("epochs", 2000))  # fitting default
         hmm_concurrency = min(
             96 if partition == "cpu_backfill" else 8,
             concurrency,
         )
+        # Two calibrated envelopes. Up to 10 routes x 500 epochs: measured,
+        # slowest full_hmm2 fit 1.6 h. Up to 6 routes x 2000 epochs (Qin's
+        # settings): per-epoch cost measured at 0.53x the 10-route cost on the
+        # same node, giving ~3.3 h for the slowest full_hmm2 partition, so the
+        # limit is doubled for headroom.
+        long_fit = hmm_epochs > 500
         stages["predictor-bundle"].update(
             cpus_per_task=8,
             memory="16G",
-            time="04:00:00",
+            time="08:00:00" if long_fit else "04:00:00",
             max_concurrent=hmm_concurrency,
         )
         stages["feature-generation"].update(
@@ -206,8 +212,15 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
             time="01:00:00",
             max_concurrent=hmm_concurrency,
         )
-        calibration_limits = {"max_routes": 10, "max_epochs": 500}
-        calibrated = route_count_bound <= 10 and hmm_epochs <= 500
+        calibration_limits = [
+            {"max_routes": 10, "max_epochs": 500},
+            {"max_routes": 6, "max_epochs": 2000},
+        ]
+        calibrated = any(
+            route_count_bound <= limit["max_routes"]
+            and hmm_epochs <= limit["max_epochs"]
+            for limit in calibration_limits
+        )
 
     overrides = _validated_overrides(raw_slurm)
     for stage, values in overrides.items():
