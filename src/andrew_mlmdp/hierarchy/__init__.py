@@ -52,6 +52,14 @@ from andrew_mlmdp.hierarchy.model import (
     compute_plan,
 )
 from andrew_mlmdp.hierarchy.prediction import MovementPredictions
+from andrew_mlmdp.hierarchy.profile_fitting import (
+    ProfileFitResult,
+    ProfileFitStep,
+    best_restart,
+    fit_profile_restarts,
+    fit_profiles,
+    fitted_basis,
+)
 from andrew_mlmdp.hierarchy.rollout import (
     Rollout,
     RolloutEvent,
@@ -70,6 +78,8 @@ __all__ = [
     "PairEntropy",
     "ParameterValues",
     "Plan",
+    "ProfileFitResult",
+    "ProfileFitStep",
     "Rollout",
     "RolloutEnsemble",
     "RolloutEvent",
@@ -83,12 +93,16 @@ __all__ = [
     "Template",
     "ThresholdRange",
     "UpperGraph",
+    "best_restart",
     "composition_trace",
     "compute_plan",
     "continuation_policies",
     "diagnose_pair",
     "fit_parameters",
+    "fit_profile_restarts",
+    "fit_profiles",
     "fittable_parameters",
+    "fitted_basis",
     "log_likelihood",
     "pair_entropy",
     "parameter_values",

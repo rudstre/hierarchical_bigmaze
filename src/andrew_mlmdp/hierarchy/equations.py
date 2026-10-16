@@ -250,8 +250,26 @@ def _validated_parameter_values(
 def _dynamic_access_profiles(
     template: "Template",
     values: Mapping[str, Tensor],
+    profiles: Tensor | None = None,
 ) -> Tensor:
     device = next(iter(values.values())).device
+    if profiles is not None:
+        # Behavior-fitted profiles arrive already peak-gauged by the caller and
+        # replace the stored basis profiles. A gate would act on top of them, so
+        # only ungated distributed bases accept an override.
+        basis = template.basis
+        if basis.locations is not None or basis.core_threshold is not None:
+            raise ValueError(
+                "Profile overrides require an ungated distributed basis"
+            )
+        expected = (len(template.maze.free_cells), basis.n_subgoals)
+        if tuple(profiles.shape) != expected:
+            raise ValueError(f"Profile override must have shape {expected}")
+        if profiles.dtype != torch.float64 or profiles.device != device:
+            raise ValueError(
+                "Profile override must be float64 on the parameter device"
+            )
+        return profiles
     profiles = torch.tensor(
         template.basis.profiles,
         dtype=torch.float64,
@@ -307,6 +325,7 @@ def _build_hierarchy(
     values: Mapping[str, Tensor],
     *,
     task_boundary: Tensor | None = None,
+    access_profiles: Tensor | None = None,
 ) -> _Hierarchy:
     maze = template.maze
     goal_state = maze.state_index(goal)
@@ -334,7 +353,7 @@ def _build_hierarchy(
         dtype=torch.float64,
         device=device,
     )
-    access_profiles = _dynamic_access_profiles(template, values)
+    access_profiles = _dynamic_access_profiles(template, values, access_profiles)
     raw_access = values["alpha"] * access_profiles[interior_index, :].T
     interior_passive = physical_passive[interior_index[:, None], interior_index]
     goal_index = torch.tensor([goal_state], dtype=torch.long, device=device)

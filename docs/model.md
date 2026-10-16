@@ -565,6 +565,80 @@ The returned normalized `D` can be passed to `SubgoalBasis.from_profiles`,
 optionally applying the separate execution gate described above. For L2
 normalization, pass the same mode to discovery and basis construction.
 
+## 12. Behavior-fitted distributed profiles
+
+[`fit_profiles`](../src/andrew_mlmdp/hierarchy/profile_fitting.py) learns the
+profile matrix `D` directly from behavior instead of taking it from NMF. It
+fits a non-negative raw matrix `W` (`n x k`) jointly with
+`lower_control_cost`, `upper_control_cost`, `alpha`, and `beta`, through the
+same exact latent-controller likelihood as `fit_parameters`. Only ungated
+distributed bases are accepted: the gate parameters `tau` and `eta` are
+redundant once `D` itself is free. The template's `goal_reward_mode`,
+commitment settings, and composition are frozen and recorded in provenance.
+
+The peak gauge is part of the differentiable model,
+
+```math
+D_{sj} = \frac{W_{sj}}{\max_x W_{xj}},
+```
+
+so changing the peak entry of `W` rescales every other entry of its column
+and receives the corresponding gradient. Renormalizing after an unconstrained
+step instead is not a projection onto `max D = 1` and can converge to a
+non-optimal point. After every Adam step `W` is projected onto `W >= 0`; this
+preserves exact zeros, and a zero entry can later become positive because it
+is itself the optimized variable. The scale of `W` is not rebased (the
+objective is invariant to it, but Adam's dynamics are not); the per-column
+maximum of `W` is recorded every evaluation.
+
+With every column peaking at one, the shared `alpha` means every learned
+subgoal has the same maximum access strength. Columns differ in where and how
+broadly they are accessible, not in peak amplitude.
+
+The minimized objective is
+
+```math
+J = -\frac{1}{N}\sum_{\tau}\log\sum_z p(\tau, z \mid D, \theta)
+    + \lambda_c R_c(D) + \lambda_d R_{Dir}(D) + \lambda_o R_o(D),
+```
+
+where `N` counts likelihood factors (collapsed physical moves). Dividing by
+`N` keeps the structural penalties equally strong for mice with different
+amounts of data, so this is penalized marginal likelihood, not MAP under a
+fixed prior. With `d_j = D_j / sum_s D_sj`, `G` the shortest-path distance
+divided by the maze diameter, and `E` the undirected passive edges:
+
+- compactness `R_c = (1/k) sum_j d_j^T G d_j` opposes broad or disconnected
+  columns;
+- graph-Dirichlet smoothness
+  `R_Dir = (1/(k|E|)) sum_j sum_(s,t) (D_sj - D_tj)^2` opposes abrupt, spiky
+  columns (unlike total variation, which is nearly width-neutral on corridor
+  graphs);
+- overlap `R_o = (2/(k(k-1))) sum_{j<l} cos(D_j, D_l)^2` weakly discourages
+  duplicate columns.
+
+A column is structurally usable for goal `g` only if it has positive mass on
+a state other than `g`. After each projected step, every column is checked
+against every **evaluation** goal, including goals that appear only in
+held-out data. A violating step is rejected: `W`, the transformed behavioral
+parameters, and the Adam moments and step counters are restored exactly, the
+learning rate is multiplied by `lr_decay`, and the step is retried with the
+same gradient. Exceeding `max_rejections` ends the restart with reason
+`rejection_limit`, an optimizer failure rather than evidence of model
+infeasibility. Learning-rate scheduling, best-state restoration, and
+convergence otherwise follow `fit_parameters`; tolerances must be supplied
+explicitly because they are on the per-decision scale.
+
+`fit_profile_restarts` initializes each restart from random localized columns
+`exp(-d / width)` with an explicit seed; `best_restart` selects by training
+objective among restarts that did not end in a failure reason, and every
+restart is retained. `fitted_basis` wraps the selected profiles in an ungated
+`SubgoalBasis` for diagnostics, rollouts, and movement prediction.
+
+States the animal rarely visits influence the likelihood only indirectly
+through planning, so their fitted `D` values are weakly identified by
+behavior; fitted maps should be shown alongside state occupancy.
+
 ## End-to-end implementation map
 
 | Stage | Public result | Implementation |

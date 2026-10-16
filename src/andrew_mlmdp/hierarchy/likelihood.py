@@ -268,8 +268,13 @@ def prepared_log_likelihoods(
     *,
     parameter_values: "Mapping[str, Tensor]",
     diagnostics: BatchTimings | None = None,
+    access_profiles: Tensor | None = None,
 ) -> Tensor:
-    """Return ordered trial scores from one prepared differentiable graph."""
+    """Return ordered trial scores from one prepared differentiable graph.
+
+    ``access_profiles`` optionally replaces the basis profiles with a
+    differentiable, already peak-gauged tensor (ungated soft bases only).
+    """
 
     return _prepared_log_likelihoods(
         template,
@@ -277,6 +282,7 @@ def prepared_log_likelihoods(
         parameter_values=parameter_values,
         diagnostics=diagnostics,
         use_reference_recursion=False,
+        access_profiles=access_profiles,
     )
 
 
@@ -305,6 +311,7 @@ def _prepared_log_likelihoods(
     parameter_values: "Mapping[str, Tensor]",
     diagnostics: BatchTimings | None,
     use_reference_recursion: bool,
+    access_profiles: Tensor | None = None,
 ) -> Tensor:
     """Build shared operators and run the selected private recurrence."""
 
@@ -342,6 +349,7 @@ def _prepared_log_likelihoods(
             goal_metadata.goal,
             values,
             task_boundary=boundary,
+            access_profiles=access_profiles,
         )
         continuation_policies = _continuation_policy_bank(model, boundary_pinv)
         goal_policy = _goal_only_policy(model)
@@ -574,6 +582,7 @@ def total_prepared_log_likelihood(
     *,
     parameter_values: Mapping[str, Tensor],
     diagnostics: BatchTimings | None = None,
+    access_profiles: Tensor | None = None,
 ) -> Tensor:
     """Sum ordered trial scores from the prepared likelihood engine."""
 
@@ -582,6 +591,7 @@ def total_prepared_log_likelihood(
         prepared,
         parameter_values=parameter_values,
         diagnostics=diagnostics,
+        access_profiles=access_profiles,
     ).sum()
 
 
