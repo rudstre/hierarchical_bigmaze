@@ -773,10 +773,20 @@ def _shared_column_bank(
     continuation_after_access = continuation_policies[
         subtask_indices, :, access_interior
     ]
+    goal_after_access = goal_policy[:, access_interior].permute(1, 2, 0)
+    if model.template.commitment_radius is not None:
+        # Within the commitment radius a composed column may have zero mass
+        # (allowed by _compose_policy); those rows are replaced by the goal-only
+        # policy below. Substitute before renormalizing so 0/0 never enters the
+        # graph: torch.where would otherwise send NaN gradients through the
+        # discarded branch even though the likelihood itself is finite.
+        within = metadata.shared_within_radius.view(-1, 1, 1)
+        continuation_after_access = torch.where(
+            within, goal_after_access, continuation_after_access
+        )
     continuation_after_access = _suppressed_physical(
         continuation_after_access, projection
     )
-    goal_after_access = goal_policy[:, access_interior].permute(1, 2, 0)
     goal_after_access = _suppressed_physical(goal_after_access, projection)
 
     if model.template.commitment_mode == "radius":

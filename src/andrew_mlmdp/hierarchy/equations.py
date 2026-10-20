@@ -725,11 +725,54 @@ def _compose_policy(
             weights[..., :-1] @ model.task_basis.interior_desirability[:, :-1].T
             + weights[..., -1:] * learned
         )
-    return _lower_policy(
-        model,
-        interior,
-        reconstructed_boundary,
-        zero_columns="zero" if goal_desirability is not None else "error",
+    if goal_desirability is not None:
+        return _lower_policy(
+            model, interior, reconstructed_boundary, zero_columns="zero"
+        )
+    committed = _radius_committed_columns(model)
+    if committed is None:
+        return _lower_policy(
+            model, interior, reconstructed_boundary, zero_columns="error"
+        )
+    # Under radius commitment, the exact goal-only policy replaces the composed
+    # policy at every state within commitment_radius of the goal, in both the
+    # rollout and the likelihood. A composed column there may legitimately have
+    # zero mass (e.g. with goal_reward_mode="deferred", a dead-end pocket behind
+    # the goal that no subgoal reaches has zero desirability everywhere). Such
+    # columns are left exactly zero; a zero-mass column at any state outside
+    # the radius is still an error.
+    physical, policy = _lower_policy(
+        model, interior, reconstructed_boundary, zero_columns="zero"
+    )
+    column_mass = policy.sum(dim=-2)
+    undefined = ~(column_mass > 0.0) & ~committed
+    if bool(undefined.any()):
+        raise ValueError(
+            "Controlled dynamics contain a zero-mass column outside the "
+            "commitment radius"
+        )
+    return physical, policy
+
+
+def _radius_committed_columns(model: _Hierarchy) -> Tensor | None:
+    """Interior columns replaced by the goal-only policy under radius commitment.
+
+    Uses the same BFS step distance to the goal as the rollout and likelihood.
+    Returns ``None`` when the template has no commitment radius.
+    """
+
+    radius = model.template.commitment_radius
+    if radius is None:
+        return None
+    maze = model.template.maze
+    distances = maze.distances_from(model.goal)
+    return torch.tensor(
+        [
+            distances[maze.coordinate(state)] <= radius
+            for state in model.interior_states
+        ],
+        dtype=torch.bool,
+        device=model.device,
     )
 
 

@@ -11,10 +11,12 @@ from andrew_mlmdp.hierarchy.likelihood import (
     total_prepared_log_likelihood,
 )
 from andrew_mlmdp.hierarchy.profile_fitting import (
+    access_gate,
     best_restart,
     fit_profile_restarts,
     fit_profiles,
     fitted_basis,
+    log_peak_gauge,
     peak_gauge,
     profile_feasibility,
     profile_geometry,
@@ -439,3 +441,287 @@ def test_random_localized_profiles_have_unit_peaks():
     assert profiles.shape == (6, 3)
     assert np.allclose(profiles.max(axis=0), 1.0)
     assert np.all(profiles > 0.0)
+
+
+def _log_objective(template, prepared, log_raw, values, n_decisions):
+    log_likelihood = total_prepared_log_likelihood(
+        template,
+        prepared,
+        parameter_values=values,
+        access_profiles=log_peak_gauge(log_raw),
+    )
+    return -log_likelihood / n_decisions
+
+
+def test_log_gauge_is_shift_invariant_with_unit_peaks():
+    log_raw = torch.log(torch.tensor(PROFILES + 0.05, dtype=torch.float64))
+    profiles = log_peak_gauge(log_raw)
+    shifted = log_peak_gauge(log_raw + torch.tensor([3.0, -7.0], dtype=torch.float64))
+    assert torch.allclose(profiles, shifted, rtol=1e-14, atol=0.0)
+    peaks = profiles.max(dim=0).values
+    assert torch.allclose(peaks, torch.ones(2, dtype=torch.float64))
+    assert bool((profiles > 0.0).all())
+
+
+def test_log_gradient_matches_finite_differences():
+    template = _template()
+    prepared = prepare_batch(template, _trials())
+    values = parameter_values(template)
+    rng = np.random.default_rng(4)
+    start = np.log(PROFILES + 0.05 + 0.01 * rng.random(PROFILES.shape))
+    log_raw = torch.tensor(start, dtype=torch.float64, requires_grad=True)
+    _log_objective(template, prepared, log_raw, values, 12).backward()
+    peaks = log_raw.detach().argmax(dim=0).tolist()
+    for row, column in [(peaks[0], 0), (peaks[1], 1), (2, 0), (4, 1)]:
+        plus = log_raw.detach().clone()
+        minus = log_raw.detach().clone()
+        plus[row, column] += 1e-6
+        minus[row, column] -= 1e-6
+        with torch.no_grad():
+            numeric = (
+                float(_log_objective(template, prepared, plus, values, 12))
+                - float(_log_objective(template, prepared, minus, values, 12))
+            ) / 2e-6
+        analytic = log_raw.grad[row, column].item()
+        assert analytic == pytest.approx(numeric, rel=1e-5, abs=1e-9)
+
+
+def test_log_parameterization_requires_positive_initial_profiles():
+    with pytest.raises(ValueError, match="strictly positive"):
+        fit_profiles(
+            _template(),
+            _trials(),
+            initial_profiles=PROFILES,
+            evaluation_goals=[GOAL],
+            penalty_weights=PENALTIES,
+            parameterization="log",
+            **TOLERANCES,
+        )
+
+
+def test_log_fit_improves_objective_and_keeps_positive_unit_peak_profiles():
+    template = _template()
+    result = fit_profiles(
+        template,
+        _trials(),
+        initial_profiles=PROFILES + 0.05,
+        evaluation_goals=[GOAL],
+        penalty_weights=PENALTIES,
+        parameterization="log",
+        max_steps=25,
+        **TOLERANCES,
+    )
+    assert result.provenance["parameterization"] == "log"
+    assert result.rejections == ()
+    assert result.best_objective < result.objective_history[0]
+    assert np.all(result.best_profiles > 0.0)
+    assert np.allclose(result.best_profiles.max(axis=0), 1.0)
+    # The raw state is log D: its column maxima are the gauge's zero point.
+    gauged = np.exp(
+        result.best_raw_profiles - result.best_raw_profiles.max(axis=0, keepdims=True)
+    )
+    assert np.allclose(gauged, result.best_profiles)
+
+
+def test_gaussian_random_profiles_have_unit_peaks_and_lighter_tails():
+    maze = Maze.from_ascii("......")
+    gaussian = random_localized_profiles(
+        maze, 2, np.random.default_rng(0), shape="gaussian"
+    )
+    exponential = random_localized_profiles(maze, 2, np.random.default_rng(0))
+    assert np.allclose(gaussian.max(axis=0), 1.0)
+    # Same centres and widths: the far tail is much lighter.
+    assert np.all(gaussian.min(axis=0) < exponential.min(axis=0))
+
+
+def test_access_gate_zeroes_entries_below_threshold_and_keeps_unit_peak():
+    profiles = torch.tensor([[1.0, 0.04], [0.05, 1.0], [0.5, 0.2]], dtype=torch.float64)
+    gated = access_gate(profiles, 0.05)
+    assert gated[1, 0].item() == 0.0
+    assert gated[0, 1].item() == 0.0
+    assert torch.allclose(gated.max(dim=0).values, torch.ones(2, dtype=torch.float64))
+    assert gated[2, 0].item() == pytest.approx((0.5 - 0.05) / 0.95)
+    assert torch.equal(access_gate(profiles, None), profiles)
+
+
+def test_gated_entries_get_gradient_only_through_penalties():
+    template = _template()
+    prepared = prepare_batch(template, _trials())
+    geometry = profile_geometry(template)
+    values = parameter_values(template)
+    start = np.log(PROFILES + 0.01)
+    # Entry (5, 0) has D ~ 0.01 / 1.01 < tau, so the gate removes it.
+    below = (5, 0)
+
+    def gradient(dirichlet_weight):
+        log_raw = torch.tensor(start, dtype=torch.float64, requires_grad=True)
+        ungated = log_peak_gauge(log_raw)
+        log_likelihood = total_prepared_log_likelihood(
+            template,
+            prepared,
+            parameter_values=values,
+            access_profiles=access_gate(ungated, 0.05),
+        )
+        penalty = structural_penalties(ungated, geometry)["dirichlet"]
+        (-log_likelihood / 12 + dirichlet_weight * penalty).backward()
+        return log_raw.grad[below].item()
+
+    assert gradient(0.0) == 0.0
+    assert gradient(1.0) != 0.0
+
+
+def test_fit_with_access_threshold_reports_gated_and_ungated_profiles():
+    template = _template()
+    result = fit_profiles(
+        template,
+        _trials(),
+        initial_profiles=PROFILES + 0.01,
+        evaluation_goals=[GOAL],
+        penalty_weights=PENALTIES,
+        parameterization="log",
+        access_threshold=0.05,
+        max_steps=10,
+        **TOLERANCES,
+    )
+    gated = result.best_profiles
+    ungated = result.best_ungated_profiles
+    assert result.provenance["access_threshold"] == 0.05
+    assert np.all(ungated > 0.0)
+    assert np.all(gated[ungated < 0.05] == 0.0)
+    assert np.allclose(gated, np.maximum(ungated - 0.05, 0.0) / 0.95)
+    assert np.allclose(gated.max(axis=0), 1.0)
+
+
+def test_access_threshold_must_be_in_unit_interval():
+    with pytest.raises(ValueError, match="access_threshold"):
+        fit_profiles(
+            _template(),
+            _trials(),
+            initial_profiles=PROFILES + 0.01,
+            evaluation_goals=[GOAL],
+            penalty_weights=PENALTIES,
+            parameterization="log",
+            access_threshold=1.0,
+            **TOLERANCES,
+        )
+
+
+def _validation_trials():
+    return (
+        Trial("v", 1, GOAL, ((0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5))),
+        Trial("v", 2, GOAL, ((0, 1), (0, 2), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5))),
+    )
+
+
+def test_validation_selection_reports_best_checked_state():
+    result = fit_profiles(
+        _template(),
+        _trials(),
+        initial_profiles=PROFILES + 0.05,
+        evaluation_goals=[GOAL],
+        penalty_weights=PENALTIES,
+        parameterization="log",
+        validation_trials=_validation_trials(),
+        validation_interval=3,
+        max_steps=20,
+        **TOLERANCES,
+    )
+    checked = [
+        (step.evaluation, step.validation_ll_per_decision, step.objective)
+        for step in result.history
+        if step.validation_ll_per_decision is not None
+    ]
+    assert [evaluation for evaluation, _, _ in checked] == list(
+        range(0, len(result.history), 3)
+    )
+    best = max(checked, key=lambda item: item[1])
+    assert result.selection == "validation"
+    assert result.best_validation_ll_per_decision == best[1]
+    assert result.best_objective == best[2]
+    assert result.provenance["validation"]["interval"] == 3
+
+
+def test_validation_patience_stops_after_stale_checks(monkeypatch):
+    import andrew_mlmdp.hierarchy.profile_fitting as module
+
+    real = module.total_prepared_log_likelihood
+    calls = {"validation": 0}
+
+    def fake(template, prepared, **kwargs):
+        value = real(template, prepared, **kwargs)
+        is_validation = len(prepared.trials) == 2 and not torch.is_grad_enabled()
+        if is_validation:
+            # Validation scores get strictly worse after the first check.
+            calls["validation"] += 1
+            return value - 10.0 * calls["validation"]
+        return value
+
+    monkeypatch.setattr(module, "total_prepared_log_likelihood", fake)
+    result = fit_profiles(
+        _template(),
+        _trials(),
+        initial_profiles=PROFILES + 0.05,
+        evaluation_goals=[GOAL],
+        penalty_weights=PENALTIES,
+        parameterization="log",
+        validation_trials=_validation_trials(),
+        validation_interval=1,
+        validation_patience=2,
+        max_steps=50,
+        **TOLERANCES,
+    )
+    assert result.reason == "validation_patience"
+    assert len(result.history) == 3
+    assert result.best_objective == result.history[0].objective
+
+
+def test_validation_arguments_are_checked():
+    options = dict(
+        initial_profiles=PROFILES + 0.05,
+        evaluation_goals=[GOAL],
+        penalty_weights=PENALTIES,
+        parameterization="log",
+        **TOLERANCES,
+    )
+    with pytest.raises(ValueError, match="validation_interval"):
+        fit_profiles(
+            _template(), _trials(), validation_trials=_validation_trials(),
+            validation_interval=0, **options,
+        )
+    with pytest.raises(ValueError, match="validation goal"):
+        fit_profiles(
+            _template(), _trials(),
+            validation_trials=(
+                Trial("v", 1, (0, 0), ((0, 3), (0, 2), (0, 1), (0, 0))),
+            ),
+            **options,
+        )
+
+
+def test_freeze_profiles_fits_theta_only():
+    initial = PROFILES + 0.05
+    result = fit_profiles(
+        _template(),
+        _trials(),
+        initial_profiles=initial,
+        evaluation_goals=[GOAL],
+        penalty_weights=PENALTIES,
+        parameterization="log",
+        theta_names=("lower_control_cost", "beta"),
+        freeze_profiles=True,
+        max_steps=15,
+        **TOLERANCES,
+    )
+    gauged = initial / initial.max(axis=0, keepdims=True)
+    assert np.allclose(result.best_profiles, gauged, rtol=1e-12, atol=0.0)
+    first, best = result.history[0].theta_values, result.best_theta.as_floats()
+    assert best["beta"] != first["beta"]
+    assert result.best_objective < result.objective_history[0]
+    assert all(step.profile_gradient_norm == 0.0 for step in result.history)
+    with pytest.raises(ValueError, match="freeze_profiles"):
+        fit_profiles(
+            _template(), _trials(), initial_profiles=initial,
+            evaluation_goals=[GOAL], penalty_weights=PENALTIES,
+            parameterization="log", theta_names=(), freeze_profiles=True,
+            **TOLERANCES,
+        )

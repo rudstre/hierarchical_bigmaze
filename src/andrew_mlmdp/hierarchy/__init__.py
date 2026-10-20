@@ -65,8 +65,14 @@ from andrew_mlmdp.hierarchy.rollout import (
     RolloutEvent,
     SubgoalAccess,
 )
+from andrew_mlmdp.hierarchy.simulation import (
+    CensoredRollout,
+    SimulatedTrials,
+    simulate_trials,
+)
 
 __all__ = [
+    "CensoredRollout",
     "CompositionTrace",
     "ContinuationPolicy",
     "DiagnosticSweep",
@@ -85,6 +91,7 @@ __all__ = [
     "RolloutEvent",
     "RolloutSummary",
     "RouteSummary",
+    "SimulatedTrials",
     "SubgoalAccess",
     "SubgoalBasis",
     "Task",
@@ -109,6 +116,7 @@ __all__ = [
     "required_parameters",
     "sample_rollouts",
     "shortest_path_length",
+    "simulate_trials",
     "summarize_rollouts",
     "summarize_routes",
     "sweep_diagnostics",

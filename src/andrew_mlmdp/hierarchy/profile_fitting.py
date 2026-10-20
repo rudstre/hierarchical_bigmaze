@@ -97,6 +97,8 @@ class ProfileFitStep:
     raw_column_maxima: tuple[float, ...]
     peak_states: tuple[int, ...]
     goal_one_hot_margin: tuple[float, ...]
+    # Validation LL per decision at this state, when it was evaluated.
+    validation_ll_per_decision: float | None = None
 
 
 @dataclass(frozen=True)
@@ -106,8 +108,13 @@ class ProfileFitResult:
     initial_raw_profiles: np.ndarray
     best_raw_profiles: np.ndarray | None
     last_raw_profiles: np.ndarray
+    # The profiles the model uses: gated when access_threshold is set.
     best_profiles: np.ndarray | None
+    # Peak-gauged profiles before the gate (equal to best_profiles without one);
+    # strictly positive in log space, so usable to warm-start another fit.
+    best_ungated_profiles: np.ndarray | None
     best_theta: ParameterValues | None
+    # Training objective at the reported best state.
     best_objective: float | None
     history: tuple[ProfileFitStep, ...]
     rejections: tuple[ProfileRejection, ...]
@@ -115,6 +122,10 @@ class ProfileFitResult:
     converged: bool
     reason: str
     provenance: Mapping[str, object]
+    # "training": best state = lowest training objective. "validation": best
+    # state = highest validation LL among the checked states.
+    selection: str = "training"
+    best_validation_ll_per_decision: float | None = None
 
     @property
     def objective_history(self) -> tuple[float, ...]:
@@ -125,6 +136,36 @@ def peak_gauge(raw_profiles: Tensor) -> Tensor:
     """Return ``D = W / max_s W`` column-wise (differentiable)."""
 
     return raw_profiles / raw_profiles.max(dim=0, keepdim=True).values
+
+
+def log_peak_gauge(log_profiles: Tensor) -> Tensor:
+    """Return ``D = exp(V - max_s V)`` column-wise (differentiable).
+
+    Near ``D = 0`` the likelihood depends on ``log D``: the composed Layer-1
+    policy can take a subgoal-access transition of passive probability
+    ``alpha * D`` at a control cost of about ``lower_control_cost *
+    log(1 / (alpha * D))``, which can undercut an exponentially discounted
+    walk. Optimizing ``V = log D`` puts the parameter on that scale. ``D`` is
+    then strictly positive; exact zeros are only the limit ``V -> -inf``.
+    """
+
+    return torch.exp(log_profiles - log_profiles.max(dim=0, keepdim=True).values)
+
+
+def access_gate(profiles: Tensor, threshold: float | None) -> Tensor:
+    """Fixed core gate ``max(0, D - tau) / (1 - tau)`` on peak-gauged ``D``.
+
+    Entries below ``tau`` become exact zeros, so subgoal access there is
+    impossible rather than merely improbable. Without it, strictly positive
+    tails let the composed policy take subgoal access almost anywhere at a
+    control cost of about ``lower_control_cost * log(1 / (alpha * D))``; when
+    ``lower_control_cost`` is also free, that cost collapses and the joint fit
+    degenerates. The peak stays at one. ``None`` leaves ``D`` unchanged.
+    """
+
+    if threshold is None:
+        return profiles
+    return torch.clamp(profiles - threshold, min=0.0) / (1.0 - threshold)
 
 
 def profile_geometry(template: "Template") -> ProfileGeometry:
@@ -240,13 +281,21 @@ def random_localized_profiles(
     maze: Maze,
     n_subgoals: int,
     rng: np.random.Generator,
+    *,
+    shape: str = "exponential",
 ) -> np.ndarray:
-    """Random smooth localized columns ``exp(-d / width)`` with peak one.
+    """Random smooth localized columns with peak one.
 
-    Centres are distinct random states and widths are uniform between one step
-    and a quarter of the maze diameter. These are task-independent and are not
-    derived from NMF.
+    ``shape="exponential"`` gives ``exp(-d / width)``; ``"gaussian"`` gives
+    ``exp(-(d / width)**2 / 2)``, whose far tails are negligible, which matters
+    because small positive access values act as cheap exits (see
+    :func:`log_peak_gauge`). Centres are distinct random states and widths are
+    uniform between one step and a quarter of the maze diameter. These are
+    task-independent and are not derived from NMF.
     """
+
+    if shape not in ("exponential", "gaussian"):
+        raise ValueError("shape must be 'exponential' or 'gaussian'")
 
     coordinates = maze.free_cells
     n_states = len(coordinates)
@@ -263,7 +312,10 @@ def random_localized_profiles(
         columns.append(column)
     widths = rng.uniform(1.0, max(1.0, 0.25 * diameter), size=n_subgoals)
     for index, (column, width) in enumerate(zip(columns, widths, strict=True)):
-        profiles[:, index] = np.exp(-column / width)
+        if shape == "exponential":
+            profiles[:, index] = np.exp(-column / width)
+        else:
+            profiles[:, index] = np.exp(-0.5 * (column / width) ** 2)
     return profiles
 
 
@@ -284,10 +336,40 @@ def fit_profiles(
     lr_patience: int = 7,
     min_lr: float = 1e-5,
     max_rejections: int = 20,
+    parameterization: str = "linear",
+    access_threshold: float | None = None,
+    validation_trials: Iterable[Trial] | None = None,
+    validation_interval: int = 10,
+    validation_patience: int | None = None,
+    freeze_profiles: bool = False,
     initial_profile_seed: int | None = None,
+    initial_profile_description: str | None = None,
     callback: Callable[[ProfileFitStep], None] | None = None,
 ) -> ProfileFitResult:
-    """Fit ``W`` and ``theta`` by projected full-batch Adam on ``J``.
+    """Fit the raw profiles and ``theta`` by full-batch Adam on ``J``.
+
+    ``parameterization="linear"`` optimizes ``W >= 0`` with ``D = W / max W``
+    and projection after each step (exact zeros representable).
+    ``parameterization="log"`` optimizes unconstrained ``V`` with
+    ``D = exp(V - max V)`` (strictly positive ``D``, no projection); it needs
+    strictly positive ``initial_profiles``.
+
+    ``access_threshold`` (tau) applies :func:`access_gate` to the peak-gauged
+    profiles before the likelihood, so the model uses exact-zero support. The
+    structural penalties act on the ungated profiles, which keeps a gradient
+    on sub-threshold entries so they can re-enter the support.
+
+    ``freeze_profiles=True`` holds the profiles at ``initial_profiles`` (after
+    the peak gauge and any gate) and fits only ``theta``; it is the theta step
+    of a staged fit and needs at least one name in ``theta_names``.
+
+    With ``validation_trials``, validation LL per decision is evaluated every
+    ``validation_interval`` evaluations (no gradient flows through it), and the
+    reported best state is the checked state with the highest validation LL
+    rather than the lowest training objective. ``validation_patience`` stops
+    the fit after that many consecutive checks without improvement. The
+    validation trials then act as a selection set and must not also be used
+    for final scoring.
 
     ``evaluation_goals`` must contain every goal the fitted model will be
     scored on, including held-out goals; feasibility is enforced for all of
@@ -317,6 +399,17 @@ def fit_profiles(
         raise ValueError("penalty_weights must be finite and non-negative")
     if isinstance(max_rejections, bool) or max_rejections < 0:
         raise ValueError("max_rejections must be a non-negative integer")
+    if parameterization not in ("linear", "log"):
+        raise ValueError("parameterization must be 'linear' or 'log'")
+    log_space = parameterization == "log"
+    if access_threshold is not None and not 0.0 <= access_threshold < 1.0:
+        raise ValueError("access_threshold must be in [0, 1)")
+    if isinstance(validation_interval, bool) or validation_interval < 1:
+        raise ValueError("validation_interval must be a positive integer")
+    if freeze_profiles and not theta:
+        raise ValueError("freeze_profiles needs at least one theta name to fit")
+    if validation_patience is not None and validation_patience < 1:
+        raise ValueError("validation_patience must be a positive integer")
     config = validate_adam_config(
         lr=lr,
         max_steps=max_steps,
@@ -344,8 +437,23 @@ def fit_profiles(
     violations = profile_feasibility(initial, maze, goals)
     if violations:
         raise ValueError("Infeasible initial profiles: " + "; ".join(violations))
-    # Start with every column at peak one so lr has a meaning in D units.
+    if log_space and np.any(initial <= 0.0):
+        raise ValueError(
+            "Log parameterization needs strictly positive initial_profiles"
+        )
+    # Start with every column at peak one so lr has a meaning in D (or log D)
+    # units.
     initial = initial / initial.max(axis=0, keepdims=True)
+    gauge = log_peak_gauge if log_space else peak_gauge
+    if access_threshold is not None:
+        violations = profile_feasibility(
+            access_gate(torch.tensor(initial), access_threshold), maze, goals
+        )
+        if violations:
+            raise ValueError(
+                "Infeasible initial profiles after the access gate: "
+                + "; ".join(violations)
+            )
 
     geometry = profile_geometry(template)
     prepared = prepare_batch(template, materialized)
@@ -363,14 +471,43 @@ def fit_profiles(
     if n_decisions == 0:
         raise ValueError("Profile fitting requires at least one movement")
 
+    validation = None if validation_trials is None else tuple(validation_trials)
+    if validation is not None:
+        validation_goals = {trial.goal for trial in validation}
+        if not validation_goals <= set(goals):
+            raise ValueError("evaluation_goals must include every validation goal")
+        prepared_validation = prepare_batch(template, validation)
+        n_validation = _collapsed_move_count(validation)
+        if n_validation == 0:
+            raise ValueError("validation_trials contain no movements")
+
     initial_values = {
         name: value.detach() for name, value in parameter_values(template).items()
     }
     raw_theta = _RawParameters(initial_values, theta, threshold_max=None)
-    raw_profiles = nn.Parameter(torch.tensor(initial, dtype=torch.float64))
+    raw_initial = np.log(initial) if log_space else initial
+    raw_profiles = nn.Parameter(
+        torch.tensor(raw_initial, dtype=torch.float64),
+        requires_grad=not freeze_profiles,
+    )
+
+    def feasibility_violations() -> tuple[str, ...]:
+        # The check is scale-free, so linear W can be checked directly; log V
+        # is mapped back to strictly positive D (always usable for every goal).
+        with torch.no_grad():
+            if not log_space:
+                # An all-zero linear column has no peak to gauge by.
+                violations = profile_feasibility(raw_profiles, maze, goals)
+                if violations or access_threshold is None:
+                    return violations
+            checked = access_gate(gauge(raw_profiles), access_threshold)
+        return profile_feasibility(checked, maze, goals)
 
     def make_optimizer(rate: float) -> torch.optim.Adam:
-        return torch.optim.Adam([raw_profiles, *raw_theta.parameters()], lr=rate)
+        fitted = [*raw_theta.parameters()]
+        if not freeze_profiles:
+            fitted.insert(0, raw_profiles)
+        return torch.optim.Adam(fitted, lr=rate)
 
     def make_scheduler(optimizer):
         return _plateau_scheduler(
@@ -401,12 +538,17 @@ def fit_profiles(
     updates = 0
     converged = False
     reason = "max_steps"
+    best_validation: float | None = None
+    best_validation_state = None
+    best_validation_objective: float | None = None
+    stale_checks = 0
 
     while True:
         learning_rate_now = float(optimizer.param_groups[0]["lr"])
         optimizer.zero_grad()
         try:
-            profiles = peak_gauge(raw_profiles)
+            ungated = gauge(raw_profiles)
+            profiles = access_gate(ungated, access_threshold)
             values = raw_theta.physical_values(initial_values)
             log_likelihood = total_prepared_log_likelihood(
                 template,
@@ -414,7 +556,7 @@ def fit_profiles(
                 parameter_values=values,
                 access_profiles=profiles,
             )
-            penalties = structural_penalties(profiles, geometry)
+            penalties = structural_penalties(ungated, geometry)
         except NumericalError:
             reason = "numerical_failure"
             break
@@ -438,6 +580,29 @@ def fit_profiles(
             best_objective = objective_value
             best_state = clone_state()
 
+        validation_value = None
+        if validation is not None and len(history) % validation_interval == 0:
+            with torch.no_grad():
+                validation_value = float(
+                    total_prepared_log_likelihood(
+                        template,
+                        prepared_validation,
+                        parameter_values={
+                            name: value.detach() for name, value in values.items()
+                        },
+                        access_profiles=profiles.detach(),
+                    )
+                ) / n_validation
+            if np.isfinite(validation_value) and (
+                best_validation is None or validation_value > best_validation
+            ):
+                best_validation = validation_value
+                best_validation_state = clone_state()
+                best_validation_objective = objective_value
+                stale_checks = 0
+            else:
+                stale_checks += 1
+
         try:
             objective.backward()
         except RuntimeError:
@@ -446,11 +611,15 @@ def fit_profiles(
         history.append(
             _step(history, updates, learning_rate_now, objective_value,
                   log_likelihood, n_decisions, penalties, best_objective,
-                  values, theta, raw_theta, raw_profiles, profiles, maze, goals)
+                  values, theta, raw_theta, raw_profiles, profiles, maze, goals,
+                  validation_value)
         )
         if callback is not None:
             callback(history[-1])
         latest = history[-1]
+        if validation_patience is not None and stale_checks >= validation_patience:
+            reason = "validation_patience"
+            break
         if not (
             np.isfinite(latest.profile_gradient_norm)
             and np.isfinite(latest.theta_gradient_norm)
@@ -492,9 +661,10 @@ def fit_profiles(
             state_before = clone_state()
             optimizer_before = copy.deepcopy(optimizer.state_dict())
             optimizer.step()
-            with torch.no_grad():
-                raw_profiles.clamp_(min=0.0)
-            violations = profile_feasibility(raw_profiles, maze, goals)
+            if not log_space:
+                with torch.no_grad():
+                    raw_profiles.clamp_(min=0.0)
+            violations = feasibility_violations()
             if not violations:
                 break
             step_lr = float(optimizer.param_groups[0]["lr"])
@@ -524,12 +694,23 @@ def fit_profiles(
             stale_steps = 0
             at_final_rate = False
 
+    selection = "training"
+    if best_validation_state is not None:
+        # Report the validation-selected state instead of the training optimum.
+        best_state = best_validation_state
+        best_objective = best_validation_objective
+        selection = "validation"
     last_raw = raw_profiles.detach().cpu().numpy().copy()
-    best_raw = best_profiles = best_theta = None
+    best_raw = best_profiles = best_ungated = best_theta = None
     if best_state is not None:
         restore_state(best_state)
         best_raw = raw_profiles.detach().cpu().numpy().copy()
-        best_profiles = best_raw / best_raw.max(axis=0, keepdims=True)
+        with torch.no_grad():
+            ungated_tensor = gauge(raw_profiles)
+            best_ungated = ungated_tensor.cpu().numpy().copy()
+            best_profiles = (
+                access_gate(ungated_tensor, access_threshold).cpu().numpy().copy()
+            )
         best_theta = _snapshot(raw_theta.physical_values(initial_values))
     provenance = {
         "n_subgoals": basis.n_subgoals,
@@ -540,6 +721,18 @@ def fit_profiles(
         "n_trials": len(materialized),
         "n_decisions": n_decisions,
         "initial_profile_seed": initial_profile_seed,
+        "initial_profile_description": initial_profile_description,
+        "parameterization": parameterization,
+        "access_threshold": access_threshold,
+        "freeze_profiles": freeze_profiles,
+        "validation": None
+        if validation is None
+        else {
+            "n_trials": len(validation),
+            "n_decisions": n_validation,
+            "interval": validation_interval,
+            "patience": validation_patience,
+        },
         "goal_reward_mode": template.goal_reward_mode,
         "commitment_mode": template.commitment_mode,
         "commitment_radius": template.commitment_radius,
@@ -557,10 +750,13 @@ def fit_profiles(
         },
     }
     return ProfileFitResult(
-        initial_raw_profiles=initial,
+        initial_raw_profiles=raw_initial,
         best_raw_profiles=best_raw,
         last_raw_profiles=last_raw,
         best_profiles=best_profiles,
+        best_ungated_profiles=best_ungated,
+        selection=selection,
+        best_validation_ll_per_decision=best_validation,
         best_theta=best_theta,
         best_objective=best_objective,
         history=tuple(history),
@@ -577,6 +773,7 @@ def fit_profile_restarts(
     trials: Iterable[Trial],
     *,
     seeds: Sequence[int],
+    initial_shape: str = "exponential",
     **fit_options,
 ) -> tuple[ProfileFitResult, ...]:
     """Fit one restart per explicit seed from random localized profiles."""
@@ -590,6 +787,7 @@ def fit_profile_restarts(
             template.maze,
             template.basis.n_subgoals,
             np.random.default_rng(seed),
+            shape=initial_shape,
         )
         results.append(
             fit_profiles(
@@ -597,6 +795,7 @@ def fit_profile_restarts(
                 materialized,
                 initial_profiles=initial,
                 initial_profile_seed=int(seed),
+                initial_profile_description=f"random localized {initial_shape}",
                 **fit_options,
             )
         )
@@ -641,7 +840,7 @@ def _collapsed_move_count(trials: Sequence[Trial]) -> int:
 def _step(
     history, updates, lr, objective_value, log_likelihood, n_decisions,
     penalties, best_objective, values, theta, raw_theta, raw_profiles,
-    profiles, maze, goals,
+    profiles, maze, goals, validation_value=None,
 ) -> ProfileFitStep:
     theta_gradients = {}
     squared = 0.0
@@ -651,11 +850,14 @@ def _step(
         theta_gradients[name] = value
         squared += value**2
     profile_gradient = None if raw_theta is None else raw_profiles.grad
-    profile_norm = (
-        np.nan
-        if profile_gradient is None
-        else float(torch.linalg.vector_norm(profile_gradient.detach()))
-    )
+    if raw_theta is None:
+        profile_norm = np.nan
+    elif not raw_profiles.requires_grad:
+        profile_norm = 0.0  # frozen profiles (theta-only step)
+    elif profile_gradient is None:
+        profile_norm = np.nan
+    else:
+        profile_norm = float(torch.linalg.vector_norm(profile_gradient.detach()))
     gauged = profiles.detach().cpu().numpy()
     raw = raw_profiles.detach().cpu().numpy()
     return ProfileFitStep(
@@ -677,4 +879,5 @@ def _step(
         raw_column_maxima=tuple(float(value) for value in raw.max(axis=0)),
         peak_states=tuple(int(value) for value in raw.argmax(axis=0)),
         goal_one_hot_margin=goal_one_hot_margin(gauged, maze, goals),
+        validation_ll_per_decision=validation_value,
     )

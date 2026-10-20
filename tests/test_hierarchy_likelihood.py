@@ -339,3 +339,108 @@ def test_first_departure_closure_matches_analytical_solution():
     assert departure.sum(dim=(0, 1)) == pytest.approx(torch.ones(2))
     forward = torch.tensor([0.7, 0.3], dtype=torch.float64)
     assert departure[1] @ forward == pytest.approx(expected @ forward)
+
+
+def _pocket_template(commitment_mode, commitment_radius):
+    """Corridor with the goal at (0, 1): (0, 0) is a dead-end pocket behind it.
+
+    The subgoal has no mass in the pocket, so under deferred goal reward the
+    pocket has zero desirability for every Layer-1 option.
+    """
+
+    maze = Maze.from_ascii(".....")
+    basis = SubgoalBasis.from_profiles(
+        maze,
+        np.asarray([[0.0], [0.0], [0.5], [1.0], [0.5]]),
+        core_threshold=None,
+    )
+    return Environment(maze).hierarchy(
+        basis,
+        parameters=Parameters(
+            goal_reward=0.2,
+            lower_control_cost=0.5,
+            upper_control_cost=1.0,
+            alpha=1.0,
+            beta=0.5,
+        ),
+        goal_reward_mode="deferred",
+        commitment_mode=commitment_mode,
+        commitment_radius=commitment_radius,
+    )
+
+
+def test_zero_mass_pocket_inside_commitment_radius_is_left_zero():
+    template = _pocket_template("both", 1)
+    model = template.task((0, 1))._tensor_model
+    policy = _plan(model, (0, 4)).lower_policy
+    pocket = model.interior_index[(0, 0)]
+    mass = policy.sum(dim=0)
+    assert torch.all(policy[:, pocket] == 0.0)
+    others = [index for index in range(mass.shape[0]) if index != pocket]
+    assert torch.allclose(mass[others], torch.ones(len(others), dtype=mass.dtype))
+
+
+@pytest.mark.parametrize(
+    ("commitment_mode", "commitment_radius"),
+    [("radius", 0), ("termination", None)],
+)
+def test_zero_mass_pocket_outside_commitment_radius_still_raises(
+    commitment_mode, commitment_radius
+):
+    template = _pocket_template(commitment_mode, commitment_radius)
+    with pytest.raises(ValueError, match="zero-mass column"):
+        _plan(template.task((0, 1))._tensor_model, (0, 4))
+
+
+def test_pocket_template_likelihood_matches_rollout_frequencies():
+    task = _pocket_template("both", 1).task((0, 1))
+    start = (0, 3)
+    n_rollouts = 3000
+    counts = {(0, 2): 0, (0, 4): 0}
+    for seed in range(n_rollouts):
+        rollout = task.rollout(start, max_steps=200, seed=seed)
+        assert rollout.status == "reached_goal"
+        first = next(
+            coordinate for coordinate in rollout.trajectory if coordinate != start
+        )
+        counts[first] += 1
+    for outcome, count in counts.items():
+        exact = np.exp(task.log_likelihood([start, outcome]))
+        assert count / n_rollouts == pytest.approx(exact, abs=0.03)
+    assert np.isfinite(task.log_likelihood([(0, 4), (0, 3), (0, 2), (0, 1)]))
+
+
+def test_zero_mass_columns_inside_radius_give_finite_gradients():
+    from andrew_mlmdp.dataset import Trial
+    from andrew_mlmdp.hierarchy.equations import parameter_values
+    from andrew_mlmdp.hierarchy.likelihood import (
+        prepare_batch,
+        total_prepared_log_likelihood,
+    )
+
+    template = _pocket_template("both", 1)
+    trials = (
+        # Starts in the pocket (0, 0): a visited state inside the radius whose
+        # composed column has zero mass.
+        Trial("s", 1, (0, 1), ((0, 0), (0, 1))),
+        Trial("s", 2, (0, 1), ((0, 4), (0, 3), (0, 2), (0, 1))),
+    )
+    prepared = prepare_batch(template, trials)
+    profiles = torch.tensor(
+        template.basis.profiles, dtype=torch.float64, requires_grad=True
+    )
+    values = {
+        name: value.detach().clone().requires_grad_(True)
+        for name, value in parameter_values(template).items()
+    }
+    log_likelihood = total_prepared_log_likelihood(
+        template, prepared, parameter_values=values, access_profiles=profiles
+    )
+    assert torch.isfinite(log_likelihood)
+    log_likelihood.backward()
+    assert torch.isfinite(profiles.grad).all()
+    for name in ("lower_control_cost", "upper_control_cost", "alpha", "beta"):
+        assert torch.isfinite(values[name].grad)
+    task = template.task((0, 1))
+    expected = sum(task.log_likelihood(list(trial.trajectory)) for trial in trials)
+    assert float(log_likelihood.detach()) == pytest.approx(expected, abs=1e-10)

@@ -383,6 +383,15 @@ step from the goal is within any radius `>= 1`, the final approach into the
 goal is always scored by the exact goal-only policy, never by the composed
 mixture whose direct-to-goal weight `"deferred"` zeroes.
 
+Under `"radius"` or `"both"`, the composed Layer-1 policy is never used at
+states within `commitment_radius` of the goal. A composed column there may
+therefore have zero mass and is left exactly zero rather than rejected. This
+happens with `"deferred"` when a dead-end pocket behind the goal has no subgoal
+access: its only exit is the goal, whose pre-commitment weight is zero, so
+every Layer-1 option has zero desirability there. A zero-mass composed column
+at any state outside the radius, or under `"termination"`, is still an error
+(see [`_compose_policy`](../src/andrew_mlmdp/hierarchy/equations.py)).
+
 Second, the target is expressed in the reusable task basis:
 
 ```math
@@ -594,6 +603,45 @@ maximum of `W` is recorded every evaluation.
 With every column peaking at one, the shared `alpha` means every learned
 subgoal has the same maximum access strength. Columns differ in where and how
 broadly they are accessible, not in peak amplitude.
+
+**Small access values are not negligible.** Entering a subgoal boundary copy
+ends the Layer-1 first-exit task with an O(1) boundary desirability, and a
+distributed subgoal can be entered from any state with `D > 0` without moving.
+The composed policy can amplify an access transition of passive probability
+`alpha * D` at a control cost of roughly
+`lower_control_cost * log(1 / (alpha * D))`, while walking discounts
+desirability by `exp(interior_reward / lower_control_cost)` per step. Far from
+every boundary, even `D ~ 1e-12` can therefore carry most of the controlled
+probability (measured on the four-rooms recovery setup: 69% access mass nine
+steps from the subgoal support). The likelihood consequently depends on
+`log D` near zero and is not Lipschitz at exact zeros; a fixed, exactly-zero
+support and an arbitrarily small positive value are behaviorally different.
+Fitted maps must be read with this in mind, and linear-scale penalties barely
+constrain these tails.
+
+`parameterization="log"` optimizes `V = log D` with
+`D = exp(V - max_s V)` inside the forward pass. There is no projection and no
+floor: `D` is strictly positive and exact zeros are only the limit
+`V -> -inf`, so this path does not preserve the exact-zero semantics of the
+linear path. It requires strictly positive initial profiles;
+`random_localized_profiles(..., shape="gaussian")` gives light tails. The
+parameterization, initial-profile description, and seed are recorded in
+provenance.
+
+`access_threshold` (tau) applies a fixed core gate to the peak-gauged fitted
+profiles before the likelihood, `D_hat = max(0, D - tau) / (1 - tau)`, so the
+model uses exact-zero support again. This matters when the behavioral
+parameters are fitted jointly with `D`: on the `maze_1` recovery setup
+(planted K = 4-6), free `lower_control_cost` collapsed (about 0.05-0.15 of the
+planted value) while `alpha` grew, which made the strictly positive tails of
+log-space `D` nearly free subgoal exits from every state. The resulting fits
+beat the planted model on training likelihood but were far worse on held-out
+data. With `D` fixed at the planted (exact-zero) profiles, the same
+parameters were recovered within about 20%. The structural penalties act on
+the ungated profiles, so sub-threshold entries keep a smoothing gradient and
+can re-enter the support. `ProfileFitResult.best_profiles` is the gated `D`
+the model uses; `best_ungated_profiles` is the positive pre-gate `D` used for
+warm starts. `tau` is a structural assumption and is recorded in provenance.
 
 The minimized objective is
 
