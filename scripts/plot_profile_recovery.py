@@ -199,8 +199,12 @@ def plot_summary(summary, output: Path) -> None:
                 summary["fits"][name]["matched_cosine"][column] for name in names
             )
         ]
-        ax.scatter(positions + 0.12 * (column - (n_subgoals - 1) / 2), values,
-                   s=50, color=SERIES[column], label=f"subgoal {column + 1}", zorder=3)
+        # One colour for all subgoals: with up to 10 subgoals, per-subgoal
+        # colours would have to repeat. Identity is shown in profiles.png.
+        spread = 0.6 / max(n_subgoals, 1)
+        ax.scatter(positions + spread * (column - (n_subgoals - 1) / 2), values,
+                   s=30, color=SERIES[0], zorder=3,
+                   label="planted subgoals" if column == 0 else None)
     ax.set_ylim(0.0, 1.05)
     ax.set_ylabel("cosine (planted vs fitted)")
     ax.set_title("Profile recovery", color=TEXT)

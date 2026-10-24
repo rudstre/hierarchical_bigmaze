@@ -272,6 +272,21 @@ if root is None:
                 min_value=0,
                 value=int(hmm["cost_freeze_epochs"]),
             )
+            route_prior = h1.checkbox(
+                "Dirichlet prior on route weights",
+                value=hmm["route_prior_concentration"] is not None,
+                help="Add a symmetric Dirichlet log prior on the non-uniform route "
+                "weights to the training objective, as in Qin's 2024 Route_HMM. "
+                "Validation scores and checkpoint selection stay likelihood-only.",
+            )
+            route_prior_concentration = h2.number_input(
+                "Route-weight prior concentration α",
+                min_value=1.0,
+                value=float(hmm["route_prior_concentration"] or 100.0),
+                step=10.0,
+                help="α per route; larger holds the weights closer to equal. "
+                "α = 1 is flat. Qin's 2024 routes used 100.",
+            )
             discovery_config = st.text_input(
                 "Discovery configuration", payload["discovery_config"]
             )
@@ -299,6 +314,10 @@ if root is None:
                 ("cognitive_constant", float(cognitive_constant)),
                 ("cost_learning_rate", float(cost_learning_rate)),
                 ("cost_freeze_epochs", int(cost_freeze_epochs)),
+                (
+                    "route_prior_concentration",
+                    float(route_prior_concentration) if route_prior else None,
+                ),
             ):
                 # Keys are written only when already present or changed from
                 # the fitting default, so applying unchanged settings does not
@@ -486,8 +505,106 @@ if page == "Progress":
     live_progress()
     manager_file = root / "slurm_manager.json"
     if manager_file.exists():
+        drift = show_error(access.source_drift, root)
+        source_changed = bool(drift) and not drift["matches"]
+        if source_changed:
+            failed = drift["failed_tasks"]
+            st.warning(
+                "The scientific source code has changed since this run's "
+                "fingerprint was recorded. Workers refuse to start under different "
+                "code, so retried tasks would fail"
+                + (
+                    f"; {failed} task log(s) already show this failure."
+                    if failed
+                    else "."
+                )
+            )
+            with st.expander("What changed", expanded=True):
+                changed = drift["changed_files"]
+                if changed is None:
+                    st.write(
+                        "File-level changes are unavailable for this run (no "
+                        "recorded per-file digests for its fingerprint)."
+                    )
+                else:
+                    st.json(changed)
+                if drift["stages"]:
+                    st.dataframe(
+                        [
+                            {
+                                "stage source": row["stage"],
+                                "changed for existing artifacts": row["changed"],
+                            }
+                            for row in drift["stages"]
+                        ],
+                        hide_index=True,
+                    )
+                st.caption(
+                    f"Recorded fingerprint {drift['recorded'][:12]}…, current "
+                    f"{drift['current'][:12]}…. Stage-source digests are read from "
+                    "the oldest and newest artifact of each kind."
+                )
+            if drift["blocking_stages"]:
+                st.error(
+                    "Existing artifacts were produced with different code for "
+                    f"stage source(s) {', '.join(drift['blocking_stages'])}. "
+                    "Workers re-check these when reusing artifacts and would "
+                    "refuse them, so this run cannot continue with the current "
+                    "code. Start a new run, or restore the code the run was "
+                    "created with."
+                )
+            else:
+                with st.form("rerecord_worker_source"):
+                    st.write(
+                        "Override: re-record the fingerprint so the remaining "
+                        "tasks of this run use the current code. Completed "
+                        "artifacts keep the code they were made with; the change "
+                        "and your reason are recorded in the run's manager file."
+                    )
+                    acknowledged = st.checkbox(
+                        "I have reviewed the changes and the rest of this run "
+                        "should use the current code"
+                    )
+                    reason = st.text_input("Reason (recorded with the run)")
+                    if st.form_submit_button(
+                        "Re-record fingerprint and retry missing work"
+                    ):
+                        if not acknowledged or not reason.strip():
+                            st.error("Tick the acknowledgement and give a reason.")
+                        else:
+                            reply = show_error(
+                                access.control,
+                                root,
+                                "retry-missing",
+                                rerecord_reason=reason.strip(),
+                            )
+                            if reply:
+                                st.success(reply)
+        if drift and drift["history"]:
+            with st.expander(
+                f"Worker source re-recorded {len(drift['history'])} time(s)"
+            ):
+                st.dataframe(
+                    [
+                        {
+                            "recorded_at": item["recorded_at"],
+                            "reason": item["reason"],
+                            "previous": item["previous"][:12],
+                            "current": item["current"][:12],
+                            "git_head": item.get("git_head"),
+                        }
+                        for item in drift["history"]
+                    ],
+                    hide_index=True,
+                )
         c1, c2 = st.columns(2)
-        if c1.button("Retry missing work"):
+        if c1.button(
+            "Retry missing work",
+            disabled=source_changed,
+            help="Disabled while the source differs from the run's fingerprint."
+            if source_changed
+            else None,
+        ):
             reply = show_error(access.control, root, "retry-missing")
             if reply:
                 st.success(reply)

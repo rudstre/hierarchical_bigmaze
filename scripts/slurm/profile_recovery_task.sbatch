@@ -4,15 +4,18 @@
 # cpu_backfill nodes can preempt (requeue) tasks; each task is seeded and
 # writes its outputs atomically at the end, so a requeue only costs time.
 #SBATCH --exclude=enc1-node3
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
-#SBATCH --time=06:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=2G
+#SBATCH --time=01:00:00
 # One fit per array task: task 0 is the oracle; task i >= 1 is restart seed
 # i-1, or (with RECOVERY_WARM_FROM) the warm start from source rank i-1.
 # Expects RECOVERY_RUN_DIR and RECOVERY_ARGS in the environment.
 set -euo pipefail
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
-export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}" PYTHONDONTWRITEBYTECODE=1
+# One core, one thread: the thread benchmark (results/thread_bench) found
+# the fitting code slower with more threads (centre search 1: 201 s,
+# 8: 353 s); peak memory per task was ~0.65 GB.
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}" MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}" PYTHONDONTWRITEBYTECODE=1
 PY="${HIERARCHY_PYTHON:-/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/python}"
 task="${SLURM_ARRAY_TASK_ID}"
 part="${RECOVERY_RUN_DIR}/parts/task_$(printf '%03d' "${task}")"

@@ -58,7 +58,7 @@ def test_pca_and_learning_curve_profiles_use_stage_specific_resources():
         _config(method="blocked_trial_learning_curve"), _slurm()
     )
 
-    assert ordinary["profile"] == "auto-cpu-v2"
+    assert ordinary["profile"] == "auto-cpu-v3"
     assert ordinary["stages"]["predictor-bundle"]["cpus_per_task"] == 1
     assert ordinary["stages"]["feature-generation"]["time"] == "01:00:00"
     assert ordinary["stages"]["selected-refit"]["memory"] == "4G"
@@ -66,7 +66,7 @@ def test_pca_and_learning_curve_profiles_use_stage_specific_resources():
     assert learning["stages"]["regression"]["time"] == "04:00:00"
 
 
-def test_calibrated_fixed_and_automatic_hmm_profiles_request_eight_cpus():
+def test_calibrated_fixed_and_automatic_hmm_profiles_request_two_cpus():
     fixed = resolve_resource_plan(_config(route_family="hmm", routes=10), _slurm())
     automatic = resolve_resource_plan(
         replace(
@@ -83,9 +83,9 @@ def test_calibrated_fixed_and_automatic_hmm_profiles_request_eight_cpus():
     assert fixed["stages"]["predictor-bundle"] == {
         "partition": "cpu",
         "account": None,
-        "cpus_per_task": 8,
+        "cpus_per_task": 2,
         "memory": "17G",
-        "time": "04:00:00",
+        "time": "05:00:00",
         "max_concurrent": 8,
     }
     assert automatic["route_count_bound"] == 7
@@ -142,11 +142,12 @@ def test_invalid_stage_overrides_are_rejected(overrides, message):
 @pytest.mark.parametrize(
     ("routes", "epochs", "calibrated", "time", "memory"),
     [
-        # Twice the measured worst fits: 10 x 500 took 1.59 h, 6 x 2000 2.45 h.
-        (10, 500, True, "04:00:00", "17G"),
-        (6, 2000, True, "05:00:00", "16G"),
-        (10, 2000, True, "13:00:00", "17G"),
-        (15, 2000, False, "1-15:00:00", "35G"),
+        # Twice the measured worst fits (8 CPUs: 10 x 500 took 1.59 h, 6 x 2000
+        # 2.45 h) times the 2-CPU slowdown 1.52; memory twice the peak.
+        (10, 500, True, "05:00:00", "17G"),
+        (6, 2000, True, "08:00:00", "7G"),
+        (10, 2000, True, "19:00:00", "17G"),
+        (15, 2000, False, "2-11:00:00", "35G"),
     ],
 )
 def test_hmm_predictor_resources_scale_from_measured_fits(

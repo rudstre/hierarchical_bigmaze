@@ -148,6 +148,38 @@ def test_streamlit_rank_range_form_updates_configuration_json_together():
     assert json.loads(raw)["subgoal_selection"]["rank_range"] == [4, 9]
 
 
+def test_streamlit_route_prior_is_written_only_when_enabled():
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=30
+    ).run()
+
+    def apply_and_read_hmm():
+        next(
+            w for w in app.button if w.label == "Apply common settings to JSON"
+        ).click().run()
+        raw = next(
+            widget for widget in app.text_area if widget.label == "Configuration JSON"
+        ).value
+        return json.loads(raw)["predictors"].get("hmm", {})
+
+    # Unchanged settings leave the workflow signature alone.
+    assert "route_prior_concentration" not in apply_and_read_hmm()
+
+    next(
+        w for w in app.checkbox if w.label == "Dirichlet prior on route weights"
+    ).check()
+    next(
+        w for w in app.number_input if w.label == "Route-weight prior concentration α"
+    ).set_value(250.0)
+    assert apply_and_read_hmm()["route_prior_concentration"] == 250.0
+
+    next(
+        w for w in app.checkbox if w.label == "Dirichlet prior on route weights"
+    ).uncheck()
+    assert apply_and_read_hmm()["route_prior_concentration"] is None
+
+
 def test_resource_preview_tracks_route_family_and_advanced_overrides():
     payload = json.loads((ROOT / "configs/regression_workflow.json").read_text())
     payload["predictors"]["route_family"] = "hmm"
@@ -164,7 +196,7 @@ def test_resource_preview_tracks_route_family_and_advanced_overrides():
     plan = access.resource_preview(payload)
 
     assert plan["route_family"] == "hmm"
-    assert plan["stages"]["predictor-bundle"]["cpus_per_task"] == 8
+    assert plan["stages"]["predictor-bundle"]["cpus_per_task"] == 2
     assert plan["stages"]["feature-generation"]["cpus_per_task"] == 6
     assert any(row["stage"] == "candidate" for row in plan["rows"])
 
@@ -413,3 +445,54 @@ def test_absolute_performance_loader_uses_singletons_combination_and_scope(
     assert [
         row["model_id"] for row in one_predictor["comparison"]["models"]
     ] == ["vector"]
+
+
+def test_retry_with_override_passes_the_reason_to_the_manager(tmp_path, monkeypatch):
+    (tmp_path / "slurm_manager.json").write_text(
+        json.dumps(
+            {
+                "config_path": "config.json",
+                "run_id": "run",
+                "python_executable": "python",
+                "submissions": [],
+            }
+        )
+    )
+    commands = []
+    # The manager echoes each sbatch command, then prints its --json summary.
+    manager_stdout = "sbatch --parsable --array=0-2%3 stage.sbatch\n" + json.dumps(
+        {
+            "output_dir": str(tmp_path),
+            "submitted_jobs": [
+                {"stage": "predictor-bundle", "job_id": "1", "task_count": 3,
+                 "dependency": []},
+                {"stage": "regression", "job_id": "2", "task_count": 36,
+                 "dependency": ["1"]},
+            ],
+            "artifacts_before": {},
+        },
+        indent=2,
+    )
+    monkeypatch.setattr(
+        access.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command)
+        or SimpleNamespace(returncode=0, stdout=manager_stdout, stderr=""),
+    )
+
+    reply = access.control(tmp_path, "retry-missing")
+    access.control(tmp_path, "retry-missing", rerecord_reason="unrelated scripts")
+
+    assert reply == (
+        "Submitted 2 job(s) for the missing work: predictor-bundle (3 tasks), "
+        "regression (36 tasks)."
+    )
+    assert "--json" in commands[0]
+    assert "--rerecord-worker-source" not in commands[0]
+    assert commands[1][-3:] == [
+        "--retry-missing",
+        "--rerecord-worker-source",
+        "unrelated scripts",
+    ]
+    with pytest.raises(ValueError, match="Only a retry"):
+        access.control(tmp_path, "cancel", rerecord_reason="no")

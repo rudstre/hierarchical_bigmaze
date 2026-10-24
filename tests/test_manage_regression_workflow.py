@@ -642,3 +642,136 @@ def test_retry_submits_only_missing_tasks(tmp_path, monkeypatch):
     assert captured[0]["discovery"] == []
     assert captured[0]["aggregation"] == [{"stage": "aggregation"}]
     assert captured[0]["plotting"] == [{"stage": "plotting"}]
+
+
+def _drifted_run(tmp_path, monkeypatch):
+    """A run whose recorded worker source differs from the current source."""
+    config_path = ROOT / "configs/regression_workflow.json"
+    output = tmp_path / "run"
+    (output / "logs").mkdir(parents=True)
+    (output / "manifest.json").write_text(json.dumps({"partitions": []}))
+    current = manager.source_code_fingerprint(ROOT)
+    baseline = [dict(item) for item in current["files"]]
+    baseline[0]["sha256"] = "old"
+    state = {
+        "config_digest": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "output_dir": str(output),
+        "project_root": str(ROOT),
+        "python_executable": "python",
+        "config_path": str(config_path),
+        "max_array_size": 100,
+        "submissions": [],
+        "precompute_lattice": False,
+        "worker_source": "stale",
+        "worker_source_files": baseline,
+    }
+    manager._atomic_json(output / "slurm_manager.json", state)
+    (output / "logs" / "predictor-bundle-1_0.out").write_text(
+        f"ValueError: {manager.WORKER_SOURCE_FAILURE}\n"
+    )
+    submitted = []
+    monkeypatch.setattr(
+        manager, "_artifact_state", lambda _config, _root, _task, _manifest: "missing"
+    )
+    monkeypatch.setattr(
+        manager,
+        "_submit_pipeline",
+        lambda _state, _path, _config, _raw, tasks, **_kwargs: submitted.append(tasks),
+    )
+
+    def args(*extra):
+        return manager.parser().parse_args(
+            [
+                "--config", str(config_path),
+                "--output-dir", str(output),
+                "--run-id", "drift_test",
+                "--retry-missing",
+                *extra,
+            ]
+        )
+
+    return output, current, baseline[0]["path"], submitted, args
+
+
+def test_retry_refuses_to_submit_when_worker_source_changed(tmp_path, monkeypatch):
+    output, _current, _changed, submitted, args = _drifted_run(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="--rerecord-worker-source"):
+        manager._main(args())
+
+    assert submitted == []
+    assert manager._read(output / "slurm_manager.json")["worker_source"] == "stale"
+
+
+def test_worker_source_drift_lists_changed_files_and_failed_tasks(
+    tmp_path, monkeypatch
+):
+    output, current, changed, _submitted, _args = _drifted_run(tmp_path, monkeypatch)
+    state = manager._read(output / "slurm_manager.json")
+
+    drift = manager.worker_source_drift(_config(), output, state)
+
+    assert not drift["matches"]
+    assert drift["current"] == current["content_sha256"]
+    assert drift["changed_files"] == {
+        "modified": [changed],
+        "added": [],
+        "removed": [],
+    }
+    assert drift["failed_tasks"] == 1
+    assert drift["blocking_stages"] == []
+
+
+def test_rerecorded_worker_source_is_recorded_and_retry_proceeds(
+    tmp_path, monkeypatch
+):
+    output, current, changed, submitted, args = _drifted_run(tmp_path, monkeypatch)
+
+    assert manager._main(args("--rerecord-worker-source", "unrelated scripts")) == 0
+
+    state = manager._read(output / "slurm_manager.json")
+    assert state["worker_source"] == current["content_sha256"]
+    (entry,) = state["worker_source_history"]
+    assert entry["reason"] == "unrelated scripts"
+    assert entry["previous"] == "stale"
+    assert entry["current"] == current["content_sha256"]
+    assert entry["changed_files"]["modified"] == [changed]
+    assert len(submitted) == 1
+    # The re-recorded source is now the baseline, so nothing differs.
+    assert manager.worker_source_drift(_config(), output, state)["matches"]
+
+
+def test_rerecord_is_refused_when_existing_artifacts_used_other_stage_source(
+    tmp_path, monkeypatch
+):
+    output, _current, _changed, submitted, args = _drifted_run(tmp_path, monkeypatch)
+    candidate = output / "partitions" / "p" / "candidates" / "inner" / "k_04_x.json"
+    candidate.parent.mkdir(parents=True)
+    source = {"stage": "candidate", "sha256": "old", "files": []}
+    candidate.write_text(json.dumps({"compatibility": {"source": source}}))
+
+    with pytest.raises(ValueError, match="cannot be re-recorded"):
+        manager._main(args("--rerecord-worker-source", "try anyway"))
+
+    assert submitted == []
+    assert manager._read(output / "slurm_manager.json")["worker_source"] == "stale"
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--rerecord-worker-source", "reason"], "requires --retry-missing"),
+        (["--retry-missing", "--rerecord-worker-source", "  "], "non-empty reason"),
+    ],
+)
+def test_rerecord_option_is_validated(tmp_path, extra, message):
+    args = manager.parser().parse_args(
+        [
+            "--config", str(ROOT / "configs/regression_workflow.json"),
+            "--output-dir", str(tmp_path / "run"),
+            "--run-id", "x",
+            *extra,
+        ]
+    )
+    with pytest.raises(ValueError, match=message):
+        manager._main(args)

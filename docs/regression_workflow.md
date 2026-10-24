@@ -58,6 +58,15 @@ for the full-model learning curve.
   the best mean of the last `smooth_k` (5) evaluations are kept. The held-out
   session never enters this split. `validation_fraction: 0` fits all trials and
   keeps the final iterate.
+- `predictors.hmm.route_prior_concentration` (default `null`, off) adds the log
+  density of a symmetric Dirichlet(α) prior on the non-uniform route weights,
+  per observation, to the training objective, as in Qin's 2024 `Route_HMM`
+  (which used α = 100). α must be at least 1; larger values hold the route
+  weights closer to equal and keep routes from collapsing to zero weight.
+  Validation scores and checkpoint selection remain likelihood-only, and
+  predictor diagnostics record the per-epoch prior term as
+  `training_log_route_prior`. The Streamlit HMM settings expose it as
+  "Dirichlet prior on route weights".
 - `regression_cv.method: "blocked_trial_kfold"` runs the original full/reduced
   ablation analysis; `n_splits` changes only regression splits and results.
 - `regression_cv.method: "blocked_trial_learning_curve"` fits only the full
@@ -195,6 +204,19 @@ Retries contain exact scalar tasks. No production job is submitted by tests.
 including pending downstream stages. It leaves completed artifacts and the
 manager record in place. Add `--dry-run` to preview the job IDs; use
 `--retry-missing` later if you want to resume.
+
+Workers refuse to start when the scientific source (`src/`, `scripts/` outside
+`slurm/` and `gui/`, and `pyproject.toml`) differs from the fingerprint the run
+recorded. This includes tasks that wait in the queue while the code is edited.
+`--retry-missing` therefore refuses to submit while the source differs. To let
+the rest of the run use the current code, pass
+`--rerecord-worker-source "REASON"`. The previous fingerprint, the changed
+files, the reason and the time are appended to `worker_source_history` in
+`slurm_manager.json`. The override is refused when an existing artifact
+recorded a different per-stage source (`candidate`, `feature` or `regression`
+scopes), because workers re-check those when reusing artifacts; start a new run
+in that case. The GUI Progress page shows the same information and offers the
+override behind an acknowledgement and a required reason.
 
 ## Artifacts and reuse
 

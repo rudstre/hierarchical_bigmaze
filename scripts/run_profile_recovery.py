@@ -23,7 +23,9 @@ import json
 import os
 import time
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -65,9 +67,23 @@ PLANTED_THETA = {
 DOOHAN_DATA_ROOT = PROJECT_ROOT / "external" / "GridMaze-mFC-ephys-DATA" / "data"
 # The first --planted-subgoals of these are planted. Order: the two degree-4
 # junctions and one degree-3 junction, then degree-3 junctions added greedily to
-# maximize the minimum maze distance to those already chosen (5, 5, then 2).
-DOOHAN_CENTRES = ((5, 2), (5, 5), (2, 3), (1, 5), (2, 0), (1, 2))
+# maximize the minimum maze distance to those already chosen (5, 5, then 2);
+# centres 7-10 are chosen the same way from all states (junction degree breaks
+# ties), because the remaining junctions are 1 step from chosen centres.
+DOOHAN_CENTRES = (
+    (5, 2), (5, 5), (2, 3), (1, 5), (2, 0), (1, 2),
+    (3, 6), (3, 5), (6, 0), (6, 4),
+)
 DOOHAN_WIDTH = 1.0
+# --planted-width-mode: per-subgoal widths of the planted bumps (cycled).
+PLANTED_WIDTHS = {
+    "current": (DOOHAN_WIDTH,),
+    "narrow": (0.5,),
+    "mixed": (0.5, 1.0, 1.5),
+}
+# NMF bases precomputed by the regression workflow (identical across the
+# stored code-version directories; the most complete one is used).
+NMF_BASES = DOOHAN_DATA_ROOT / "nmf_bases"
 DOOHAN_RADIUS = 2
 # Frozen structural choice: no goal inpainting before commitment. Commitment to
 # the goal-only policy happens through the upper-termination draw at subgoal
@@ -90,14 +106,18 @@ ORACLE_LOG_FLOOR = float(np.exp(-30.0))
 def planted_profiles(
     maze: Maze,
     centres=SUBGOAL_CENTRES,
-    width: float = SUBGOAL_WIDTH,
+    width: float | Sequence[float] = SUBGOAL_WIDTH,
     radius: int = SUBGOAL_RADIUS,
 ) -> np.ndarray:
-    """Localized bumps ``exp(-d / width)``, exactly zero beyond ``radius``."""
+    """Localized bumps ``exp(-d / width)``, exactly zero beyond ``radius``.
+
+    ``width`` is one value or one per subgoal.
+    """
 
     coordinates = maze.free_cells
     profiles = np.zeros((len(coordinates), len(centres)))
-    for column, centre in enumerate(centres):
+    widths = [width] * len(centres) if np.isscalar(width) else list(width)
+    for column, (centre, width) in enumerate(zip(centres, widths, strict=True)):
         distances = maze.distances_from(centre)
         for state, coordinate in enumerate(coordinates):
             distance = distances[coordinate]
@@ -157,6 +177,27 @@ def design(maze: Maze, n_trials: int, rng: np.random.Generator, prefix: str):
         session = f"{prefix}{index * N_SESSIONS // n_trials}"
         entries.append((session, start, goal))
     return entries
+
+
+def load_nmf_profiles(maze_name: str, k: int) -> tuple[np.ndarray, dict]:
+    """Selected connected-NMF profiles ``[state, k]`` for a maze and rank."""
+
+    candidates = sorted(
+        (NMF_BASES / maze_name).glob(f"*/k_{k:02d}.json"),
+        key=lambda path: -len(list(path.parent.glob("k_*.json"))),
+    )
+    if not candidates:
+        raise SystemExit(f"No precomputed NMF basis for {maze_name} k={k}")
+    artifact = json.loads(candidates[0].read_text())
+    if artifact.get("status") != "success":
+        raise SystemExit(f"NMF basis {candidates[0]} did not succeed")
+    selected = artifact["discovery"]["selected_discovery"]
+    profiles = np.asarray(selected["profiles"], dtype=np.float64)
+    return profiles, {
+        "path": str(candidates[0].relative_to(PROJECT_ROOT)),
+        "profile_sha256": selected["profile_sha256"],
+        "selected_seed": artifact["discovery"]["selected_seed"],
+    }
 
 
 def template_for(
@@ -222,10 +263,148 @@ def atomic_write(path: Path, write) -> None:
     os.replace(temporary, path)
 
 
+def simulate_setup(args) -> SimpleNamespace:
+    """Build the planted model and simulate train / held-out / validation splits.
+
+    Shared by every recovery script so that a given set of setup arguments and
+    ``--data-seed`` always produce identical data. Uses ``args.setup``, the
+    doohan design options, ``planted_subgoals``, ``commitment_radius``,
+    ``data_seed``, and the split sizes (four-rooms only).
+    """
+
+    if args.setup == "four_rooms":
+        maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
+        maze_source = {"kind": "file", "name": "four_rooms"}
+        centres, width, bump_radius = SUBGOAL_CENTRES, SUBGOAL_WIDTH, SUBGOAL_RADIUS
+        goals = GOALS
+        design_info = {
+            "kind": "random starts",
+            "min_start_distance": MIN_START_DISTANCE,
+        }
+        default_radius = 3
+    else:
+        maze, real_design, design_info = doohan_design(
+            args.doohan_maze, args.design_subject, args.start_date, args.end_date
+        )
+        maze_source = {"kind": "doohan", "name": args.doohan_maze}
+        if not 1 <= args.planted_subgoals <= len(DOOHAN_CENTRES):
+            raise SystemExit("--planted-subgoals out of range")
+        centres = DOOHAN_CENTRES[: args.planted_subgoals]
+        cycle = PLANTED_WIDTHS[getattr(args, "planted_width_mode", "current")]
+        width = tuple(cycle[j % len(cycle)] for j in range(len(centres)))
+        if len(set(width)) == 1:
+            width = width[0]  # scalar, as recorded by earlier runs
+        bump_radius = DOOHAN_RADIUS
+        goals = tuple(sorted({goal for _, _, goal in real_design}))
+        default_radius = 2
+    radius = (
+        default_radius if args.commitment_radius is None else args.commitment_radius
+    )
+    structure = {**STRUCTURE, "commitment_radius": radius}
+    environment = Environment(maze)
+    true_profiles = planted_profiles(maze, centres, width, bump_radius)
+    planted = template_for(environment, true_profiles, PLANTED_THETA, structure)
+
+    def split_design(n_trials, rng, prefix):
+        # Real designs are reused for every split with fresh rollouts, standing
+        # in for new sessions of the same experiment.
+        if args.setup == "four_rooms":
+            return design(maze, n_trials, rng, prefix)
+        return [
+            (f"{prefix}:{session}", start, goal)
+            for session, start, goal in real_design
+        ]
+
+    # Separate child seeds for designs and rollouts of each split. Spawned
+    # children are indexed, so adding the validation pair (children 4 and 5)
+    # leaves the train and held-out data of earlier runs unchanged.
+    (
+        train_seed,
+        heldout_seed,
+        train_rollout,
+        heldout_rollout,
+        validation_seed,
+        validation_rollout,
+    ) = (
+        int(child.generate_state(1)[0])
+        for child in np.random.SeedSequence(args.data_seed).spawn(6)
+    )
+    started = time.perf_counter()
+    train = simulate_trials(
+        planted,
+        split_design(args.n_train, np.random.default_rng(train_seed), "train"),
+        seed=train_rollout,
+    )
+    heldout = simulate_trials(
+        planted,
+        split_design(args.n_heldout, np.random.default_rng(heldout_seed), "heldout"),
+        seed=heldout_rollout,
+    )
+    # Validation chooses penalty strengths; held-out is only ever reported.
+    validation = simulate_trials(
+        planted,
+        split_design(
+            args.n_validation, np.random.default_rng(validation_seed), "valid"
+        ),
+        seed=validation_rollout,
+    )
+    print(
+        f"simulated {len(train.trials)} train / {len(heldout.trials)} held-out trials "
+        f"({len(train.censored)} / {len(heldout.censored)} censored) "
+        f"in {time.perf_counter() - started:.1f}s",
+        flush=True,
+    )
+    splits = (("train", train), ("held-out", heldout), ("validation", validation))
+    for split, simulated in splits:
+        n_designed = len(simulated.trials) + len(simulated.censored)
+        fraction = len(simulated.censored) / n_designed
+        if fraction > MAX_CENSORED_FRACTION:
+            statuses = Counter(record.status for record in simulated.censored)
+            raise SystemExit(
+                f"{split}: {fraction:.0%} of rollouts censored "
+                f"({dict(statuses)}), above {MAX_CENSORED_FRACTION:.0%}; "
+                "the planted design cannot generate valid recovery data"
+            )
+    return SimpleNamespace(
+        maze=maze,
+        maze_source=maze_source,
+        centres=centres,
+        width=width,
+        bump_radius=bump_radius,
+        goals=goals,
+        design_info=design_info,
+        structure=structure,
+        environment=environment,
+        true_profiles=true_profiles,
+        planted=planted,
+        train=train,
+        heldout=heldout,
+        validation=validation,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--fit-theta", action="store_true")
+    parser.add_argument(
+        "--planted-width-mode", choices=tuple(PLANTED_WIDTHS), default="current"
+    )
+    parser.add_argument(
+        "--hold-theta",
+        type=float,
+        nargs=3,
+        metavar=("LOWER_COST", "UPPER_COST", "BETA"),
+        default=None,
+        help="fit D only with theta held at this grid point (alpha via "
+        "--fixed-alpha): one cell of a profile-likelihood grid over theta",
+    )
+    parser.add_argument(
+        "--nmf-init",
+        action="store_true",
+        help="add a restart initialized at the precomputed NMF solution for "
+        "the fitted K (task-structure based, not behavior)",
+    )
     parser.add_argument(
         "--hold-default-theta",
         action="store_true",
@@ -331,95 +510,16 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.setup == "four_rooms":
-        maze = Maze.from_file(PROJECT_ROOT / "mazes" / "four_rooms.txt")
-        maze_source = {"kind": "file", "name": "four_rooms"}
-        centres, width, bump_radius = SUBGOAL_CENTRES, SUBGOAL_WIDTH, SUBGOAL_RADIUS
-        goals = GOALS
-        design_info = {
-            "kind": "random starts",
-            "min_start_distance": MIN_START_DISTANCE,
-        }
-        default_radius = 3
-    else:
-        maze, real_design, design_info = doohan_design(
-            args.doohan_maze, args.design_subject, args.start_date, args.end_date
-        )
-        maze_source = {"kind": "doohan", "name": args.doohan_maze}
-        if not 1 <= args.planted_subgoals <= len(DOOHAN_CENTRES):
-            raise SystemExit("--planted-subgoals out of range")
-        centres = DOOHAN_CENTRES[: args.planted_subgoals]
-        width, bump_radius = DOOHAN_WIDTH, DOOHAN_RADIUS
-        goals = tuple(sorted({goal for _, _, goal in real_design}))
-        default_radius = 2
-    radius = (
-        default_radius if args.commitment_radius is None else args.commitment_radius
+    setup = simulate_setup(args)
+    maze, maze_source, goals = setup.maze, setup.maze_source, setup.goals
+    centres, width, bump_radius = setup.centres, setup.width, setup.bump_radius
+    design_info, structure = setup.design_info, setup.structure
+    environment, true_profiles, planted = (
+        setup.environment,
+        setup.true_profiles,
+        setup.planted,
     )
-    structure = {**STRUCTURE, "commitment_radius": radius}
-    environment = Environment(maze)
-    true_profiles = planted_profiles(maze, centres, width, bump_radius)
-    planted = template_for(environment, true_profiles, PLANTED_THETA, structure)
-
-    def split_design(n_trials, rng, prefix):
-        # Real designs are reused for every split with fresh rollouts, standing
-        # in for new sessions of the same experiment.
-        if args.setup == "four_rooms":
-            return design(maze, n_trials, rng, prefix)
-        return [
-            (f"{prefix}:{session}", start, goal)
-            for session, start, goal in real_design
-        ]
-
-    # Separate child seeds for designs and rollouts of each split. Spawned
-    # children are indexed, so adding the validation pair (children 4 and 5)
-    # leaves the train and held-out data of earlier runs unchanged.
-    (
-        train_seed,
-        heldout_seed,
-        train_rollout,
-        heldout_rollout,
-        validation_seed,
-        validation_rollout,
-    ) = (
-        int(child.generate_state(1)[0])
-        for child in np.random.SeedSequence(args.data_seed).spawn(6)
-    )
-    started = time.perf_counter()
-    train = simulate_trials(
-        planted,
-        split_design(args.n_train, np.random.default_rng(train_seed), "train"),
-        seed=train_rollout,
-    )
-    heldout = simulate_trials(
-        planted,
-        split_design(args.n_heldout, np.random.default_rng(heldout_seed), "heldout"),
-        seed=heldout_rollout,
-    )
-    # Validation chooses penalty strengths; held-out is only ever reported.
-    validation = simulate_trials(
-        planted,
-        split_design(
-            args.n_validation, np.random.default_rng(validation_seed), "valid"
-        ),
-        seed=validation_rollout,
-    )
-    print(
-        f"simulated {len(train.trials)} train / {len(heldout.trials)} held-out trials "
-        f"({len(train.censored)} / {len(heldout.censored)} censored) "
-        f"in {time.perf_counter() - started:.1f}s",
-        flush=True,
-    )
-    splits = (("train", train), ("held-out", heldout), ("validation", validation))
-    for split, simulated in splits:
-        n_designed = len(simulated.trials) + len(simulated.censored)
-        fraction = len(simulated.censored) / n_designed
-        if fraction > MAX_CENSORED_FRACTION:
-            statuses = Counter(record.status for record in simulated.censored)
-            raise SystemExit(
-                f"{split}: {fraction:.0%} of rollouts censored "
-                f"({dict(statuses)}), above {MAX_CENSORED_FRACTION:.0%}; "
-                "the planted design cannot generate valid recovery data"
-            )
+    train, heldout, validation = setup.train, setup.heldout, setup.validation
 
     if args.hold_default_theta and args.fit_theta:
         raise SystemExit("--hold-default-theta and --fit-theta are exclusive")
@@ -432,10 +532,14 @@ def main() -> None:
     # theta_held records which fixed theta a theta-fixed run used, so a later
     # stage can tell a default-theta source (safe to inherit) from a
     # planted-theta one (would start the fit at the truth).
+    if args.hold_theta is not None and (args.fit_theta or args.hold_default_theta):
+        raise SystemExit("--hold-theta excludes --fit-theta and --hold-default-theta")
     if args.fit_theta:
         theta_held = None
     elif args.hold_default_theta:
         theta_held = "default"
+    elif args.hold_theta is not None:
+        theta_held = "grid"
     else:
         theta_held = "planted"
     initial_theta = (
@@ -443,12 +547,21 @@ def main() -> None:
         if theta_held == "planted"
         else {name: float(getattr(point_parameters(), name)) for name in PLANTED_THETA}
     )
+    if args.hold_theta is not None:
+        lower, upper, beta = args.hold_theta
+        initial_theta = {
+            **initial_theta,
+            "lower_control_cost": lower,
+            "upper_control_cost": upper,
+            "beta": beta,
+        }
     n_fit = args.fit_subgoals or true_profiles.shape[1]
     theta_names = THETA_NAMES if args.fit_theta else ()
     if args.fixed_alpha is not None:
         if theta_held == "planted":
             raise SystemExit(
-                "--fixed-alpha needs --fit-theta or --hold-default-theta"
+                "--fixed-alpha needs --fit-theta, --hold-theta, or "
+                "--hold-default-theta"
             )
         # alpha becomes a structural constant shared by every fit; set before
         # any template is built so random restarts hold the same value.
@@ -547,6 +660,27 @@ def main() -> None:
             seeds=(seed,),
             initial_shape=initial_shape,
             callback=progress(f"seed {seed}"),
+            **fit_options,
+        )
+    nmf_source = None
+    if args.nmf_init:
+        nmf_profiles, nmf_source = load_nmf_profiles(maze_source["name"], n_fit)
+        if nmf_profiles.shape != (len(maze.free_cells), n_fit):
+            raise SystemExit(f"NMF profiles have shape {nmf_profiles.shape}")
+        # NMF profiles contain exact zeros (connectivity mask); log-space fits
+        # need positive starts, raised to the same initialization-only floor
+        # as the oracle.
+        nmf_initial = nmf_profiles / nmf_profiles.max(axis=0, keepdims=True)
+        if log_space:
+            nmf_initial = np.maximum(nmf_initial, ORACLE_LOG_FLOOR)
+        print(f"fitting NMF-initialized restart ({nmf_source['path']})", flush=True)
+        fit_initial_theta["nmf"] = dict(initial_theta)
+        fits["nmf"] = fit_profiles(
+            fit_template,
+            train.trials,
+            initial_profiles=nmf_initial,
+            initial_profile_description=f"NMF {nmf_source}",
+            callback=progress("nmf"),
             **fit_options,
         )
     warm_source = None
@@ -728,6 +862,9 @@ def main() -> None:
         "fit_subgoals": int(n_fit),
         "fit_theta": args.fit_theta,
         "theta_held": theta_held,
+        "hold_theta": args.hold_theta,
+        "nmf_init": nmf_source,
+        "planted_width_mode": args.planted_width_mode,
         "freeze_profiles": args.freeze_profiles,
         "parameterization": args.parameterization,
         "access_threshold": args.access_threshold,

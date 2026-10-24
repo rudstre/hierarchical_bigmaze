@@ -7,8 +7,8 @@ import re
 from copy import deepcopy
 from typing import Mapping
 
-RESOURCE_PROFILE_VERSION = 2
-RESOURCE_PROFILE_NAME = "auto-cpu-v2"
+RESOURCE_PROFILE_VERSION = 3
+RESOURCE_PROFILE_NAME = "auto-cpu-v3"
 
 # Measured HMM route fits (8 CPUs, cpu_backfill, 36 partitions each): worst
 # seconds per epoch (elapsed_seconds / epochs) and peak MaxRSS from sacct.
@@ -27,6 +27,15 @@ _HMM_TIME_EXPONENT = math.log(11.19 / 4.41) / math.log(11 / 7)
 _HMM_EXTRAPOLATION_TIME_EXPONENT = 3.0
 _HMM_MEASURED_MAX_ROUTES = 10
 _HMM_HEADROOM = 2.0
+# HMM stages run on 2 CPUs: the route fit scales poorly with threads. On one
+# node (results/thread_bench: a route-data-curve condition at 200 epochs),
+# whole-task wall time was 1027 s / 665 s / 583 s / 437 s at 1 / 2 / 4 / 8
+# threads, so 2 CPUs give the most work per core. The per-epoch times above
+# were measured at 8 CPUs; estimates scale them by the 2-thread slowdown.
+_HMM_CPUS = 2
+_HMM_CPU_SLOWDOWN = 665.4 / 436.8
+# Smallest memory request; the measured peaks (3.57-8.07 GB) are well above it.
+_HMM_MIN_MEMORY_GB = 4
 
 
 def _slurm_hours(hours):
@@ -43,12 +52,13 @@ def hmm_resource_estimate(n_routes, epochs):
         if n_routes <= _HMM_REFERENCE_ROUTES or scale <= 1
         else _HMM_EXTRAPOLATION_TIME_EXPONENT
     )
+    # Seconds per epoch at the 8 CPUs the reference fits were measured on.
     seconds_per_epoch = _HMM_REFERENCE_SECONDS_PER_EPOCH * scale**exponent
-    fit_hours = _HMM_HEADROOM * seconds_per_epoch * epochs / 3600
+    fit_hours = (
+        _HMM_HEADROOM * _HMM_CPU_SLOWDOWN * seconds_per_epoch * epochs / 3600
+    )
     memory_gb = _HMM_HEADROOM * _HMM_REFERENCE_MEMORY_GB * scale**2
-    # 16G and 1 h are the requests already used successfully for every
-    # measured configuration; they are kept as floors.
-    memory = f"{max(16, math.ceil(memory_gb))}G"
+    memory = f"{max(_HMM_MIN_MEMORY_GB, math.ceil(memory_gb))}G"
     return {
         "calibrated": n_routes <= _HMM_MEASURED_MAX_ROUTES,
         "seconds_per_epoch": seconds_per_epoch,
@@ -57,7 +67,7 @@ def hmm_resource_estimate(n_routes, epochs):
         # is scaled from the 1 h request by the per-epoch route scaling.
         "feature_generation": {
             "memory": memory,
-            "time": _slurm_hours(max(1.0, scale**exponent)),
+            "time": _slurm_hours(max(1.0, _HMM_CPU_SLOWDOWN * scale**exponent)),
         },
     }
 
@@ -247,12 +257,12 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
         )
         estimate = hmm_resource_estimate(route_count_bound, hmm_epochs)
         stages["predictor-bundle"].update(
-            cpus_per_task=8,
+            cpus_per_task=_HMM_CPUS,
             max_concurrent=hmm_concurrency,
             **estimate["predictor_bundle"],
         )
         stages["feature-generation"].update(
-            cpus_per_task=8,
+            cpus_per_task=_HMM_CPUS,
             max_concurrent=hmm_concurrency,
             **estimate["feature_generation"],
         )

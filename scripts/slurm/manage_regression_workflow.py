@@ -29,6 +29,7 @@ from andrew_mlmdp.regression_resources import (  # noqa: E402
 from andrew_mlmdp.regression_workflow import (  # noqa: E402
     PredictorPartition,
     _candidate_path,
+    _stage_source,
     build_manifest,
     candidate_tasks,
     load_regression_workflow_config,
@@ -52,6 +53,12 @@ def parser():
     result.add_argument("--python", default=DEFAULT_PYTHON)
     result.add_argument("--max-array-size", type=int, default=1000)
     result.add_argument("--retry-missing", action="store_true")
+    result.add_argument(
+        "--rerecord-worker-source",
+        metavar="REASON",
+        help="With --retry-missing: accept the current scientific source for the "
+        "rest of the run, recording the previous fingerprint and this reason",
+    )
     result.add_argument("--no-precompute-lattice", action="store_true")
     result.add_argument("--lattice-memory")
     result.add_argument("--lattice-time")
@@ -85,6 +92,132 @@ def _read(path):
     if not isinstance(payload, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return payload
+
+
+WORKER_SOURCE_FAILURE = "Scientific worker source changed after submission"
+# Artifact files whose compatibility records carry per-stage source digests.
+_STAGE_SOURCE_ARTIFACTS = (
+    "partitions/*/candidates/*/k_*.json",
+    "partitions/*/predictor.json",
+    "partitions/*/features.json",
+    "partitions/*/regression*.json",
+    "partitions/*/policy_overlap.json",
+)
+
+
+def _source_baseline_files(manager, output):
+    """Per-file digests behind the recorded worker source, when known."""
+    history = manager.get("worker_source_history") or []
+    if history:
+        return history[-1]["files"]
+    if manager.get("worker_source_files"):
+        return manager["worker_source_files"]
+    # Runs created before the manager stored file digests: the GUI snapshot
+    # records the full fingerprint, usable only if it is the same source.
+    provenance = output / "inputs" / "provenance.json"
+    if provenance.is_file():
+        source = _read(provenance).get("scientific_source") or {}
+        if source.get("content_sha256") == manager.get("worker_source"):
+            return source.get("files")
+    return None
+
+
+def _stage_digests(value, found):
+    if isinstance(value, dict):
+        if set(value) >= {"stage", "sha256", "files"}:
+            found.setdefault(value["stage"], set()).add(value["sha256"])
+        for item in value.values():
+            _stage_digests(item, found)
+    return found
+
+
+def worker_source_drift(config, output, manager):
+    """Compare the run's recorded worker source with the current source.
+
+    Workers refuse to start when the whole-source fingerprint differs; that
+    check can be re-recorded. Artifacts also record per-stage source digests,
+    which workers check when they reuse an artifact. A change there cannot be
+    re-recorded, so stages with existing artifacts and changed stage source
+    block the override. Those digests are read from the oldest and newest
+    artifact of each kind rather than every artifact.
+    """
+    output = Path(output)
+    current = source_code_fingerprint(manager["project_root"])
+    recorded = manager.get("worker_source")
+    result = {
+        "recorded": recorded,
+        "current": current["content_sha256"],
+        "matches": recorded is None or recorded == current["content_sha256"],
+        "changed_files": None,
+        "stages": [],
+        "blocking_stages": [],
+        "failed_tasks": 0,
+        "history": manager.get("worker_source_history") or [],
+    }
+    if result["matches"]:
+        return result
+    baseline = _source_baseline_files(manager, output)
+    if baseline is not None:
+        before = {item["path"]: item["sha256"] for item in baseline}
+        after = {item["path"]: item["sha256"] for item in current["files"]}
+        result["changed_files"] = {
+            "modified": sorted(
+                p for p in before.keys() & after if before[p] != after[p]
+            ),
+            "added": sorted(after.keys() - before.keys()),
+            "removed": sorted(before.keys() - after.keys()),
+        }
+    recorded_stages = {}
+    for pattern in _STAGE_SOURCE_ARTIFACTS:
+        paths = sorted(output.glob(pattern), key=lambda path: path.stat().st_mtime)
+        for path in {paths[0], paths[-1]} if paths else ():
+            _stage_digests(_read(path).get("compatibility"), recorded_stages)
+    for stage in sorted(recorded_stages):
+        current_digest = _stage_source(config, stage)["sha256"]
+        changed = recorded_stages[stage] != {current_digest}
+        result["stages"].append(
+            {
+                "stage": stage,
+                "recorded": sorted(recorded_stages[stage]),
+                "current": current_digest,
+                "changed": changed,
+            }
+        )
+        if changed:
+            result["blocking_stages"].append(stage)
+    logs = output / "logs"
+    if logs.is_dir():
+        result["failed_tasks"] = sum(
+            WORKER_SOURCE_FAILURE in path.read_text(errors="replace")
+            for path in logs.glob("*.out")
+        )
+    return result
+
+
+def _rerecord_worker_source(config, output, manager, reason):
+    drift = worker_source_drift(config, output, manager)
+    if drift["matches"]:
+        return drift
+    if drift["blocking_stages"]:
+        raise ValueError(
+            "Existing artifacts were produced with different source for stages "
+            f"{drift['blocking_stages']}; workers would refuse them, so the "
+            "fingerprint cannot be re-recorded. Start a new run instead."
+        )
+    current = source_code_fingerprint(manager["project_root"])
+    manager.setdefault("worker_source_history", []).append(
+        {
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "reason": reason,
+            "previous": drift["recorded"],
+            "current": current["content_sha256"],
+            "git_head": current["git_head"],
+            "changed_files": drift["changed_files"],
+            "files": current["files"],
+        }
+    )
+    manager["worker_source"] = current["content_sha256"]
+    return drift
 
 
 def _partition(record):
@@ -895,6 +1028,12 @@ def main(argv=None):
 def _main(args):
     if args.cancel and (args.status or args.retry_missing):
         raise ValueError("--cancel cannot be combined with --status or --retry-missing")
+    if args.rerecord_worker_source is not None and not args.retry_missing:
+        raise ValueError("--rerecord-worker-source requires --retry-missing")
+    if args.rerecord_worker_source is not None and not (
+        args.rerecord_worker_source.strip()
+    ):
+        raise ValueError("--rerecord-worker-source needs a non-empty reason")
     root = args.project_root.resolve()
     config_path = args.config.resolve()
     output = (
@@ -947,6 +1086,22 @@ def _main(args):
         ):
             raise ValueError("Workflow manifest differs from the submitted input")
         workflow_manifest = _read(output / "manifest.json")
+        if args.retry_missing:
+            # Workers refuse to start under a different source, so submitting
+            # without resolving the mismatch would only produce failed jobs.
+            if args.rerecord_worker_source is not None:
+                _rerecord_worker_source(
+                    config, output, manager, args.rerecord_worker_source.strip()
+                )
+                if not args.dry_run:
+                    _atomic_json(manager_path, manager)
+            elif not worker_source_drift(config, output, manager)["matches"]:
+                raise ValueError(
+                    "Scientific worker source changed since this run's fingerprint "
+                    "was recorded, so retried tasks would fail. Review the change "
+                    "and pass --rerecord-worker-source REASON to continue with "
+                    "the current source."
+                )
     else:
         if args.retry_missing or args.status:
             raise ValueError(f"No workflow run at {output}")
@@ -1006,6 +1161,8 @@ def _main(args):
                 and config.regression_cv.method == "blocked_trial_kfold"
             ),
             "worker_source": source_code_fingerprint(root)["content_sha256"],
+            # Per-file digests let a later source change be listed file by file.
+            "worker_source_files": source_code_fingerprint(root)["files"],
         }
         if not args.dry_run:
             output.mkdir(parents=True, exist_ok=True)

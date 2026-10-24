@@ -26,6 +26,7 @@ from andrew_mlmdp.regression_resources import (  # noqa: E402
 )
 from andrew_mlmdp.regression_workflow import (  # noqa: E402
     build_manifest,
+    load_regression_workflow_config,
     regression_config_from_payload,
 )
 from andrew_mlmdp.validation import (  # noqa: E402
@@ -35,6 +36,7 @@ from andrew_mlmdp.validation import (  # noqa: E402
 )
 
 _SCHEDULER_CACHE = {}
+_SOURCE_DRIFT_CACHE = {}
 _ARTIFACT_STATUS_CACHE = {}
 
 
@@ -509,11 +511,28 @@ def _manager_process(output, config_path, run_id, options):
     return {"pid": process.pid, "log": str(log), "run_dir": str(output)}
 
 
-def control(root, action):
+def source_drift(root):
+    """Whether retried workers would refuse to start, and why (cached 30 s)."""
+    root = Path(root).resolve()
+    manager_path = root / "slurm_manager.json"
+    key = (str(root), manager_path.stat().st_mtime_ns)
+    cached = _SOURCE_DRIFT_CACHE.get(key)
+    if cached is None or time.monotonic() - cached[0] >= 30:
+        manager = read_json(manager_path)
+        config = load_regression_workflow_config(manager["config_path"])
+        drift = manager_module().worker_source_drift(config, root, manager)
+        cached = (time.monotonic(), drift)
+        _SOURCE_DRIFT_CACHE[key] = cached
+    return cached[1]
+
+
+def control(root, action, *, rerecord_reason=None):
     root = Path(root).resolve()
     manager = read_json(root / "slurm_manager.json")
     if action not in {"cancel", "retry-missing"}:
         raise ValueError("Unknown workflow action")
+    if rerecord_reason is not None and action != "retry-missing":
+        raise ValueError("Only a retry can re-record the worker source")
     command = [
         sys.executable,
         str(ROOT / "scripts/slurm/manage_regression_workflow.py"),
@@ -525,8 +544,15 @@ def control(root, action):
         manager["run_id"],
         "--python",
         manager["python_executable"],
+        *(["--json"] if action == "retry-missing" else []),
         "--" + action,
+        *(
+            ["--rerecord-worker-source", rerecord_reason]
+            if rerecord_reason is not None
+            else []
+        ),
     ]
+    _SOURCE_DRIFT_CACHE.clear()
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if result.returncode:
         recorded = [
@@ -537,7 +563,19 @@ def control(root, action):
             f"{result.stderr or result.stdout}\nRecorded job IDs: "
             f"{recorded or 'none'}"
         )
+    if action == "retry-missing":
+        return _retry_summary(result.stdout)
     return result.stdout
+
+
+def _retry_summary(stdout):
+    # The manager echoes every sbatch command before its JSON summary.
+    lines = stdout.splitlines()
+    jobs = json.loads("\n".join(lines[lines.index("{") :]))["submitted_jobs"]
+    if not jobs:
+        return "Nothing to retry: no missing work."
+    stages = ", ".join(f"{job['stage']} ({job['task_count']} tasks)" for job in jobs)
+    return f"Submitted {len(jobs)} job(s) for the missing work: {stages}."
 
 
 def recent_logs(root, count=8):
