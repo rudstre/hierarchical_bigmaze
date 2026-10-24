@@ -77,6 +77,11 @@ STAGES = (
     "candidate",
     "selection",
     "selected-refit",
+    "behavioral-cell",
+    "behavioral-selection",
+    "behavioral-local-cell",
+    "behavioral-local-selection",
+    "behavioral-refit",
     "predictor-bundle",
     "feature-generation",
     "regression",
@@ -229,6 +234,12 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
     stages["selected-refit"].update(
         memory=highest_rank_band["memory"], time=highest_rank_band["time"]
     )
+    # Provisional ceiling from simulated cells, pending completion of the
+    # real K=6 pilot. One CPU follows the thread benchmark; the fit records
+    # its actual wall time/RSS. Do not describe this estimate as calibrated.
+    if config.behavioral:
+        for stage in ("behavioral-cell", "behavioral-local-cell", "behavioral-refit"):
+            stages[stage].update(cpus_per_task=1, memory="8G", time="12:00:00")
     stages["feature-generation"]["time"] = "01:00:00"
     stages["policy-overlap"]["time"] = "01:00:00"
     stages["lattice-precompute"]["time"] = "01:00:00"
@@ -299,6 +310,7 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
         "hmm_epochs": hmm_epochs,
         "calibration_limits": calibration_limits,
         "calibrated": calibrated,
+        **({"behavioral_calibrated": False} if config.behavioral else {}),
         "launchable": launchable,
         "launch_block_reason": reason if not launchable else None,
         "stages": stages,

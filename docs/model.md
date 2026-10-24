@@ -576,6 +576,16 @@ normalization, pass the same mode to discovery and basis construction.
 
 ## 12. Behavior-fitted distributed profiles
 
+[`behavioral_profiles.fit_cell`](../src/andrew_mlmdp/hierarchy/behavioral_profiles.py)
+is the canonical fixed-θ centre-search plus free-form refinement procedure shared
+by regression fitting and the reproduction pilot. It selects among all refined
+starts by training objective. The regression workflow chooses θ on inner LOSO
+sessions, applies the existing one-SE K rule, optionally refines θ at fixed K*,
+and refits D on all predictor-training sessions. See the
+[regression statistical contract](regression_workflow.md#behavioral-profiles-and-nested-θ-selection)
+for defaults, seeds, failure handling, and the held-out boundary. Joint θ+D
+refinement is not used by this predictor.
+
 [`fit_profiles`](../src/andrew_mlmdp/hierarchy/profile_fitting.py) learns the
 profile matrix `D` directly from behavior instead of taking it from NMF. It
 fits a non-negative raw matrix `W` (`n x k`) jointly with

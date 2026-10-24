@@ -180,3 +180,19 @@ def test_hmm_resources_use_fitting_defaults_when_unspecified():
     assert plan["route_count_bound"] == 6
     assert plan["hmm_epochs"] == 2000
     assert plan["calibrated"]
+
+
+def test_behavioral_resources_are_explicitly_provisional_and_overridable():
+    from andrew_mlmdp.regression_workflow import MLMDPConfig
+
+    config = replace(_config(), mlmdp=MLMDPConfig())
+    plan = resolve_resource_plan(config, _slurm())
+    assert plan['behavioral_calibrated'] is False
+    for stage in ('behavioral-cell', 'behavioral-local-cell', 'behavioral-refit'):
+        assert plan['stages'][stage]['cpus_per_task'] == 1
+        assert plan['stages'][stage]['time'] == '12:00:00'
+    overridden = resolve_resource_plan(config, _slurm(stage_overrides={
+        'behavioral-cell': {'memory': '3G', 'time': '06:00:00'}
+    }))
+    assert overridden['stages']['behavioral-cell']['memory'] == '3G'
+    assert overridden['stages']['behavioral-cell']['time'] == '06:00:00'

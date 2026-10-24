@@ -1,6 +1,6 @@
 """Observed-decision overlap of the action vectors used by Qin regression.
 
-The regression feature artifact is the source of the eight predictor vectors.
+The regression feature artifact is the source of all configured predictor vectors.
 Some are scores rather than policies, so the projection to action probabilities
 is explicit here and never changes regression fitting or its saved features.
 """
@@ -90,18 +90,36 @@ def _check_inputs(config, partition, features, bundle) -> None:
         or bundle.get("compatibility", {}).get("heldout_session_id") != heldout
     ):
         raise ValueError("Predictor training/held-out sessions do not match")
-    candidate = bundle.get("mlmdp_candidate", {})
-    candidate_compatibility = candidate.get("compatibility", {})
-    if (
-        candidate.get("status") != "success"
-        or candidate.get("validation_session_id") is not None
-        or candidate_compatibility.get("partition") != identity
-        or candidate_compatibility.get("partition_digest") != partition.digest
-        or candidate_compatibility.get("training_session_ids") != training
-        or candidate_compatibility.get("candidate_role") != "all_training"
-        or heldout in training
-    ):
-        raise ValueError("Hierarchy predictions do not come from this held-out fit")
+    from andrew_mlmdp.regression_execution import bundle_mlmdp_candidates
+    from andrew_mlmdp.regression_workflow import (
+        BEHAVIORAL_MLMDP,
+        MLMDP_PREDICTOR_NAMES,
+    )
+
+    candidates = bundle_mlmdp_candidates(bundle)
+    if set(candidates) != set(config.predictors.names) & MLMDP_PREDICTOR_NAMES:
+        raise ValueError("Bundle MLMDP candidates differ from configured predictors")
+    for name, candidate in candidates.items():
+        candidate_compatibility = candidate.get("compatibility", {})
+        # NMF all-training candidates and behavioral refits mark their role
+        # differently; both must be fitted on exactly the training sessions.
+        role_ok = (
+            candidate_compatibility.get("role") == "refit"
+            if name == BEHAVIORAL_MLMDP
+            else candidate_compatibility.get("candidate_role") == "all_training"
+        )
+        if (
+            candidate.get("status") != "success"
+            or candidate.get("validation_session_id") is not None
+            or candidate_compatibility.get("partition") != identity
+            or candidate_compatibility.get("partition_digest") != partition.digest
+            or candidate_compatibility.get("training_session_ids") != training
+            or not role_ok
+            or heldout in training
+        ):
+            raise ValueError(
+                f"{name} predictions do not come from this held-out fit"
+            )
     if bundle.get("route", {}).get("family") != config.predictors.route_family:
         raise ValueError("Route family differs from the configuration")
     if np.asarray(bundle.get("habit_counts")).shape != (196,):
@@ -109,8 +127,17 @@ def _check_inputs(config, partition, features, bundle) -> None:
 
 
 def _check_hierarchy_vectors(features, bundle, names, values) -> None:
-    """Audit the one external predictor against its fitted held-out table."""
-    candidate = bundle["mlmdp_candidate"]
+    """Audit every external MLMDP predictor against its fitted held-out table."""
+    from andrew_mlmdp.regression_execution import bundle_mlmdp_candidates
+
+    candidates = bundle_mlmdp_candidates(bundle)
+    if not set(candidates) <= set(names):
+        raise ValueError("Bundle MLMDP predictors are not configured predictors")
+    for name, candidate in candidates.items():
+        _check_one_hierarchy_vector(features, candidate, names.index(name), values)
+
+
+def _check_one_hierarchy_vector(features, candidate, index, values) -> None:
     columns = candidate.get("prediction_columns")
     rows = candidate.get("heldout_predictions")
     if not isinstance(columns, list) or not isinstance(rows, list):
@@ -127,7 +154,7 @@ def _check_hierarchy_vectors(features, bundle, names, values) -> None:
     if len(keys) != len(set(keys)) or set(keys) != set(predictions):
         raise ValueError("Hierarchy decision keys do not match regression features")
     expected = np.asarray([predictions[key] for key in keys], dtype=np.float32)
-    actual = values[:, :, names.index("hierarchical_mlmdp")]
+    actual = values[:, :, index]
     # Qin's external regressor is explicitly cast to float32 before stacking.
     if not np.array_equal(actual, expected.astype(np.float64)):
         raise ValueError("Hierarchy action vectors differ from regression features")
@@ -192,15 +219,17 @@ def compute_overlap(
 ):
     """Compute policy and observed-behavior overlap on common-valid movements."""
     names = tuple(predictor_names)
-    if len(names) != 8 or "vector" not in names or "hierarchical_mlmdp" not in names:
-        raise ValueError("Overlap requires the eight configured regression predictors")
+    from andrew_mlmdp.regression_workflow import MLMDP_PREDICTOR_NAMES
+
+    if "vector" not in names or not set(names) & MLMDP_PREDICTOR_NAMES:
+        raise ValueError("Overlap requires the configured regression predictors")
     values = np.asarray(features["predictor_action_values"], dtype=np.float64)
     mask = np.asarray(features["impossible_action_mask"], dtype=np.float64)
     actions = np.asarray(features["responses"], dtype=np.int64)
     keys = features["decision_keys"]
     if (
         values.ndim != 3
-        or values.shape[1:] != (4, 8)
+        or values.shape[1:] != (4, len(names))
         or mask.shape != values.shape[:2]
         or actions.shape != (len(values),)
         or len(keys) != len(values)

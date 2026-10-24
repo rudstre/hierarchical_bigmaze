@@ -300,7 +300,16 @@ def lattice_progress(root, manifest):
         "completed": completed,
         "successful": successful,
         "failed": failed,
-        "total": 255 * len(manifest["partitions"]),
+        "total": (
+            2
+            ** len(
+                regression_config_from_payload(
+                    manifest["configuration"], ROOT
+                ).predictors.names
+            )
+            - 1
+        )
+        * len(manifest["partitions"]),
         "missing_features": sum(
             not (
                 root / "partitions" / item["partition_digest"] / "features.json"

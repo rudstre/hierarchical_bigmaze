@@ -21,10 +21,14 @@ from andrew_mlmdp.validation import _payload_digest
 ROOT = Path(__file__).parents[1]
 
 
-def test_lattice_contains_every_nonempty_subset_once():
-    names = PredictorConfig().names
+@pytest.mark.parametrize(
+    "mlmdps", [("hierarchical_mlmdp",), ("behavioral_mlmdp", "hierarchical_mlmdp")]
+)
+def test_lattice_contains_every_nonempty_subset_once(mlmdps):
+    names = PredictorConfig(mlmdp_predictors=mlmdps).names
     grid = predictor_subsets(names)
-    assert len(grid) == 255 == sum(comb(8, k) for k in range(1, 9))
+    n = len(names)
+    assert len(grid) == 2**n - 1 == sum(comb(n, k) for k in range(1, n + 1))
     assert len(set(grid)) == len(grid)
     assert grid[0] == (names[0],)
     assert grid[-1] == names

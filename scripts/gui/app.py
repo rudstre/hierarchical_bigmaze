@@ -26,7 +26,7 @@ import andrew_mlmdp.regression_reporting as regression_reporting  # noqa: E402
 
 # Streamlit can rerun this file while retaining an older imported reporting
 # module. Reload only when the app and cached module disagree on this API.
-if any(
+if not hasattr(regression_reporting, "make_behavioral_rank_figure") or any(
     "show_significance" not in inspect.signature(maker).parameters
     for maker in (
         regression_reporting.make_regression_figure,
@@ -56,6 +56,8 @@ from andrew_mlmdp.regression_policy_overlap import pool_overlap  # noqa: E402
 from andrew_mlmdp.regression_reporting import (  # noqa: E402
     make_absolute_accuracy_figure,
     make_absolute_log_likelihood_figure,
+    make_behavioral_rank_figure,
+    make_behavioral_theta_figure,
     make_learning_curve_accuracy_figure,
     make_learning_curve_figure,
     make_regression_accuracy_figure,
@@ -208,6 +210,26 @@ if root is None:
             high = c3.number_input(
                 "Maximum rank", min_value=2, max_value=49, value=rank[1]
             )
+            mlmdp = payload.get("mlmdp", {})
+            also_nmf = st.checkbox(
+                "Also fit NMF MLMDP (both enter the regression)",
+                value="nmf" in mlmdp.get("profile_sources", ["behavioral"]),
+            )
+            theta_search = st.radio(
+                "θ search",
+                ["Coarse grid", "Coarse + fine grid"],
+                index=int(
+                    mlmdp.get("behavioral", {}).get(
+                        "theta_search", mlmdp.get("theta_search", "coarse")
+                    )
+                    == "coarse_and_local"
+                ),
+                horizontal=True,
+            )
+            st.caption(
+                "Behavioral θ and K use inner held-out sessions. Auto route counts "
+                "follow the behavioral K when both MLMDPs are enabled."
+            )
             route = c1.selectbox(
                 "Route family",
                 ["pca", "hmm"],
@@ -305,6 +327,16 @@ if root is None:
             if heldout != "explicit in JSON":
                 updated["heldout_sessions"] = heldout
             updated["subgoal_selection"]["rank_range"] = [int(low), int(high)]
+            behavioral_settings = dict(mlmdp.get("behavioral", {}))
+            behavioral_settings["theta_search"] = (
+                "coarse" if theta_search == "Coarse grid" else "coarse_and_local"
+            )
+            updated["mlmdp"] = {
+                "profile_sources": ["behavioral", "nmf"]
+                if also_nmf
+                else ["behavioral"],
+                "behavioral": behavioral_settings,
+            }
             updated["predictors"]["route_family"] = route
             hmm_settings = updated["predictors"].setdefault("hmm", {})
             for name, value in (
@@ -369,6 +401,11 @@ if root is None:
             )
         )
         st.dataframe(resource_plan["rows"], hide_index=True, width="stretch")
+        if resource_plan.get("behavioral_calibrated") is False:
+            st.caption(
+                "Behavioral cell resources are provisional: 1 CPU, 8 GB, 12 h; "
+                "the real-data timing pilot is still pending."
+            )
         if not resource_plan["launchable"]:
             st.error(resource_plan["launch_block_reason"])
     if st.button("Preview training and evaluation sessions"):
@@ -382,7 +419,9 @@ if root is None:
         )
         st.json(st.session_state.preview_manifest["unavailable_partitions"])
     run_id = st.text_input("New run ID")
-    no_lattice = st.checkbox("Skip the 255-combination lattice", value=False)
+    no_lattice = st.checkbox(
+        "Skip the all-subsets predictor lattice (2^n - 1 regressions)", value=False
+    )
     if st.button(
         "Launch workflow",
         type="primary",
@@ -621,6 +660,8 @@ if page == "Results":
         for p in partitions
     }
     views = ["Predictor combinations", "Policy overlap", "Original reports"]
+    if config.behavioral:
+        views.append("Behavioral MLMDP")
     if config.predictors.route_family == "hmm":
         views.append("HMM routes")
     analysis_view = st.segmented_control(
@@ -644,6 +685,31 @@ if page == "Results":
     scope_key = (
         "all_decisions" if scope.startswith("All") else "three_or_four_valid_actions"
     )
+    if analysis_view == "Behavioral MLMDP":
+        st.subheader("Behavioral subgoal and θ selection")
+        if not selected_digests:
+            st.info("Select a subject and session to view its selection.")
+        else:
+            digest = st.selectbox(
+                "Predictor partition", selected_digests, format_func=lambda d: labels[d]
+            )
+            directory = root / "partitions" / digest / "behavioral"
+            selection_path = directory / "selection.json"
+            if not selection_path.is_file():
+                st.info("The coarse selection is not available yet.")
+            else:
+                selection = read_json(selection_path)
+                st.write("Selection status:", selection["status"])
+                st.plotly_chart(make_behavioral_rank_figure(selection), width="stretch")
+                if selection["status"] == "selected":
+                    final_path = directory / "final_selection.json"
+                    final = read_json(final_path) if final_path.is_file() else None
+                    st.plotly_chart(
+                        make_behavioral_theta_figure(selection, final), width="stretch"
+                    )
+                    st.json((final or selection)["selection"])
+                with st.expander("All cells and failure records"):
+                    st.json(selection["theta_rows"])
     if analysis_view == "Predictor combinations":
         if config.regression_cv.method != "blocked_trial_kfold":
             st.info("Predictor combinations require a k-fold workflow.")
@@ -673,9 +739,7 @@ if page == "Results":
                 @st.fragment(run_every="5s")
                 def live_lattice_progress():
                     current = show_error(access.lattice_progress, root, manifest)
-                    if current and (
-                        current["job_ids"] or current["completed"]
-                    ):
+                    if current and (current["job_ids"] or current["completed"]):
                         st.progress(
                             current["completed"] / current["total"],
                             text=(
@@ -716,8 +780,7 @@ if page == "Results":
                             submitted = show_error(access.submit_lattice_backfill, root)
                             if submitted is not None:
                                 st.success(
-                                    "Submitted SLURM jobs: "
-                                    + ", ".join(submitted)
+                                    "Submitted SLURM jobs: " + ", ".join(submitted)
                                 )
                                 st.rerun()
             with st.expander("Saved fit attempt"):
@@ -1037,8 +1100,7 @@ if page == "Results":
                 )
         if pooled and pooled["status"] != "complete":
             st.code(
-                "python scripts/run_regression_analysis.py overlap "
-                f"--output-dir {root}"
+                f"python scripts/run_regression_analysis.py overlap --output-dir {root}"
             )
     if analysis_view == "Original reports":
         reports = [

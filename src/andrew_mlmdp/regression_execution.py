@@ -196,12 +196,53 @@ def _fit_route_and_habit(
     }
 
 
+def bundle_mlmdp_candidates(bundle: Mapping[str, object]) -> dict[str, object]:
+    """MLMDP candidate per predictor name; historical bundles hold only NMF."""
+    if "mlmdp_candidates" in bundle:
+        return dict(bundle["mlmdp_candidates"])
+    return {"hierarchical_mlmdp": bundle["mlmdp_candidate"]}
+
+
 def _predictor_compatibility(config, partition, candidate, route_rows, route_settings):
     from andrew_mlmdp.regression_workflow import (
         _stage_source,
         compatibility_signatures,
     )
 
+    if config.mlmdp is not None:
+        candidates = candidate
+        return {
+            "artifact_type": "heldout_predictor_bundle",
+            "partition": _json_value(partition.metadata()),
+            "partition_digest": partition.digest,
+            "training_session_ids": _json_value(list(partition.training_session_ids)),
+            "heldout_session_id": _json_value(partition.heldout_session_id),
+            "selected_k": {name: int(c["k"]) for name, c in candidates.items()},
+            "candidate_digest": {
+                name: _payload_digest(c) for name, c in candidates.items()
+            },
+            "predictor_signature": compatibility_signatures(config)["predictor"],
+            "route_family": config.predictors.route_family,
+            "route_settings_specification": config.predictors.selected_route_settings,
+            "route_settings": route_settings,
+            "predictor_names": list(config.predictors.names),
+            "route_training_data_digest": _payload_digest(
+                _json_value(route_rows.to_dict("records"))
+            ),
+            "source": {
+                **(
+                    {"candidate": _stage_source(config, "candidate")}
+                    if config.nmf
+                    else {}
+                ),
+                **(
+                    {"behavioral": _stage_source(config, "behavioral")}
+                    if config.behavioral
+                    else {}
+                ),
+                "feature_builders": _stage_source(config, "feature"),
+            },
+        }
     return {
         "artifact_type": "heldout_predictor_bundle",
         "partition": _json_value(partition.metadata()),
@@ -234,7 +275,10 @@ def run_predictor_bundle(
     force: bool = False,
 ) -> dict[str, object]:
     """Fit MLMDP, the selected route family, and habit once per partition."""
+    from andrew_mlmdp.regression_behavioral import run_behavioral_refit
     from andrew_mlmdp.regression_workflow import (
+        BEHAVIORAL_MLMDP,
+        NMF_MLMDP,
         aggregate_partition,
         load_candidate_records,
         run_candidate_fit,
@@ -242,35 +286,55 @@ def run_predictor_bundle(
 
     root = Path(output_dir).resolve()
     destination = root / "partitions" / partition.digest / "predictor.json"
-    selection = aggregate_partition(config, root, partition)
-    if selection["status"] != "selected":
-        return {"status": selection["status"], "partition_digest": partition.digest}
-    selected_k = int(selection["selection"]["selected_k"])
-    if config.subgoal_selection.method == "session_cv":
-        candidate = run_candidate_fit(
-            config,
-            root,
-            partition,
-            k=selected_k,
-            validation_session_id=None,
-            force=force,
-        )
-    else:
-        candidate = next(
-            record
-            for record in load_candidate_records(config, root, partition)
-            if int(record["k"]) == selected_k
-        )
-    if candidate["status"] != "success":
-        return {
-            "status": candidate["status"],
-            "partition_digest": partition.digest,
-        }
+    candidates: dict[str, dict[str, object]] = {}
+    selections: dict[str, object] = {}
+    if config.nmf:
+        selection = aggregate_partition(config, root, partition)
+        if selection["status"] != "selected":
+            return {"status": selection["status"], "partition_digest": partition.digest}
+        selected_k = int(selection["selection"]["selected_k"])
+        if config.subgoal_selection.method == "session_cv":
+            candidate = run_candidate_fit(
+                config,
+                root,
+                partition,
+                k=selected_k,
+                validation_session_id=None,
+                force=force,
+            )
+        else:
+            candidate = next(
+                record
+                for record in load_candidate_records(config, root, partition)
+                if int(record["k"]) == selected_k
+            )
+        if candidate["status"] != "success":
+            return {
+                "status": candidate["status"],
+                "partition_digest": partition.digest,
+            }
+        candidates[NMF_MLMDP] = candidate
+        selections[NMF_MLMDP] = selection["selection"]
+    if config.behavioral:
+        refit = run_behavioral_refit(config, root, partition, force=force)
+        if refit["status"] != "success":
+            return {"status": refit["status"], "partition_digest": partition.digest}
+        candidates[BEHAVIORAL_MLMDP] = refit
+        selections[BEHAVIORAL_MLMDP] = refit["selection"]
 
-    route_settings = config.predictors.resolved_route_settings(selected_k)
+    # Rank-aware ("auto") route counts follow the behavioral rank when it is
+    # fitted, otherwise the NMF rank.
+    route_k = int(
+        candidates[BEHAVIORAL_MLMDP if config.behavioral else NMF_MLMDP]["k"]
+    )
+    route_settings = config.predictors.resolved_route_settings(route_k)
     _, route_rows = _route_training_table(config, partition)
     compatibility = _predictor_compatibility(
-        config, partition, candidate, route_rows, route_settings
+        config,
+        partition,
+        candidates if config.mlmdp is not None else candidates[NMF_MLMDP],
+        route_rows,
+        route_settings,
     )
     if destination.is_file() and not force:
         from andrew_mlmdp.regression_workflow import _read_json
@@ -328,18 +392,30 @@ def run_predictor_bundle(
         _atomic_write_json(destination, payload)
         return payload
 
+    if config.mlmdp is None:
+        # Historical layout, unchanged so existing bundles remain reusable.
+        mlmdp_fields = {
+            "selection": selections[NMF_MLMDP],
+            "selected_k": route_k,
+            "mlmdp_candidate": candidates[NMF_MLMDP],
+        }
+    else:
+        mlmdp_fields = {
+            "selection": selections,
+            "selected_k": {name: int(c["k"]) for name, c in candidates.items()},
+            "route_rank": route_k,
+            "mlmdp_candidates": candidates,
+        }
     payload = {
         "schema_version": 1,
         "artifact_type": "heldout_predictor_bundle",
         "status": "success",
         "partition": _json_value(partition.metadata()),
         "partition_digest": partition.digest,
-        "selection": selection["selection"],
-        "selected_k": selected_k,
+        **mlmdp_fields,
         "training_session_ids": _json_value(list(partition.training_session_ids)),
         "heldout_session_id": _json_value(partition.heldout_session_id),
         "compatibility": compatibility,
-        "mlmdp_candidate": candidate,
         **fitted_predictors,
         "elapsed_seconds": time.perf_counter() - started,
     }
@@ -454,7 +530,8 @@ def write_feature_artifact(
         habit=torch.tensor(bundle["habit_counts"]),
         hmm_model=route["hmm_model"],
         external_regressors={
-            "hierarchical_mlmdp": _prediction_table(bundle["mlmdp_candidate"])
+            name: _prediction_table(candidate)
+            for name, candidate in bundle_mlmdp_candidates(bundle).items()
         },
         n_components=route["n_components"],
     )
@@ -969,7 +1046,9 @@ def regression_variant_predictors(
     if variant == "combined":
         return names
     if variant == "route_only":
-        return tuple(name for name in names if name != "hierarchical_mlmdp")
+        from andrew_mlmdp.regression_workflow import MLMDP_PREDICTOR_NAMES
+
+        return tuple(name for name in names if name not in MLMDP_PREDICTOR_NAMES)
     if variant == "mlmdp_only":
         route_predictors = {
             "pca_route",

@@ -26,7 +26,8 @@ from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_di
 _PREDICTOR_STYLE = {
     "vector": ("Vector", "#D55E00"),
     "optimal": ("Optimal", "#0072B2"),
-    "hierarchical_mlmdp": ("Hierarchical MLMDP", "#E69F00"),
+    "hierarchical_mlmdp": ("Hierarchical MLMDP (NMF)", "#E69F00"),
+    "behavioral_mlmdp": ("Hierarchical MLMDP (behavioral)", "#8C510A"),
     "pca_route": ("PCA route", "#009E73"),
     "pca_route_planning": ("PCA route planning", "#CC79A7"),
     "hmm_route": ("HMM route", "#009E73"),
@@ -37,6 +38,97 @@ _PREDICTOR_STYLE = {
 }
 
 _JUNCTION_SCOPE = "valid-actions-3-4"
+
+
+def make_behavioral_rank_figure(selection):
+    """Inner-session mean ± SE at each rank's selected coarse theta."""
+    import plotly.graph_objects as go
+
+    rows = selection.get("rank_rows", [])
+    figure = go.Figure(
+        go.Scatter(
+            x=[r["k"] for r in rows],
+            y=[r.get("validation_ll_per_transition_mean") for r in rows],
+            error_y={
+                "type": "data",
+                "array": [r.get("validation_ll_per_transition_se") for r in rows],
+            },
+            mode="lines+markers",
+            name="Best coarse θ at each K",
+            connectgaps=False,
+        )
+    )
+    selected_k = selection.get("selection", {}).get("selected_k")
+    if selected_k is not None:
+        figure.add_vline(
+            x=selected_k, line_dash="dash", annotation_text=f"K*={selected_k}"
+        )
+    figure.update_layout(
+        title="Behavioral MLMDP: coarse rank selection",
+        xaxis_title="Subgoal rank K",
+        yaxis_title="Inner LL (nats/transition)",
+        meta={
+            "partition_digest": selection.get("partition_digest"),
+            "source_selection_digest": selection.get("artifact_digest"),
+        },
+    )
+    return figure
+
+
+def make_behavioral_theta_figure(selection, final_selection=None):
+    """Coarse and local theta landscape at the fixed selected rank K*."""
+    import plotly.graph_objects as go
+
+    k = selection["selection"]["selected_k"]
+    row = next(r for r in selection["theta_rows"] if r["k"] == k)
+    cells = {c["theta_cell"]: c for c in row["cells"]}
+    if final_selection and final_selection.get("theta_rows"):
+        cells.update(
+            {c["theta_cell"]: c for c in final_selection["theta_rows"][0]["cells"]}
+        )
+    eligible = [c for c in cells.values() if c["eligible"] and c["theta"] is not None]
+    figure = go.Figure(
+        go.Scatter3d(
+            x=[c["theta"][0] for c in eligible],
+            y=[c["theta"][1] for c in eligible],
+            z=[c["theta"][2] for c in eligible],
+            text=[c["theta_cell"] for c in eligible],
+            mode="markers",
+            marker={
+                "size": 6,
+                "color": [c["validation_ll_per_transition_mean"] for c in eligible],
+                "colorscale": "Viridis",
+                "colorbar": {"title": "Inner LL"},
+            },
+            name="Eligible θ cells",
+        )
+    )
+    chosen = (final_selection or selection).get("selection", {}).get("theta")
+    if chosen is not None:
+        figure.add_trace(
+            go.Scatter3d(
+                x=[chosen[0]],
+                y=[chosen[1]],
+                z=[chosen[2]],
+                mode="markers",
+                marker={"size": 10, "symbol": "diamond", "color": "red"},
+                name="Selected θ",
+            )
+        )
+    figure.update_layout(
+        title=f"Inner-session θ landscape at K*={k}",
+        scene={
+            "xaxis": {"title": "λ₁", "type": "log"},
+            "yaxis": {"title": "λ₂", "type": "log"},
+            "zaxis": {"title": "β", "type": "log"},
+        },
+        meta={
+            "partition_digest": selection.get("partition_digest"),
+            "source_selection_digest": selection.get("artifact_digest"),
+            "ineligible_cells": [c for c in cells.values() if not c["eligible"]],
+        },
+    )
+    return figure
 
 
 def _qin_scoring_imports(project_root):

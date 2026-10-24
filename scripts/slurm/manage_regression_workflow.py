@@ -20,9 +20,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from andrew_mlmdp.regression_behavioral import (  # noqa: E402
+    cell_path,
+    cell_tasks,
+    local_cell_tasks,
+    local_cells_for,
+)
 from andrew_mlmdp.regression_cli import _table  # noqa: E402
 from andrew_mlmdp.regression_reporting import report_stem  # noqa: E402
 from andrew_mlmdp.regression_resources import (  # noqa: E402
+    STAGES,
     resolve_resource_plan,
     resource_bands,
 )
@@ -98,6 +105,9 @@ WORKER_SOURCE_FAILURE = "Scientific worker source changed after submission"
 # Artifact files whose compatibility records carry per-stage source digests.
 _STAGE_SOURCE_ARTIFACTS = (
     "partitions/*/candidates/*/k_*.json",
+    "partitions/*/behavioral/coarse/k_*.json",
+    "partitions/*/behavioral/local/k_*.json",
+    "partitions/*/behavioral/refit.json",
     "partitions/*/predictor.json",
     "partitions/*/features.json",
     "partitions/*/regression*.json",
@@ -240,7 +250,11 @@ def _resource_bands(raw, rank_range):
 def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
     partitions = [_partition(record) for record in workflow_manifest["partitions"]]
     tasks = {
-        "discovery": [{"stage": "discovery", "k": rank} for rank in config.ranks],
+        "discovery": (
+            [{"stage": "discovery", "k": rank} for rank in config.ranks]
+            if config.nmf
+            else []
+        ),
         "candidate": [],
         "selection": [],
         "selected-refit": [],
@@ -251,6 +265,15 @@ def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
         "aggregation": [{"stage": "aggregation"}],
         "plotting": [{"stage": "plotting"}],
     }
+    if config.behavioral:
+        for stage in (
+            "behavioral-cell",
+            "behavioral-selection",
+            "behavioral-local-cell",
+            "behavioral-local-selection",
+            "behavioral-refit",
+        ):
+            tasks[stage] = []
     if include_lattice and config.regression_cv.method == "blocked_trial_kfold":
         tasks["lattice-precompute"] = [
             {"stage": "lattice-precompute", "partition_digest": p.digest}
@@ -258,18 +281,47 @@ def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
         ]
     for partition in partitions:
         identity = {"partition_digest": partition.digest}
-        tasks["candidate"].extend(
-            {
-                "stage": "candidate",
-                **identity,
-                "k": rank,
-                "validation_session_id": validation,
-            }
-            for rank, validation in candidate_tasks(config, partition)
-        )
-        tasks["selection"].append({"stage": "selection", **identity})
-        if config.subgoal_selection.method == "session_cv":
-            tasks["selected-refit"].append({"stage": "selected-refit", **identity})
+        if config.behavioral:
+            tasks["behavioral-cell"].extend(
+                {
+                    "stage": "behavioral-cell",
+                    **identity,
+                    "k": k,
+                    "validation_session_id": session,
+                    "theta_cell": cell,
+                }
+                for k, session, cell in cell_tasks(config, partition)
+            )
+            tasks["behavioral-selection"].append(
+                {"stage": "behavioral-selection", **identity}
+            )
+            tasks["behavioral-local-cell"].extend(
+                {
+                    "stage": "behavioral-local-cell",
+                    **identity,
+                    "validation_session_id": session,
+                    "local_index": index,
+                }
+                for session, index in local_cell_tasks(config, partition)
+            )
+            if config.mlmdp.theta_search == "coarse_and_local":
+                tasks["behavioral-local-selection"].append(
+                    {"stage": "behavioral-local-selection", **identity}
+                )
+            tasks["behavioral-refit"].append({"stage": "behavioral-refit", **identity})
+        if config.nmf:
+            tasks["candidate"].extend(
+                {
+                    "stage": "candidate",
+                    **identity,
+                    "k": rank,
+                    "validation_session_id": validation,
+                }
+                for rank, validation in candidate_tasks(config, partition)
+            )
+            tasks["selection"].append({"stage": "selection", **identity})
+            if config.subgoal_selection.method == "session_cv":
+                tasks["selected-refit"].append({"stage": "selected-refit", **identity})
         for stage in (
             "predictor-bundle",
             "feature-generation",
@@ -277,7 +329,7 @@ def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
             "policy-overlap",
         ):
             tasks[stage].append({"stage": stage, **identity})
-    return tasks
+    return {stage: tasks[stage] for stage in STAGES if stage in tasks}
 
 
 def _task_path(run_dir, stage, label, attempt):
@@ -476,12 +528,13 @@ def _artifact_state(
             return "missing"
         index = _read(path)
         entries = index.get("entries", [])
+        size = 2 ** len(config.predictors.names) - 1
         complete = (
             index.get("all_attempted")
-            and index.get("expected") == 255
-            and index.get("completed") == 255
-            and len(entries) == 255
-            and len({tuple(e["predictor_names"]) for e in entries}) == 255
+            and index.get("expected") == size
+            and index.get("completed") == size
+            and len(entries) == size
+            and len({tuple(e["predictor_names"]) for e in entries}) == size
         )
         return "success" if complete else "pending"
     if stage == "discovery":
@@ -491,6 +544,54 @@ def _artifact_state(
             else config.resolve_path(config.dataset.data_root) / "nmf_bases"
         )
         path = directory / f"k_{task['k']:02d}.json"
+    elif stage in {"behavioral-cell", "behavioral-local-cell"}:
+        manifest = (
+            _read(run_dir / "manifest.json")
+            if workflow_manifest is None
+            else workflow_manifest
+        )
+        record = next(
+            item
+            for item in manifest["partitions"]
+            if item["partition_digest"] == digest
+        )
+        partition = _partition(record)
+        if stage == "behavioral-cell":
+            path = cell_path(
+                run_dir,
+                partition,
+                "coarse",
+                task["k"],
+                task["validation_session_id"],
+                task["theta_cell"],
+            )
+        else:
+            selection_path = partition_dir / "behavioral/selection.json"
+            if not selection_path.is_file():
+                return "missing"
+            selection = _read(selection_path)
+            if selection.get("status") != "selected":
+                return "pending" if selection.get("status") == "pending" else "blocked"
+            cells = list(local_cells_for(selection, config))
+            path = cell_path(
+                run_dir,
+                partition,
+                "local",
+                int(selection["selection"]["selected_k"]),
+                task["validation_session_id"],
+                cells[task["local_index"]],
+            )
+    elif stage in {
+        "behavioral-selection",
+        "behavioral-local-selection",
+        "behavioral-refit",
+    }:
+        filename = {
+            "behavioral-selection": "selection.json",
+            "behavioral-local-selection": "final_selection.json",
+            "behavioral-refit": "refit.json",
+        }[stage]
+        path = partition_dir / "behavioral" / filename
     elif stage == "candidate":
         manifest = (
             _read(run_dir / "manifest.json")
@@ -524,7 +625,9 @@ def _artifact_state(
             return "missing"
         selected = _read(selection).get("selection", {}).get("selected_k")
         if selected is None:
-            return "blocked"
+            return (
+                "pending" if _read(selection).get("status") == "pending" else "blocked"
+            )
         path = _candidate_path(run_dir, _partition(record), int(selected), None)
     elif stage == "selection":
         path = partition_dir / "selection.json"
@@ -744,12 +847,14 @@ def _stage_state(artifacts, scheduler, submissions):
 
 def _status_report(states, manager, *, scheduler_records=None):
     records = (
-        _scheduler_records(manager)
-        if scheduler_records is None
-        else scheduler_records
+        _scheduler_records(manager) if scheduler_records is None else scheduler_records
     )
     stages = {}
     for stage, artifact_counter in states.items():
+        if not sum(artifact_counter.values()):
+            # Disabled sources and the unused local grid have no tasks; they
+            # must not keep a successfully completed workflow pending.
+            continue
         submissions = [
             item for item in manager["submissions"] if item["stage"] == stage
         ]
@@ -893,9 +998,7 @@ def _resource_plan_for_submission(manager, config, raw):
         return _legacy_resource_plan(manager, config, raw)
     plan = resolve_resource_plan(config, raw["slurm"])
     if manager.get("lattice_resources"):
-        plan["stages"]["lattice-precompute"].update(
-            manager["lattice_resources"]
-        )
+        plan["stages"]["lattice-precompute"].update(manager["lattice_resources"])
     return plan
 
 
@@ -969,8 +1072,42 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
         candidate_jobs,
         dry_run=dry_run,
     )
+    if tasks["selected-refit"]:
+        dependency = (
+            _submit_group(
+                manager,
+                manager_path,
+                "selected-refit",
+                tasks["selected-refit"],
+                stages["selected-refit"],
+                dependency,
+                dry_run=dry_run,
+            )
+            or dependency
+        )
+    nmf_dependency = dependency or candidate_jobs
+    behavioral_dependency = []
+    if config.behavioral:
+        for stage in (
+            "behavioral-cell",
+            "behavioral-selection",
+            "behavioral-local-cell",
+            "behavioral-local-selection",
+            "behavioral-refit",
+        ):
+            jobs = _submit_group(
+                manager,
+                manager_path,
+                stage,
+                tasks[stage],
+                stages[stage],
+                behavioral_dependency,
+                dry_run=dry_run,
+            )
+            if jobs:
+                behavioral_dependency = jobs
+    dependency = [*nmf_dependency, *behavioral_dependency]
     for stage in (
-        "selected-refit",
         "predictor-bundle",
         "feature-generation",
         "regression",

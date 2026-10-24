@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -61,6 +61,13 @@ _HMM_REGRESSORS = (
     "forward",
     "reverse",
 )
+# MLMDP predictor names by subgoal-profile source. "hierarchical_mlmdp" keeps
+# its historical meaning (NMF-basis profiles) so earlier artifacts stay
+# correctly labelled; behavior-fitted profiles enter as "behavioral_mlmdp".
+NMF_MLMDP = "hierarchical_mlmdp"
+BEHAVIORAL_MLMDP = "behavioral_mlmdp"
+MLMDP_PREDICTORS = {"behavioral": BEHAVIORAL_MLMDP, "nmf": NMF_MLMDP}
+MLMDP_PREDICTOR_NAMES = frozenset(MLMDP_PREDICTORS.values())
 
 
 def _rank_range(value: Sequence[int]) -> tuple[int, int]:
@@ -156,6 +163,70 @@ class RegressionCVConfig:
 
 
 @dataclass(frozen=True)
+class MLMDPConfig:
+    """Which hierarchical MLMDP predictors are fitted, and how.
+
+    ``profile_sources`` lists the subgoal-profile sources, each giving one
+    MLMDP predictor: ``behavioral`` (profiles fitted to behavior per theta
+    cell, ``hierarchy/behavioral_profiles.py``) and ``nmf`` (the precomputed
+    NMF bases). ``theta_search`` is ``coarse`` (theta chosen on the coarse
+    grid) or ``coarse_and_local`` (then refined on the local grid at the
+    selected rank). ``behavioral`` overrides ``BehavioralFitSettings``.
+    """
+
+    profile_sources: tuple[str, ...] = ("behavioral",)
+    theta_search: Literal["coarse", "coarse_and_local"] = "coarse"
+    behavioral: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        sources = tuple(self.profile_sources)
+        if (
+            not sources
+            or len(set(sources)) != len(sources)
+            or not set(sources) <= set(MLMDP_PREDICTORS)
+        ):
+            raise ValueError(
+                "mlmdp.profile_sources must be a non-empty subset of "
+                "['behavioral', 'nmf']"
+            )
+        # Canonical order: predictor order must not depend on list order.
+        object.__setattr__(
+            self,
+            "profile_sources",
+            tuple(source for source in MLMDP_PREDICTORS if source in sources),
+        )
+        if self.theta_search not in {"coarse", "coarse_and_local"}:
+            raise ValueError(
+                "mlmdp.theta_search must be 'coarse' or 'coarse_and_local'"
+            )
+        object.__setattr__(self, "behavioral", dict(self.behavioral))
+        self.settings  # validates the overrides
+
+    @property
+    def settings(self):
+        from andrew_mlmdp.hierarchy.behavioral_profiles import BehavioralFitSettings
+
+        try:
+            return BehavioralFitSettings(**self.behavioral)
+        except TypeError as error:
+            raise ValueError(f"Unknown mlmdp.behavioral setting: {error}") from error
+
+    @property
+    def predictor_names(self) -> tuple[str, ...]:
+        return tuple(MLMDP_PREDICTORS[source] for source in self.profile_sources)
+
+    def normalized(self) -> dict[str, object]:
+        payload: dict[str, object] = {"profile_sources": list(self.profile_sources)}
+        if "behavioral" in self.profile_sources:
+            # Resolved settings, so the record does not depend on code defaults.
+            payload["behavioral"] = {
+                "theta_search": self.theta_search,
+                **self.settings.as_dict(),
+            }
+        return payload
+
+
+@dataclass(frozen=True)
 class PredictorConfig:
     """The one route family fitted for each predictor-training partition."""
 
@@ -223,9 +294,17 @@ class PredictorConfig:
             )
             raise ValueError(f"predictors.{name} must be {range_description} or 'auto'")
 
+    # Set by RegressionWorkflowConfig from its ``mlmdp`` block and recorded
+    # there; excluded from the predictors payload (see normalized_payload).
+    mlmdp_predictors: tuple[str, ...] = (NMF_MLMDP,)
+
     @property
     def names(self) -> tuple[str, ...]:
-        return _PCA_REGRESSORS if self.route_family == "pca" else _HMM_REGRESSORS
+        base = _PCA_REGRESSORS if self.route_family == "pca" else _HMM_REGRESSORS
+        names: list[str] = []
+        for name in base:
+            names.extend(self.mlmdp_predictors if name == NMF_MLMDP else (name,))
+        return tuple(names)
 
     @property
     def selected_route_settings(self) -> dict[str, object]:
@@ -258,6 +337,9 @@ class RegressionWorkflowConfig:
     predictors: PredictorConfig = PredictorConfig()
     random_seed: int = 123
     discovery_dir: str | None = None
+    # None is the historical NMF-only workflow; it is omitted from the
+    # normalized payload so earlier run signatures are unchanged.
+    mlmdp: MLMDPConfig | None = None
     project_root: Path = Path.cwd()
     source_path: Path | None = None
 
@@ -302,6 +384,29 @@ class RegressionWorkflowConfig:
             or self.random_seed < 0
         ):
             raise ValueError("random_seed must be a non-negative integer")
+        mlmdp_predictors = (
+            (NMF_MLMDP,) if self.mlmdp is None else self.mlmdp.predictor_names
+        )
+        object.__setattr__(
+            self,
+            "predictors",
+            replace(self.predictors, mlmdp_predictors=mlmdp_predictors),
+        )
+        if self.behavioral and self.subgoal_selection.method == "training_ll":
+            # Theta is chosen on held-out inner sessions; training LL favours
+            # collapsed control costs (docs/model.md, behavior-fitted profiles).
+            raise ValueError(
+                "behavioral MLMDP profiles require subgoal_selection.method "
+                "session_cv or fixed"
+            )
+
+    @property
+    def behavioral(self) -> bool:
+        return self.mlmdp is not None and "behavioral" in self.mlmdp.profile_sources
+
+    @property
+    def nmf(self) -> bool:
+        return self.mlmdp is None or "nmf" in self.mlmdp.profile_sources
 
     def resolve_path(self, value: str) -> Path:
         path = Path(value)
@@ -338,8 +443,15 @@ class RegressionWorkflowConfig:
                     if value is not None
                 }
             ),
-            "predictors": _json_value(asdict(self.predictors)),
+            "predictors": _json_value(
+                {
+                    key: value
+                    for key, value in asdict(self.predictors).items()
+                    if key != "mlmdp_predictors"
+                }
+            ),
             "random_seed": self.random_seed,
+            **({} if self.mlmdp is None else {"mlmdp": self.mlmdp.normalized()}),
         }
 
     @property
@@ -375,7 +487,7 @@ def regression_config_from_payload(payload, project_root, *, source_path=None):
         "predictors",
         "random_seed",
     }
-    optional = {"discovery_dir", "slurm"}
+    optional = {"discovery_dir", "slurm", "mlmdp"}
     if not isinstance(payload, dict) or set(payload) - optional != required:
         if isinstance(payload, dict) and (
             {"ranks", "rank_min", "rank_max"} & set(payload)
@@ -388,6 +500,16 @@ def regression_config_from_payload(payload, project_root, *, source_path=None):
         raise ValueError(
             "Unsupported regression-workflow schema version; migrate the configuration"
         )
+    mlmdp = payload.get("mlmdp")
+    if mlmdp is not None:
+        mlmdp = dict(mlmdp)
+        behavioral = dict(mlmdp.get("behavioral", {}))
+        if "theta_search" in behavioral:
+            search = behavioral.pop("theta_search")
+            if "theta_search" in mlmdp and mlmdp["theta_search"] != search:
+                raise ValueError("Conflicting mlmdp theta_search settings")
+            mlmdp["theta_search"] = search
+        mlmdp["behavioral"] = behavioral
     config = RegressionWorkflowConfig(
         dataset=RegressionDatasetConfig(
             **{
@@ -417,6 +539,7 @@ def regression_config_from_payload(payload, project_root, *, source_path=None):
         regression_cv=RegressionCVConfig(**payload["regression_cv"]),
         predictors=PredictorConfig(**payload["predictors"]),
         random_seed=payload["random_seed"],
+        mlmdp=(None if "mlmdp" not in payload else MLMDPConfig(**mlmdp)),
         project_root=project_root,
         source_path=source_path,
     )
@@ -603,7 +726,12 @@ def build_predictor_partitions(
                 )
         for session in heldout:
             training = tuple(value for value in ordered if value != session)
-            required = 2 if config.subgoal_selection.method == "session_cv" else 1
+            # Behavioral theta is chosen by inner LOSO even at a fixed rank.
+            required = (
+                2
+                if config.subgoal_selection.method == "session_cv" or config.behavioral
+                else 1
+            )
             if len(training) < required:
                 unavailable[f"{subject}/{session}"] = (
                     f"requires at least {required} predictor-training sessions"
@@ -1016,6 +1144,7 @@ def _stage_source(config: RegressionWorkflowConfig, stage: str) -> dict[str, obj
         "feature": (
             "src/andrew_mlmdp/regression_execution.py",
             "src/andrew_mlmdp/doohan_canonical.py",
+            "external/qin_route_model/fixed_maze_analysis/src/regressionhelper/constants.py",
             "external/qin_route_model/lowrank_lmdp/src/lowrank_lmdp/model.py",
             "external/qin_route_model/fixed_maze_analysis/src/regressionhelper/regressor_building_funcs.py",
             "external/qin_route_model/fixed_maze_analysis/src/pcahelper/pca_generation_funcs.py",
@@ -1026,8 +1155,29 @@ def _stage_source(config: RegressionWorkflowConfig, stage: str) -> dict[str, obj
             "external/qin_route_model/fixed_maze_analysis/src/mazehelper/optimal_policy.py",
             "external/qin_route_model/fixed_maze_analysis/src/mazehelper/transition_matrix_functions.py",
         ),
+        "behavioral": (
+            "src/andrew_mlmdp/regression_behavioral.py",
+            "src/andrew_mlmdp/regression_workflow.py",
+            "src/andrew_mlmdp/workflow_fitting.py",
+            "src/andrew_mlmdp/maze.py",
+            "src/andrew_mlmdp/hierarchy/behavioral_profiles.py",
+            "src/andrew_mlmdp/hierarchy/subgoal_search.py",
+            "src/andrew_mlmdp/hierarchy/profile_fitting.py",
+            "src/andrew_mlmdp/hierarchy/prediction.py",
+            "src/andrew_mlmdp/hierarchy/likelihood.py",
+            "src/andrew_mlmdp/hierarchy/fitting.py",
+            "src/andrew_mlmdp/hierarchy/model.py",
+            "src/andrew_mlmdp/hierarchy/equations.py",
+            "src/andrew_mlmdp/nested_validation.py",
+            "src/andrew_mlmdp/validation.py",
+            "src/andrew_mlmdp/dataset.py",
+            "src/andrew_mlmdp/doohan_dataset.py",
+            "src/andrew_mlmdp/doohan_canonical.py",
+            "src/andrew_mlmdp/lmdp.py",
+        ),
         "regression": (
             "src/andrew_mlmdp/regression_execution.py",
+            "external/qin_route_model/fixed_maze_analysis/src/regressionhelper/constants.py",
             "external/qin_route_model/fixed_maze_analysis/src/regressionhelper/regressor_building_funcs.py",
             "external/qin_route_model/fixed_maze_analysis/src/regressionhelper/regression_loglikelihood_funcs.py",
         ),
@@ -1374,14 +1524,42 @@ def run_local_workflow(
     partitions, unavailable = build_predictor_partitions(table, config)
     results = []
     for partition in partitions:
-        for k, validation_session_id in candidate_tasks(config, partition):
-            fit_candidates(
-                config,
-                output_dir,
-                partition,
-                k=k,
-                validation_session_id=validation_session_id,
+        if config.nmf:
+            for k, validation_session_id in candidate_tasks(config, partition):
+                fit_candidates(
+                    config,
+                    output_dir,
+                    partition,
+                    k=k,
+                    validation_session_id=validation_session_id,
+                )
+        if config.behavioral:
+            from andrew_mlmdp.regression_behavioral import (
+                aggregate_behavioral_selection,
+                cell_tasks,
+                local_cell_tasks,
+                run_behavioral_cell,
+                run_behavioral_local_cell,
             )
+
+            for k, session, cell in cell_tasks(config, partition):
+                run_behavioral_cell(
+                    config,
+                    output_dir,
+                    partition,
+                    k=k,
+                    validation_session_id=session,
+                    theta_cell=cell,
+                )
+            aggregate_behavioral_selection(config, output_dir, partition)
+            for session, index in local_cell_tasks(config, partition):
+                run_behavioral_local_cell(
+                    config,
+                    output_dir,
+                    partition,
+                    validation_session_id=session,
+                    offset_index=index,
+                )
         run_selected_predictor(config, output_dir, partition)
         results.append(run_blocked_regression(config, output_dir, partition, table))
     from andrew_mlmdp.regression_reporting import write_regression_variant_reports

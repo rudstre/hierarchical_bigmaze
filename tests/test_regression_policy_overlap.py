@@ -474,13 +474,21 @@ def test_cli_partition_command_writes_overlap_artifact(tmp_path, monkeypatch, ca
 
 
 @pytest.mark.parametrize("family", ["pca", "hmm"])
+@pytest.mark.parametrize(
+    "mlmdps",
+    [
+        ("hierarchical_mlmdp",),
+        ("behavioral_mlmdp",),
+        ("behavioral_mlmdp", "hierarchical_mlmdp"),
+    ],
+)
 def test_overlap_uses_qin_regression_vectors_and_causal_route_beliefs(
-    family, monkeypatch, tmp_path
+    family, mlmdps, monkeypatch, tmp_path
 ):
     _prepare_qin_imports(Path(__file__).parents[1])
     from regressionhelper.regressor_building_funcs import SubjectProcessor
 
-    names = PredictorConfig(route_family=family).names
+    names = PredictorConfig(route_family=family, mlmdp_predictors=mlmdps).names
     rows = pd.DataFrame(
         {
             "subject_id": ["m2"] * 4,
@@ -555,9 +563,15 @@ def test_overlap_uses_qin_regression_vectors_and_causal_route_beliefs(
         pcs=torch.zeros((196, 1)) if family == "pca" else None,
         habit=habit,
         hmm_model=model if family == "hmm" else None,
-        external_regressors={"hierarchical_mlmdp": hierarchy},
+        external_regressors={name: hierarchy for name in mlmdps},
         n_components=1,
     )["X_t"].numpy()
+    assert design.shape == (len(rows), 4, len(names) + 2)
+    for name in mlmdps:
+        assert np.array_equal(
+            design[:, :, names.index(name) + 1],
+            hierarchy[[f"action_{a}" for a in range(4)]].to_numpy(),
+        )
     saved = {"predictor_action_values": design[..., 1:-1].tolist()}
     path = tmp_path / "feature_vectors.json"
     path.write_text(json.dumps(saved), encoding="utf-8")
@@ -617,3 +631,61 @@ def test_all_location_overlap_has_a_distinct_population():
             ],
             [*selected, {"partition_digest": "other"}],
         )
+
+
+@pytest.mark.parametrize("sources", [("behavioral",), ("behavioral", "nmf")])
+def test_overlap_audits_every_mlmdp_candidate(sources):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from andrew_mlmdp.regression_policy_overlap import (
+        _check_hierarchy_vectors,
+        _check_inputs,
+    )
+    from andrew_mlmdp.regression_workflow import BEHAVIORAL_MLMDP, MLMDPConfig
+
+    legacy = _config()
+    partition = PredictorPartition(1, "m2", "session", ("train",))
+    features, bundle = json.loads(
+        json.dumps(_artifacts(legacy, partition, one_row=True))
+    )
+    config = replace(legacy, mlmdp=MLMDPConfig(sources))
+    candidate = bundle.pop("mlmdp_candidate")
+    candidates = {}
+    original = np.asarray(features["predictor_action_values"])
+    vectors = []
+    for name in config.predictors.names:
+        if name == BEHAVIORAL_MLMDP:
+            vectors.append(
+                original[:, :, legacy.predictors.names.index("hierarchical_mlmdp")]
+            )
+        else:
+            vectors.append(original[:, :, legacy.predictors.names.index(name)])
+    values = np.stack(vectors, axis=-1)
+    for name in config.mlmdp.predictor_names:
+        candidates[name] = deepcopy(candidate)
+        if name == BEHAVIORAL_MLMDP:
+            candidates[name]["compatibility"]["role"] = "refit"
+    bundle["mlmdp_candidates"] = candidates
+    bundle["compatibility"]["predictor_signature"] = compatibility_signatures(config)[
+        "predictor"
+    ]
+    features["predictor_names"] = list(config.predictors.names)
+    features["predictor_action_values"] = values.tolist()
+    _check_inputs(config, partition, features, bundle)
+    _check_hierarchy_vectors(features, bundle, list(config.predictors.names), values)
+    overlap = compute_overlap(features, bundle, config.predictors.names)
+    assert (
+        np.asarray(overlap["overlap_matrix"]).shape
+        == (len(config.predictors.names) + 1,) * 2
+    )
+    for name in candidates:
+        corrupted = values.copy()
+        corrupted[0, 0, config.predictors.names.index(name)] += 0.1
+        with pytest.raises(ValueError, match="Hierarchy action vectors differ"):
+            _check_hierarchy_vectors(
+                features, bundle, list(config.predictors.names), corrupted
+            )
+    bundle["mlmdp_candidates"].pop(BEHAVIORAL_MLMDP)
+    with pytest.raises(ValueError, match="candidates differ"):
+        _check_inputs(config, partition, features, bundle)

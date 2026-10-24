@@ -775,3 +775,128 @@ def test_rerecord_option_is_validated(tmp_path, extra, message):
     )
     with pytest.raises(ValueError, match=message):
         manager._main(args)
+
+
+@pytest.mark.parametrize("sources", [("behavioral",), ("behavioral", "nmf")])
+@pytest.mark.parametrize("search", ["coarse", "coarse_and_local"])
+def test_behavioral_tasks_and_dependencies(sources, search, monkeypatch, tmp_path):
+    from dataclasses import replace
+
+    config = replace(_config(), mlmdp=workflow.MLMDPConfig(sources, search))
+    tasks = manager._stage_tasks(config, _workflow_manifest(), include_lattice=True)
+    assert len(tasks["behavioral-cell"]) == 2 * 3 * 3 * 36
+    assert len(tasks["behavioral-selection"]) == 2
+    assert len(tasks["behavioral-refit"]) == 2
+    assert len(tasks["behavioral-local-cell"]) == (
+        2 * 3 * 26 if search == "coarse_and_local" else 0
+    )
+    assert bool(tasks["discovery"]) == ("nmf" in sources)
+    assert bool(tasks["candidate"]) == ("nmf" in sources)
+    assert bool(tasks["selection"]) == ("nmf" in sources)
+    assert bool(tasks["selected-refit"]) == ("nmf" in sources)
+    assert all(
+        "k" not in t and "theta_cell" not in t for t in tasks["behavioral-local-cell"]
+    )
+    submitted = {}
+
+    def submit(manager_state, path, stage, stage_tasks, resources, dependency, **kw):
+        if not stage_tasks:
+            return []
+        assert kw["dry_run"]
+        submitted[stage] = list(dependency)
+        return [stage]
+
+    monkeypatch.setattr(manager, "_submit_group", submit)
+    state = {"submissions": [], "lattice_resources": {}}
+    raw = {
+        "slurm": {
+            "partition": "cpu",
+            "max_concurrent": 4,
+            "resource_bands": [
+                {"rank_range": [4, 6], "memory": "2G", "time": "01:00:00"}
+            ],
+        }
+    }
+    manager._submit_pipeline(
+        state, tmp_path / "manager.json", config, raw, tasks, dry_run=True
+    )
+    assert submitted["behavioral-cell"] == []
+    assert submitted["behavioral-selection"] == ["behavioral-cell"]
+    end = "behavioral-selection"
+    if search == "coarse_and_local":
+        assert submitted["behavioral-local-cell"] == [end]
+        assert submitted["behavioral-local-selection"] == ["behavioral-local-cell"]
+        end = "behavioral-local-selection"
+    assert submitted["behavioral-refit"] == [end]
+    assert submitted["predictor-bundle"] == (
+        ["selected-refit", "behavioral-refit"]
+        if "nmf" in sources
+        else ["behavioral-refit"]
+    )
+    assert submitted["lattice-precompute"] == ["feature-generation"]
+    assert not (tmp_path / "manager.json").exists()
+
+
+def test_worker_forwards_behavioral_cell_identity(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "behavioral_worker", ROOT / "scripts/run_regression_workflow_task.py"
+    )
+    worker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(worker)
+    monkeypatch.setattr(worker, "load_regression_workflow_config", lambda path: None)
+    commands = []
+    monkeypatch.setattr(worker, "workflow_main", lambda cmd: commands.append(cmd) or 0)
+    monkeypatch.setattr(worker, "report_progress", lambda **kw: None)
+    monkeypatch.setenv("REGRESSION_PROGRESS", str(tmp_path / "progress.json"))
+    for stage, extra in (
+        ("behavioral-cell", {"k": 6, "theta_cell": "l1_0.3_l2_0.6_b_1"}),
+        ("behavioral-local-cell", {"local_index": 0}),
+    ):
+        task = {
+            "stage": stage,
+            "partition_digest": "partition",
+            "validation_session_id": 5,
+            **extra,
+        }
+        task_path = tmp_path / "tasks.json"
+        task_path.write_text(
+            json.dumps(
+                {"artifact_type": "regression_workflow_task_list", "tasks": [task]}
+            )
+        )
+        assert (
+            worker._main(
+                [
+                    "--config",
+                    str(tmp_path / "config.json"),
+                    "--output-dir",
+                    str(tmp_path),
+                    "--stage",
+                    stage,
+                    "--task-list",
+                    str(task_path),
+                    "--task-id",
+                    "0",
+                ]
+            )
+            == 0
+        )
+        cmd = commands[-1]
+        assert cmd[cmd.index("--validation-session-json") + 1] == "5"
+        flag = "--theta-cell" if stage == "behavioral-cell" else "--local-index"
+        assert cmd[cmd.index(flag) + 1] == str(next(reversed(extra.values())))
+
+
+def test_disabled_sources_do_not_keep_the_status_pending():
+    states = {
+        'discovery': Counter(), 'candidate': Counter(),
+        'behavioral-cell': Counter(success=5),
+        'behavioral-selection': Counter(success=1),
+        'behavioral-local-cell': Counter(),
+        'behavioral-refit': Counter(success=1),
+    }
+    report = manager._status_report(states, {'submissions': []}, scheduler_records={})
+    assert report['summary'] == {
+        'state': 'COMPLETE', 'current_stage': None,
+        'completed_stages': 3, 'total_stages': 3,
+    }

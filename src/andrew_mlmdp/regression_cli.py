@@ -8,6 +8,13 @@ from pathlib import Path
 
 from andrew_mlmdp.doohan_canonical import doohan_to_canonical_decisions
 from andrew_mlmdp.doohan_dataset import DoohanDataset
+from andrew_mlmdp.regression_behavioral import (
+    aggregate_behavioral_final_selection,
+    aggregate_behavioral_selection,
+    run_behavioral_cell,
+    run_behavioral_local_cell,
+    run_behavioral_refit,
+)
 from andrew_mlmdp.regression_execution import (
     _REGRESSION_VARIANTS,
     _variant_compatibility,
@@ -42,6 +49,11 @@ _COMMANDS = (
     "candidate",
     "selection",
     "selected-refit",
+    "behavioral-cell",
+    "behavioral-selection",
+    "behavioral-local-cell",
+    "behavioral-local-selection",
+    "behavioral-refit",
     "predictor-bundle",
     "feature-generation",
     "regression",
@@ -62,6 +74,10 @@ def parser():
     result.add_argument("--partition-digest")
     result.add_argument("--k", type=int)
     result.add_argument("--validation-session-json")
+    result.add_argument("--theta-cell", help="behavioral-cell: coarse cell name")
+    result.add_argument(
+        "--local-index", type=int, help="behavioral-local-cell: neighbour 0-25"
+    )
     result.add_argument("--force", action="store_true")
     result.add_argument(
         "--json",
@@ -201,7 +217,20 @@ def _status(config, output_dir, table):
     partitions, unavailable = build_predictor_partitions(table, config)
     root = Path(output_dir).resolve()
     stages = (
-        ("selection", "selection.json"),
+        *(
+            (("selection", "selection.json"),)
+            if config.nmf
+            else ()
+        ),
+        *(
+            (
+                ("behavioral_selection", "behavioral/selection.json"),
+                ("behavioral_final_selection", "behavioral/final_selection.json"),
+                ("behavioral_refit", "behavioral/refit.json"),
+            )
+            if config.behavioral
+            else ()
+        ),
         ("predictor_bundle", "predictor.json"),
         ("features", "features.json"),
         ("regression", "regression.json"),
@@ -326,6 +355,44 @@ def main(argv=None):
                 validation_session_id=validation_session,
                 force=args.force,
             )
+        elif command == "behavioral-cell":
+            if args.k is None or args.theta_cell is None:
+                raise ValueError("behavioral-cell requires --k and --theta-cell")
+            if args.validation_session_json is None:
+                raise ValueError("behavioral-cell requires --validation-session-json")
+            result = run_behavioral_cell(
+                config,
+                args.output_dir,
+                partition,
+                k=args.k,
+                validation_session_id=json.loads(args.validation_session_json),
+                theta_cell=args.theta_cell,
+                force=args.force,
+            )
+        elif command == "behavioral-selection":
+            result = aggregate_behavioral_selection(config, args.output_dir, partition)
+        elif command == "behavioral-local-cell":
+            if args.local_index is None or args.validation_session_json is None:
+                raise ValueError(
+                    "behavioral-local-cell requires --local-index and "
+                    "--validation-session-json"
+                )
+            result = run_behavioral_local_cell(
+                config,
+                args.output_dir,
+                partition,
+                validation_session_id=json.loads(args.validation_session_json),
+                offset_index=args.local_index,
+                force=args.force,
+            )
+        elif command == "behavioral-local-selection":
+            result = aggregate_behavioral_final_selection(
+                config, args.output_dir, partition
+            )
+        elif command == "behavioral-refit":
+            result = run_behavioral_refit(
+                config, args.output_dir, partition, force=args.force
+            )
         elif command == "selection":
             result = aggregate_partition(config, args.output_dir, partition)
         elif command == "selected-refit":
@@ -377,9 +444,8 @@ def _format_result(command, result, output_dir):
     if command == "status":
         rows = result["partitions"]
         lines = [f"Workflow status: {len(rows)} partitions"]
-        for stage in (
-            "selection", "predictor_bundle", "features", "regression", "policy_overlap"
-        ):
+        stages = [key for key in rows[0] if key != "partition_digest"] if rows else []
+        for stage in stages:
             counts = {}
             for row in rows:
                 state = row[stage]

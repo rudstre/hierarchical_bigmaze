@@ -99,10 +99,19 @@ def load_features(root, expected):
 
 
 def predictor_subsets(names):
+    """Every non-empty predictor subset (2**n - 1 regressions)."""
     names = tuple(names)
-    if len(names) != 8 or len(set(names)) != 8:
-        raise ValueError("The lattice requires exactly eight distinct predictors")
-    return [subset for n in range(1, 9) for subset in itertools.combinations(names, n)]
+    if not names or len(set(names)) != len(names):
+        raise ValueError("The lattice requires distinct predictors")
+    return [
+        subset
+        for n in range(1, len(names) + 1)
+        for subset in itertools.combinations(names, n)
+    ]
+
+
+def lattice_size(names) -> int:
+    return 2 ** len(tuple(names)) - 1
 
 
 def score_regression(record, features, scope, project_root):

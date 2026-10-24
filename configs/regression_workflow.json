@@ -49,5 +49,13 @@
         "time": "04:00:00"
       }
     ]
+  },
+  "mlmdp": {
+    "profile_sources": [
+      "behavioral"
+    ],
+    "behavioral": {
+      "theta_search": "coarse"
+    }
   }
 }

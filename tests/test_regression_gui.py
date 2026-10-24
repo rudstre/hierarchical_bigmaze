@@ -65,6 +65,7 @@ def test_snapshot_survives_edit_to_original_discovery_config(tmp_path, monkeypat
 def test_streamlit_reopens_historical_run_without_original_config(tmp_path):
     streamlit = pytest.importorskip("streamlit.testing.v1")
     payload = json.loads((ROOT / "configs/regression_workflow.json").read_text())
+    payload.pop("mlmdp", None)
     payload["discovery_config"] = "/missing/historical/discovery.json"
     payload.pop("slurm")
     (tmp_path / "manifest.json").write_text(
@@ -496,3 +497,22 @@ def test_retry_with_override_passes_the_reason_to_the_manager(tmp_path, monkeypa
     ]
     with pytest.raises(ValueError, match="Only a retry"):
         access.control(tmp_path, "cancel", rerecord_reason="no")
+
+
+def test_streamlit_behavioral_defaults_and_optional_nmf():
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=30
+    ).run()
+    checkbox = next(w for w in app.checkbox if w.label.startswith("Also fit NMF"))
+    assert not checkbox.value
+    checkbox.check()
+    next(w for w in app.radio if w.label == "θ search").set_value("Coarse + fine grid")
+    next(
+        w for w in app.button if w.label == "Apply common settings to JSON"
+    ).click().run()
+    assert not app.exception
+    raw = next(w for w in app.text_area if w.label == "Configuration JSON").value
+    mlmdp = json.loads(raw)["mlmdp"]
+    assert mlmdp["profile_sources"] == ["behavioral", "nmf"]
+    assert mlmdp["behavioral"]["theta_search"] == "coarse_and_local"

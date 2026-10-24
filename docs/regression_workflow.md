@@ -10,8 +10,10 @@ contiguous whole-trial blocks define regression test folds inside that session.
 All preprocessing statistics and coefficients are fitted from the other blocks.
 
 The response is the observed four-way action. The design contains an intercept
-and four-action values for vector, optimal, hierarchical MLMDP, route, route
-planning, habit, forward, and reverse predictors. Impossible actions retain
+and four-action values for vector, optimal, the configured MLMDPs, route, route
+planning, habit, forward, and reverse predictors. New configurations use
+`behavioral_mlmdp`; optional `hierarchical_mlmdp` retains its historical NMF
+meaning. Enabling both gives nine predictors in one regression. Impossible actions retain
 Qin's exact `-1e10` additive mask. In k-fold mode, each fold fits Qin's full
 conditional-logit model, the intercept-omitted model, and one model omitting
 each predictor. Unique predictability is reduced minus full held-out mean NLL
@@ -20,9 +22,9 @@ and reports test log likelihood in nats/decision.
 
 K-fold mode runs the same ablation procedure for three prespecified predictor
 sets. The combined set contains every predictor. The route-only set removes the
-hierarchical MLMDP predictor while retaining the selected PCA or HMM route and
+configured MLMDP predictors while retaining the selected PCA or HMM route and
 route-planning predictors. The MLMDP-only set removes both route predictors
-while retaining hierarchical MLMDP. Vector, optimal, habit, forward, and
+while retaining every configured MLMDP. Vector, optimal, habit, forward, and
 reverse controls remain in all three sets.
 
 ## Configuration
@@ -38,6 +40,7 @@ for the full-model learning curve.
 - A list of `subject_id`/`session_id` records selects exactly one typed session
   per subject without JSON object-key coercion.
 - `subgoal_selection.method` is `session_cv`, `training_ll`, or `fixed`.
+  Behavioral profiles reject `training_ll`; fixed K still uses inner LOSO for θ.
 - `subgoal_selection.rank_range` is always inclusive `[lower, higher]`.
 - `predictors.route_family` is `pca` or `hmm`; the unused family's settings do
   not affect predictor compatibility.
@@ -47,7 +50,8 @@ for the full-model learning curve.
   PCA routes after positive/negative splitting.
 - `predictors.hmm.n_routes` accepts a fixed positive integer or `"auto"`.
   Here `"auto"` fits `K + 1` HMM routes. The resolved numeric route settings
-  are recorded in each predictor artifact.
+  are recorded in each predictor artifact. When behavioral profiles are enabled,
+  auto counts use behavioral K*, including when NMF is also fitted.
 - Unspecified `predictors.hmm` settings default to Qin's mouse fits: 6 routes,
   `cognitive_constant` 30, `action_cost` 0.13, `reward_value` 1,
   `action_entropy_param` 0.2, `route_entropy_param` 0, `noise` 1 decaying by
@@ -128,11 +132,119 @@ fits. The manifest stores the chronological trial sequence once and represents
 each split by its training count and block start; this compact representation
 still determines every train/test assignment exactly.
 
-`session_cv` fits rank candidates once for each omitted predictor-training
+For the NMF profile source, `session_cv` fits rank candidates once for each omitted predictor-training
 session, selects using only those held-out scores, and refits the winner on all
 predictor-training sessions. `training_ll` fits every candidate once on all
 predictor-training sessions and selects the greatest total training LL, with a
 lower-rank tie break. `fixed` requires `[k, k]` and fits that rank once.
+
+## Behavioral profiles and nested θ selection
+
+New configurations explicitly contain:
+
+```json
+"mlmdp": {
+  "profile_sources": ["behavioral"],
+  "behavioral": {"theta_search": "coarse"}
+}
+```
+
+Use `["behavioral", "nmf"]` to include both MLMDPs in the same regression, or
+`["nmf"]` for NMF alone. Historical payloads without `mlmdp` remain NMF-only;
+normalization omits the block in that case, preserving their exact configuration
+signatures. Historical bundles with `mlmdp_candidate` retain their NMF meaning;
+new bundles use `mlmdp_candidates`, indexed by predictor name. The combined
+k-fold ablations measure each MLMDP's unique predictability conditional on the
+other predictors. Route-only excludes all MLMDPs; MLMDP-only retains both when
+both are configured.
+
+The canonical per-cell procedure is
+[`fit_cell`](../src/andrew_mlmdp/hierarchy/behavioral_profiles.py). Defaults are
+Gaussian centre search (60 fit steps, patience 10, screen top 2, local radius 1)
+from one greedy and eight k-means++ starts, followed by free-form refinement of
+every start (log parameterization, learning rate 0.1, 1500 steps, tolerance
+1e-6; Dirichlet 0.1, compactness 0.3, overlap 0). It keeps the lowest eligible
+training objective. The model uses deferred goal reward, both commitment modes,
+radius 2, α=1, interior reward −1, goal reward 0, and fixed access gate 0.05.
+The exp(−30) floor is used only for initialization; fitted gated profiles retain
+exact zeros. Overrides live beside `theta_search` in `mlmdp.behavioral` and are
+fully resolved in normalized configuration records.
+
+For every K and inner validation session, the coarse stage fits D on all other
+predictor-training sessions at each of 36 θ cells: λ₁ ∈ {0.3, 0.6, 1.2},
+λ₂ ∈ {0.6, 1.2, 2.4}, β ∈ {1, 2, 4, 8}. Strict validation LL per physical
+transition is averaged **equally across sessions**. A cell must succeed on every
+inner session. θ_K maximizes that mean; ties follow configured grid order.
+The unchanged one-standard-error rank rule chooses the smallest K within one
+SE of the best θ_K mean.
+
+With `theta_search: "coarse_and_local"`, the same inner folds score 26 local
+neighbours at multiplicative √2 spacing around θ at K*. The best mean among
+those and the coarse centre chooses θ*. K* stays fixed. With `"coarse"`, the
+coarse θ at K* is final. Refit uses all predictor-training sessions at (K*, θ*)
+and emits strict training scores and reserved-session action predictions.
+The outer session never selects θ, K, starts, or optimizer settings. Its goals
+are included in the feasibility check as task-design information.
+
+Seeds derive from `SeedSequence([random_seed, partition_digest_integer, K,
+fold_index])` and are shared across θ cells of a fold. Start seeds and child
+indices are recorded. Every start remains in the artifact, including optimizer
+failures and infeasible initializations. All-start failure makes the cell a
+`scientific_failure`; its detailed reasons distinguish optimizer and numerical
+failure from model infeasibility. Missing or operationally failed cells leave
+selection pending. Scientific failures make a cell ineligible and are never
+silently omitted. Start checkpoints and cell artifacts validate their scientific
+identity and are written atomically; force reruns bypass start checkpoints.
+
+The SLURM stages are `behavioral-cell → behavioral-selection → behavioral-refit`,
+or `behavioral-cell → behavioral-selection → behavioral-local-cell →
+behavioral-local-selection → behavioral-refit`. Local tasks freeze fold and
+offset identities before submission and resolve θ and K* at execution. The NMF
+`discovery → candidate → selection → selected-refit` chain runs only when NMF
+is enabled. `predictor-bundle` waits for all enabled chains, followed by features,
+regressions, overlap, aggregation, and plots. Behavioral artifacts live under
+`partitions/<digest>/behavioral/`: `coarse/`, `selection.json`, `local/`,
+`final_selection.json`, and `refit.json`. Workers accept `--theta-cell` for coarse
+cells and `--local-index` for local cells, plus `--validation-session-json`.
+
+The real K=6 pilot and stored-simulation reproduction started before this change
+are still running (SLURM 3827355 and 3827356). Completed timing/RSS results are
+not yet available; the resource profile is explicitly provisional (one CPU,
+8 GB, 12 h per cell/refit) and supports stage overrides. Cell artifacts record
+elapsed seconds and peak RSS. The simulated estimate is about 2.5–3 CPU-hours
+per cell: ranks 2–10, five folds, 36 cells require 1620 cells per partition;
+36 outer partitions approach 150,000 CPU-hours. Start with one subject,
+`heldout_sessions: "last"`, a narrow rank range and a SLURM pilot before a full
+run. The checked-in rank range and all-session selection are not a measured
+production resource recommendation.
+
+A separate end-to-end real-data SLURM smoke test completed all nine enabled
+stages for m2 with the last session held out: five inner cells, selection,
+refit, feature generation, all three regression variants, overlap, and reports.
+It used fixed K=2, one θ cell, one seeded start, three centre-fit steps and ten
+refinement steps, so it checks workflow execution rather than convergence or
+default-fit cost. Cells took 32.9–67.9 s; the all-training refit took 57.0 s
+with 0.51 GiB process peak RSS. Its configuration and verification record are
+in `results/behavioral_pilot/workflow_smoke/`. The completed greedy and first
+seeded stored-simulation starts match the original objectives within 6e-17
+and D within 5e-15 after column permutation; the remaining starts are pending.
+
+The GUI defaults to behavioral profiles, offers “Also fit NMF MLMDP (both enter
+the regression)” and coarse/fine θ controls, and shows θ_K means ± SE, selected
+K*, and the inner-LL θ landscape under “Behavioral MLMDP”.
+
+Limitations:
+
+- Behavioral and default NMF models differ in structure as well as D: NMF uses
+  inpainted goal reward, termination commitment, and fitted α, τ, η. For a D-only
+  comparison match `adam.goal_reward_mode`, commitment mode/radius, access gate
+  and parameter constraints explicitly.
+- One real inner session per fold gives noisier θ selection than the simulated
+  396-trial validation design.
+- Maximizing θ at each K makes the inner K curve optimistic; it does not touch
+  the outer held-out score.
+- Joint θ+D refinement and a validation guard are outside this workflow. The
+  experimental simulation scripts remain separate.
 
 ## Commands
 
@@ -302,11 +414,11 @@ stored all-decision fold likelihood before junction scores are accepted.
 
 ## Observed-decision policy overlap
 
-The `policy-overlap` stage compares the eight configured regression predictors
+The `policy-overlap` stage compares all configured regression predictors
 on the same held-out movements used to generate their feature tensor. It reads
 the four-action values and impossible-action mask from `features.json`; it does
-not refit predictors or infer Qin routes a second time. The saved hierarchy
-predictor is checked against the selected candidate's held-out predictions,
+not refit predictors or infer Qin routes a second time. Every saved MLMDP
+predictor is checked against its selected candidate's held-out predictions,
 whose fit excludes this session. Route and habit predictors come from that
 partition's complementary training sessions, and route history in the feature
 tensor is causal.
@@ -320,7 +432,7 @@ action. The regression feature and fitted coefficient remain unchanged. The
 vector predictor instead puts equal mass on the valid directions tied for its
 highest stored directional score. In particular, the optimal predictor's
 existing tie weights are retained by normalizing its stored vector. A movement
-enters the primary analysis only if all eight policies are defined.
+enters the primary analysis only if all configured policies are defined.
 Zero-support predictors, trial-start forward/reverse predictors, and blocked
 forward/reverse preferences exclude that movement; no uniform distribution is
 substituted. Artifacts record eligible and included movement counts, exclusions
@@ -337,8 +449,8 @@ The observed action on each included movement is added as the one-hot
 `observed_behavior` distribution. Its overlap with policy `p` is therefore
 `p(observed action)`. This is fractional for probabilistic or tied policies; it
 is not argmax percentage-correct accuracy, and it is not an estimated
-stationary behavioral policy. Each session's 9×9 matrix averages overlap among
-the eight projected predictors and observed behavior across its included
+stationary behavioral policy. Each session's (n+1)×(n+1) matrix averages overlap among
+the n projected predictors and observed behavior across its included
 movements.
 The pooled matrix divides the sum of the session overlap numerators by the
 total included movement count, so repeated visits and longer sessions have
@@ -356,7 +468,7 @@ After changing an overlap projection or upgrading an existing 8×8 run, add
 9×9 artifacts with the original `reverse` projection use the prior schema and
 are not reused.
 
-The eight model policies are explicit projections of the regression's saved
+The configured model policies are explicit projections of the regression's saved
 action **values**; several predictors are not native probability distributions.
 Overlap describes their similarity on observed behavioral decisions. It does
 not measure regression-coefficient similarity and does not by itself establish
@@ -404,7 +516,8 @@ these inputs before calculating, so editing one in place stops new work rather
 than silently changing the experiment. The
 configuration preview resolves subjects, dates, predictor-training sessions, and
 held-out sessions before launch. The default k-fold manager run also submits a
-lattice stage: all 255 nonempty combinations of the eight predictors, one worker
+lattice stage: all 2ⁿ−1 nonempty combinations of the n configured predictors (255 for eight,
+511 for nine), one worker
 per held-out partition. Disable this with `--no-precompute-lattice` when invoking
 the manager directly, or the equivalent GUI checkbox. Lattice tasks initially
 request one CPU, 2 GB, and thirty minutes; override with `--lattice-memory` and
@@ -435,7 +548,7 @@ render both likelihood and accuracy figures in the browser. Change the checks
 or optional session/location filters and click again to regenerate the figures
 from saved scores. For an older k-fold run with saved features, the Results GUI
 can submit the existing lattice backfill to SLURM and show its progress; this
-computes all 255 combinations per partition, then the plot button reads the
+computes all 2ⁿ−1 combinations per partition, then the plot button reads the
 saved numerical results. Missing scope or overlap calculations still show their
 CLI backfill commands. Add `--cancel` to an
 analysis command to cancel only the recorded active jobs for that kind and
