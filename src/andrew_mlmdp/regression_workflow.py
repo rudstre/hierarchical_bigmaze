@@ -1536,21 +1536,21 @@ def run_local_workflow(
         if config.behavioral:
             from andrew_mlmdp.regression_behavioral import (
                 aggregate_behavioral_selection,
-                cell_tasks,
                 local_cell_tasks,
-                run_behavioral_cell,
+                run_behavioral_cells,
                 run_behavioral_local_cell,
             )
 
-            for k, session, cell in cell_tasks(config, partition):
-                run_behavioral_cell(
-                    config,
-                    output_dir,
-                    partition,
-                    k=k,
-                    validation_session_id=session,
-                    theta_cell=cell,
-                )
+            # Folds shared with an earlier partition are reused, not refitted.
+            for k in config.ranks:
+                for session in partition.training_session_ids:
+                    run_behavioral_cells(
+                        config,
+                        output_dir,
+                        partition,
+                        k=k,
+                        validation_session_id=session,
+                    )
             aggregate_behavioral_selection(config, output_dir, partition)
             for session, index in local_cell_tasks(config, partition):
                 run_behavioral_local_cell(

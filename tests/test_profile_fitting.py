@@ -379,6 +379,89 @@ def test_rejection_limit_is_an_optimizer_failure(monkeypatch):
     assert best_restart([result]) is None
 
 
+# Column 1 is a narrow bump on the goal whose only off-goal support (state 4)
+# sits just above the access gate; compactness pushes it below the gate, which
+# collapses the column onto the goal.
+COLLAPSING = np.array(
+    [[1.0, 1e-6], [0.6, 1e-6], [0.3, 1e-5], [0.1, 1e-3], [0.02, 0.08], [1e-3, 1.0]]
+)
+
+
+def _collapse_fit(infeasible_step, max_steps=60, **kwargs):
+    return fit_profiles(
+        _template(),
+        _trials(),
+        initial_profiles=COLLAPSING,
+        evaluation_goals=[GOAL],
+        penalty_weights={"compactness": 1.0, "dirichlet": 0.0, "overlap": 0.0},
+        parameterization="log",
+        access_threshold=0.05,
+        lr=0.1,
+        max_steps=max_steps,
+        infeasible_step=infeasible_step,
+        **kwargs,
+        **TOLERANCES,
+    )
+
+
+def test_goal_collapse_is_rejected_by_default():
+    result = _collapse_fit("reject")
+    assert result.reason == "rejection_limit"
+    assert result.constraint_events == ()
+    assert all("only on goal" in r.violations[0] for r in result.rejections)
+    assert result.provenance["infeasible_step"] == "reject"
+
+
+def test_freeze_holds_the_collapsing_column_and_continues():
+    short, long = _collapse_fit("freeze", 30), _collapse_fit("freeze", 60)
+    for result in (short, long):
+        assert result.reason == "max_steps" and result.rejections == ()
+        (event,) = result.constraint_events
+        assert (event.action, event.column, event.goal) == ("freeze", 1, GOAL)
+    # The frozen column no longer moves; the other column does.
+    before, after = short.last_raw_profiles, long.last_raw_profiles
+    np.testing.assert_array_equal(before[:, 1], after[:, 1])
+    assert not np.array_equal(before[:, 0], after[:, 0])
+    assert profile_feasibility(long.best_profiles, _template().maze, [GOAL]) == ()
+
+
+def test_projection_restores_minimal_off_goal_support():
+    margin = 0.1
+    result = _collapse_fit("project", projection_margin=margin)
+    assert result.reason == "max_steps" and result.rejections == ()
+    assert result.constraint_events
+    assert result.provenance["projection_margin"] == margin
+    for event in result.constraint_events:
+        assert (event.action, event.column, event.goal, event.state) == (
+            "project", 1, GOAL, 4
+        )
+        assert event.before <= 0.05 < event.after
+        assert event.after == pytest.approx(0.05 * np.exp(margin))
+    gated = result.best_profiles
+    assert profile_feasibility(gated, _template().maze, [GOAL]) == ()
+    # Exact zeros are kept: column 1 is supported on the goal and state 4 only.
+    assert set(np.flatnonzero(gated[:, 1])) == {4, 5}
+    # Staying feasible reaches a lower objective than the rejected fit.
+    assert result.best_objective < _collapse_fit("reject").best_objective
+
+
+def test_infeasible_step_options_are_validated():
+    with pytest.raises(ValueError, match="infeasible_step"):
+        _collapse_fit("clip")
+    with pytest.raises(ValueError, match="positive access_threshold"):
+        fit_profiles(
+            _template(),
+            _trials(),
+            initial_profiles=PROFILES + 0.05,
+            evaluation_goals=[GOAL],
+            penalty_weights=PENALTIES,
+            infeasible_step="project",
+            **TOLERANCES,
+        )
+    with pytest.raises(ValueError, match="projection_margin"):
+        _collapse_fit("project", projection_margin=4.0)
+
+
 def test_heldout_trajectory_through_zeroed_region_scores_finite():
     template = _template()
     profiles = np.zeros((6, 2))

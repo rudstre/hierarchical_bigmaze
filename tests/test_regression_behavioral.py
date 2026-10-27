@@ -387,14 +387,9 @@ def test_local_grid_refines_theta_at_selected_rank_only(
     root = tmp_path
     workflow.write_manifest(config, root, table)
     (partition,), _ = workflow.build_predictor_partitions(table, config)
-    for k, session, cell in behavioral.cell_tasks(config, partition):
-        behavioral.run_behavioral_cell(
-            config,
-            root,
-            partition,
-            k=k,
-            validation_session_id=session,
-            theta_cell=cell,
+    for _, k, session in behavioral.coarse_tasks(config, [partition]):
+        behavioral.run_behavioral_cells(
+            config, root, partition, k=k, validation_session_id=session
         )
     # Local cells are blocked until the coarse selection exists.
     assert (
@@ -428,6 +423,84 @@ def test_local_grid_refines_theta_at_selected_rank_only(
         theta_key(t) for t in local_theta_grid(centre, settings.local_step)
     }
     assert set(means) == allowed
+
+
+def test_partitions_share_symmetric_inner_folds(simulated, monkeypatch, tmp_path):
+    from dataclasses import replace
+
+    maze, trials, table = simulated
+    config = replace(_config(("behavioral",)), heldout_sessions="all")
+    _patch_data(monkeypatch, maze, trials, table)
+    fitted = []
+
+    def fixed_d_cell(environment, trials, goals, k, theta, settings, seed, **kw):
+        # Fixed D, as in the local-grid test; records each fit's training data.
+        fitted.append(tuple(sorted({t.session_id for t in trials})))
+        profiles, ungated = _gated_bumps(maze, [(1, 1), (3, 3), (1, 3)][:k])
+        return CellFit(
+            k,
+            tuple(theta),
+            "success",
+            "fixed",
+            profiles,
+            ungated,
+            held_parameters(theta, settings),
+            0.0,
+            {},
+            seed,
+        )
+
+    monkeypatch.setattr(behavioral, "fit_cell", fixed_d_cell)
+    workflow.write_manifest(config, tmp_path, table)
+    partitions, _ = workflow.build_predictor_partitions(table, config)
+    assert len(partitions) == 3
+    # Three sessions: three unordered (outer, inner) pairs instead of six.
+    tasks = behavioral.coarse_tasks(config, partitions)
+    assert len(tasks) == 3 * len(config.ranks)
+    for partition, k, session in tasks:
+        behavioral.run_behavioral_cells(
+            config, tmp_path, partition, k=k, validation_session_id=session
+        )
+    n_cells = len(behavioral.coarse_cells(config))
+    assert len(fitted) == len(tasks) * n_cells
+    assert sorted(set(fitted)) == [("1",), ("2",), ("3",)]
+
+    for partition in partitions:
+        selection = behavioral.aggregate_behavioral_selection(
+            config, tmp_path, partition
+        )
+        assert selection["status"] == "selected"
+        assert selection["observed_cells"] == selection["expected_cells"]
+        for session in partition.training_session_ids:
+            # The partition reads the shared fit's score of its own inner
+            # session, never of its outer held-out session.
+            path = behavioral.cell_path(
+                tmp_path,
+                partition,
+                "coarse",
+                config.ranks[0],
+                session,
+                next(iter(behavioral.coarse_cells(config))),
+            )
+            artifact = workflow._read_json(path)
+            scores = {s["session_id"]: s for s in artifact["validation"]}
+            assert set(scores) == {session, partition.heldout_session_id}
+            record = behavioral._coarse_record(artifact, session)
+            assert (
+                record["validation_ll_per_transition"]
+                == (scores[session]["validation_ll_per_transition"])
+            )
+    # Both partitions sharing a fold derive the same seed and artifact path.
+    first, second = partitions[0], partitions[1]
+    for k in config.ranks:
+        assert behavioral._cell_seed(
+            config, first, k, second.heldout_session_id
+        ) == behavioral._cell_seed(config, second, k, first.heldout_session_id)
+        assert behavioral.cell_path(
+            tmp_path, first, "coarse", k, second.heldout_session_id, "c"
+        ) == behavioral.cell_path(
+            tmp_path, second, "coarse", k, first.heldout_session_id, "c"
+        )
 
 
 def test_legacy_normalization_preserves_exact_historical_signature():

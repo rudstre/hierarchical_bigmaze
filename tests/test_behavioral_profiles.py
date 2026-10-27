@@ -93,6 +93,14 @@ def test_coarse_grid_matches_experimental_cells():
     assert len(expected) == 36
 
 
+def test_default_starts_and_goal_collapse_treatment():
+    # Chosen from the simulated theta grid (see BehavioralFitSettings).
+    settings = BehavioralFitSettings()
+    assert settings.start_names == ("greedy", "seed0", "seed1")
+    assert settings.infeasible_step == "project"
+    assert settings.as_dict()["projection_margin"] == 0.1
+
+
 def test_local_grid_matches_experimental_cells_and_excludes_centre():
     cells = _make_theta_cells()
     centre = (0.6, 1.2, 2.0)

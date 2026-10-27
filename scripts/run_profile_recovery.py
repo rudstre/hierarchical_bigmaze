@@ -493,6 +493,13 @@ def main() -> None:
         help="select each fit's best state, and rank warm-start sources, by "
         "validation LL; early-stop on validation",
     )
+    parser.add_argument(
+        "--infeasible-step",
+        choices=("reject", "freeze", "project"),
+        default="reject",
+        help="treatment of a step that collapses a profile onto a goal",
+    )
+    parser.add_argument("--projection-margin", type=float, default=0.1)
     parser.add_argument("--validation-interval", type=int, default=10)
     parser.add_argument("--validation-patience", type=int, default=10)
     parser.add_argument(
@@ -601,6 +608,8 @@ def main() -> None:
         parameterization=args.parameterization,
         access_threshold=args.access_threshold,
         freeze_profiles=args.freeze_profiles,
+        infeasible_step=args.infeasible_step,
+        projection_margin=args.projection_margin,
     )
     if args.validation_select:
         fit_options.update(
@@ -795,6 +804,14 @@ def main() -> None:
             "converged": result.converged,
             "updates": result.updates,
             "n_rejections": len(result.rejections),
+            "n_projections": sum(
+                event.action == "project" for event in result.constraint_events
+            ),
+            "frozen_columns": [
+                event.column
+                for event in result.constraint_events
+                if event.action == "freeze"
+            ],
             "objective_history": list(result.objective_history),
             "best_objective": result.best_objective,
             "initial_profile_seed": result.provenance["initial_profile_seed"],

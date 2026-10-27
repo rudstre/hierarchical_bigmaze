@@ -47,7 +47,16 @@ HELD_THETA_NAMES = ("lower_control_cost", "upper_control_cost", "beta")
 
 @dataclass(frozen=True)
 class BehavioralFitSettings:
-    """Every choice of the per-cell procedure; defaults = theta_cells.sbatch."""
+    """Every choice of the per-cell procedure.
+
+    Defaults follow theta_cells.sbatch except two choices made from the
+    simulated theta grid (results/theta_grid/constraint_test, seed 101, K 6
+    and 8): goal-collapsing refinement steps are projected rather than
+    rejected, and two seeded starts follow the greedy one instead of eight.
+    Projection left the chosen theta unchanged in every setting and removed
+    every start failure; with it, greedy + 2 chose the full-budget theta in
+    79% of settings at a mean held-out cost of 0.001 LL per decision.
+    """
 
     # Frozen structural choices (see run_profile_recovery.STRUCTURE).
     goal_reward_mode: str = "deferred"
@@ -66,7 +75,7 @@ class BehavioralFitSettings:
     screen_top: int = 2
     local_radius: int = 1
     greedy_start: bool = True
-    n_seeded_starts: int = 8
+    n_seeded_starts: int = 2
     # Free-form refinement.
     parameterization: str = "log"
     lr: float = 0.1
@@ -75,6 +84,10 @@ class BehavioralFitSettings:
     lambda_compactness: float = 0.3
     lambda_dirichlet: float = 0.1
     lambda_overlap: float = 0.0
+    # What a refinement step that collapses a column onto a goal does
+    # (profile_fitting.fit_profiles): "reject", "freeze", or "project".
+    infeasible_step: str = "project"
+    projection_margin: float = 0.1
     # Log-space warm starts need strictly positive profiles; Gaussian bumps
     # underflow far from the centre. Initialization only.
     warm_floor: float = float(np.exp(-30.0))
@@ -108,6 +121,10 @@ class BehavioralFitSettings:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
         if not isinstance(self.greedy_start, bool):
             raise ValueError("greedy_start must be boolean")
+        if self.infeasible_step not in {"reject", "freeze", "project"}:
+            raise ValueError("infeasible_step must be reject, freeze, or project")
+        if not math.isfinite(self.projection_margin) or self.projection_margin <= 0:
+            raise ValueError("projection_margin must be positive and finite")
         if self.shape not in {"gaussian", "exponential"}:
             raise ValueError("shape must be gaussian or exponential")
         if self.parameterization not in {"linear", "log"}:
@@ -481,6 +498,8 @@ def fit_cell(
                 convergence_tolerance=settings.tolerance,
                 parameterization=settings.parameterization,
                 access_threshold=settings.access_threshold,
+                infeasible_step=settings.infeasible_step,
+                projection_margin=settings.projection_margin,
                 initial_profile_description=f"centre search start {name}",
             )
         except (NumericalError, ValueError) as error:
@@ -523,6 +542,7 @@ def fit_cell(
             "refine_updates": refined.updates,
             "refine_rejections": len(refined.rejections),
             "rejections": [asdict(rejection) for rejection in refined.rejections],
+            "constraint_events": [asdict(event) for event in refined.constraint_events],
             "refine_provenance": dict(refined.provenance),
             "elapsed_seconds": time.perf_counter() - started,
             "best_objective": refined.best_objective if eligible else None,

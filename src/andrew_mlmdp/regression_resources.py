@@ -240,6 +240,15 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
     if config.behavioral:
         for stage in ("behavioral-cell", "behavioral-local-cell", "behavioral-refit"):
             stages[stage].update(cpus_per_task=1, memory="8G", time="12:00:00")
+        # A behavioral-cell task fits every coarse theta cell of one fold and
+        # K in sequence. Budget the documented simulated estimate of ~3
+        # CPU-hours per nine-start cell (1/3 h per start); cells checkpoint,
+        # so a timed-out task resumes.
+        from andrew_mlmdp.hierarchy.behavioral_profiles import coarse_theta_grid
+
+        settings = config.mlmdp.settings
+        n_starts = len(coarse_theta_grid(settings)) * len(settings.start_names)
+        stages["behavioral-cell"]["time"] = _slurm_hours(n_starts / 3.0)
     stages["feature-generation"]["time"] = "01:00:00"
     stages["policy-overlap"]["time"] = "01:00:00"
     stages["lattice-precompute"]["time"] = "01:00:00"

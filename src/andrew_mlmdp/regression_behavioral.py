@@ -5,7 +5,11 @@ hyperparameter chosen exactly like the subgoal rank:
 
 1. coarse cells: for every rank K, inner validation session v, and coarse
    theta cell, fit D on the predictor-training sessions other than v
-   (``behavioral_profiles.fit_cell``) and score v strictly;
+   (``behavioral_profiles.fit_cell``) and score v strictly. The fit excludes
+   the outer session h and v symmetrically, so it is shared with the
+   partition holding out v (inner session h): it is stored once per inner
+   fold under ``behavioral_folds/``, scores both excluded sessions, and each
+   partition reads only its own inner validation score;
 2. selection: theta_K maximizes the mean inner validation LL over v (a cell
    must succeed for every v); the existing one-standard-error rule
    (``nested_rank_selection``) is applied to the theta_K scores, giving K*;
@@ -22,6 +26,7 @@ structural feasibility check) before the refit's predictions.
 
 from __future__ import annotations
 
+import json
 import math
 import resource
 import time
@@ -48,7 +53,7 @@ from andrew_mlmdp.validation import (
     _strict_score,
 )
 
-BEHAVIORAL_SCHEMA_VERSION = 1
+BEHAVIORAL_SCHEMA_VERSION = 2
 ROLES = ("coarse", "local", "refit")
 
 
@@ -71,7 +76,8 @@ def coarse_cells(config) -> dict[str, tuple[float, float, float]]:
 
 
 def cell_tasks(config, partition) -> list[tuple[int, Any, str]]:
-    """Every coarse (K, inner validation session, theta cell) fit."""
+    """Every coarse (K, inner validation session, theta cell) record that one
+    partition's selection reads."""
 
     return [
         (k, session, cell)
@@ -79,6 +85,49 @@ def cell_tasks(config, partition) -> list[tuple[int, Any, str]]:
         for session in partition.training_session_ids
         for cell in coarse_cells(config)
     ]
+
+
+def inner_fold(partition, validation_session_id) -> dict[str, object]:
+    """Data identity of the fit that excludes the outer and inner sessions.
+
+    A fit depends only on its training sessions and on the subject's goals
+    (from every session), so partition h with inner session v and partition
+    v with inner session h share it. The excluded sessions are canonically
+    ordered so both partitions name it identically. ``None`` is the refit,
+    which excludes only the outer session.
+    """
+
+    excluded = [partition.heldout_session_id]
+    if validation_session_id is not None:
+        excluded.append(validation_session_id)
+    return _json_value(
+        {
+            "maze_id": partition.maze_id,
+            "subject_id": partition.subject_id,
+            "training_session_ids": [
+                s for s in partition.training_session_ids if s != validation_session_id
+            ],
+            "excluded_session_ids": sorted(_json_value(excluded), key=json.dumps),
+        }
+    )
+
+
+def coarse_tasks(config, partitions) -> list[tuple[Any, int, Any]]:
+    """Every (partition, K, inner session) task; each fits all coarse cells.
+
+    A fold shared by two partitions is listed once, under the first partition
+    (in the given order) that needs it.
+    """
+
+    seen = set()
+    tasks = []
+    for partition in partitions:
+        for session in partition.training_session_ids:
+            digest = _payload_digest(inner_fold(partition, session))
+            if digest not in seen:
+                seen.add(digest)
+                tasks.extend((partition, k, session) for k in config.ranks)
+    return tasks
 
 
 def local_cell_tasks(config, partition) -> list[tuple[Any, int]]:
@@ -97,16 +146,12 @@ def _cell_seed(config, partition, k: int, validation_session_id) -> int:
     """Centre-search seed shared by every theta cell of one (K, fold).
 
     Cells of the same fold then differ only in theta (common random
-    numbers). The all-training refit uses fold index len(training).
+    numbers). The seed depends only on the fold's data identity, so the two
+    partitions sharing a fold, and its coarse and local cells, agree.
     """
 
-    sessions = tuple(partition.training_session_ids)
-    fold = (
-        len(sessions)
-        if validation_session_id is None
-        else sessions.index(validation_session_id)
-    )
-    entropy = [config.random_seed, int(partition.digest[:16], 16), k, fold]
+    fold = _payload_digest(inner_fold(partition, validation_session_id))
+    entropy = [config.random_seed, int(fold[:16], 16), k]
     return int(np.random.SeedSequence(entropy).generate_state(1)[0])
 
 
@@ -130,33 +175,46 @@ def behavioral_compatibility(
     training = tuple(
         s for s in partition.training_session_ids if s != validation_session_id
     )
-    return _json_value(
-        {
-            "schema_version": BEHAVIORAL_SCHEMA_VERSION,
-            "artifact_type": "behavioral_cell",
-            "role": role,
-            "dataset": config.normalized_payload()["dataset"],
-            "partition": partition.metadata(),
-            "partition_digest": partition.digest,
-            "canonical_data_signature": _data_signature(root),
-            "k": k,
-            "theta": list(theta),
-            "theta_cell": theta_key(theta),
-            "validation_session_id": validation_session_id,
-            "training_session_ids": list(training),
-            "settings": _settings(config).as_dict(),
-            "configuration_signature": config.signature,
-            "seed": _cell_seed(config, partition, k, validation_session_id),
-            "source": _stage_source(config, "behavioral"),
-        }
-    )
+    payload = {
+        "schema_version": BEHAVIORAL_SCHEMA_VERSION,
+        "artifact_type": "behavioral_cell",
+        "role": role,
+        "dataset": config.normalized_payload()["dataset"],
+        "canonical_data_signature": _data_signature(root),
+        "k": k,
+        "theta": list(theta),
+        "theta_cell": theta_key(theta),
+        "training_session_ids": list(training),
+        "settings": _settings(config).as_dict(),
+        "configuration_signature": config.signature,
+        "seed": _cell_seed(config, partition, k, validation_session_id),
+        "source": _stage_source(config, "behavioral"),
+    }
+    if role == "coarse":
+        # Shared by two partitions, so identified by the fold, not either one.
+        payload["fold"] = inner_fold(partition, validation_session_id)
+    else:
+        payload.update(
+            partition=partition.metadata(),
+            partition_digest=partition.digest,
+            validation_session_id=validation_session_id,
+        )
+    return _json_value(payload)
 
 
 def _behavioral_dir(root: Path, partition) -> Path:
     return root / "partitions" / partition.digest / "behavioral"
 
 
+def _fold_dir(root: Path, partition, validation_session_id) -> Path:
+    fold = _payload_digest(inner_fold(partition, validation_session_id))
+    return root / "behavioral_folds" / fold
+
+
 def cell_path(root: Path, partition, role, k, validation_session_id, cell) -> Path:
+    if role == "coarse":
+        directory = _fold_dir(root, partition, validation_session_id)
+        return directory / f"k_{k:02d}_{cell}.json"
     if role == "refit":
         return _behavioral_dir(root, partition) / "refit.json"
     session = _payload_digest({"session": _json_value(validation_session_id)})[:16]
@@ -239,8 +297,9 @@ def _fit_cell_artifact(
         "k": k,
         "theta": list(theta),
         "theta_cell": theta_key(theta),
-        "validation_session_id": _json_value(validation_session_id),
     }
+    if role != "coarse":
+        payload["validation_session_id"] = _json_value(validation_session_id)
     if selection is not None:
         # The refit records how (K*, theta*) were chosen.
         payload["selection"] = selection
@@ -296,7 +355,14 @@ def _fit_cell_artifact(
                 ungated_profiles=cell.ungated_profiles.tolist(),
                 training=_strict_score(template, training),
             )
-            if validation_session_id is not None:
+            if role == "coarse":
+                # Each partition sharing the fold reads only its own inner
+                # validation session (_coarse_record).
+                payload["validation"] = [
+                    _session_score(template, dataset, session)
+                    for session in compatibility["fold"]["excluded_session_ids"]
+                ]
+            elif validation_session_id is not None:
                 validation = _strict_score(
                     template, trials_for_sessions(dataset, (validation_session_id,))
                 )
@@ -337,28 +403,95 @@ def _fit_cell_artifact(
     return payload
 
 
-def run_behavioral_cell(
-    config, output_dir, partition, *, k, validation_session_id, theta_cell, force=False
+def _session_score(template, dataset, session_id) -> dict[str, object]:
+    """Strict validation score of one session; failing to score is scientific."""
+
+    from andrew_mlmdp.workflow_fitting import trials_for_sessions
+
+    try:
+        validation = _strict_score(
+            template, trials_for_sessions(dataset, (session_id,))
+        )
+        value = validation["pooled_log_likelihood_per_transition"]
+        if value is None or not math.isfinite(value):
+            raise RankValidationError(
+                "Validation requires a finite LL per physical transition"
+            )
+    except RankValidationError as error:
+        return {
+            "session_id": session_id,
+            "status": "scientific_failure",
+            "failure": {"type": type(error).__name__, "message": str(error)},
+        }
+    return {
+        "session_id": session_id,
+        "status": "success",
+        "validation": validation,
+        "validation_ll_per_transition": value,
+    }
+
+
+def _coarse_record(artifact, validation_session_id) -> dict[str, object]:
+    """A shared coarse fit as seen by the partition validating on one session.
+
+    Only that session's score is exposed; the other excluded session is the
+    partition's outer held-out session and must not influence its selection.
+    """
+
+    record = {
+        "k": artifact["k"],
+        "theta": artifact["theta"],
+        "theta_cell": artifact["theta_cell"],
+        "validation_session_id": validation_session_id,
+        "status": artifact["status"],
+    }
+    if artifact["status"] == "success":
+        (score,) = (
+            s
+            for s in artifact["validation"]
+            if s["session_id"] == validation_session_id
+        )
+        record["status"] = score["status"]
+        if score["status"] == "success":
+            record["validation_ll_per_transition"] = score[
+                "validation_ll_per_transition"
+            ]
+    return record
+
+
+def run_behavioral_cells(
+    config, output_dir, partition, *, k, validation_session_id, force=False
 ) -> dict[str, object]:
-    """Fit one coarse cell on one inner fold."""
+    """Fit every coarse theta cell of one (inner fold, K), in grid order.
+
+    Finished cells are reused, so a task cut short resumes where it stopped.
+    """
 
     if k not in config.ranks:
         raise ValueError(f"rank {k} is outside configured inclusive rank_range")
     if validation_session_id not in partition.training_session_ids:
         raise ValueError("inner validation session is not a predictor-training session")
-    cells = coarse_cells(config)
-    if theta_cell not in cells:
-        raise ValueError(f"Unknown coarse theta cell {theta_cell!r}")
-    return _fit_cell_artifact(
-        config,
-        Path(output_dir).resolve(),
-        partition,
-        role="coarse",
-        k=k,
-        theta=cells[theta_cell],
-        validation_session_id=validation_session_id,
-        force=force,
-    )
+    statuses = [
+        _fit_cell_artifact(
+            config,
+            Path(output_dir).resolve(),
+            partition,
+            role="coarse",
+            k=k,
+            theta=theta,
+            validation_session_id=validation_session_id,
+            force=force,
+        )["status"]
+        for theta in coarse_cells(config).values()
+    ]
+    return {
+        "status": (
+            "operational_failure" if "operational_failure" in statuses else "complete"
+        ),
+        "fold": inner_fold(partition, validation_session_id),
+        "k": k,
+        "cells": {status: statuses.count(status) for status in sorted(set(statuses))},
+    }
 
 
 def _selection_path(root: Path, partition, final: bool) -> Path:
@@ -429,6 +562,43 @@ def run_behavioral_local_cell(
     )
 
 
+def load_coarse_records(config, root: Path, partition) -> list[dict]:
+    """This partition's view of the coarse cells found; reject stale work.
+
+    Each fold directory may hold only cells of the configured ranks and grid.
+    """
+
+    cells = coarse_cells(config)
+    names = {f"k_{k:02d}_{cell}.json" for k in config.ranks for cell in cells}
+    records = []
+    for session in partition.training_session_ids:
+        directory = _fold_dir(root, partition, session)
+        if not directory.is_dir():
+            continue
+        unexpected = sorted({p.name for p in directory.glob("k_*.json")} - names)
+        if unexpected:
+            raise ValueError(f"Unexpected behavioral cell artifacts {unexpected}")
+        for k in config.ranks:
+            for cell, theta in cells.items():
+                path = cell_path(root, partition, "coarse", k, session, cell)
+                if not path.is_file():
+                    continue
+                compatibility = behavioral_compatibility(
+                    config,
+                    root,
+                    partition,
+                    role="coarse",
+                    k=k,
+                    theta=theta,
+                    validation_session_id=session,
+                )
+                artifact = _validate_cell_artifact(
+                    path, _read_json(path), compatibility
+                )
+                records.append(_coarse_record(artifact, session))
+    return records
+
+
 def load_cell_records(config, root: Path, partition, role, expected) -> list[dict]:
     """Read exactly the expected cells of one role; reject stale or extra work.
 
@@ -469,11 +639,7 @@ def aggregate_behavioral_selection(config, output_dir, partition) -> dict[str, o
 
     root = Path(output_dir).resolve()
     cells = coarse_cells(config)
-    expected = {
-        (k, session, cell): cells[cell]
-        for k, session, cell in cell_tasks(config, partition)
-    }
-    records = load_cell_records(config, root, partition, "coarse", expected)
+    records = load_coarse_records(config, root, partition)
     sessions = tuple(partition.training_session_ids)
     theta = select_theta_per_rank(
         records,
@@ -503,7 +669,7 @@ def aggregate_behavioral_selection(config, output_dir, partition) -> dict[str, o
             "compatibility": _selection_compatibility(config, root, partition),
             "partition_digest": partition.digest,
             "observed_cells": len(records),
-            "expected_cells": len(expected),
+            "expected_cells": len(cell_tasks(config, partition)),
             "theta_rows": theta["rank_rows"],
             **result,
         }
@@ -542,19 +708,10 @@ def aggregate_behavioral_final_selection(
             (k, s, cell): theta for cell, theta in local.items() for s in sessions
         }
         local_records = load_cell_records(config, root, partition, "local", expected)
-        coarse = coarse_cells(config)
-        centre_records = load_cell_records(
-            config,
-            root,
-            partition,
-            "coarse",
-            {
-                (rank, s, cell): coarse[cell]
-                for rank, s, cell in cell_tasks(config, partition)
-            },
-        )
         centre_records = [
-            r for r in centre_records if r["k"] == k and r["theta_cell"] == centre_cell
+            r
+            for r in load_coarse_records(config, root, partition)
+            if r["k"] == k and r["theta_cell"] == centre_cell
         ]
         theta = select_theta_per_rank(
             [*centre_records, *local_records],

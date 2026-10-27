@@ -784,7 +784,10 @@ def test_behavioral_tasks_and_dependencies(sources, search, monkeypatch, tmp_pat
 
     config = replace(_config(), mlmdp=workflow.MLMDPConfig(sources, search))
     tasks = manager._stage_tasks(config, _workflow_manifest(), include_lattice=True)
-    assert len(tasks["behavioral-cell"]) == 2 * 3 * 3 * 36
+    # Inner folds {s4,s1}, {s4,s2}, {s4,s3}, {s3,s1}, {s3,s2}: the two
+    # partitions share the fold excluding s3 and s4. One task per fold and K.
+    assert len(tasks["behavioral-cell"]) == 5 * 3
+    assert all("theta_cell" not in t for t in tasks["behavioral-cell"])
     assert len(tasks["behavioral-selection"]) == 2
     assert len(tasks["behavioral-refit"]) == 2
     assert len(tasks["behavioral-local-cell"]) == (
@@ -849,7 +852,7 @@ def test_worker_forwards_behavioral_cell_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "report_progress", lambda **kw: None)
     monkeypatch.setenv("REGRESSION_PROGRESS", str(tmp_path / "progress.json"))
     for stage, extra in (
-        ("behavioral-cell", {"k": 6, "theta_cell": "l1_0.3_l2_0.6_b_1"}),
+        ("behavioral-cell", {"k": 6}),
         ("behavioral-local-cell", {"local_index": 0}),
     ):
         task = {
@@ -883,8 +886,9 @@ def test_worker_forwards_behavioral_cell_identity(tmp_path, monkeypatch):
         )
         cmd = commands[-1]
         assert cmd[cmd.index("--validation-session-json") + 1] == "5"
-        flag = "--theta-cell" if stage == "behavioral-cell" else "--local-index"
+        flag = "--k" if stage == "behavioral-cell" else "--local-index"
         assert cmd[cmd.index(flag) + 1] == str(next(reversed(extra.values())))
+        assert "--theta-cell" not in cmd
 
 
 def test_disabled_sources_do_not_keep_the_status_pending():

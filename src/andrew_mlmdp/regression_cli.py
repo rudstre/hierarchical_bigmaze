@@ -11,7 +11,7 @@ from andrew_mlmdp.doohan_dataset import DoohanDataset
 from andrew_mlmdp.regression_behavioral import (
     aggregate_behavioral_final_selection,
     aggregate_behavioral_selection,
-    run_behavioral_cell,
+    run_behavioral_cells,
     run_behavioral_local_cell,
     run_behavioral_refit,
 )
@@ -74,7 +74,6 @@ def parser():
     result.add_argument("--partition-digest")
     result.add_argument("--k", type=int)
     result.add_argument("--validation-session-json")
-    result.add_argument("--theta-cell", help="behavioral-cell: coarse cell name")
     result.add_argument(
         "--local-index", type=int, help="behavioral-local-cell: neighbour 0-25"
     )
@@ -356,17 +355,16 @@ def main(argv=None):
                 force=args.force,
             )
         elif command == "behavioral-cell":
-            if args.k is None or args.theta_cell is None:
-                raise ValueError("behavioral-cell requires --k and --theta-cell")
-            if args.validation_session_json is None:
-                raise ValueError("behavioral-cell requires --validation-session-json")
-            result = run_behavioral_cell(
+            if args.k is None or args.validation_session_json is None:
+                raise ValueError(
+                    "behavioral-cell requires --k and --validation-session-json"
+                )
+            result = run_behavioral_cells(
                 config,
                 args.output_dir,
                 partition,
                 k=args.k,
                 validation_session_id=json.loads(args.validation_session_json),
-                theta_cell=args.theta_cell,
                 force=args.force,
             )
         elif command == "behavioral-selection":

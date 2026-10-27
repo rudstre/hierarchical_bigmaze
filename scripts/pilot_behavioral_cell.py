@@ -23,6 +23,7 @@ import argparse
 import json
 import resource
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from andrew_mlmdp.hierarchy.behavioral_profiles import (
@@ -196,6 +197,10 @@ def main() -> None:
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     settings = BehavioralFitSettings()
+    if args.mode == "simulated":
+        # Stored theta_cells.sbatch cells used eight seeded starts and
+        # rejected goal-collapsing steps; reproduce them as they were run.
+        settings = replace(settings, n_seeded_starts=8, infeasible_step="reject")
     source = source_code_fingerprint(PROJECT_ROOT)
     result = real(args, settings) if args.mode == "real" else simulated(args, settings)
     result["settings"] = settings.as_dict()

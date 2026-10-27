@@ -190,7 +190,11 @@ def test_behavioral_resources_are_explicitly_provisional_and_overridable():
     assert plan['behavioral_calibrated'] is False
     for stage in ('behavioral-cell', 'behavioral-local-cell', 'behavioral-refit'):
         assert plan['stages'][stage]['cpus_per_task'] == 1
+    for stage in ('behavioral-local-cell', 'behavioral-refit'):
         assert plan['stages'][stage]['time'] == '12:00:00'
+    # One behavioral-cell task fits all 36 coarse cells of a fold and K, at
+    # three starts per cell and 1/3 h per start.
+    assert plan['stages']['behavioral-cell']['time'] == '1-12:00:00'
     overridden = resolve_resource_plan(config, _slurm(stage_overrides={
         'behavioral-cell': {'memory': '3G', 'time': '06:00:00'}
     }))

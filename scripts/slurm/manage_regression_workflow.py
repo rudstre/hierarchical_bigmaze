@@ -22,7 +22,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from andrew_mlmdp.regression_behavioral import (  # noqa: E402
     cell_path,
-    cell_tasks,
+    coarse_cells,
+    coarse_tasks,
     local_cell_tasks,
     local_cells_for,
 )
@@ -105,6 +106,7 @@ WORKER_SOURCE_FAILURE = "Scientific worker source changed after submission"
 # Artifact files whose compatibility records carry per-stage source digests.
 _STAGE_SOURCE_ARTIFACTS = (
     "partitions/*/candidates/*/k_*.json",
+    "behavioral_folds/*/k_*.json",
     "partitions/*/behavioral/coarse/k_*.json",
     "partitions/*/behavioral/local/k_*.json",
     "partitions/*/behavioral/refit.json",
@@ -279,19 +281,21 @@ def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
             {"stage": "lattice-precompute", "partition_digest": p.digest}
             for p in partitions
         ]
+    if config.behavioral:
+        # One task per (inner fold, K) fits every coarse theta cell; folds
+        # shared by two partitions are scheduled once.
+        tasks["behavioral-cell"] = [
+            {
+                "stage": "behavioral-cell",
+                "partition_digest": partition.digest,
+                "k": k,
+                "validation_session_id": session,
+            }
+            for partition, k, session in coarse_tasks(config, partitions)
+        ]
     for partition in partitions:
         identity = {"partition_digest": partition.digest}
         if config.behavioral:
-            tasks["behavioral-cell"].extend(
-                {
-                    "stage": "behavioral-cell",
-                    **identity,
-                    "k": k,
-                    "validation_session_id": session,
-                    "theta_cell": cell,
-                }
-                for k, session, cell in cell_tasks(config, partition)
-            )
             tasks["behavioral-selection"].append(
                 {"stage": "behavioral-selection", **identity}
             )
@@ -557,14 +561,17 @@ def _artifact_state(
         )
         partition = _partition(record)
         if stage == "behavioral-cell":
-            path = cell_path(
-                run_dir,
-                partition,
-                "coarse",
-                task["k"],
-                task["validation_session_id"],
-                task["theta_cell"],
-            )
+            paths = [
+                cell_path(
+                    run_dir,
+                    partition,
+                    "coarse",
+                    task["k"],
+                    task["validation_session_id"],
+                    cell,
+                )
+                for cell in coarse_cells(config)
+            ]
         else:
             selection_path = partition_dir / "behavioral/selection.json"
             if not selection_path.is_file():

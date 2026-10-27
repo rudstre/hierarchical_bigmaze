@@ -161,10 +161,29 @@ both are configured.
 The canonical per-cell procedure is
 [`fit_cell`](../src/andrew_mlmdp/hierarchy/behavioral_profiles.py). Defaults are
 Gaussian centre search (60 fit steps, patience 10, screen top 2, local radius 1)
-from one greedy and eight k-means++ starts, followed by free-form refinement of
+from one greedy and two k-means++ starts, followed by free-form refinement of
 every start (log parameterization, learning rate 0.1, 1500 steps, tolerance
 1e-6; Dirichlet 0.1, compactness 0.3, overlap 0). It keeps the lowest eligible
-training objective. The model uses deferred goal reward, both commitment modes,
+training objective.
+
+A refinement step that collapses a profile onto a goal (its gated support
+becomes that goal alone, which the model cannot represent) is projected: the
+column's largest off-goal entry is raised to 0.1 log units above the access
+gate, and the step is kept. Every projection is recorded with the start.
+Previously such steps were rejected with a lower learning rate, which pinned
+the fit at the boundary until the rejection limit discarded the start: 26% of
+the real-data starts finished before the first full run was cancelled, and 38%
+of the simulated K=6 and K=8 starts, ended this way, mostly narrow bumps
+centred on a goal pulled in by compactness. On the simulated θ
+grid (`results/theta_grid/constraint_test` on the cluster: seed 101, K 6 and
+8, three widths, 36 cells), projection made every start eligible, revived the
+37/216 cells with no eligible start, never worsened a cell's training
+objective, and left the chosen θ unchanged in all six settings. Freezing the
+column instead performed almost identically. With projection, greedy plus two
+seeded starts chose the nine-start θ in 79% of settings at a mean held-out
+cost of 0.001 LL per decision (maximum 0.015); greedy plus four reached 86%.
+The rule is `mlmdp.behavioral.infeasible_step` (`"project"`, `"freeze"`, or the
+historical `"reject"`), and the start count `n_seeded_starts`. The model uses deferred goal reward, both commitment modes,
 radius 2, α=1, interior reward −1, goal reward 0, and fixed access gate 0.05.
 The exp(−30) floor is used only for initialization; fitted gated profiles retain
 exact zeros. Overrides live beside `theta_search` in `mlmdp.behavioral` and are
@@ -186,8 +205,18 @@ and emits strict training scores and reserved-session action predictions.
 The outer session never selects θ, K, starts, or optimizer settings. Its goals
 are included in the feasibility check as task-design information.
 
-Seeds derive from `SeedSequence([random_seed, partition_digest_integer, K,
-fold_index])` and are shared across θ cells of a fold. Start seeds and child
+A coarse fit for outer session h and inner session v trains on the sessions
+other than h and v, with goals from all of the subject's sessions, so it is
+identical for partition h (inner v) and partition v (inner h). Each such inner
+fold is fitted once, stored under `behavioral_folds/<fold digest>/`, and scores
+both excluded sessions. A partition reads only the score of its own inner
+validation session; the other score belongs to its outer session and is never
+read by it. With six sessions per subject this halves the coarse fits.
+
+Seeds derive from `SeedSequence([random_seed, fold_digest_integer, K])`, where
+the fold digest identifies the subject, training sessions, and excluded
+sessions; they are shared across θ cells of a fold, by both partitions sharing
+it, and by its local cells. Start seeds and child
 indices are recorded. Every start remains in the artifact, including optimizer
 failures and infeasible initializations. All-start failure makes the cell a
 `scientific_failure`; its detailed reasons distinguish optimizer and numerical
@@ -199,18 +228,24 @@ identity and are written atomically; force reruns bypass start checkpoints.
 The SLURM stages are `behavioral-cell → behavioral-selection → behavioral-refit`,
 or `behavioral-cell → behavioral-selection → behavioral-local-cell →
 behavioral-local-selection → behavioral-refit`. Local tasks freeze fold and
-offset identities before submission and resolve θ and K* at execution. The NMF
+offset identities before submission and resolve θ and K* at execution. One
+`behavioral-cell` task fits every coarse θ cell of one (inner fold, K) in grid
+order, reusing finished cells, so a task cut short resumes. The NMF
 `discovery → candidate → selection → selected-refit` chain runs only when NMF
 is enabled. `predictor-bundle` waits for all enabled chains, followed by features,
-regressions, overlap, aggregation, and plots. Behavioral artifacts live under
-`partitions/<digest>/behavioral/`: `coarse/`, `selection.json`, `local/`,
-`final_selection.json`, and `refit.json`. Workers accept `--theta-cell` for coarse
-cells and `--local-index` for local cells, plus `--validation-session-json`.
+regressions, overlap, aggregation, and plots. Coarse cells live under
+`behavioral_folds/<fold digest>/`; the other behavioral artifacts live under
+`partitions/<digest>/behavioral/`: `selection.json`, `local/`,
+`final_selection.json`, and `refit.json`. Coarse workers take `--k` and
+`--validation-session-json` (with any partition sharing the fold); local workers
+also take `--local-index`.
 
 The real K=6 pilot and stored-simulation reproduction started before this change
 are still running (SLURM 3827355 and 3827356). Completed timing/RSS results are
 not yet available; the resource profile is explicitly provisional (one CPU,
-8 GB, 12 h per cell/refit) and supports stage overrides. Cell artifacts record
+8 GB, 12 h per local cell/refit, and 1/3 h per start for a whole
+`behavioral-cell` task, i.e. 36 h for 36 three-start cells) and supports stage
+overrides. Cell artifacts record
 elapsed seconds and peak RSS. The simulated estimate is about 2.5–3 CPU-hours
 per cell: ranks 2–10, five folds, 36 cells require 1620 cells per partition;
 36 outer partitions approach 150,000 CPU-hours. Start with one subject,

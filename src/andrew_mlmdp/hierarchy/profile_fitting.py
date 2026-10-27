@@ -21,6 +21,15 @@ zeros. A projected step that makes any column structurally infeasible for any
 evaluation goal is rejected: parameters and Adam state are restored and the
 learning rate is lowered. Rejections are optimizer events, never evidence that
 the model is infeasible.
+
+The only reachable violation in log space is a column collapsing onto a goal
+(its gated support becomes that goal alone). Repeated rejection pins such a
+fit at the boundary until the rejection limit discards it, so two explicit
+alternatives exist (``infeasible_step``): ``"freeze"`` holds each collapsing
+column at its last feasible values for the rest of the fit, and ``"project"``
+raises the column's largest off-goal entry to ``projection_margin`` (log
+units) above the access gate, the nearest feasible point for that column.
+Both are constraint treatments, recorded as events in the result.
 """
 
 from __future__ import annotations
@@ -80,6 +89,23 @@ class ProfileRejection:
 
 
 @dataclass(frozen=True)
+class ProfileConstraintEvent:
+    """A collapsing column frozen, or one of its entries projected, at a step."""
+
+    updates: int
+    action: str
+    column: int
+    goal: Coordinate
+    # Projection only: the raised state and its peak-gauged D before/after.
+    state: int | None = None
+    before: float | None = None
+    after: float | None = None
+
+
+INFEASIBLE_STEPS = ("reject", "freeze", "project")
+
+
+@dataclass(frozen=True)
 class ProfileFitStep:
     """Diagnostics for one evaluated (W, theta) state."""
 
@@ -126,6 +152,7 @@ class ProfileFitResult:
     # state = highest validation LL among the checked states.
     selection: str = "training"
     best_validation_ll_per_decision: float | None = None
+    constraint_events: tuple[ProfileConstraintEvent, ...] = ()
 
     @property
     def objective_history(self) -> tuple[float, ...]:
@@ -336,6 +363,8 @@ def fit_profiles(
     lr_patience: int = 7,
     min_lr: float = 1e-5,
     max_rejections: int = 20,
+    infeasible_step: str = "reject",
+    projection_margin: float = 0.1,
     parameterization: str = "linear",
     access_threshold: float | None = None,
     validation_trials: Iterable[Trial] | None = None,
@@ -371,6 +400,12 @@ def fit_profiles(
     validation trials then act as a selection set and must not also be used
     for final scoring.
 
+    ``infeasible_step`` chooses what happens to a step that collapses a
+    column onto a goal: ``"reject"`` it (lowering lr), ``"freeze"`` that
+    column, or ``"project"`` it back above the access gate by
+    ``projection_margin`` log units (requires ``access_threshold > 0``). Other
+    violations are always rejected.
+
     ``evaluation_goals`` must contain every goal the fitted model will be
     scored on, including held-out goals; feasibility is enforced for all of
     them. Tolerances are on the per-decision objective scale and must be
@@ -399,6 +434,21 @@ def fit_profiles(
         raise ValueError("penalty_weights must be finite and non-negative")
     if isinstance(max_rejections, bool) or max_rejections < 0:
         raise ValueError("max_rejections must be a non-negative integer")
+    if infeasible_step not in INFEASIBLE_STEPS:
+        raise ValueError(
+            "infeasible_step must be one of " + ", ".join(INFEASIBLE_STEPS)
+        )
+    if infeasible_step == "project":
+        if not access_threshold:
+            raise ValueError("projection needs a positive access_threshold")
+        if not (
+            np.isfinite(projection_margin)
+            and projection_margin > 0.0
+            and access_threshold * np.exp(projection_margin) < 1.0
+        ):
+            raise ValueError(
+                "projection_margin must be positive and keep tau * exp(margin) < 1"
+            )
     if parameterization not in ("linear", "log"):
         raise ValueError("parameterization must be 'linear' or 'log'")
     log_space = parameterization == "log"
@@ -503,6 +553,46 @@ def fit_profiles(
             checked = access_gate(gauge(raw_profiles), access_threshold)
         return profile_feasibility(checked, maze, goals)
 
+    goal_indices = {goal: maze.state_index(goal) for goal in goals}
+
+    def collapsed_columns() -> list[tuple[int, Coordinate]]:
+        # (column, goal) pairs whose gated support is that goal alone; an
+        # all-zero linear column has no off-goal entry to restore.
+        with torch.no_grad():
+            if not log_space and not torch.all(raw_profiles.max(dim=0).values > 0):
+                return []
+            gated = access_gate(gauge(raw_profiles), access_threshold).numpy()
+        return [
+            (column, goal)
+            for column in range(gated.shape[1])
+            for goal, index in goal_indices.items()
+            if not gated[:, column].sum() - gated[index, column] > 0.0
+        ]
+
+    def project(column: int, goal: Coordinate) -> ProfileConstraintEvent:
+        # Raise the largest off-goal entry to tau * exp(margin) of the peak;
+        # the peak (on the goal) and every other entry are unchanged.
+        with torch.no_grad():
+            values = raw_profiles[:, column]
+            off_goal = values.clone()
+            off_goal[goal_indices[goal]] = -torch.inf if log_space else -1.0
+            state = int(torch.argmax(off_goal))
+            if log_space:
+                before = float(torch.exp(values[state] - values.max()))
+                target = values.max() + np.log(access_threshold) + projection_margin
+            else:
+                before = float(values[state] / values.max())
+                target = values.max() * access_threshold * np.exp(projection_margin)
+            values[state] = torch.maximum(values[state], target)
+            after = float(
+                torch.exp(values[state] - values.max())
+                if log_space
+                else values[state] / values.max()
+            )
+        return ProfileConstraintEvent(
+            updates, "project", column, goal, state, before, after
+        )
+
     def make_optimizer(rate: float) -> torch.optim.Adam:
         fitted = [*raw_theta.parameters()]
         if not freeze_profiles:
@@ -530,6 +620,8 @@ def fit_profiles(
     scheduler = make_scheduler(optimizer)
     history: list[ProfileFitStep] = []
     rejections: list[ProfileRejection] = []
+    constraint_events: list[ProfileConstraintEvent] = []
+    frozen_columns: set[int] = set()
     best_objective: float | None = None
     best_state = None
     stage_best: float | None = None
@@ -655,21 +747,53 @@ def fit_profiles(
 
         # Propose a projected step; on structural violation restore the exact
         # pre-step parameters and Adam state, lower lr, and retry with the
-        # same gradients (they are untouched by the restore).
+        # same gradients (they are untouched by the restore). Collapsing
+        # columns are instead projected or frozen when so configured.
         rejected_out = False
         while True:
             state_before = clone_state()
             optimizer_before = copy.deepcopy(optimizer.state_dict())
             optimizer.step()
+            if frozen_columns:
+                with torch.no_grad():
+                    columns = sorted(frozen_columns)
+                    raw_profiles[:, columns] = state_before[0][:, columns]
             if not log_space:
                 with torch.no_grad():
                     raw_profiles.clamp_(min=0.0)
             violations = feasibility_violations()
+            if violations and infeasible_step == "project":
+                collapsed = collapsed_columns()
+                if collapsed:
+                    constraint_events.extend(project(*pair) for pair in collapsed)
+                    violations = feasibility_violations()
             if not violations:
                 break
             step_lr = float(optimizer.param_groups[0]["lr"])
             restore_state(state_before)
             optimizer.load_state_dict(optimizer_before)
+            if infeasible_step == "freeze":
+                # Re-apply the proposal to find the collapsing columns, then
+                # retry it from the restored state with them held fixed.
+                optimizer.step()
+                if frozen_columns:
+                    with torch.no_grad():
+                        columns = sorted(frozen_columns)
+                        raw_profiles[:, columns] = state_before[0][:, columns]
+                newly = [
+                    (column, goal)
+                    for column, goal in collapsed_columns()
+                    if column not in frozen_columns
+                ]
+                restore_state(state_before)
+                optimizer.load_state_dict(optimizer_before)
+                if newly:
+                    for column, goal in newly:
+                        frozen_columns.add(column)
+                        constraint_events.append(
+                            ProfileConstraintEvent(updates, "freeze", column, goal)
+                        )
+                    continue
             rejections.append(ProfileRejection(updates, step_lr, violations))
             next_lr = step_lr * config.lr_decay
             if len(rejections) > max_rejections or next_lr < config.min_lr:
@@ -748,6 +872,10 @@ def fit_profiles(
             "min_lr": config.min_lr,
             "max_rejections": max_rejections,
         },
+        "infeasible_step": infeasible_step,
+        "projection_margin": (
+            projection_margin if infeasible_step == "project" else None
+        ),
     }
     return ProfileFitResult(
         initial_raw_profiles=raw_initial,
@@ -761,6 +889,7 @@ def fit_profiles(
         best_objective=best_objective,
         history=tuple(history),
         rejections=tuple(rejections),
+        constraint_events=tuple(constraint_events),
         updates=updates,
         converged=converged,
         reason=reason,
