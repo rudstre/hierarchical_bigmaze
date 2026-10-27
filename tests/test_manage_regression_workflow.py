@@ -402,6 +402,64 @@ def test_dry_run_builds_complete_dependency_graph_without_writing(
     assert not (tmp_path / "run").exists()
 
 
+@pytest.mark.parametrize(
+    "scope, expected_limits",
+    [
+        # 2,500 tasks form arrays of 1,000, 1,000 and 500 tasks. A stage-wide
+        # cap of 800 is shared as ceil(800 / 3) = 267 per array.
+        ("stage", [267, 267, 267]),
+        # Plans frozen before the stage scope keep SLURM's per-array cap.
+        (None, [800, 800, 500]),
+    ],
+)
+def test_max_concurrent_is_shared_across_a_stage_arrays(
+    monkeypatch, tmp_path, scope, expected_limits
+):
+    commands = []
+    monkeypatch.setattr(
+        manager,
+        "_run",
+        lambda command, dry_run: commands.append(command) or "",
+    )
+    plan = {} if scope is None else {"concurrency_scope": scope}
+    state = {
+        "project_root": str(ROOT),
+        "python_executable": "python",
+        "config_path": str(tmp_path / "config.json"),
+        "output_dir": str(tmp_path / "run"),
+        "max_array_size": 1000,
+        "submissions": [],
+        "resolved_resources": plan,
+    }
+    resources = {
+        "partition": "cpu_backfill",
+        "account": None,
+        "cpus_per_task": 1,
+        "memory": "3G",
+        "time": "03:00:00",
+        "max_concurrent": 800,
+    }
+    tasks = [{"stage": "behavioral-cell", "k": index} for index in range(2500)]
+
+    manager._submit_group(
+        state,
+        tmp_path / "manager.json",
+        "behavioral-cell",
+        tasks,
+        resources,
+        [],
+        dry_run=True,
+    )
+
+    arrays = [
+        next(part for part in command if part.startswith("--array="))
+        for command in commands
+    ]
+    assert [int(array.rsplit("%", 1)[1]) for array in arrays] == expected_limits
+    assert arrays[0].startswith("--array=0-999%")
+    assert arrays[2].startswith("--array=0-499%")
+
+
 def test_lattice_starts_after_features_without_waiting_for_regression(
     monkeypatch, tmp_path
 ):
@@ -782,12 +840,31 @@ def test_rerecord_option_is_validated(tmp_path, extra, message):
 def test_behavioral_tasks_and_dependencies(sources, search, monkeypatch, tmp_path):
     from dataclasses import replace
 
+    from andrew_mlmdp.regression_behavioral import coarse_cells
+
     config = replace(_config(), mlmdp=workflow.MLMDPConfig(sources, search))
-    tasks = manager._stage_tasks(config, _workflow_manifest(), include_lattice=True)
+    tasks = manager._stage_tasks(
+        config, _workflow_manifest(), include_lattice=True, include_route_fit=True
+    )
     # Inner folds {s4,s1}, {s4,s2}, {s4,s3}, {s3,s1}, {s3,s2}: the two
-    # partitions share the fold excluding s3 and s4. One task per fold and K.
-    assert len(tasks["behavioral-cell"]) == 5 * 3
-    assert all("theta_cell" not in t for t in tasks["behavioral-cell"])
+    # partitions share the fold excluding s3 and s4. One task per fold, K, and
+    # coarse theta cell, in grid order.
+    cells = list(coarse_cells(config))
+    assert len(cells) == 36
+    assert len(tasks["behavioral-cell"]) == 5 * 3 * 36
+    by_fold_and_k = {}
+    for task in tasks["behavioral-cell"]:
+        identity = (
+            task["partition_digest"],
+            task["k"],
+            json.dumps(task["validation_session_id"]),
+        )
+        by_fold_and_k.setdefault(identity, []).append(task["theta_cell"])
+    assert len(by_fold_and_k) == 5 * 3
+    assert all(names == cells for names in by_fold_and_k.values())
+    assert len(tasks["route-fit"]) == 2
+    without_route_fit = manager._stage_tasks(config, _workflow_manifest())
+    assert "route-fit" not in without_route_fit
     assert len(tasks["behavioral-selection"]) == 2
     assert len(tasks["behavioral-refit"]) == 2
     assert len(tasks["behavioral-local-cell"]) == (
@@ -823,6 +900,8 @@ def test_behavioral_tasks_and_dependencies(sources, search, monkeypatch, tmp_pat
     manager._submit_pipeline(
         state, tmp_path / "manager.json", config, raw, tasks, dry_run=True
     )
+    # Fixed routes start with the run; only the bundle waits for them.
+    assert submitted["route-fit"] == []
     assert submitted["behavioral-cell"] == []
     assert submitted["behavioral-selection"] == ["behavioral-cell"]
     end = "behavioral-selection"
@@ -832,10 +911,11 @@ def test_behavioral_tasks_and_dependencies(sources, search, monkeypatch, tmp_pat
         end = "behavioral-local-selection"
     assert submitted["behavioral-refit"] == [end]
     assert submitted["predictor-bundle"] == (
-        ["selected-refit", "behavioral-refit"]
+        ["selected-refit", "behavioral-refit", "route-fit"]
         if "nmf" in sources
-        else ["behavioral-refit"]
+        else ["behavioral-refit", "route-fit"]
     )
+    assert submitted["feature-generation"] == ["predictor-bundle"]
     assert submitted["lattice-precompute"] == ["feature-generation"]
     assert not (tmp_path / "manager.json").exists()
 
@@ -852,7 +932,7 @@ def test_worker_forwards_behavioral_cell_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "report_progress", lambda **kw: None)
     monkeypatch.setenv("REGRESSION_PROGRESS", str(tmp_path / "progress.json"))
     for stage, extra in (
-        ("behavioral-cell", {"k": 6}),
+        ("behavioral-cell", {"theta_cell": "l1_0.3_l2_0.6_b_1", "k": 6}),
         ("behavioral-local-cell", {"local_index": 0}),
     ):
         task = {
@@ -888,7 +968,10 @@ def test_worker_forwards_behavioral_cell_identity(tmp_path, monkeypatch):
         assert cmd[cmd.index("--validation-session-json") + 1] == "5"
         flag = "--k" if stage == "behavioral-cell" else "--local-index"
         assert cmd[cmd.index(flag) + 1] == str(next(reversed(extra.values())))
-        assert "--theta-cell" not in cmd
+        if stage == "behavioral-cell":
+            assert cmd[cmd.index("--theta-cell") + 1] == "l1_0.3_l2_0.6_b_1"
+        else:
+            assert "--theta-cell" not in cmd
 
 
 def test_disabled_sources_do_not_keep_the_status_pending():

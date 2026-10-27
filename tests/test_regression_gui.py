@@ -197,9 +197,42 @@ def test_resource_preview_tracks_route_family_and_advanced_overrides():
     plan = access.resource_preview(payload)
 
     assert plan["route_family"] == "hmm"
-    assert plan["stages"]["predictor-bundle"]["cpus_per_task"] == 2
+    assert plan["stages"]["route-fit"]["cpus_per_task"] == 8
+    assert plan["stages"]["predictor-bundle"]["cpus_per_task"] == 1
     assert plan["stages"]["feature-generation"]["cpus_per_task"] == 6
     assert any(row["stage"] == "candidate" for row in plan["rows"])
+
+
+def test_streamlit_max_concurrent_is_editable_execution_setting():
+    from andrew_mlmdp.regression_workflow import regression_config_from_payload
+
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=30
+    ).run()
+
+    def configuration():
+        raw = next(
+            widget for widget in app.text_area if widget.label == "Configuration JSON"
+        ).value
+        return json.loads(raw)
+
+    field = next(
+        widget
+        for widget in app.number_input
+        if widget.label == "Max concurrent tasks per stage"
+    )
+    assert field.value == 1200
+    before = configuration()
+    field.set_value(160).run()
+    after = configuration()
+
+    assert after["slurm"]["max_concurrent"] == 160
+    # Resources are execution provenance, not part of the scientific identity.
+    assert (
+        regression_config_from_payload(after, ROOT).signature
+        == regression_config_from_payload(before, ROOT).signature
+    )
 
 
 def test_streamlit_advanced_overrides_update_configuration_json():
@@ -516,3 +549,19 @@ def test_streamlit_behavioral_defaults_and_optional_nmf():
     mlmdp = json.loads(raw)["mlmdp"]
     assert mlmdp["profile_sources"] == ["behavioral", "nmf"]
     assert mlmdp["behavioral"]["theta_search"] == "coarse_and_local"
+    # The goal-commitment structure is written explicitly, defaulting to the
+    # behavioral fit's termination-plus-radius setting.
+    assert mlmdp["behavioral"]["commitment_mode"] == "both"
+    assert mlmdp["behavioral"]["commitment_radius"] == 2
+
+    next(
+        w for w in app.selectbox if w.label == "Behavioral goal commitment"
+    ).set_value("termination")
+    next(
+        w for w in app.button if w.label == "Apply common settings to JSON"
+    ).click().run()
+    assert not app.exception
+    raw = next(w for w in app.text_area if w.label == "Configuration JSON").value
+    behavioral = json.loads(raw)["mlmdp"]["behavioral"]
+    assert behavioral["commitment_mode"] == "termination"
+    assert behavioral["commitment_radius"] is None

@@ -9,7 +9,10 @@
   },
   "discovery_config": "configs/hierarchy_rank_validation_loso.json",
   "discovery_dir": "output/hierarchy_rank_discovery",
-  "adam": {},
+  "adam": {
+    "commitment_mode": "both",
+    "commitment_radius": 2
+  },
   "heldout_sessions": "all",
   "subgoal_selection": {
     "method": "session_cv",
@@ -33,10 +36,10 @@
   },
   "random_seed": 123,
   "slurm": {
-    "partition": "cpu_backfill",
+    "partition": "cpu_backfill,cpu",
     "resource_profile": "auto",
     "stage_overrides": {},
-    "max_concurrent": 256,
+    "max_concurrent": 1200,
     "resource_bands": [
       {
         "rank_range": [2, 12],

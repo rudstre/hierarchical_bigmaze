@@ -23,6 +23,7 @@ from andrew_mlmdp.regression_execution import (
     regression_variant_path,
     regression_variant_predictors,
     run_predictor_bundle,
+    run_route_fit,
     run_saved_regression_variants,
 )
 from andrew_mlmdp.regression_policy_overlap import (
@@ -54,6 +55,7 @@ _COMMANDS = (
     "behavioral-local-cell",
     "behavioral-local-selection",
     "behavioral-refit",
+    "route-fit",
     "predictor-bundle",
     "feature-generation",
     "regression",
@@ -76,6 +78,9 @@ def parser():
     result.add_argument("--validation-session-json")
     result.add_argument(
         "--local-index", type=int, help="behavioral-local-cell: neighbour 0-25"
+    )
+    result.add_argument(
+        "--theta-cell", help="behavioral-cell: fit only this coarse theta cell"
     )
     result.add_argument("--force", action="store_true")
     result.add_argument(
@@ -230,6 +235,11 @@ def _status(config, output_dir, table):
             if config.behavioral
             else ()
         ),
+        *(
+            (("route_fit", "route_fit.json"),)
+            if config.predictors.routes_rank_independent
+            else ()
+        ),
         ("predictor_bundle", "predictor.json"),
         ("features", "features.json"),
         ("regression", "regression.json"),
@@ -365,6 +375,7 @@ def main(argv=None):
                 partition,
                 k=args.k,
                 validation_session_id=json.loads(args.validation_session_json),
+                theta_cell=args.theta_cell,
                 force=args.force,
             )
         elif command == "behavioral-selection":
@@ -395,6 +406,10 @@ def main(argv=None):
             result = aggregate_partition(config, args.output_dir, partition)
         elif command == "selected-refit":
             result = _selected_refit(config, args.output_dir, partition, args.force)
+        elif command == "route-fit":
+            result = run_route_fit(
+                config, args.output_dir, partition, force=args.force
+            )
         elif command == "predictor-bundle":
             result = run_predictor_bundle(
                 config, args.output_dir, partition, force=args.force

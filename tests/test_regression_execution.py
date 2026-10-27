@@ -506,6 +506,114 @@ def test_unexpected_predictor_runtime_error_propagates(monkeypatch, tmp_path):
         execution.run_predictor_bundle(config, tmp_path, partition)
 
 
+def _fake_route_fits(monkeypatch, outcomes):
+    """Replace the route fit; each call takes the next outcome (dict or error)."""
+    calls = []
+
+    def fit(config, partition, route_rows, route_settings):
+        calls.append(dict(route_settings))
+        outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(execution, "_fit_route_and_habit", fit)
+    return calls
+
+
+_FITTED_ROUTES = {
+    "route": {"family": "hmm", "settings": {"n_routes": 6}, "seed": 7},
+    "habit_counts": [[1.0, 2.0]],
+    "n_training_decisions": 1,
+    "training_data_digest": "digest",
+    "torch_version": "test",
+}
+
+
+def test_bundle_copies_rank_independent_route_fit_without_refitting(
+    monkeypatch, tmp_path
+):
+    config = _config(route_family="hmm")
+    assert config.predictors.routes_rank_independent
+    partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
+    _prepare_predictor_failure_test(monkeypatch, partition)
+    calls = _fake_route_fits(monkeypatch, [_FITTED_ROUTES])
+
+    route_fit = execution.run_route_fit(config, tmp_path, partition)
+    bundle = execution.run_predictor_bundle(config, tmp_path, partition)
+
+    # The route stage fitted once; the bundle reused its artifact.
+    assert len(calls) == 1
+    assert calls[0] == config.predictors.selected_route_settings
+    assert route_fit["status"] == "success"
+    assert route_fit["compatibility"]["seed"] == execution._route_seed(
+        config, partition
+    )
+    assert bundle["status"] == "success"
+    for name, value in _FITTED_ROUTES.items():
+        assert bundle[name] == value
+    assert bundle["compatibility"] == {"partition_digest": partition.digest}
+    assert bundle["elapsed_seconds"] == route_fit["elapsed_seconds"]
+    assert bundle["route_fit_artifact"]["artifact_digest"] == (
+        route_fit["artifact_digest"]
+    )
+    unsigned = {k: v for k, v in bundle.items() if k != "artifact_digest"}
+    assert bundle["artifact_digest"] == execution._payload_digest(unsigned)
+
+
+def test_route_fit_failures_carry_into_the_bundle_and_retry_only_when_operational(
+    monkeypatch, tmp_path
+):
+    config = _config(route_family="hmm")
+    partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
+    _prepare_predictor_failure_test(monkeypatch, partition)
+    scientific = execution.HMMScientificFitError(
+        "optimizer_gradient", FloatingPointError("nonfinite gradient")
+    )
+    calls = _fake_route_fits(monkeypatch, [scientific, _FITTED_ROUTES])
+
+    assert execution.run_route_fit(config, tmp_path, partition)["status"] == (
+        "scientific_failure"
+    )
+    bundle = execution.run_predictor_bundle(config, tmp_path, partition)
+    # A scientific failure is terminal: never refitted, carried as recorded.
+    assert len(calls) == 1
+    assert bundle["status"] == "scientific_failure"
+    assert bundle["stage"] == "optimizer_gradient"
+
+    operational = execution.HMMOperationalFitError(
+        "policy_solve", RuntimeError("backend failed")
+    )
+    retried = tmp_path / "retried"
+    calls = _fake_route_fits(monkeypatch, [operational, _FITTED_ROUTES])
+    assert execution.run_route_fit(config, retried, partition)["status"] == (
+        "operational_failure"
+    )
+    # An operational failure is retried by the next attempt.
+    assert execution.run_predictor_bundle(config, retried, partition)["status"] == (
+        "success"
+    )
+    assert len(calls) == 2
+
+
+def test_rank_aware_routes_are_still_fitted_by_the_bundle(monkeypatch, tmp_path):
+    predictors = workflow.PredictorConfig(route_family="hmm", hmm={"n_routes": "auto"})
+    config = _config(predictors=predictors)
+    assert not config.predictors.routes_rank_independent
+    partition = workflow.PredictorPartition(1, 10, 3, (1, 2))
+    _prepare_predictor_failure_test(monkeypatch, partition)
+    calls = _fake_route_fits(monkeypatch, [_FITTED_ROUTES])
+
+    with pytest.raises(ValueError, match="Rank-aware"):
+        execution.run_route_fit(config, tmp_path, partition)
+    bundle = execution.run_predictor_bundle(config, tmp_path, partition)
+
+    assert bundle["status"] == "success"
+    assert calls == [{"n_routes": 4}]
+    assert "route_fit_artifact" not in bundle
+    assert not (tmp_path / "partitions" / partition.digest / "route_fit.json").exists()
+
+
 def test_qin_history_predictors_reset_at_every_trial_boundary():
     from types import SimpleNamespace
 

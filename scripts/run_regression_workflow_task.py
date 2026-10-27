@@ -125,6 +125,8 @@ def _main(argv=None):
         command.extend(["--k", str(task["k"])])
     if task.get("local_index") is not None:
         command.extend(["--local-index", str(task["local_index"])])
+    if task.get("theta_cell") is not None:
+        command.extend(["--theta-cell", task["theta_cell"]])
     if "validation_session_id" in task and task["validation_session_id"] is not None:
         command.extend(
             [

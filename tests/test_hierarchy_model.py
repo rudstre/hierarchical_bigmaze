@@ -290,15 +290,18 @@ def test_commitment_mode_and_radius_validate_together():
     with pytest.raises(ValueError, match="commitment_mode"):
         environment.hierarchy(basis, commitment_mode="invalid")
     with pytest.raises(ValueError, match="commitment_radius must be None"):
-        environment.hierarchy(basis, commitment_radius=2)
+        environment.hierarchy(
+            basis, commitment_mode="termination", commitment_radius=2
+        )
     with pytest.raises(ValueError, match="non-negative integer"):
         environment.hierarchy(basis, commitment_mode="radius", commitment_radius=None)
     with pytest.raises(ValueError, match="non-negative integer"):
         environment.hierarchy(basis, commitment_mode="radius", commitment_radius=-1)
 
+    # The library default matches the behavioral fit's goal commitment.
     default = environment.hierarchy(basis)
-    assert default.commitment_mode == "termination"
-    assert default.commitment_radius is None
+    assert default.commitment_mode == "both"
+    assert default.commitment_radius == 2
 
     radius = environment.hierarchy(
         basis, commitment_mode="radius", commitment_radius=0

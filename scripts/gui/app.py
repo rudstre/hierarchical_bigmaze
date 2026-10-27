@@ -35,6 +35,9 @@ if not hasattr(regression_reporting, "make_behavioral_rank_figure") or any(
 ):
     importlib.reload(regression_reporting)
 
+from andrew_mlmdp.hierarchy.behavioral_profiles import (  # noqa: E402
+    BehavioralFitSettings,
+)
 from andrew_mlmdp.hmm_route_plots import (  # noqa: E402
     hmm_route_maps,
     make_hmm_route_figure,
@@ -226,6 +229,26 @@ if root is None:
                 ),
                 horizontal=True,
             )
+            behavioral = {
+                **BehavioralFitSettings().as_dict(),
+                **mlmdp.get("behavioral", {}),
+            }
+            commitment_modes = ["both", "termination", "radius"]
+            m1, m2 = st.columns(2)
+            commitment_mode = m1.selectbox(
+                "Behavioral goal commitment",
+                commitment_modes,
+                index=commitment_modes.index(behavioral["commitment_mode"]),
+                help="When the exact goal-only policy replaces the composed "
+                "policy: 'termination' = stochastic upper-termination draw at a "
+                "subgoal access; 'radius' = within the radius of the goal (no "
+                "draw); 'both' = either.",
+            )
+            commitment_radius = m2.number_input(
+                "Commitment radius (grid steps; ignored for termination)",
+                min_value=1,
+                value=int(behavioral["commitment_radius"] or 2),
+            )
             st.caption(
                 "Behavioral θ and K use inner held-out sessions. Auto route counts "
                 "follow the behavioral K when both MLMDPs are enabled."
@@ -331,6 +354,10 @@ if root is None:
             behavioral_settings["theta_search"] = (
                 "coarse" if theta_search == "Coarse grid" else "coarse_and_local"
             )
+            behavioral_settings["commitment_mode"] = commitment_mode
+            behavioral_settings["commitment_radius"] = (
+                None if commitment_mode == "termination" else int(commitment_radius)
+            )
             updated["mlmdp"] = {
                 "profile_sources": ["behavioral", "nmf"]
                 if also_nmf
@@ -366,6 +393,23 @@ if root is None:
             updated["discovery_dir"] = discovery_dir or None
             st.session_state.pending_config_text = json.dumps(updated, indent=2)
             st.rerun()
+    configured_concurrency = int(payload.get("slurm", {}).get("max_concurrent", 1200))
+    concurrency = st.number_input(
+        "Max concurrent tasks per stage",
+        min_value=1,
+        value=configured_concurrency,
+        step=50,
+        help=(
+            "Total running tasks per workflow stage, shared across the stage's "
+            "SLURM arrays (1,000 tasks each), so it holds as subjects are added. "
+            "Execution setting only; it does not change the scientific signature."
+        ),
+    )
+    if int(concurrency) != configured_concurrency:
+        updated = json.loads(raw)
+        updated.setdefault("slurm", {})["max_concurrent"] = int(concurrency)
+        st.session_state.pending_config_text = json.dumps(updated, indent=2)
+        st.rerun()
     with st.expander("Advanced resource overrides"):
         configured_overrides = payload.get("slurm", {}).get("stage_overrides", {})
         override_source = json.dumps(configured_overrides, indent=2, sort_keys=True)
@@ -403,8 +447,9 @@ if root is None:
         st.dataframe(resource_plan["rows"], hide_index=True, width="stretch")
         if resource_plan.get("behavioral_calibrated") is False:
             st.caption(
-                "Behavioral cell resources are provisional: 1 CPU, 8 GB, 12 h; "
-                "the real-data timing pilot is still pending."
+                "Behavioral cell resources are provisional: 1 CPU, 3 GB and "
+                "1 h per start per theta cell, from real-data starts at K 3-9 "
+                "(median 5-12 min, peak 0.66 GB); K above 9 is unmeasured."
             )
         if not resource_plan["launchable"]:
             st.error(resource_plan["launch_block_reason"])

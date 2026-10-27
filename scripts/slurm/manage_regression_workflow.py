@@ -8,6 +8,7 @@ import fcntl
 import getpass
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -110,6 +111,7 @@ _STAGE_SOURCE_ARTIFACTS = (
     "partitions/*/behavioral/coarse/k_*.json",
     "partitions/*/behavioral/local/k_*.json",
     "partitions/*/behavioral/refit.json",
+    "partitions/*/route_fit.json",
     "partitions/*/predictor.json",
     "partitions/*/features.json",
     "partitions/*/regression*.json",
@@ -249,7 +251,14 @@ def _resource_bands(raw, rank_range):
     return resource_bands(raw.get("slurm", {}), rank_range)
 
 
-def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
+def _stage_tasks(
+    config, workflow_manifest, *, include_lattice=False, include_route_fit=False
+):
+    """Scalar tasks per stage.
+
+    ``include_route_fit`` follows the run's frozen resource plan, so runs
+    submitted before the route-fit stage keep fitting routes in the bundle.
+    """
     partitions = [_partition(record) for record in workflow_manifest["partitions"]]
     tasks = {
         "discovery": (
@@ -282,16 +291,23 @@ def _stage_tasks(config, workflow_manifest, *, include_lattice=False):
             for p in partitions
         ]
     if config.behavioral:
-        # One task per (inner fold, K) fits every coarse theta cell; folds
-        # shared by two partitions are scheduled once.
+        # One task per (inner fold, K, theta cell); folds shared by two
+        # partitions are scheduled once.
         tasks["behavioral-cell"] = [
             {
                 "stage": "behavioral-cell",
                 "partition_digest": partition.digest,
                 "k": k,
                 "validation_session_id": session,
+                "theta_cell": cell,
             }
             for partition, k, session in coarse_tasks(config, partitions)
+            for cell in coarse_cells(config)
+        ]
+    if include_route_fit and config.predictors.routes_rank_independent:
+        tasks["route-fit"] = [
+            {"stage": "route-fit", "partition_digest": partition.digest}
+            for partition in partitions
         ]
     for partition in partitions:
         identity = {"partition_digest": partition.digest}
@@ -428,6 +444,12 @@ def _submit_group(
         tasks[index : index + manager["max_array_size"]]
         for index in range(0, len(tasks), manager["max_array_size"])
     ]
+    # SLURM's %N limit applies to each array. Current plans cap the whole
+    # stage, so the limit is shared across its arrays; older plans keep
+    # their per-array meaning.
+    per_array_limit = resources["max_concurrent"]
+    if manager.get("resolved_resources", {}).get("concurrency_scope") == "stage":
+        per_array_limit = max(1, math.ceil(per_array_limit / len(chunks)))
     jobs = []
     for chunk_index, chunk in enumerate(chunks):
         attempt = 1 + sum(
@@ -464,7 +486,7 @@ def _submit_group(
                 f"REGRESSION_TASK_LIST={task_path}",
             )
         )
-        array_limit = min(resources["max_concurrent"], len(chunk))
+        array_limit = min(per_array_limit, len(chunk))
         command = [
             "sbatch",
             "--parsable",
@@ -500,6 +522,7 @@ def _submit_group(
                     "task_list": str(task_path),
                     "task_list_digest": _read(task_path)["task_list_digest"],
                     "task_count": len(chunk),
+                    "array_limit": array_limit,
                     "dependency": dependency,
                     "resources": {"cpus_per_task": 1, **resources},
                     "submitted_at": datetime.now(UTC).isoformat(),
@@ -570,7 +593,12 @@ def _artifact_state(
                     task["validation_session_id"],
                     cell,
                 )
-                for cell in coarse_cells(config)
+                # Older task lists carry no cell and fit every cell.
+                for cell in (
+                    [task["theta_cell"]]
+                    if task.get("theta_cell") is not None
+                    else coarse_cells(config)
+                )
             ]
         else:
             selection_path = partition_dir / "behavioral/selection.json"
@@ -638,6 +666,8 @@ def _artifact_state(
         path = _candidate_path(run_dir, _partition(record), int(selected), None)
     elif stage == "selection":
         path = partition_dir / "selection.json"
+    elif stage == "route-fit":
+        path = partition_dir / "route_fit.json"
     elif stage == "predictor-bundle":
         path = partition_dir / "predictor.json"
     elif stage == "feature-generation":
@@ -1045,6 +1075,16 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
     if not plan["launchable"]:
         raise ValueError(plan["launch_block_reason"])
     stages = plan["stages"]
+    # Rank-independent routes need no MLMDP result, so they start at once.
+    route_jobs = _submit_group(
+        manager,
+        manager_path,
+        "route-fit",
+        tasks.get("route-fit", []),
+        stages.get("route-fit"),
+        [],
+        dry_run=dry_run,
+    )
     dependency = _submit_group(
         manager,
         manager_path,
@@ -1113,7 +1153,7 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
             )
             if jobs:
                 behavioral_dependency = jobs
-    dependency = [*nmf_dependency, *behavioral_dependency]
+    dependency = [*nmf_dependency, *behavioral_dependency, *route_jobs]
     for stage in (
         "predictor-bundle",
         "feature-generation",
@@ -1321,6 +1361,9 @@ def _main(args):
         config,
         workflow_manifest,
         include_lattice=manager.get("precompute_lattice", False),
+        include_route_fit=manager.get("resolved_resources", {}).get(
+            "route_fit", False
+        ),
     )
     states = {
         stage: Counter(

@@ -310,6 +310,12 @@ class PredictorConfig:
     def selected_route_settings(self) -> dict[str, object]:
         return dict(self.pca if self.route_family == "pca" else self.hmm)
 
+    @property
+    def routes_rank_independent(self) -> bool:
+        """Whether route fitting can start before any MLMDP rank is selected."""
+        name = "n_components" if self.route_family == "pca" else "n_routes"
+        return self.selected_route_settings.get(name) != "auto"
+
     def resolved_route_settings(self, selected_k: int) -> dict[str, object]:
         """Resolve a rank-aware route count for one selected MLMDP rank."""
         if (

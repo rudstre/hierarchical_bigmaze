@@ -371,6 +371,9 @@ def status(root):
         config,
         manifest,
         include_lattice=bool(record and record.get("precompute_lattice")),
+        include_route_fit=bool(
+            record and record.get("resolved_resources", {}).get("route_fit")
+        ),
     )
     from collections import Counter
 

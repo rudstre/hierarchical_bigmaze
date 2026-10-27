@@ -602,8 +602,8 @@ class Environment:
         composition_exponent: float = 1.0,
         composition_mode: Literal["power", "winner_take_all"] = "power",
         goal_reward_mode: Literal["inpainted", "fixed", "deferred"] = "inpainted",
-        commitment_mode: Literal["termination", "radius", "both"] = "termination",
-        commitment_radius: int | None = None,
+        commitment_mode: Literal["termination", "radius", "both"] = "both",
+        commitment_radius: int | None = 2,
     ):
         """Create a reusable hierarchy template for a supplied subgoal basis.
 
@@ -637,8 +637,8 @@ class Environment:
         composed policy is replaced by the exact goal-only policy, i.e. the
         docs' "upper termination" event:
 
-        - ``"termination"`` (default, ``commitment_radius`` must be
-          ``None``): the only trigger is the existing stochastic
+        - ``"termination"`` (``commitment_radius`` must be ``None``): the
+          only trigger is the existing stochastic
           upper-termination draw at a subgoal access
           (``upper_controlled[-1, entered_state]``).
         - ``"radius"``: the termination draw is disabled entirely (it never
@@ -646,8 +646,10 @@ class Environment:
           ``commitment_radius`` grid steps of the goal, the exact goal-only
           policy is installed unconditionally, independent of any subgoal
           access.
-        - ``"both"``: the termination draw stays active and the radius check
-          is applied on top of it, so either can trigger the switch.
+        - ``"both"`` (default, with ``commitment_radius=2``, matching the
+          behavioral fit's ``BehavioralFitSettings``): the termination draw
+          stays active and the radius check is applied on top of it, so
+          either can trigger the switch.
 
         ``commitment_radius`` is a grid-searched integer, not a fitted
         parameter: it is not differentiable, so it must be swept manually

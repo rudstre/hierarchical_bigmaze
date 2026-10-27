@@ -503,6 +503,87 @@ def test_partitions_share_symmetric_inner_folds(simulated, monkeypatch, tmp_path
         )
 
 
+def test_single_theta_cell_tasks_match_the_whole_fold_task(
+    simulated, monkeypatch, tmp_path
+):
+    maze, trials, table = simulated
+    config = _config(("behavioral",))
+    _patch_data(monkeypatch, maze, trials, table)
+    fitted = []
+
+    def fixed_d_cell(environment, trials, goals, k, theta, settings, seed, **kw):
+        fitted.append((k, tuple(theta), seed))
+        profiles, ungated = _gated_bumps(maze, [(1, 1), (3, 3), (1, 3)][:k])
+        return CellFit(
+            k,
+            tuple(theta),
+            "success",
+            "fixed",
+            profiles,
+            ungated,
+            held_parameters(theta, settings),
+            0.0,
+            {},
+            seed,
+        )
+
+    monkeypatch.setattr(behavioral, "fit_cell", fixed_d_cell)
+    cells = behavioral.coarse_cells(config)
+    results = {}
+    for layout in ("whole_fold", "per_cell"):
+        root = tmp_path / layout
+        workflow.write_manifest(config, root, table)
+        (partition,), _ = workflow.build_predictor_partitions(table, config)
+        _, k, session = behavioral.coarse_tasks(config, [partition])[0]
+        start = len(fitted)
+        if layout == "whole_fold":
+            behavioral.run_behavioral_cells(
+                config, root, partition, k=k, validation_session_id=session
+            )
+        else:
+            for name in cells:
+                before = len(fitted)
+                behavioral.run_behavioral_cells(
+                    config,
+                    root,
+                    partition,
+                    k=k,
+                    validation_session_id=session,
+                    theta_cell=name,
+                )
+                # A per-cell task fits exactly its own cell.
+                assert fitted[before:] == [
+                    (k, cells[name], fitted[before][2])
+                ]
+        results[layout] = {
+            "fits": fitted[start:],
+            "artifacts": {
+                name: workflow._read_json(
+                    behavioral.cell_path(root, partition, "coarse", k, session, name)
+                )
+                for name in cells
+            },
+        }
+
+    # Same cells, grid order, and seeds; identical scientific identity and
+    # validation scores in every artifact.
+    assert results["per_cell"]["fits"] == results["whole_fold"]["fits"]
+    for name in cells:
+        whole = results["whole_fold"]["artifacts"][name]
+        single = results["per_cell"]["artifacts"][name]
+        assert single["compatibility"] == whole["compatibility"]
+        assert single["validation"] == whole["validation"]
+    with pytest.raises(ValueError, match="unknown coarse theta cell"):
+        behavioral.run_behavioral_cells(
+            config,
+            tmp_path / "per_cell",
+            partition,
+            k=k,
+            validation_session_id=session,
+            theta_cell="not_a_cell",
+        )
+
+
 def test_legacy_normalization_preserves_exact_historical_signature():
     # Recorded from HEAD before the behavioral change, with a portable root.
     legacy = workflow.RegressionWorkflowConfig(

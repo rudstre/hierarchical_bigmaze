@@ -81,9 +81,26 @@ for the full-model learning curve.
   `slurm.stage_overrides` entries may set `cpus_per_task`, `memory`, `time`, and
   `max_concurrent` for a named stage. Resource settings are execution
   provenance and do not enter the scientific configuration signature.
+- `slurm.max_concurrent` (default 1200, editable in the GUI as "Max concurrent
+  tasks per stage") caps the running tasks of a whole stage. The manager splits
+  a stage into SLURM arrays of 1,000 tasks and gives each array
+  `ceil(max_concurrent / n_arrays)`, because SLURM's `%N` limit applies per
+  array; the cap therefore stays fixed as subjects are added. Runs whose frozen
+  plan predates this (no `concurrency_scope`) keep the per-array meaning on
+  retry. Each candidate rank band is its own group.
 
-The HMM CPU profile (`auto-cpu-v2`) requests 8 CPUs and estimates predictor
-fitting time and memory from measured fits on `cpu_backfill`: the slowest of
+When route settings do not depend on the selected rank (a fixed HMM
+`n_routes` or PCA `n_components`), a `route-fit` stage fits routes and habit
+counts at the start of the run, alongside MLMDP fitting, and writes
+`partitions/<digest>/route_fit.json`. The route fit uses the same training
+rows, settings, and seed as before, so the bundle copies it unchanged and
+records its digest as `route_fit_artifact`. A route-fit scientific failure is
+terminal and carries into the bundle; an operational failure is retried. With
+`"auto"` routes the bundle still fits them after rank selection. Runs submitted
+before this stage keep fitting routes in the bundle.
+
+The HMM CPU profile (`auto-cpu-v4`) requests 8 CPUs for the route fit and
+estimates its time and memory from measured fits on `cpu_backfill`: the slowest of
 36 partitions took 11.19 s/epoch with 10 routes (`full_hmm2`, 500 epochs,
 peak 8.07 GB) and 4.41 s/epoch with 6 routes (`full_hmm_xiao2`, 2000 epochs,
 peak 3.57 GB). Time is linear in epochs; per-epoch time scales as
@@ -93,9 +110,15 @@ with floors of 16 GB and one hour (for example, 6 routes x 2000 epochs requests
 5 h, 10 routes x 2000 epochs 13 h). Above 10 routes the time exponent is the
 dense-solve bound 3 and the plan is reported as an extrapolated estimate; it
 remains launchable, and stage overrides still take precedence. Learned costs
-(`learn_costs`) were not part of the measured fits. The default
-`cpu_backfill` profile permits 96 concurrent HMM tasks and 256 concurrent
-one-CPU tasks; selecting the protected `cpu` partition reduces the automatic HMM
+(`learn_costs`) and the route-weight Dirichlet prior were not part of the
+measured fits. Eight threads are less efficient per core than two (thread
+benchmark: 665 s at 2 threads, 437 s at 8), but there is one route fit per
+partition on the critical path, so the profile favors wall time; feature
+generation runs no epochs and keeps 2 CPUs. The default partition is
+`"cpu_backfill,cpu"`: SLURM starts each task on whichever partition can run it
+first, adding the idle protected `cpu` nodes to the preemptible GPU-node pool.
+Any partition list that includes `cpu_backfill` permits 96 concurrent HMM
+tasks; selecting the protected `cpu` partition alone reduces the automatic HMM
 cap to eight. For `n_routes: "auto"`, the manager uses `max_rank + 1` as the
 pre-submission bound. The workers hide CUDA devices, so backfill jobs remain CPU-only
 on GPU-equipped nodes. No GPU profile is defined.
@@ -228,24 +251,29 @@ identity and are written atomically; force reruns bypass start checkpoints.
 The SLURM stages are `behavioral-cell → behavioral-selection → behavioral-refit`,
 or `behavioral-cell → behavioral-selection → behavioral-local-cell →
 behavioral-local-selection → behavioral-refit`. Local tasks freeze fold and
-offset identities before submission and resolve θ and K* at execution. One
-`behavioral-cell` task fits every coarse θ cell of one (inner fold, K) in grid
-order, reusing finished cells, so a task cut short resumes. The NMF
+offset identities before submission and resolve θ and K* at execution. Each
+`behavioral-cell` task fits one coarse θ cell of one (inner fold, K), so the
+cells of a fold run in parallel. Seeds depend only on the fold and K, so the
+artifacts match those of fitting the fold's cells in sequence. Finished cells
+are reused. Without `--theta-cell` a worker fits every cell of the fold in grid
+order, as task lists written before this change do. The NMF
 `discovery → candidate → selection → selected-refit` chain runs only when NMF
-is enabled. `predictor-bundle` waits for all enabled chains, followed by features,
+is enabled. `route-fit` (when enabled) starts with no dependency.
+`predictor-bundle` waits for all enabled chains and the route fit, followed by features,
 regressions, overlap, aggregation, and plots. Coarse cells live under
 `behavioral_folds/<fold digest>/`; the other behavioral artifacts live under
 `partitions/<digest>/behavioral/`: `selection.json`, `local/`,
-`final_selection.json`, and `refit.json`. Coarse workers take `--k` and
-`--validation-session-json` (with any partition sharing the fold); local workers
-also take `--local-index`.
+`final_selection.json`, and `refit.json`. Coarse workers take `--k`,
+`--validation-session-json` (with any partition sharing the fold), and
+`--theta-cell`; local workers take `--local-index` instead of `--theta-cell`.
 
-The real K=6 pilot and stored-simulation reproduction started before this change
-are still running (SLURM 3827355 and 3827356). Completed timing/RSS results are
-not yet available; the resource profile is explicitly provisional (one CPU,
-8 GB, 12 h per local cell/refit, and 1/3 h per start for a whole
-`behavioral-cell` task, i.e. 36 h for 36 three-start cells) and supports stage
-overrides. Cell artifacts record
+The behavioral resource profile is provisional: one CPU, 3 GB, and 1 h per
+start for each coarse or local θ-cell task (3 h for three starts), and 12 h for
+the refit. It rests on real-data m2 starts at 1 CPU from the cancelled
+`mlmdp_behavior_full` run (median 5–12 min and at most 22 min per start at
+K 3–9) and on the real K=6 pilot (SLURM 3827355: 94 min for nine starts, peak
+RSS 0.66 GB). Those starts used the earlier `reject` rule; K above 9 and
+the `project` rule are unmeasured. Stage overrides take precedence. Cell artifacts record
 elapsed seconds and peak RSS. The simulated estimate is about 2.5–3 CPU-hours
 per cell: ranks 2–10, five folds, 36 cells require 1620 cells per partition;
 36 outer partitions approach 150,000 CPU-hours. Start with one subject,
@@ -271,7 +299,10 @@ K*, and the inner-LL θ landscape under “Behavioral MLMDP”.
 Limitations:
 
 - Behavioral and default NMF models differ in structure as well as D: NMF uses
-  inpainted goal reward, termination commitment, and fitted α, τ, η. For a D-only
+  inpainted goal reward and fitted α, τ, η. Both use termination-plus-radius-2
+  commitment: the repository configs set `adam.commitment_mode: "both"` and
+  `adam.commitment_radius: 2` explicitly, because an `adam` block without them
+  means termination only (the setting every earlier run used). For a D-only
   comparison match `adam.goal_reward_mode`, commitment mode/radius, access gate
   and parameter constraints explicitly.
 - One real inner session per fold gives noisier θ selection than the simulated
@@ -339,7 +370,8 @@ python scripts/slurm/manage_regression_workflow.py \
 The manager writes immutable task lists, chunks arrays, assigns inclusive rank
 resource bands, and freezes the complete resolved resource table before any
 job is submitted. Every submission records its CPU, memory, time, and
-concurrency request; retries reuse that table. Historical schema-v1 managers
+concurrency request, plus the per-array `array_limit` it received; retries
+reuse that table. Historical schema-v1 managers
 retain their one-CPU retry behavior. The manager records job dependencies and
 task-list digests and consults both `squeue` and `sacct`. Status output reports
 artifact completion and array task counts for the latest attempt of each stage,

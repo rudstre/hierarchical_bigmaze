@@ -460,17 +460,32 @@ def _coarse_record(artifact, validation_session_id) -> dict[str, object]:
 
 
 def run_behavioral_cells(
-    config, output_dir, partition, *, k, validation_session_id, force=False
+    config,
+    output_dir,
+    partition,
+    *,
+    k,
+    validation_session_id,
+    theta_cell=None,
+    force=False,
 ) -> dict[str, object]:
-    """Fit every coarse theta cell of one (inner fold, K), in grid order.
+    """Fit the coarse theta cells of one (inner fold, K), in grid order.
 
-    Finished cells are reused, so a task cut short resumes where it stopped.
+    ``theta_cell`` restricts the task to one named cell, so SLURM can run the
+    cells of a fold in parallel; seeds depend only on (fold, K), so the result
+    is the same either way. Finished cells are reused, so a task cut short
+    resumes where it stopped.
     """
 
     if k not in config.ranks:
         raise ValueError(f"rank {k} is outside configured inclusive rank_range")
     if validation_session_id not in partition.training_session_ids:
         raise ValueError("inner validation session is not a predictor-training session")
+    cells = coarse_cells(config)
+    if theta_cell is not None:
+        if theta_cell not in cells:
+            raise ValueError(f"unknown coarse theta cell {theta_cell!r}")
+        cells = {theta_cell: cells[theta_cell]}
     statuses = [
         _fit_cell_artifact(
             config,
@@ -482,7 +497,7 @@ def run_behavioral_cells(
             validation_session_id=validation_session_id,
             force=force,
         )["status"]
-        for theta in coarse_cells(config).values()
+        for theta in cells.values()
     ]
     return {
         "status": (

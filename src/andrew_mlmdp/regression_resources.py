@@ -7,8 +7,8 @@ import re
 from copy import deepcopy
 from typing import Mapping
 
-RESOURCE_PROFILE_VERSION = 3
-RESOURCE_PROFILE_NAME = "auto-cpu-v3"
+RESOURCE_PROFILE_VERSION = 4
+RESOURCE_PROFILE_NAME = "auto-cpu-v4"
 
 # Measured HMM route fits (8 CPUs, cpu_backfill, 36 partitions each): worst
 # seconds per epoch (elapsed_seconds / epochs) and peak MaxRSS from sacct.
@@ -27,13 +27,16 @@ _HMM_TIME_EXPONENT = math.log(11.19 / 4.41) / math.log(11 / 7)
 _HMM_EXTRAPOLATION_TIME_EXPONENT = 3.0
 _HMM_MEASURED_MAX_ROUTES = 10
 _HMM_HEADROOM = 2.0
-# HMM stages run on 2 CPUs: the route fit scales poorly with threads. On one
-# node (results/thread_bench: a route-data-curve condition at 200 epochs),
-# whole-task wall time was 1027 s / 665 s / 583 s / 437 s at 1 / 2 / 4 / 8
-# threads, so 2 CPUs give the most work per core. The per-epoch times above
-# were measured at 8 CPUs; estimates scale them by the 2-thread slowdown.
-_HMM_CPUS = 2
-_HMM_CPU_SLOWDOWN = 665.4 / 436.8
+# The route fit scales poorly with threads. On one node (results/thread_bench:
+# a route-data-curve condition at 200 epochs), whole-task wall time was
+# 1027 s / 665 s / 583 s / 437 s at 1 / 2 / 4 / 8 threads, so 2 CPUs give the
+# most work per core but 8 give the shortest wall time. There is one route fit
+# per partition and it sits on the critical path, so it uses 8 CPUs, the count
+# the per-epoch times above were measured at. Feature generation runs no
+# epochs and keeps 2 CPUs, scaled by the 2-thread slowdown.
+_HMM_FIT_CPUS = 8
+_HMM_FEATURE_CPUS = 2
+_HMM_FEATURE_SLOWDOWN = 665.4 / 436.8
 # Smallest memory request; the measured peaks (3.57-8.07 GB) are well above it.
 _HMM_MIN_MEMORY_GB = 4
 
@@ -45,7 +48,7 @@ def _slurm_hours(hours):
 
 
 def hmm_resource_estimate(n_routes, epochs):
-    """Predictor-bundle and feature-generation estimates from measured fits."""
+    """Route-fit and feature-generation estimates from measured fits."""
     scale = (n_routes + 1) / (_HMM_REFERENCE_ROUTES + 1)
     exponent = (
         _HMM_TIME_EXPONENT
@@ -54,20 +57,23 @@ def hmm_resource_estimate(n_routes, epochs):
     )
     # Seconds per epoch at the 8 CPUs the reference fits were measured on.
     seconds_per_epoch = _HMM_REFERENCE_SECONDS_PER_EPOCH * scale**exponent
-    fit_hours = (
-        _HMM_HEADROOM * _HMM_CPU_SLOWDOWN * seconds_per_epoch * epochs / 3600
-    )
+    fit_hours = _HMM_HEADROOM * seconds_per_epoch * epochs / 3600
     memory_gb = _HMM_HEADROOM * _HMM_REFERENCE_MEMORY_GB * scale**2
     memory = f"{max(_HMM_MIN_MEMORY_GB, math.ceil(memory_gb))}G"
     return {
         "calibrated": n_routes <= _HMM_MEASURED_MAX_ROUTES,
         "seconds_per_epoch": seconds_per_epoch,
-        "predictor_bundle": {"memory": memory, "time": _slurm_hours(fit_hours)},
+        "route_fit": {
+            "cpus_per_task": _HMM_FIT_CPUS,
+            "memory": memory,
+            "time": _slurm_hours(fit_hours),
+        },
         # Feature generation rebuilds the model and runs no epochs; its cost
         # is scaled from the 1 h request by the per-epoch route scaling.
         "feature_generation": {
+            "cpus_per_task": _HMM_FEATURE_CPUS,
             "memory": memory,
-            "time": _slurm_hours(max(1.0, _HMM_CPU_SLOWDOWN * scale**exponent)),
+            "time": _slurm_hours(max(1.0, _HMM_FEATURE_SLOWDOWN * scale**exponent)),
         },
     }
 
@@ -82,6 +88,7 @@ STAGES = (
     "behavioral-local-cell",
     "behavioral-local-selection",
     "behavioral-refit",
+    "route-fit",
     "predictor-bundle",
     "feature-generation",
     "regression",
@@ -234,21 +241,20 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
     stages["selected-refit"].update(
         memory=highest_rank_band["memory"], time=highest_rank_band["time"]
     )
-    # Provisional ceiling from simulated cells, pending completion of the
-    # real K=6 pilot. One CPU follows the thread benchmark; the fit records
-    # its actual wall time/RSS. Do not describe this estimate as calibrated.
+    # Real-data starts (m2, cancelled mlmdp_behavior_full run, 1 CPU) took a
+    # median 5-12 min and at most 22 min at K 3-9; the K=6 pilot cell peaked
+    # at 0.66 GB RSS. Budget 1 h per start for K up to 12, still uncalibrated
+    # there. Coarse and local tasks fit one theta cell each; the refit uses
+    # every training session and keeps a wider ceiling.
     if config.behavioral:
-        for stage in ("behavioral-cell", "behavioral-local-cell", "behavioral-refit"):
-            stages[stage].update(cpus_per_task=1, memory="8G", time="12:00:00")
-        # A behavioral-cell task fits every coarse theta cell of one fold and
-        # K in sequence. Budget the documented simulated estimate of ~3
-        # CPU-hours per nine-start cell (1/3 h per start); cells checkpoint,
-        # so a timed-out task resumes.
-        from andrew_mlmdp.hierarchy.behavioral_profiles import coarse_theta_grid
-
-        settings = config.mlmdp.settings
-        n_starts = len(coarse_theta_grid(settings)) * len(settings.start_names)
-        stages["behavioral-cell"]["time"] = _slurm_hours(n_starts / 3.0)
+        n_starts = len(config.mlmdp.settings.start_names)
+        for stage in ("behavioral-cell", "behavioral-local-cell"):
+            stages[stage].update(
+                cpus_per_task=1, memory="3G", time=_slurm_hours(n_starts * 1.0)
+            )
+        stages["behavioral-refit"].update(
+            cpus_per_task=1, memory="3G", time="12:00:00"
+        )
     stages["feature-generation"]["time"] = "01:00:00"
     stages["policy-overlap"]["time"] = "01:00:00"
     stages["lattice-precompute"]["time"] = "01:00:00"
@@ -256,12 +262,18 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
         stages["regression"]["time"] = "04:00:00"
 
     route_family = config.predictors.route_family
+    # Rank-independent routes are fitted by their own stage at the start of
+    # the run; otherwise the predictor bundle fits them after rank selection.
+    route_fit = config.predictors.routes_rank_independent
+    route_stage = "route-fit" if route_fit else "predictor-bundle"
+    if route_fit:
+        stages["predictor-bundle"]["time"] = "01:00:00"
     route_count_bound = None
     hmm_epochs = None
     calibrated = True
     calibration_limits = None
     if route_family == "pca":
-        stages["predictor-bundle"]["time"] = "02:00:00"
+        stages[route_stage]["time"] = "02:00:00"
     else:
         hmm = config.predictors.selected_route_settings
         configured_routes = hmm.get("n_routes", 6)  # fitting default
@@ -271,20 +283,19 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
             else int(configured_routes)
         )
         hmm_epochs = int(hmm.get("epochs", 2000))  # fitting default
+        # The protected cpu partition alone is small (260 CPUs), so the
+        # 8-CPU route fits are capped at eight there; any list that includes
+        # cpu_backfill (e.g. "cpu_backfill,cpu") has its capacity.
         hmm_concurrency = min(
-            96 if partition == "cpu_backfill" else 8,
+            96 if "cpu_backfill" in partition.split(",") else 8,
             concurrency,
         )
         estimate = hmm_resource_estimate(route_count_bound, hmm_epochs)
-        stages["predictor-bundle"].update(
-            cpus_per_task=_HMM_CPUS,
-            max_concurrent=hmm_concurrency,
-            **estimate["predictor_bundle"],
+        stages[route_stage].update(
+            max_concurrent=hmm_concurrency, **estimate["route_fit"]
         )
         stages["feature-generation"].update(
-            cpus_per_task=_HMM_CPUS,
-            max_concurrent=hmm_concurrency,
-            **estimate["feature_generation"],
+            max_concurrent=hmm_concurrency, **estimate["feature_generation"]
         )
         calibration_limits = [{"max_routes": _HMM_MEASURED_MAX_ROUTES}]
         calibrated = estimate["calibrated"]
@@ -322,6 +333,10 @@ def resolve_resource_plan(config, raw_slurm: Mapping[str, object]):
         **({"behavioral_calibrated": False} if config.behavioral else {}),
         "launchable": launchable,
         "launch_block_reason": reason if not launchable else None,
+        # Older frozen plans lack these keys: they have no route-fit stage
+        # and cap each SLURM array, not each stage.
+        "route_fit": route_fit,
+        "concurrency_scope": "stage",
         "stages": stages,
         "candidate_bands": candidate_bands,
     }
@@ -348,6 +363,8 @@ def resource_plan_rows(plan):
                 }
                 for band in plan["candidate_bands"]
             )
+        elif stage == "route-fit" and not plan.get("route_fit"):
+            continue
         else:
             rows.append(
                 {

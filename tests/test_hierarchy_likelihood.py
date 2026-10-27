@@ -34,6 +34,8 @@ def _likelihood_task():
         .hierarchy(
             basis,
             parameters=parameters,
+            commitment_mode="termination",
+            commitment_radius=None,
         )
         .task((0, 3))
     )
@@ -72,6 +74,8 @@ def _gated_likelihood_task():
         .hierarchy(
             basis,
             parameters=parameters,
+            commitment_mode="termination",
+            commitment_radius=None,
         )
         .task((0, 5))
     )
@@ -151,7 +155,13 @@ def test_commitment_radius_rescues_deferred_direct_approach_from_negative_infini
 
     deferred = (
         Environment(maze)
-        .hierarchy(basis, parameters=parameters, goal_reward_mode="deferred")
+        .hierarchy(
+            basis,
+            parameters=parameters,
+            goal_reward_mode="deferred",
+            commitment_mode="termination",
+            commitment_radius=None,
+        )
         .task(goal)
     )
     assert deferred.log_likelihood(trajectory) == -np.inf

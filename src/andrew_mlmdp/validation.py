@@ -190,6 +190,9 @@ class AdamValidationConfig:
     initialization_seed: int = 123
     future_restart_log_scale: float = 0.45
     goal_reward_mode: Literal["inpainted", "fixed", "deferred"] = "inpainted"
+    # Kept at termination-only, unlike Template's default: frozen run configs
+    # omit these fields, so this default fixes what their fits used. New
+    # configs set the behavioral fit's ("both", 2) explicitly.
     commitment_mode: Literal["termination", "radius", "both"] = "termination"
     commitment_radius: int | None = None
 

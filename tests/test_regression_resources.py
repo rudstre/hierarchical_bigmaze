@@ -7,6 +7,7 @@ import andrew_mlmdp.regression_workflow as workflow
 from andrew_mlmdp.regression_resources import (
     hmm_resource_estimate,
     resolve_resource_plan,
+    resource_plan_rows,
 )
 from andrew_mlmdp.validation import AdamValidationConfig
 
@@ -58,15 +59,20 @@ def test_pca_and_learning_curve_profiles_use_stage_specific_resources():
         _config(method="blocked_trial_learning_curve"), _slurm()
     )
 
-    assert ordinary["profile"] == "auto-cpu-v3"
+    assert ordinary["profile"] == "auto-cpu-v4"
+    assert ordinary["concurrency_scope"] == "stage"
+    # Fixed PCA components do not depend on the MLMDP rank.
+    assert ordinary["route_fit"] is True
+    assert ordinary["stages"]["route-fit"]["time"] == "02:00:00"
     assert ordinary["stages"]["predictor-bundle"]["cpus_per_task"] == 1
+    assert ordinary["stages"]["predictor-bundle"]["time"] == "01:00:00"
     assert ordinary["stages"]["feature-generation"]["time"] == "01:00:00"
     assert ordinary["stages"]["selected-refit"]["memory"] == "4G"
     assert ordinary["candidate_bands"][0]["memory"] == "2G"
     assert learning["stages"]["regression"]["time"] == "04:00:00"
 
 
-def test_calibrated_fixed_and_automatic_hmm_profiles_request_two_cpus():
+def test_hmm_route_fit_runs_on_eight_cpus_in_the_stage_that_fits_routes():
     fixed = resolve_resource_plan(_config(route_family="hmm", routes=10), _slurm())
     automatic = resolve_resource_plan(
         replace(
@@ -77,19 +83,30 @@ def test_calibrated_fixed_and_automatic_hmm_profiles_request_two_cpus():
         ),
         _slurm(),
     )
+    route_fit = {
+        "partition": "cpu",
+        "account": None,
+        "cpus_per_task": 8,
+        "memory": "17G",
+        "time": "04:00:00",
+        "max_concurrent": 8,
+    }
 
     assert fixed["calibrated"] and fixed["launchable"]
     assert fixed["route_count_bound"] == 10
-    assert fixed["stages"]["predictor-bundle"] == {
-        "partition": "cpu",
-        "account": None,
-        "cpus_per_task": 2,
-        "memory": "17G",
-        "time": "05:00:00",
-        "max_concurrent": 8,
-    }
+    # Fixed routes are fitted by their own stage; the bundle only copies them.
+    assert fixed["route_fit"] is True
+    assert fixed["stages"]["route-fit"] == route_fit
+    assert fixed["stages"]["predictor-bundle"]["cpus_per_task"] == 1
+    assert fixed["stages"]["predictor-bundle"]["time"] == "01:00:00"
+    assert fixed["stages"]["feature-generation"]["cpus_per_task"] == 2
+    # Rank-aware routes still need the selected rank, so the bundle fits them.
+    assert automatic["route_fit"] is False
     assert automatic["route_count_bound"] == 7
+    assert automatic["stages"]["predictor-bundle"]["cpus_per_task"] == 8
     assert automatic["launchable"]
+    assert "route-fit" in {row["stage"] for row in resource_plan_rows(fixed)}
+    assert "route-fit" not in {row["stage"] for row in resource_plan_rows(automatic)}
 
 
 def test_general_backfill_profile_uses_available_cpu_capacity():
@@ -98,9 +115,16 @@ def test_general_backfill_profile_uses_available_cpu_capacity():
         _slurm(partition="cpu_backfill", max_concurrent=256),
     )
 
-    assert plan["stages"]["predictor-bundle"]["max_concurrent"] == 96
+    assert plan["stages"]["route-fit"]["max_concurrent"] == 96
     assert plan["stages"]["feature-generation"]["max_concurrent"] == 96
     assert plan["stages"]["regression"]["max_concurrent"] == 256
+
+    combined = resolve_resource_plan(
+        _config(route_family="hmm", routes=10),
+        _slurm(partition="cpu_backfill,cpu", max_concurrent=256),
+    )
+    assert combined["stages"]["route-fit"]["max_concurrent"] == 96
+    assert combined["stages"]["route-fit"]["partition"] == "cpu_backfill,cpu"
 
 
 def test_hmm_beyond_measured_routes_is_estimated_and_launchable():
@@ -113,7 +137,7 @@ def test_hmm_beyond_measured_routes_is_estimated_and_launchable():
             "time": "08:00:00",
             "max_concurrent": 4,
         }
-        for stage in ("predictor-bundle", "feature-generation")
+        for stage in ("route-fit", "feature-generation")
     }
     explicit = resolve_resource_plan(config, _slurm(stage_overrides=overrides))
 
@@ -121,7 +145,7 @@ def test_hmm_beyond_measured_routes_is_estimated_and_launchable():
     assert estimated["launchable"]
     assert estimated["launch_block_reason"] is None
     assert explicit["stages"]["feature-generation"]["memory"] == "32G"
-    assert explicit["stages"]["predictor-bundle"]["cpus_per_task"] == 12
+    assert explicit["stages"]["route-fit"]["cpus_per_task"] == 12
 
 
 @pytest.mark.parametrize(
@@ -142,15 +166,15 @@ def test_invalid_stage_overrides_are_rejected(overrides, message):
 @pytest.mark.parametrize(
     ("routes", "epochs", "calibrated", "time", "memory"),
     [
-        # Twice the measured worst fits (8 CPUs: 10 x 500 took 1.59 h, 6 x 2000
-        # 2.45 h) times the 2-CPU slowdown 1.52; memory twice the peak.
-        (10, 500, True, "05:00:00", "17G"),
-        (6, 2000, True, "08:00:00", "7G"),
-        (10, 2000, True, "19:00:00", "17G"),
-        (15, 2000, False, "2-11:00:00", "35G"),
+        # Twice the measured worst fits at the 8 CPUs the route fit uses
+        # (10 x 500 took 1.59 h, 6 x 2000 2.45 h); memory twice the peak.
+        (10, 500, True, "04:00:00", "17G"),
+        (6, 2000, True, "05:00:00", "7G"),
+        (10, 2000, True, "13:00:00", "17G"),
+        (15, 2000, False, "1-15:00:00", "35G"),
     ],
 )
-def test_hmm_predictor_resources_scale_from_measured_fits(
+def test_hmm_route_fit_resources_scale_from_measured_fits(
     routes, epochs, calibrated, time, memory
 ):
     plan = resolve_resource_plan(
@@ -159,8 +183,9 @@ def test_hmm_predictor_resources_scale_from_measured_fits(
 
     assert plan["calibrated"] is calibrated
     assert plan["launchable"]
-    assert plan["stages"]["predictor-bundle"]["time"] == time
-    assert plan["stages"]["predictor-bundle"]["memory"] == memory
+    assert plan["stages"]["route-fit"]["cpus_per_task"] == 8
+    assert plan["stages"]["route-fit"]["time"] == time
+    assert plan["stages"]["route-fit"]["memory"] == memory
 
 
 def test_hmm_estimate_reproduces_measured_seconds_per_epoch():
@@ -190,13 +215,13 @@ def test_behavioral_resources_are_explicitly_provisional_and_overridable():
     assert plan['behavioral_calibrated'] is False
     for stage in ('behavioral-cell', 'behavioral-local-cell', 'behavioral-refit'):
         assert plan['stages'][stage]['cpus_per_task'] == 1
-    for stage in ('behavioral-local-cell', 'behavioral-refit'):
-        assert plan['stages'][stage]['time'] == '12:00:00'
-    # One behavioral-cell task fits all 36 coarse cells of a fold and K, at
-    # three starts per cell and 1/3 h per start.
-    assert plan['stages']['behavioral-cell']['time'] == '1-12:00:00'
+        assert plan['stages'][stage]['memory'] == '3G'
+    # Coarse and local tasks fit one theta cell: three starts at 1 h each.
+    for stage in ('behavioral-cell', 'behavioral-local-cell'):
+        assert plan['stages'][stage]['time'] == '03:00:00'
+    assert plan['stages']['behavioral-refit']['time'] == '12:00:00'
     overridden = resolve_resource_plan(config, _slurm(stage_overrides={
-        'behavioral-cell': {'memory': '3G', 'time': '06:00:00'}
+        'behavioral-cell': {'memory': '5G', 'time': '06:00:00'}
     }))
-    assert overridden['stages']['behavioral-cell']['memory'] == '3G'
+    assert overridden['stages']['behavioral-cell']['memory'] == '5G'
     assert overridden['stages']['behavioral-cell']['time'] == '06:00:00'

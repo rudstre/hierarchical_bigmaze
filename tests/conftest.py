@@ -51,9 +51,13 @@ def four_room_template(
         FOUR_ROOM_SUBGOALS,
         labels=("A", "B", "C", "D", "E", "F"),
     )
+    # The canonical four-room reference was recorded under termination-only
+    # commitment, the paper's original construction.
     return four_room_environment.hierarchy(
         basis,
         parameters=regression_parameters,
+        commitment_mode="termination",
+        commitment_radius=None,
         task_library=TaskLibrary.from_desirabilities(
             len(FOUR_ROOM_SUBGOALS),
             target_value=np.exp(1.0 / 0.15),

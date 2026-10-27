@@ -196,6 +196,125 @@ def _fit_route_and_habit(
     }
 
 
+def _route_fit_compatibility(config, partition, route_rows, route_settings):
+    from andrew_mlmdp.regression_workflow import _stage_source
+
+    return {
+        "artifact_type": "heldout_route_fit",
+        "partition_digest": partition.digest,
+        "training_session_ids": _json_value(list(partition.training_session_ids)),
+        "route_family": config.predictors.route_family,
+        "route_settings": route_settings,
+        "route_training_data_digest": _payload_digest(
+            _json_value(route_rows.to_dict("records"))
+        ),
+        "seed": _route_seed(config, partition),
+        "source": {"feature_builders": _stage_source(config, "feature")},
+    }
+
+
+def _route_fit_failure(
+    status, compatibility, partition, phase, error_type, error, started
+):
+    return {
+        "schema_version": 1,
+        "artifact_type": "heldout_route_fit",
+        "status": status,
+        "stage": phase,
+        "partition_digest": partition.digest,
+        "compatibility": compatibility,
+        "failure": {"type": error_type, "message": str(error)},
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+def run_route_fit(
+    config,
+    output_dir: str | Path,
+    partition,
+    *,
+    route_rows=None,
+    force: bool = False,
+) -> dict[str, object]:
+    """Fit the rank-independent route family and habit counts for a partition.
+
+    The fit depends only on the partition's training sessions, so this stage
+    starts with the run instead of waiting for MLMDP rank selection. Predictor
+    bundles copy its result unchanged. A cached scientific failure is terminal
+    and returned as recorded; an operational failure is retried.
+    """
+    if not config.predictors.routes_rank_independent:
+        raise ValueError("Rank-aware ('auto') routes are fitted by the bundle")
+    if route_rows is None:
+        _, route_rows = _route_training_table(config, partition)
+    route_settings = config.predictors.selected_route_settings
+    destination = (
+        Path(output_dir).resolve() / "partitions" / partition.digest / "route_fit.json"
+    )
+    compatibility = _route_fit_compatibility(
+        config, partition, route_rows, route_settings
+    )
+    if destination.is_file() and not force:
+        from andrew_mlmdp.regression_workflow import _read_json
+
+        existing = _validate_cached_artifact(
+            destination,
+            _read_json(destination),
+            artifact_type="heldout_route_fit",
+            partition=partition,
+            compatibility=compatibility,
+        )
+        if existing.get("status") in {"success", "scientific_failure"}:
+            return existing
+
+    started = time.perf_counter()
+    try:
+        fitted_predictors = _fit_route_and_habit(
+            config, partition, route_rows, route_settings
+        )
+    except HMMScientificFitError as error:
+        payload = _route_fit_failure(
+            "scientific_failure",
+            compatibility,
+            partition,
+            error.phase,
+            error.original_type,
+            error,
+            started,
+        )
+        _atomic_write_json(destination, payload)
+        return payload
+    except (
+        HMMOperationalFitError,
+        torch.OutOfMemoryError,
+        MemoryError,
+        OSError,
+    ) as error:
+        payload = _route_fit_failure(
+            "operational_failure",
+            compatibility,
+            partition,
+            getattr(error, "phase", "predictor_fit"),
+            getattr(error, "original_type", type(error).__name__),
+            error,
+            started,
+        )
+        _atomic_write_json(destination, payload)
+        return payload
+    payload = {
+        "schema_version": 1,
+        "artifact_type": "heldout_route_fit",
+        "status": "success",
+        "partition_digest": partition.digest,
+        "compatibility": compatibility,
+        "fitted_predictors": fitted_predictors,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    payload["artifact_digest"] = _payload_digest(payload)
+    _atomic_write_json(destination, payload)
+    return _json_value(payload)
+
+
 def bundle_mlmdp_candidates(bundle: Mapping[str, object]) -> dict[str, object]:
     """MLMDP candidate per predictor name; historical bundles hold only NMF."""
     if "mlmdp_candidates" in bundle:
@@ -349,6 +468,46 @@ def run_predictor_bundle(
         if existing.get("status") == "success":
             return existing
 
+    if config.predictors.routes_rank_independent:
+        route_fit = run_route_fit(
+            config, root, partition, route_rows=route_rows, force=force
+        )
+        if route_fit["status"] != "success":
+            # The route stage's own status carries over: a scientific failure
+            # stays terminal and an operational failure stays retryable.
+            payload = {
+                "schema_version": 1,
+                "artifact_type": "heldout_predictor_bundle",
+                "status": route_fit["status"],
+                "stage": route_fit["stage"],
+                "partition_digest": partition.digest,
+                "compatibility": compatibility,
+                "failure": route_fit["failure"],
+                "route_fit_artifact": {
+                    "path": f"partitions/{partition.digest}/route_fit.json"
+                },
+                "elapsed_seconds": 0.0,
+            }
+            _atomic_write_json(destination, payload)
+            return payload
+        payload = _bundle_success_payload(
+            config,
+            partition,
+            candidates,
+            selections,
+            route_k,
+            compatibility,
+            route_fit["fitted_predictors"],
+            route_fit["elapsed_seconds"],
+        )
+        payload["route_fit_artifact"] = {
+            "path": f"partitions/{partition.digest}/route_fit.json",
+            "artifact_digest": route_fit["artifact_digest"],
+        }
+        payload["artifact_digest"] = _payload_digest(payload)
+        _atomic_write_json(destination, payload)
+        return _json_value(payload)
+
     started = time.perf_counter()
     try:
         fitted_predictors = _fit_route_and_habit(
@@ -392,6 +551,33 @@ def run_predictor_bundle(
         _atomic_write_json(destination, payload)
         return payload
 
+    payload = _bundle_success_payload(
+        config,
+        partition,
+        candidates,
+        selections,
+        route_k,
+        compatibility,
+        fitted_predictors,
+        time.perf_counter() - started,
+    )
+    payload["artifact_digest"] = _payload_digest(payload)
+    _atomic_write_json(destination, payload)
+    return _json_value(payload)
+
+
+def _bundle_success_payload(
+    config,
+    partition,
+    candidates,
+    selections,
+    route_k,
+    compatibility,
+    fitted_predictors,
+    elapsed_seconds,
+):
+    from andrew_mlmdp.regression_workflow import NMF_MLMDP
+
     if config.mlmdp is None:
         # Historical layout, unchanged so existing bundles remain reusable.
         mlmdp_fields = {
@@ -406,7 +592,7 @@ def run_predictor_bundle(
             "route_rank": route_k,
             "mlmdp_candidates": candidates,
         }
-    payload = {
+    return {
         "schema_version": 1,
         "artifact_type": "heldout_predictor_bundle",
         "status": "success",
@@ -417,11 +603,8 @@ def run_predictor_bundle(
         "heldout_session_id": _json_value(partition.heldout_session_id),
         "compatibility": compatibility,
         **fitted_predictors,
-        "elapsed_seconds": time.perf_counter() - started,
+        "elapsed_seconds": elapsed_seconds,
     }
-    payload["artifact_digest"] = _payload_digest(payload)
-    _atomic_write_json(destination, payload)
-    return _json_value(payload)
 
 
 def _reconstruct_route(config, partition, bundle):

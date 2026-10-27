@@ -366,8 +366,8 @@ access event exists through which upper termination could ever fire).
 
 `commitment_mode`/`commitment_radius` on `Environment.hierarchy` (or
 `Template`) control *when* upper termination's exact goal-only policy is
-installed, independent of `goal_reward_mode`. The default, `"termination"`
-(with `commitment_radius=None`), is exactly the mechanism above: the only
+installed, independent of `goal_reward_mode`. `"termination"` (with
+`commitment_radius=None`) is exactly the mechanism above: the only
 trigger is the stochastic draw at a subgoal access,
 `upper_controlled[-1, entered_state]`. `"radius"` disables that draw
 entirely (it is forced to zero everywhere it is read — `_solve_upper` itself,
@@ -375,7 +375,8 @@ and hence the abstract layer, is untouched) and instead installs the exact
 goal-only policy unconditionally whenever the agent's physical state is
 within `commitment_radius` grid steps of the goal, regardless of subgoal
 access. `"both"` keeps the termination draw active and applies the radius
-check on top of it. `commitment_radius` is a grid-searched integer, not a
+check on top of it. The default is `"both"` with `commitment_radius=2`, the
+same structure the behavioral profile fit uses. `commitment_radius` is a grid-searched integer, not a
 fitted parameter — it has no gradient and must be swept manually. Combining
 `commitment_mode="radius"` with `goal_reward_mode="deferred"` makes
 `"deferred"` well-posed for arbitrary trajectories: since a state one grid

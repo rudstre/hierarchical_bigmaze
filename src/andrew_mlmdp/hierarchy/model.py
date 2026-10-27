@@ -282,8 +282,8 @@ class Template:
         composition_exponent: float = 1.0,
         composition_mode: Literal["power", "winner_take_all"] = "power",
         goal_reward_mode: Literal["inpainted", "fixed", "deferred"] = "inpainted",
-        commitment_mode: Literal["termination", "radius", "both"] = "termination",
-        commitment_radius: int | None = None,
+        commitment_mode: Literal["termination", "radius", "both"] = "both",
+        commitment_radius: int | None = 2,
     ) -> None:
         if basis.maze != environment.maze:
             raise ValueError(

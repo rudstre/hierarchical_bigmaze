@@ -290,7 +290,11 @@ def test_commitment_radius_prevents_deferred_nonfinite_loss_abort():
     trials = (Trial("s", 1, (0, 5), ((0, 4), (0, 5))),)
 
     deferred = Environment(maze).hierarchy(
-        basis, parameters=parameters, goal_reward_mode="deferred"
+        basis,
+        parameters=parameters,
+        goal_reward_mode="deferred",
+        commitment_mode="termination",
+        commitment_radius=None,
     )
     aborted = fit_parameters(
         deferred, trials, names=("alpha", "beta"), max_steps=5, patience=20
