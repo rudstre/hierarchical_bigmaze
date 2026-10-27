@@ -13,7 +13,12 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
-from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
+from andrew_mlmdp.validation import (
+    _atomic_write_json,
+    _json_value,
+    _payload_digest,
+    source_root,
+)
 
 
 class HMMScientificFitError(RuntimeError):
@@ -142,7 +147,7 @@ def _tensor_lists(state_dict) -> dict[str, object]:
 def _fit_route_and_habit(
     config, partition, route_rows, route_settings
 ) -> dict[str, object]:
-    qin = _qin_route_imports(config.project_root)
+    qin = _qin_route_imports(source_root())
     import torch
 
     seed = _route_seed(config, partition)
@@ -608,7 +613,7 @@ def _bundle_success_payload(
 
 
 def _reconstruct_route(config, partition, bundle):
-    qin = _qin_route_imports(config.project_root)
+    qin = _qin_route_imports(source_root())
     import torch
 
     route = bundle["route"]
@@ -693,7 +698,7 @@ def write_feature_artifact(
         if existing.get("status") == "success":
             return existing
 
-    qin = _qin_feature_imports(config.project_root)
+    qin = _qin_feature_imports(source_root())
     route = _reconstruct_route(config, partition, bundle)
     fold = SimpleNamespace(
         subject_id=partition.subject_id,
@@ -1002,7 +1007,7 @@ def _run_combined_regression(
     for index, key in enumerate(decision_keys):
         trial_to_rows.setdefault(tuple(key[:3]), []).append(index)
 
-    qin = _qin_regression_imports(config.project_root)
+    qin = _qin_regression_imports(source_root())
     finder = qin["finder"](list(config.predictors.names), config.random_seed)
     learning_curve = config.regression_cv.method == "blocked_trial_learning_curve"
     names = ["full"] if learning_curve else _model_names(config.predictors.names)
@@ -1361,7 +1366,7 @@ def fit_predictor_subset(
     for index, key in enumerate(decision_keys):
         trial_to_rows.setdefault(tuple(key[:3]), []).append(index)
 
-    finder = _qin_regression_imports(config.project_root)["finder"](
+    finder = _qin_regression_imports(source_root())["finder"](
         list(predictor_names), config.random_seed
     )
     names = _model_names(predictor_names)

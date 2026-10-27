@@ -673,10 +673,8 @@ def test_behavioral_selection_figures_include_rank_uncertainty_and_local_cells()
     ],
 )
 def test_cache_source_covers_predictions_and_external_registration(
-    stage, dependency, tmp_path
+    stage, dependency, tmp_path, monkeypatch
 ):
-    from dataclasses import replace
-
     config = _config(("behavioral",))
     recorded = workflow._stage_source(config, stage)
     assert dependency in {record["path"] for record in recorded["files"]}
@@ -684,8 +682,10 @@ def test_cache_source_covers_predictions_and_external_registration(
         destination = tmp_path / record["path"]
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text("original scientific source\n")
-    fixture_config = replace(config, project_root=tmp_path)
-    before = workflow._stage_source(fixture_config, stage)
+    # Stage source is read from the code root, which differs from the data
+    # root when a run executes from its code snapshot.
+    monkeypatch.setattr(workflow, "source_root", lambda: tmp_path)
+    before = workflow._stage_source(config, stage)
     (tmp_path / dependency).write_text("changed scientific source\n")
-    after = workflow._stage_source(fixture_config, stage)
+    after = workflow._stage_source(config, stage)
     assert before["sha256"] != after["sha256"]

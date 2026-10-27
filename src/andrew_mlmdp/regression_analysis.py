@@ -28,7 +28,12 @@ from andrew_mlmdp.regression_workflow import (
     RegressionSplit,
     regression_config_from_payload,
 )
-from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
+from andrew_mlmdp.validation import (
+    _atomic_write_json,
+    _json_value,
+    _payload_digest,
+    source_root,
+)
 from andrew_mlmdp.workflow_progress import report_progress
 
 SCOPES = ("all_decisions", "three_or_four_valid_actions")
@@ -731,7 +736,7 @@ def run_lattice(root, partition_digest, *, attempt="initial", subsets=None):
             )
         if "artifact_digest" not in result:
             result = write_artifact(destination / "regression.json", result)
-        save_scopes(destination, result, features, config.project_root)
+        save_scopes(destination, result, features, source_root())
         entries.append(
             {
                 "analysis_digest": directory.name,
@@ -783,7 +788,7 @@ def backfill_scopes(root, partition_digest, *, attempt="initial"):
             "predictor_names": record["predictor_names"],
         }
         _, directory = _analysis_directory(root, spec, attempt)
-        save_scopes(directory / partition_digest, record, features, config.project_root)
+        save_scopes(directory / partition_digest, record, features, source_root())
     backfill_overlap(root, partition_digest, attempt=attempt)
 
 

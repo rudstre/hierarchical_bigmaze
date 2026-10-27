@@ -590,6 +590,8 @@ if page == "Progress":
     manager_file = root / "slurm_manager.json"
     if manager_file.exists():
         drift = show_error(access.source_drift, root)
+        if drift and drift["git_commit"]:
+            st.caption(f"Code pinned to commit {drift['git_commit'][:12]}")
         source_changed = bool(drift) and not drift["matches"]
         if source_changed:
             failed = drift["failed_tasks"]
@@ -636,6 +638,11 @@ if page == "Progress":
                     "refuse them, so this run cannot continue with the current "
                     "code. Start a new run, or restore the code the run was "
                     "created with."
+                )
+            elif drift["git_commit"]:
+                st.error(
+                    "This run's code snapshot was edited after export. Pinned "
+                    "runs cannot adopt different code; start a new run."
                 )
             else:
                 with st.form("rerecord_worker_source"):

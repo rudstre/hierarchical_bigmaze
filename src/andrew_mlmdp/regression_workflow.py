@@ -28,6 +28,7 @@ from andrew_mlmdp.validation import (
     _payload_digest,
     load_validation_config,
     source_code_fingerprint,
+    source_root,
 )
 from andrew_mlmdp.workflow_fitting import (
     fit_explicit_split as _fit_explicit_split,
@@ -907,7 +908,7 @@ def build_manifest(config: RegressionWorkflowConfig, table) -> dict[str, object]
         "partitions": records,
         "unavailable_partitions": unavailable,
         "source": source_code_fingerprint(
-            config.project_root, config_path=config.source_path
+            source_root(), config_path=config.source_path
         ),
     }
 
@@ -1191,7 +1192,7 @@ def _stage_source(config: RegressionWorkflowConfig, stage: str) -> dict[str, obj
     files = []
     digest = hashlib.sha256()
     for relative in relative_paths:
-        path = config.project_root / relative
+        path = source_root() / relative
         content = path.read_bytes()
         file_digest = hashlib.sha256(content).hexdigest()
         files.append({"path": relative, "sha256": file_digest})

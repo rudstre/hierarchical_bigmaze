@@ -384,9 +384,27 @@ including pending downstream stages. It leaves completed artifacts and the
 manager record in place. Add `--dry-run` to preview the job IDs; use
 `--retry-missing` later if you want to resume.
 
+Each new run is pinned to a commit. Submission is refused while `src/`,
+`scripts/`, `pyproject.toml` or the Qin submodule have uncommitted changes.
+The manager exports HEAD with `git archive`, adds the pinned Qin submodule
+commit and a link to the main tree's `external/GridMaze-mFC-ephys-DATA`, and
+places the result at `<repo>_code/<commit>/` (`--snapshot-base` overrides this).
+`CODE_SNAPSHOT.json` in that directory records the commit and a source
+fingerprint. The manager then re-executes itself from the snapshot, and the
+workers run there too. Configs, data and outputs stay in the main tree. Status
+and retry of a pinned run always re-execute from that run's snapshot, so the
+main tree can be edited or moved to another commit while the run is queued. A
+retry rebuilds a pruned snapshot from the recorded commit. `slurm_manager.json`
+records `code_root`, `git_commit`, `qin_route_model_commit`, and the worker
+environment's `pip freeze`. The environment itself is shared and is not frozen.
+To prune, delete `<repo>_code/<commit>/` directories that no run's
+`slurm_manager.json` refers to.
+
 Workers refuse to start when the scientific source (`src/`, `scripts/` outside
 `slurm/` and `gui/`, and `pyproject.toml`) differs from the fingerprint the run
-recorded. This includes tasks that wait in the queue while the code is edited.
+recorded. For pinned runs, this happens only if the snapshot itself was edited,
+and such runs cannot re-record. Runs created before pinning use the live tree,
+so for them this includes tasks that wait in the queue while the code is edited.
 `--retry-missing` therefore refuses to submit while the source differs. To let
 the rest of the run use the current code, pass
 `--rerecord-worker-source "REASON"`. The previous fingerprint, the changed

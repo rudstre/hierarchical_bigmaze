@@ -45,7 +45,9 @@ from andrew_mlmdp.regression_workflow import (  # noqa: E402
     write_manifest,
 )
 from andrew_mlmdp.validation import (  # noqa: E402
+    CODE_SNAPSHOT_RECORD,
     _payload_digest,
+    code_snapshot,
     source_code_fingerprint,
 )
 
@@ -56,6 +58,12 @@ DEFAULT_PYTHON = "/nfs/nhome/live/rudyg/micromamba/envs/GridMaze_mFC_ephys/bin/p
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
+    result.add_argument(
+        "--snapshot-base",
+        type=Path,
+        default=PROJECT_ROOT.parent / f"{PROJECT_ROOT.name}_code",
+        help="Directory holding one frozen code export per pinned commit",
+    )
     result.add_argument("--config", type=Path, required=True)
     result.add_argument("--output-dir", type=Path)
     result.add_argument("--run-id", required=True)
@@ -145,6 +153,12 @@ def _stage_digests(value, found):
     return found
 
 
+def _code_root(manager):
+    """Code that runs the workers: the pinned snapshot, or the live tree for
+    runs created before snapshots."""
+    return manager.get("code_root", manager["project_root"])
+
+
 def worker_source_drift(config, output, manager):
     """Compare the run's recorded worker source with the current source.
 
@@ -156,7 +170,7 @@ def worker_source_drift(config, output, manager):
     artifact of each kind rather than every artifact.
     """
     output = Path(output)
-    current = source_code_fingerprint(manager["project_root"])
+    current = source_code_fingerprint(_code_root(manager))
     recorded = manager.get("worker_source")
     result = {
         "recorded": recorded,
@@ -167,6 +181,7 @@ def worker_source_drift(config, output, manager):
         "blocking_stages": [],
         "failed_tasks": 0,
         "history": manager.get("worker_source_history") or [],
+        "git_commit": manager.get("git_commit"),
     }
     if result["matches"]:
         return result
@@ -209,6 +224,11 @@ def worker_source_drift(config, output, manager):
 
 
 def _rerecord_worker_source(config, output, manager, reason):
+    if "code_root" in manager:
+        raise ValueError(
+            f"This run is pinned to commit {manager['git_commit']}; start a new "
+            "run to use different code."
+        )
     drift = worker_source_drift(config, output, manager)
     if drift["matches"]:
         return drift
@@ -218,7 +238,7 @@ def _rerecord_worker_source(config, output, manager, reason):
             f"{drift['blocking_stages']}; workers would refuse them, so the "
             "fingerprint cannot be re-recorded. Start a new run instead."
         )
-    current = source_code_fingerprint(manager["project_root"])
+    current = source_code_fingerprint(_code_root(manager))
     manager.setdefault("worker_source_history", []).append(
         {
             "recorded_at": datetime.now(UTC).isoformat(),
@@ -478,7 +498,7 @@ def _submit_group(
         export = ",".join(
             (
                 "ALL",
-                f"REGRESSION_PROJECT_ROOT={manager['project_root']}",
+                f"REGRESSION_PROJECT_ROOT={_code_root(manager)}",
                 f"REGRESSION_PYTHON={manager['python_executable']}",
                 f"REGRESSION_CONFIG={manager['config_path']}",
                 f"REGRESSION_OUTPUT={manager['output_dir']}",
@@ -506,7 +526,7 @@ def _submit_group(
             command.append("--kill-on-invalid-dep=yes")
         command.append(
             str(
-                Path(manager["project_root"])
+                Path(_code_root(manager))
                 / "scripts/slurm/regression_workflow_stage.sbatch"
             )
         )
@@ -1185,15 +1205,60 @@ def _submit_pipeline(manager, manager_path, config, raw, tasks, *, dry_run):
             )
 
 
+def _required_snapshot(args, output):
+    """Code snapshot this invocation must run from, or None to run here.
+
+    New runs are pinned to a clean HEAD. Existing runs stay on their recorded
+    commit, so retries and status checks never use later main-tree code:
+    artifact compatibility is judged against the code that made the artifacts.
+    """
+    if PROJECT_ROOT != args.project_root.resolve():
+        return None
+    record = output / "slurm_manager.json"
+    if record.is_file():
+        manager = _read(record)
+        if "code_root" not in manager:
+            return None
+        # Recreates the export if it was pruned.
+        return code_snapshot(
+            args.project_root,
+            Path(manager["code_root"]).parent,
+            commit=manager["git_commit"],
+        )
+    if args.status or args.retry_missing:
+        return None
+    return code_snapshot(args.project_root, args.snapshot_base)
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = parser().parse_args(argv)
-    if args.status or args.dry_run:
-        return _main(args)
     output = (
         args.output_dir.resolve()
         if args.output_dir
         else args.project_root.resolve() / "output/regression_workflow" / args.run_id
     )
+    # Cancelling needs only the recorded job IDs, not the run's code.
+    snapshot = None if args.cancel else _required_snapshot(args, output)
+    if snapshot is not None:
+        script = Path(snapshot["code_root"]) / "scripts/slurm" / Path(__file__).name
+        print(
+            f"Running from code snapshot {snapshot['code_root']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                str(script),
+                *argv,
+                "--project-root",
+                str(args.project_root.resolve()),
+            ],
+        )
+    if args.status or args.dry_run:
+        return _main(args)
     output.mkdir(parents=True, exist_ok=True)
     with (output / ".submission.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1207,6 +1272,27 @@ def main(argv=None):
                 "Recorded jobs are still active; inspect --status before retrying"
             )
         return _main(args)
+
+
+def _code_pin(python_executable):
+    """Provenance for a new run started from a code snapshot."""
+    snapshot = PROJECT_ROOT / CODE_SNAPSHOT_RECORD
+    if not snapshot.is_file():
+        return {}
+    record = _read(snapshot)
+    # The environment is shared rather than frozen, so record what it held.
+    freeze = subprocess.run(
+        [python_executable, "-m", "pip", "freeze"], capture_output=True, text=True
+    )
+    return {
+        "code_root": str(PROJECT_ROOT),
+        "git_commit": record["git_commit"],
+        "qin_route_model_commit": record["qin_route_model_commit"],
+        "python_packages": {
+            "returncode": freeze.returncode,
+            "packages": freeze.stdout.splitlines(),
+        },
+    }
 
 
 def _main(args):
@@ -1252,6 +1338,11 @@ def _main(args):
 
     if manager_path.is_file():
         manager = _read(manager_path)
+        if "code_root" in manager and Path(manager["code_root"]) != PROJECT_ROOT:
+            raise ValueError(
+                f"This run is pinned to {manager['code_root']}; run its manager "
+                "from there (main() does this automatically)."
+            )
         if not (args.retry_missing or args.status):
             raise ValueError("Run already exists; use --status or --retry-missing")
         if (
@@ -1344,9 +1435,10 @@ def _main(args):
                 not args.no_precompute_lattice
                 and config.regression_cv.method == "blocked_trial_kfold"
             ),
-            "worker_source": source_code_fingerprint(root)["content_sha256"],
+            "worker_source": source_code_fingerprint(PROJECT_ROOT)["content_sha256"],
             # Per-file digests let a later source change be listed file by file.
-            "worker_source_files": source_code_fingerprint(root)["files"],
+            "worker_source_files": source_code_fingerprint(PROJECT_ROOT)["files"],
+            **_code_pin(args.python),
         }
         if not args.dry_run:
             output.mkdir(parents=True, exist_ok=True)

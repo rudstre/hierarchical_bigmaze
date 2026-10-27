@@ -21,7 +21,12 @@ from andrew_mlmdp.regression_execution import (
     aggregate_regression_results,
     regression_variant_predictors,
 )
-from andrew_mlmdp.validation import _atomic_write_json, _json_value, _payload_digest
+from andrew_mlmdp.validation import (
+    _atomic_write_json,
+    _json_value,
+    _payload_digest,
+    source_root,
+)
 
 _PREDICTOR_STYLE = {
     "vector": ("Vector", "#D55E00"),
@@ -341,7 +346,7 @@ def _add_uniform_policy_baseline(
 
 
 def _junction_learning_curve_summary(config, records, manifest, features):
-    nll_function, accuracy_function = _qin_scoring_imports(config.project_root)
+    nll_function, accuracy_function = _qin_scoring_imports(source_root())
     rescored = []
     for record in records:
         if record.get("status") != "success":

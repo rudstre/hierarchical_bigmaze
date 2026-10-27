@@ -2,6 +2,7 @@ import getpass
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -987,3 +988,192 @@ def test_disabled_sources_do_not_keep_the_status_pending():
         'state': 'COMPLETE', 'current_stage': None,
         'completed_stages': 3, 'total_stages': 3,
     }
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.name=test",
+            "-c", "user.email=test@example.com",
+            "-c", "protocol.file.allow=always",
+            *args,
+        ],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.fixture
+def pinned_repo(tmp_path):
+    """A repository with Qin and data submodules, committed and clean."""
+    for name, relative in (("qin", "src/model.py"), ("data", "maze.json")):
+        path = tmp_path / name / relative
+        path.parent.mkdir(parents=True)
+        path.write_text("v1\n")
+        _git(tmp_path / name, "init", "-q")
+        _git(tmp_path / name, "add", ".")
+        _git(tmp_path / name, "commit", "-qm", "init")
+    root = tmp_path / "repo"
+    (root / "src/andrew_mlmdp").mkdir(parents=True)
+    (root / "src/andrew_mlmdp/model.py").write_text("scale = 1\n")
+    (root / "scripts").mkdir()
+    (root / "scripts/run.py").write_text("")
+    (root / "pyproject.toml").write_text("[project]\nname = 'toy'\n")
+    (root / "notes.md").write_text("")
+    _git(root, "init", "-q")
+    for name, path in (
+        ("qin", "external/qin_route_model"),
+        ("data", "external/GridMaze-mFC-ephys-DATA"),
+    ):
+        _git(root, "submodule", "add", "-q", str(tmp_path / name), path)
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "init")
+    return root
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/andrew_mlmdp/model.py",
+        "scripts/new_stage.py",
+        "pyproject.toml",
+        "external/qin_route_model/src/model.py",
+    ],
+)
+def test_new_run_refuses_uncommitted_scientific_source(pinned_repo, tmp_path, path):
+    (pinned_repo / path).write_text("edited\n")
+
+    with pytest.raises(ValueError, match="commit them first"):
+        manager.code_snapshot(pinned_repo, tmp_path / "code")
+
+    assert not (tmp_path / "code").exists()
+
+
+def test_snapshot_freezes_commit_with_qin_and_links_data(pinned_repo, tmp_path):
+    from andrew_mlmdp.validation import _git_head
+
+    # Notes and other non-executed files do not block a run.
+    (pinned_repo / "notes.md").write_text("draft\n")
+    snapshot = manager.code_snapshot(pinned_repo, tmp_path / "code")
+    code_root = Path(snapshot["code_root"])
+    commit = snapshot["git_commit"]
+
+    assert code_root == (tmp_path / "code" / commit).resolve()
+    assert (code_root / "src/andrew_mlmdp/model.py").read_text() == "scale = 1\n"
+    assert (code_root / "external/qin_route_model/src/model.py").read_text() == "v1\n"
+    data = "external/GridMaze-mFC-ephys-DATA"
+    assert (code_root / data).is_symlink()
+    assert (code_root / data).resolve() == (pinned_repo / data).resolve()
+    assert _git_head(code_root) == commit
+    assert snapshot["qin_route_model_commit"] is not None
+
+    # Later main-tree commits never reach a run pinned to the old commit.
+    (pinned_repo / "src/andrew_mlmdp/model.py").write_text("scale = 2\n")
+    _git(pinned_repo, "commit", "-qam", "change")
+    again = manager.code_snapshot(pinned_repo, tmp_path / "code", commit=commit)
+    assert again == snapshot
+    assert (code_root / "src/andrew_mlmdp/model.py").read_text() == "scale = 1\n"
+
+    # A pruned export is rebuilt from the recorded commit.
+    shutil.rmtree(code_root)
+    rebuilt = manager.code_snapshot(pinned_repo, tmp_path / "code", commit=commit)
+    assert rebuilt == snapshot
+    assert (code_root / "src/andrew_mlmdp/model.py").read_text() == "scale = 1\n"
+
+    (code_root / "src/andrew_mlmdp/model.py").write_text("scale = 3\n")
+    with pytest.raises(ValueError, match="edited after export"):
+        manager.code_snapshot(pinned_repo, tmp_path / "code", commit=commit)
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_submission_runs_workers_from_pinned_code(tmp_path, monkeypatch, pinned):
+    state = {
+        "project_root": str(ROOT),
+        "python_executable": "python",
+        "config_path": str(tmp_path / "config.json"),
+        "output_dir": str(tmp_path / "run"),
+        "max_array_size": 10,
+        "submissions": [],
+    }
+    if pinned:
+        state["code_root"] = str(tmp_path / "code" / "abc123")
+    commands = []
+    monkeypatch.setattr(
+        manager, "_run", lambda command, dry_run: commands.append(command) or "12345"
+    )
+    manager._submit_group(
+        state,
+        tmp_path / "manager.json",
+        "regression",
+        [{"stage": "regression", "partition_digest": "partition"}],
+        {"partition": "cpu", "memory": "4G", "time": "01:00:00", "max_concurrent": 1},
+        [],
+    )
+    code_root = state["code_root"] if pinned else str(ROOT)
+    (command,) = commands
+    export = next(arg for arg in command if arg.startswith("--export="))
+    assert f"REGRESSION_PROJECT_ROOT={code_root}," in export
+    assert command[-1] == f"{code_root}/scripts/slurm/regression_workflow_stage.sbatch"
+
+
+def test_pinned_run_never_adopts_new_code(tmp_path, monkeypatch):
+    output, _current, _changed, submitted, args = _drifted_run(tmp_path, monkeypatch)
+    state = manager._read(output / "slurm_manager.json")
+    state.update(code_root=str(ROOT), git_commit="abc123")
+
+    with pytest.raises(ValueError, match="pinned to commit abc123"):
+        manager._rerecord_worker_source(_config(), output, state, "try anyway")
+
+    # Retrying from code other than the run's snapshot is refused outright.
+    state["code_root"] = str(tmp_path / "elsewhere")
+    manager._atomic_json(output / "slurm_manager.json", state)
+    with pytest.raises(ValueError, match="pinned to"):
+        manager._main(args())
+    assert submitted == []
+
+
+def test_manager_reexecs_from_the_runs_snapshot(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        manager,
+        "code_snapshot",
+        lambda root, base, commit=None: calls.append((root, base, commit))
+        or {"code_root": str(base / (commit or "head"))},
+    )
+    output = tmp_path / "run"
+    output.mkdir()
+
+    def required(*extra, project_root=manager.PROJECT_ROOT):
+        args = manager.parser().parse_args(
+            [
+                "--config", "config.json",
+                "--output-dir", str(output),
+                "--run-id", "r",
+                "--snapshot-base", str(tmp_path / "code"),
+                "--project-root", str(project_root),
+                *extra,
+            ]
+        )
+        return manager._required_snapshot(args, output)
+
+    # A new run is pinned to a clean HEAD of the main tree.
+    assert required() == {"code_root": str(tmp_path / "code" / "head")}
+    assert calls == [(manager.PROJECT_ROOT, tmp_path / "code", None)]
+    # Inspecting a run that does not exist needs no snapshot.
+    assert required("--status") is None
+    # Already running from a snapshot (data root differs from code root).
+    assert required(project_root=tmp_path) is None
+
+    record = output / "slurm_manager.json"
+    manager._atomic_json(record, {"project_root": str(ROOT)})
+    assert required("--retry-missing") is None  # runs from before snapshots
+
+    calls.clear()
+    pinned = tmp_path / "old_code" / "abc123"
+    manager._atomic_json(
+        record, {"code_root": str(pinned), "git_commit": "abc123"}
+    )
+    assert required("--retry-missing") == {"code_root": str(pinned)}
+    assert calls == [(manager.PROJECT_ROOT, pinned.parent, "abc123")]

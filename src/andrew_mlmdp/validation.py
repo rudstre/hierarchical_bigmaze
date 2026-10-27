@@ -10,6 +10,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import tempfile
 import time
@@ -395,6 +396,128 @@ def pooled_log_likelihood_per_transition(
     if total_transitions <= 0:
         raise ValueError("Pooled validation requires at least one movement transition")
     return total_log_likelihood / total_transitions
+
+
+# Paths whose uncommitted changes would make a run's code differ from its
+# pinned commit. scripts/ is included whole because the snapshot's manager
+# and sbatch wrapper are what actually execute.
+SNAPSHOT_SOURCE_PATHS = ("src", "scripts", "pyproject.toml")
+QIN_SUBMODULE = "external/qin_route_model"
+# Too large to copy and not code: snapshots link to the main tree's copy.
+DATA_SUBMODULE = "external/GridMaze-mFC-ephys-DATA"
+CODE_SNAPSHOT_RECORD = "CODE_SNAPSHOT.json"
+
+
+def source_root() -> Path:
+    """Repository root holding the imported ``andrew_mlmdp`` code.
+
+    Differs from a config's ``project_root`` (where data and configs live)
+    when running from a code snapshot.
+    """
+
+    return Path(__file__).resolve().parents[2]
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def uncommitted_source_changes(project_root: str | Path) -> list[str]:
+    """``git status`` lines for scientific source differing from HEAD."""
+
+    return _git(
+        Path(project_root).resolve(),
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        *SNAPSHOT_SOURCE_PATHS,
+        QIN_SUBMODULE,
+    ).splitlines()
+
+
+def _pinned_submodule_commit(root: Path, commit: str, path: str) -> str | None:
+    entry = _git(root, "ls-tree", commit, path).split()
+    return entry[2] if entry and entry[1] == "commit" else None
+
+
+def code_snapshot(
+    project_root: str | Path,
+    snapshot_base: str | Path,
+    commit: str | None = None,
+) -> dict[str, str | None]:
+    """Export ``commit`` (default: a clean HEAD) as a run's frozen code.
+
+    The snapshot is a plain ``git archive`` export plus the pinned Qin
+    submodule, built beside the final path and renamed into place so a
+    partial export is never used. One snapshot serves every run on a
+    commit; an existing one is reused only if its source is unchanged.
+    """
+
+    root = Path(project_root).resolve()
+    if commit is None:
+        dirty = uncommitted_source_changes(root)
+        if dirty:
+            raise ValueError(
+                "Runs are pinned to a commit, but scientific source has "
+                "uncommitted changes; commit them first:\n" + "\n".join(dirty)
+            )
+        commit = _git(root, "rev-parse", "HEAD").strip()
+    qin_commit = _pinned_submodule_commit(root, commit, QIN_SUBMODULE)
+    code_root = Path(snapshot_base).resolve() / commit
+    if not code_root.exists():
+        building = code_root.with_name(f"{commit}.tmp-{os.getpid()}")
+        building.mkdir(parents=True)
+        archive = subprocess.run(
+            ["git", "archive", commit], cwd=root, check=True, capture_output=True
+        ).stdout
+        subprocess.run(["tar", "-x", "-C", str(building)], input=archive, check=True)
+        if qin_commit is not None:
+            archive = subprocess.run(
+                ["git", "archive", qin_commit],
+                cwd=root / QIN_SUBMODULE,
+                check=True,
+                capture_output=True,
+            ).stdout
+            (building / QIN_SUBMODULE).mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["tar", "-x", "-C", str(building / QIN_SUBMODULE)],
+                input=archive,
+                check=True,
+            )
+        if (root / DATA_SUBMODULE).is_dir():
+            if (building / DATA_SUBMODULE).is_dir():
+                (building / DATA_SUBMODULE).rmdir()
+            (building / DATA_SUBMODULE).parent.mkdir(parents=True, exist_ok=True)
+            (building / DATA_SUBMODULE).symlink_to(root / DATA_SUBMODULE)
+        _atomic_write_json(
+            building / CODE_SNAPSHOT_RECORD,
+            {
+                "git_commit": commit,
+                "qin_route_model_commit": qin_commit,
+                "source_repository": str(root),
+                "content_sha256": source_code_fingerprint(building)["content_sha256"],
+            },
+        )
+        try:
+            building.rename(code_root)
+        except OSError:
+            # Another submission exported the same commit first.
+            if not code_root.exists():
+                raise
+            shutil.rmtree(building)
+    record = json.loads((code_root / CODE_SNAPSHOT_RECORD).read_text())
+    if record["git_commit"] != commit:
+        raise ValueError(f"Code snapshot {code_root} is not commit {commit}")
+    if source_code_fingerprint(code_root)["content_sha256"] != record["content_sha256"]:
+        raise ValueError(f"Code snapshot {code_root} was edited after export")
+    return {
+        "git_commit": commit,
+        "qin_route_model_commit": qin_commit,
+        "code_root": str(code_root),
+    }
 
 
 def source_code_fingerprint(
@@ -1571,6 +1694,10 @@ def _trial_key(trial: Trial) -> str:
 
 
 def _git_head(project_root: Path) -> str | None:
+    # Code snapshots are git exports without a repository.
+    snapshot = Path(project_root) / CODE_SNAPSHOT_RECORD
+    if snapshot.is_file():
+        return json.loads(snapshot.read_text())["git_commit"]
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
