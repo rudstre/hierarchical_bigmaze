@@ -438,6 +438,35 @@ def uncommitted_source_changes(project_root: str | Path) -> list[str]:
     ).splitlines()
 
 
+def resolve_commit(project_root: str | Path, ref: str) -> str:
+    """Full commit SHA of a branch, tag or commit name."""
+
+    try:
+        return _git(
+            Path(project_root).resolve(), "rev-parse", "--verify", f"{ref}^{{commit}}"
+        ).strip()
+    except subprocess.CalledProcessError:
+        raise ValueError(f"Unknown branch or commit: {ref}") from None
+
+
+def supports_code_pinning(project_root: str | Path, commit: str) -> bool:
+    """Whether ``commit``'s workflow manager runs from code snapshots.
+
+    An older manager, once re-executed from its snapshot, would run its
+    workers from the main tree again, so such commits cannot be pinned.
+    """
+
+    marker = ["def code_snapshot", commit, "--", "src/andrew_mlmdp/validation.py"]
+    return (
+        subprocess.run(
+            ["git", "grep", "-q", *marker],
+            cwd=Path(project_root).resolve(),
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
 def _pinned_submodule_commit(root: Path, commit: str, path: str) -> str | None:
     entry = _git(root, "ls-tree", commit, path).split()
     return entry[2] if entry and entry[1] == "commit" else None

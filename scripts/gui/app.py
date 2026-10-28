@@ -91,7 +91,14 @@ if "new_config_text" in st.session_state:
 
 runs = access.list_runs()
 choices = [str(p.parent) for p in runs]
+code_versions = show_error(access.code_versions)
 with st.sidebar:
+    if code_versions is not None:
+        st.caption(
+            f"GUI code: {code_versions['branch'] or 'detached HEAD'} @ "
+            f"{code_versions['head'][:8]}"
+            + (" + uncommitted changes" if code_versions["uncommitted"] else "")
+        )
     st.subheader("Open workflow")
     selected = st.selectbox(
         "Recent workflows", ["New workflow", *choices], format_func=recent_run_label
@@ -193,204 +200,233 @@ if root is None:
                 "Edit dataset selection in the JSON while session metadata "
                 "is unavailable."
             )
-        with st.form("common_settings"):
-            c1, c2, c3 = st.columns(3)
-            heldout = c1.selectbox(
-                "Held-out sessions",
-                ["all", "last", "explicit in JSON"],
-                index=(
-                    0
-                    if payload["heldout_sessions"] == "all"
-                    else 1
-                    if payload["heldout_sessions"] == "last"
-                    else 2
-                ),
-            )
-            rank = payload["subgoal_selection"]["rank_range"]
-            low = c2.number_input(
-                "Minimum rank", min_value=2, max_value=49, value=rank[0]
-            )
-            high = c3.number_input(
-                "Maximum rank", min_value=2, max_value=49, value=rank[1]
-            )
-            mlmdp = payload.get("mlmdp", {})
-            also_nmf = st.checkbox(
-                "Also fit NMF MLMDP (both enter the regression)",
-                value="nmf" in mlmdp.get("profile_sources", ["behavioral"]),
-            )
-            theta_search = st.radio(
-                "θ search",
-                ["Coarse grid", "Coarse + fine grid"],
-                index=int(
-                    mlmdp.get("behavioral", {}).get(
-                        "theta_search", mlmdp.get("theta_search", "coarse")
-                    )
-                    == "coarse_and_local"
-                ),
-                horizontal=True,
-            )
-            behavioral = {
-                **BehavioralFitSettings().as_dict(),
-                **mlmdp.get("behavioral", {}),
-            }
-            commitment_modes = ["both", "termination", "radius"]
-            m1, m2 = st.columns(2)
-            commitment_mode = m1.selectbox(
-                "Behavioral goal commitment",
-                commitment_modes,
-                index=commitment_modes.index(behavioral["commitment_mode"]),
-                help="When the exact goal-only policy replaces the composed "
-                "policy: 'termination' = stochastic upper-termination draw at a "
-                "subgoal access; 'radius' = within the radius of the goal (no "
-                "draw); 'both' = either.",
-            )
-            commitment_radius = m2.number_input(
-                "Commitment radius (grid steps; ignored for termination)",
-                min_value=1,
-                value=int(behavioral["commitment_radius"] or 2),
-            )
-            st.caption(
-                "Behavioral θ and K use inner held-out sessions. Auto route counts "
-                "follow the behavioral K when both MLMDPs are enabled."
-            )
-            route = c1.selectbox(
-                "Route family",
-                ["pca", "hmm"],
-                index=0 if payload["predictors"]["route_family"] == "pca" else 1,
-            )
-            method = c2.selectbox(
-                "Regression CV",
-                ["blocked_trial_kfold", "blocked_trial_learning_curve"],
-                index=0
-                if payload["regression_cv"]["method"] == "blocked_trial_kfold"
-                else 1,
-            )
-            folds = c3.number_input(
-                "Folds or learning-curve subdivisions",
-                min_value=2,
-                value=payload["regression_cv"].get(
-                    "n_splits", payload["regression_cv"].get("n_subdivisions", 5)
-                ),
-            )
-            st.markdown("**HMM route model** (used when the route family is hmm)")
-            hmm = {**HMM_GUI_DEFAULTS, **payload["predictors"].get("hmm", {})}
-            h1, h2, h3 = st.columns(3)
-            n_routes_auto = h1.checkbox(
-                "Routes from selected rank (auto)", value=hmm["n_routes"] == "auto"
-            )
-            n_routes = h1.number_input(
-                "Number of routes",
-                min_value=1,
-                value=6 if hmm["n_routes"] == "auto" else int(hmm["n_routes"]),
-                disabled=n_routes_auto,
-            )
-            learn_costs = h1.checkbox(
-                "Learn action cost and cognitive constant",
-                value=bool(hmm["learn_costs"]),
-                help="Fit a and D by maximum likelihood with Adam, as log(a) and "
-                "log(a * D); the values below are then initial values.",
-            )
-            action_cost = h2.number_input(
-                "Action cost a (initial if learned)",
-                min_value=0.0,
-                value=float(hmm["action_cost"]),
-                step=0.01,
-                format="%.4f",
-            )
-            cognitive_constant = h2.number_input(
-                "Cognitive constant D (initial if learned)",
-                min_value=0.0,
-                value=float(hmm["cognitive_constant"]),
-                step=1.0,
-            )
-            cost_learning_rate = h3.number_input(
-                "Cost learning rate (log space)",
-                min_value=0.0,
-                value=float(hmm["cost_learning_rate"]),
-                step=0.005,
-                format="%.4f",
-                help="Adam learning rate for log(a) and log(a * D); R and pi keep "
-                "their own learning rate.",
-            )
-            cost_freeze_epochs = h3.number_input(
-                "Hold costs fixed for the first N epochs",
-                min_value=0,
-                value=int(hmm["cost_freeze_epochs"]),
-            )
-            route_prior = h1.checkbox(
-                "Dirichlet prior on route weights",
-                value=hmm["route_prior_concentration"] is not None,
-                help="Add a symmetric Dirichlet log prior on the non-uniform route "
-                "weights to the training objective, as in Qin's 2024 Route_HMM. "
-                "Validation scores and checkpoint selection stay likelihood-only.",
-            )
-            route_prior_concentration = h2.number_input(
-                "Route-weight prior concentration α",
-                min_value=1.0,
-                value=float(hmm["route_prior_concentration"] or 100.0),
-                step=10.0,
-                help="α per route; larger holds the weights closer to equal. "
-                "α = 1 is flat. Qin's 2024 routes used 100.",
-            )
-            discovery_config = st.text_input(
-                "Discovery configuration", payload["discovery_config"]
-            )
-            discovery_dir = st.text_input(
-                "Shared discovery directory", payload.get("discovery_dir") or ""
-            )
-            apply_common_settings = st.form_submit_button(
-                "Apply common settings to JSON", disabled=not valid_selection
-            )
-        if apply_common_settings:
-            updated = json.loads(raw)
-            if subjects is not None:
-                updated["dataset"].update(
-                    subject_ids=subjects, start_date=start, end_date=end
+        c1, c2, c3 = st.columns(3)
+        heldout = c1.selectbox(
+            "Held-out sessions",
+            ["all", "last", "explicit in JSON"],
+            index=(
+                0
+                if payload["heldout_sessions"] == "all"
+                else 1
+                if payload["heldout_sessions"] == "last"
+                else 2
+            ),
+        )
+        rank = payload["subgoal_selection"]["rank_range"]
+        low = c2.number_input(
+            "Minimum rank", min_value=2, max_value=49, value=rank[0]
+        )
+        high = c3.number_input(
+            "Maximum rank", min_value=2, max_value=49, value=rank[1]
+        )
+        mlmdp = payload.get("mlmdp", {})
+        also_nmf = st.checkbox(
+            "Also fit NMF MLMDP (both enter the regression)",
+            value="nmf" in mlmdp.get("profile_sources", ["behavioral"]),
+        )
+        theta_search = st.radio(
+            "θ search",
+            ["Coarse grid", "Coarse + fine grid"],
+            index=int(
+                mlmdp.get("behavioral", {}).get(
+                    "theta_search", mlmdp.get("theta_search", "coarse")
                 )
-            if heldout != "explicit in JSON":
-                updated["heldout_sessions"] = heldout
+                == "coarse_and_local"
+            ),
+            horizontal=True,
+        )
+        behavioral = {
+            **BehavioralFitSettings().as_dict(),
+            **mlmdp.get("behavioral", {}),
+        }
+        commitment_modes = ["both", "termination", "radius"]
+        m1, m2 = st.columns(2)
+        commitment_mode = m1.selectbox(
+            "Behavioral goal commitment",
+            commitment_modes,
+            index=commitment_modes.index(behavioral["commitment_mode"]),
+            help="When the exact goal-only policy replaces the composed "
+            "policy: 'termination' = stochastic upper-termination draw at a "
+            "subgoal access; 'radius' = within the radius of the goal (no "
+            "draw); 'both' = either.",
+        )
+        commitment_radius = m2.number_input(
+            "Commitment radius (grid steps; ignored for termination)",
+            min_value=1,
+            value=int(behavioral["commitment_radius"] or 2),
+        )
+        st.caption(
+            "Behavioral θ and K use inner held-out sessions. Auto route counts "
+            "follow the behavioral K when both MLMDPs are enabled."
+        )
+        route = c1.selectbox(
+            "Route family",
+            ["pca", "hmm"],
+            index=0 if payload["predictors"]["route_family"] == "pca" else 1,
+        )
+        method = c2.selectbox(
+            "Regression CV",
+            ["blocked_trial_kfold", "blocked_trial_learning_curve"],
+            index=0
+            if payload["regression_cv"]["method"] == "blocked_trial_kfold"
+            else 1,
+        )
+        folds = c3.number_input(
+            "Folds or learning-curve subdivisions",
+            min_value=2,
+            value=payload["regression_cv"].get(
+                "n_splits", payload["regression_cv"].get("n_subdivisions", 5)
+            ),
+        )
+        st.markdown("**HMM route model** (used when the route family is hmm)")
+        hmm = {**HMM_GUI_DEFAULTS, **payload["predictors"].get("hmm", {})}
+        h1, h2, h3 = st.columns(3)
+        n_routes_auto = h1.checkbox(
+            "Routes from selected rank (auto)", value=hmm["n_routes"] == "auto"
+        )
+        n_routes = h1.number_input(
+            "Number of routes",
+            min_value=1,
+            value=6 if hmm["n_routes"] == "auto" else int(hmm["n_routes"]),
+            disabled=n_routes_auto,
+        )
+        learn_costs = h1.checkbox(
+            "Learn action cost and cognitive constant",
+            value=bool(hmm["learn_costs"]),
+            help="Fit a and D by maximum likelihood with Adam, as log(a) and "
+            "log(a * D); the values below are then initial values.",
+        )
+        action_cost = h2.number_input(
+            "Action cost a (initial if learned)",
+            min_value=0.0,
+            value=float(hmm["action_cost"]),
+            step=0.01,
+            format="%.4f",
+        )
+        cognitive_constant = h2.number_input(
+            "Cognitive constant D (initial if learned)",
+            min_value=0.0,
+            value=float(hmm["cognitive_constant"]),
+            step=1.0,
+        )
+        cost_learning_rate = h3.number_input(
+            "Cost learning rate (log space)",
+            min_value=0.0,
+            value=float(hmm["cost_learning_rate"]),
+            step=0.005,
+            format="%.4f",
+            help="Adam learning rate for log(a) and log(a * D); R and pi keep "
+            "their own learning rate.",
+        )
+        cost_freeze_epochs = h3.number_input(
+            "Hold costs fixed for the first N epochs",
+            min_value=0,
+            value=int(hmm["cost_freeze_epochs"]),
+        )
+        route_prior = h1.checkbox(
+            "Dirichlet prior on route weights",
+            value=hmm["route_prior_concentration"] is not None,
+            help="Add a symmetric Dirichlet log prior on the non-uniform route "
+            "weights to the training objective, as in Qin's 2024 Route_HMM. "
+            "Validation scores and checkpoint selection stay likelihood-only.",
+        )
+        route_prior_concentration = h2.number_input(
+            "Route-weight prior concentration α",
+            min_value=1.0,
+            value=float(hmm["route_prior_concentration"] or 100.0),
+            step=10.0,
+            help="α per route; larger holds the weights closer to equal. "
+            "α = 1 is flat. Qin's 2024 routes used 100.",
+        )
+        discovery_config = st.text_input(
+            "Discovery configuration", payload["discovery_config"]
+        )
+        discovery_dir = st.text_input(
+            "Shared discovery directory", payload.get("discovery_dir") or ""
+        )
+        # Every change is written to the JSON straight away: Launch submits the
+        # JSON, so unapplied widget edits would otherwise be silently dropped.
+        # A field is written only when its widget differs from what the JSON
+        # already says, so loading a configuration or editing the JSON by hand
+        # never rewrites it.
+        updated = json.loads(raw)
+        if subjects is not None and valid_selection and (
+            subjects != original
+            or start != payload["dataset"].get("start_date")
+            or end != payload["dataset"].get("end_date")
+        ):
+            updated["dataset"].update(
+                subject_ids=subjects, start_date=start, end_date=end
+            )
+        if heldout != "explicit in JSON" and heldout != payload["heldout_sessions"]:
+            updated["heldout_sessions"] = heldout
+        if [int(low), int(high)] != list(rank):
             updated["subgoal_selection"]["rank_range"] = [int(low), int(high)]
-            behavioral_settings = dict(mlmdp.get("behavioral", {}))
-            behavioral_settings["theta_search"] = (
-                "coarse" if theta_search == "Coarse grid" else "coarse_and_local"
-            )
+        updated_mlmdp = updated.setdefault("mlmdp", {})
+        profile_sources = ["behavioral", "nmf"] if also_nmf else ["behavioral"]
+        if profile_sources != mlmdp.get("profile_sources", ["behavioral"]):
+            updated_mlmdp["profile_sources"] = profile_sources
+        behavioral_settings = updated_mlmdp.setdefault("behavioral", {})
+        selected_search = (
+            "coarse" if theta_search == "Coarse grid" else "coarse_and_local"
+        )
+        current_search = mlmdp.get("behavioral", {}).get(
+            "theta_search", mlmdp.get("theta_search", "coarse")
+        )
+        selected_radius = (
+            None if commitment_mode == "termination" else int(commitment_radius)
+        )
+        commitment_changed = (commitment_mode, selected_radius) != (
+            behavioral["commitment_mode"],
+            behavioral["commitment_radius"],
+        )
+        if selected_search != current_search:
+            behavioral_settings["theta_search"] = selected_search
+            updated_mlmdp.pop("theta_search", None)
+        # Whenever the behavioral section is written, the goal-commitment
+        # structure is written with it so the JSON states it explicitly.
+        if commitment_changed or selected_search != current_search:
             behavioral_settings["commitment_mode"] = commitment_mode
-            behavioral_settings["commitment_radius"] = (
-                None if commitment_mode == "termination" else int(commitment_radius)
-            )
-            updated["mlmdp"] = {
-                "profile_sources": ["behavioral", "nmf"]
-                if also_nmf
-                else ["behavioral"],
-                "behavioral": behavioral_settings,
-            }
+            behavioral_settings["commitment_radius"] = selected_radius
+        # Drop only the sections created above, never ones the JSON had.
+        if not behavioral_settings and "behavioral" not in mlmdp:
+            updated_mlmdp.pop("behavioral")
+        if not updated_mlmdp and "mlmdp" not in payload:
+            updated.pop("mlmdp")
+        if route != payload["predictors"]["route_family"]:
             updated["predictors"]["route_family"] = route
-            hmm_settings = updated["predictors"].setdefault("hmm", {})
-            for name, value in (
-                ("n_routes", "auto" if n_routes_auto else int(n_routes)),
-                ("learn_costs", learn_costs),
-                ("action_cost", float(action_cost)),
-                ("cognitive_constant", float(cognitive_constant)),
-                ("cost_learning_rate", float(cost_learning_rate)),
-                ("cost_freeze_epochs", int(cost_freeze_epochs)),
-                (
-                    "route_prior_concentration",
-                    float(route_prior_concentration) if route_prior else None,
-                ),
-            ):
-                # Keys are written only when already present or changed from
-                # the fitting default, so applying unchanged settings does not
-                # change the workflow signature.
-                if name in hmm_settings or value != HMM_GUI_DEFAULTS[name]:
-                    hmm_settings[name] = value
+        hmm_settings = updated["predictors"].setdefault("hmm", {})
+        for name, value in (
+            ("n_routes", "auto" if n_routes_auto else int(n_routes)),
+            ("learn_costs", learn_costs),
+            ("action_cost", float(action_cost)),
+            ("cognitive_constant", float(cognitive_constant)),
+            ("cost_learning_rate", float(cost_learning_rate)),
+            ("cost_freeze_epochs", int(cost_freeze_epochs)),
+            (
+                "route_prior_concentration",
+                float(route_prior_concentration) if route_prior else None,
+            ),
+        ):
+            if value != hmm[name]:
+                hmm_settings[name] = value
+        if not hmm_settings and "hmm" not in payload["predictors"]:
+            updated["predictors"].pop("hmm")
+        current_folds = payload["regression_cv"].get(
+            "n_splits", payload["regression_cv"].get("n_subdivisions", 5)
+        )
+        if (method, int(folds)) != (payload["regression_cv"]["method"], current_folds):
             updated["regression_cv"] = {
                 "method": method,
                 (
                     "n_splits" if method == "blocked_trial_kfold" else "n_subdivisions"
                 ): int(folds),
             }
+        if discovery_config != payload["discovery_config"]:
             updated["discovery_config"] = discovery_config
+        if (discovery_dir or None) != payload.get("discovery_dir"):
             updated["discovery_dir"] = discovery_dir or None
+        if updated != payload:
             st.session_state.pending_config_text = json.dumps(updated, indent=2)
             st.rerun()
     configured_concurrency = int(payload.get("slurm", {}).get("max_concurrent", 1200))
@@ -463,6 +499,50 @@ if root is None:
             ]
         )
         st.json(st.session_state.preview_manifest["unavailable_partitions"])
+    st.subheader("Code for this run")
+    pinned_commit = None
+    code_ready = code_versions is not None
+    if code_versions is not None:
+        head = code_versions["head"]
+        pinnable = [b for b in code_versions["branches"] if b["pinnable"]]
+        choice = st.selectbox(
+            "Run the workers on",
+            [None, *pinnable],
+            format_func=lambda b: (
+                f"This checkout: {code_versions['branch'] or 'detached HEAD'} @ "
+                f"{head[:8]} — {code_versions['head_subject']}"
+                if b is None
+                else f"Branch {b['name']} @ {b['commit'][:8]} ({b['date']}) — "
+                f"{b['subject']}"
+            ),
+            help="The run is pinned to this commit: its workers, retries and "
+            "status checks use a frozen export of it, whatever the working tree "
+            "does later.",
+        )
+        commit = head if choice is None else choice["commit"]
+        if choice is not None:
+            pinned_commit = commit
+        if commit == head and code_versions["uncommitted"]:
+            st.error(
+                "The checkout has uncommitted changes to scientific source, so it "
+                "cannot be pinned. Commit them, or choose a branch:\n\n"
+                + "\n".join(f"- `{line}`" for line in code_versions["uncommitted"])
+            )
+            code_ready = False
+        elif commit != head:
+            st.warning(
+                f"Workers will run commit {commit[:12]}, not this checkout. The "
+                "session preview and resource table above come from this checkout "
+                "and may differ from what that commit does."
+            )
+        else:
+            st.caption(f"Workers will run commit {commit[:12]}.")
+        skipped = [b["name"] for b in code_versions["branches"] if not b["pinnable"]]
+        if skipped:
+            st.caption(
+                "Not offered because they predate run pinning (merge main into "
+                f"them first): {', '.join(skipped)}"
+            )
     run_id = st.text_input("New run ID")
     no_lattice = st.checkbox(
         "Skip the all-subsets predictor lattice (2^n - 1 regressions)", value=False
@@ -472,12 +552,19 @@ if root is None:
         type="primary",
         disabled=(
             not valid_selection
+            or not code_ready
             or resource_plan is None
             or not resource_plan["launchable"]
         ),
     ):
         with st.spinner("Preparing the manifest and submitting workflow jobs..."):
-            launched = show_error(access.launch, payload, run_id, no_lattice=no_lattice)
+            launched = show_error(
+                access.launch,
+                payload,
+                run_id,
+                no_lattice=no_lattice,
+                commit=pinned_commit,
+            )
         if launched:
             st.success(f"Workflow launched. Manager log: {launched['log']}")
     st.stop()
@@ -487,6 +574,13 @@ if loaded is None:
     st.stop()
 config, manifest = loaded
 st.caption(str(root))
+if (root / "slurm_manager.json").is_file():
+    run_manager = read_json(root / "slurm_manager.json")
+    st.caption(
+        f"Code: pinned to commit {run_manager['git_commit'][:12]}"
+        if run_manager.get("git_commit")
+        else "Code: the live working tree (this run predates commit pinning)"
+    )
 page = st.segmented_control(
     "View",
     ["Configuration", "Progress", "Results"],
@@ -590,8 +684,6 @@ if page == "Progress":
     manager_file = root / "slurm_manager.json"
     if manager_file.exists():
         drift = show_error(access.source_drift, root)
-        if drift and drift["git_commit"]:
-            st.caption(f"Code pinned to commit {drift['git_commit'][:12]}")
         source_changed = bool(drift) and not drift["matches"]
         if source_changed:
             failed = drift["failed_tasks"]

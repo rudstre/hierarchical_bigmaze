@@ -400,6 +400,21 @@ environment's `pip freeze`. The environment itself is shared and is not frozen.
 To prune, delete `<repo>_code/<commit>/` directories that no run's
 `slurm_manager.json` refers to.
 
+To run a new workflow on a different branch or commit without checking it out,
+pass `--commit REF`. Because the working tree isn't involved, its uncommitted
+changes don't matter, unless `REF` is the checked-out commit, which gets the
+same refusal as the default. Commits from before run pinning are refused,
+because their manager would run workers from the main tree. The GUI shows the
+checkout it runs in the sidebar and has a "Run the workers on" picker that
+offers only pinnable branches. It also shows each saved run's pinned commit.
+The GUI's session preview and resource table always come from the checkout,
+so they can differ from what another chosen commit does.
+
+In the GUI, the common-settings widgets write to the configuration JSON as
+soon as they change. Launch submits that JSON. A field is written only when
+its widget differs from the JSON, so loading a configuration or editing the
+JSON by hand never rewrites it.
+
 Workers refuse to start when the scientific source (`src/`, `scripts/` outside
 `slurm/` and `gui/`, and `pyproject.toml`) differs from the fingerprint the run
 recorded. For pinned runs, this happens only if the snapshot itself was edited,

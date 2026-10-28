@@ -109,9 +109,7 @@ def test_new_workflow_json_survives_switching_to_a_saved_run(tmp_path):
     next(w for w in app.selectbox if w.label == "Held-out sessions").select(
         "last"
     ).run()
-    next(
-        w for w in app.button if w.label == "Apply common settings to JSON"
-    ).click().run()
+    app.run()
     draft = next(w for w in app.text_area if w.label == "Configuration JSON").value
     assert json.loads(draft)["heldout_sessions"] == "last"
 
@@ -139,14 +137,36 @@ def test_streamlit_rank_range_form_updates_configuration_json_together():
 
     next(w for w in app.number_input if w.label == "Minimum rank").set_value(4)
     next(w for w in app.number_input if w.label == "Maximum rank").set_value(9)
-    next(
-        w for w in app.button if w.label == "Apply common settings to JSON"
-    ).click().run()
+    app.run()
 
     raw = next(
         widget for widget in app.text_area if widget.label == "Configuration JSON"
     ).value
     assert json.loads(raw)["subgoal_selection"]["rank_range"] == [4, 9]
+
+
+def test_common_settings_write_to_json_without_an_apply_step():
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    template = (ROOT / "configs/regression_workflow.json").read_text()
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=60
+    ).run()
+
+    def configuration():
+        raw = next(w for w in app.text_area if w.label == "Configuration JSON").value
+        return json.loads(raw)
+
+    # Loading a configuration never rewrites it.
+    assert configuration() == json.loads(template)
+    assert not any(w.label == "Apply common settings to JSON" for w in app.button)
+
+    subjects = json.loads(template)["dataset"]["subject_ids"]
+    next(w for w in app.checkbox if w.label == subjects[-1]).uncheck().run()
+    assert configuration()["dataset"]["subject_ids"] == subjects[:-1]
+    next(w for w in app.number_input if w.label == "Maximum rank").set_value(9).run()
+    assert configuration()["subgoal_selection"]["rank_range"][1] == 9
+    # Earlier edits persist through later ones.
+    assert configuration()["dataset"]["subject_ids"] == subjects[:-1]
 
 
 def test_streamlit_route_prior_is_written_only_when_enabled():
@@ -155,17 +175,15 @@ def test_streamlit_route_prior_is_written_only_when_enabled():
         str(ROOT / "scripts/gui/app.py"), default_timeout=30
     ).run()
 
-    def apply_and_read_hmm():
-        next(
-            w for w in app.button if w.label == "Apply common settings to JSON"
-        ).click().run()
+    def rerun_and_read_hmm():
+        app.run()
         raw = next(
             widget for widget in app.text_area if widget.label == "Configuration JSON"
         ).value
         return json.loads(raw)["predictors"].get("hmm", {})
 
     # Unchanged settings leave the workflow signature alone.
-    assert "route_prior_concentration" not in apply_and_read_hmm()
+    assert "route_prior_concentration" not in rerun_and_read_hmm()
 
     next(
         w for w in app.checkbox if w.label == "Dirichlet prior on route weights"
@@ -173,12 +191,12 @@ def test_streamlit_route_prior_is_written_only_when_enabled():
     next(
         w for w in app.number_input if w.label == "Route-weight prior concentration α"
     ).set_value(250.0)
-    assert apply_and_read_hmm()["route_prior_concentration"] == 250.0
+    assert rerun_and_read_hmm()["route_prior_concentration"] == 250.0
 
     next(
         w for w in app.checkbox if w.label == "Dirichlet prior on route weights"
     ).uncheck()
-    assert apply_and_read_hmm()["route_prior_concentration"] is None
+    assert rerun_and_read_hmm()["route_prior_concentration"] is None
 
 
 def test_resource_preview_tracks_route_family_and_advanced_overrides():
@@ -541,9 +559,7 @@ def test_streamlit_behavioral_defaults_and_optional_nmf():
     assert not checkbox.value
     checkbox.check()
     next(w for w in app.radio if w.label == "θ search").set_value("Coarse + fine grid")
-    next(
-        w for w in app.button if w.label == "Apply common settings to JSON"
-    ).click().run()
+    app.run()
     assert not app.exception
     raw = next(w for w in app.text_area if w.label == "Configuration JSON").value
     mlmdp = json.loads(raw)["mlmdp"]
@@ -557,11 +573,72 @@ def test_streamlit_behavioral_defaults_and_optional_nmf():
     next(
         w for w in app.selectbox if w.label == "Behavioral goal commitment"
     ).set_value("termination")
-    next(
-        w for w in app.button if w.label == "Apply common settings to JSON"
-    ).click().run()
+    app.run()
     assert not app.exception
     raw = next(w for w in app.text_area if w.label == "Configuration JSON").value
     behavioral = json.loads(raw)["mlmdp"]["behavioral"]
     assert behavioral["commitment_mode"] == "termination"
     assert behavioral["commitment_radius"] is None
+
+
+def _code_versions(uncommitted):
+    return {
+        "branch": "main",
+        "head": "a" * 40,
+        "head_subject": "checked out",
+        "uncommitted": uncommitted,
+        "branches": [
+            {"name": "main", "commit": "a" * 40, "date": "2026-10-28",
+             "subject": "checked out", "pinnable": True},
+            {"name": "feature", "commit": "b" * 40, "date": "2026-10-27",
+             "subject": "other work", "pinnable": True},
+            {"name": "old", "commit": "c" * 40, "date": "2026-01-01",
+             "subject": "before pinning", "pinnable": False},
+        ],
+    }
+
+
+def test_code_picker_shows_pinned_commit_and_blocks_dirty_checkout(monkeypatch):
+    streamlit = pytest.importorskip("streamlit.testing.v1")
+    monkeypatch.syspath_prepend(str(ROOT / "scripts/gui"))
+    import run_access
+
+    monkeypatch.setattr(
+        run_access, "code_versions", lambda: _code_versions([" M src/x.py"])
+    )
+    app = streamlit.AppTest.from_file(
+        str(ROOT / "scripts/gui/app.py"), default_timeout=60
+    ).run()
+
+    def launch_disabled():
+        return next(w for w in app.button if w.label == "Launch workflow").disabled
+
+    picker = next(w for w in app.selectbox if w.label == "Run the workers on")
+    # Branches that predate pinning are not offered.
+    assert [label.split(" @")[0] for label in picker.options] == [
+        "This checkout: main",
+        "Branch main",
+        "Branch feature",
+    ]
+    assert any("uncommitted changes" in e.value for e in app.error)
+    assert launch_disabled()
+
+    picker.select_index(2).run()
+    assert any("bbbbbbbbbbbb" in w.value for w in app.warning)
+    assert not any("uncommitted changes" in e.value for e in app.error)
+
+
+def test_launch_pins_the_chosen_commit(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(access, "ROOT", tmp_path)
+    monkeypatch.setattr(access, "resource_preview", lambda _: {"launchable": True})
+    monkeypatch.setattr(access, "snapshot_config", lambda _, output: output / "c")
+    monkeypatch.setattr(
+        access, "_manager_process", lambda *args: calls.append(args) or {}
+    )
+
+    access.launch({}, "run", commit="b" * 40)
+    access.launch({}, "run2")
+
+    assert calls[0][3] == ["--commit", "b" * 40]
+    assert calls[1][3] == []

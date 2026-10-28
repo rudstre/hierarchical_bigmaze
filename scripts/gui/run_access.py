@@ -33,6 +33,8 @@ from andrew_mlmdp.validation import (  # noqa: E402
     _atomic_write_json,
     load_validation_config,
     source_code_fingerprint,
+    supports_code_pinning,
+    uncommitted_source_changes,
 )
 
 _SCHEDULER_CACHE = {}
@@ -466,7 +468,43 @@ def snapshot_config(payload, output):
     return output / "config.json"
 
 
-def launch(payload, run_id, *, no_lattice=False):
+def code_versions():
+    """The checkout this GUI runs, and the branches a new run can be pinned to."""
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=ROOT, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    branches = []
+    listing = git(
+        "for-each-ref",
+        "refs/heads",
+        "--sort=-committerdate",
+        "--format=%(refname:short)%09%(objectname)%09%(committerdate:short)"
+        "%09%(subject)",
+    )
+    for line in listing.splitlines():
+        name, commit, date, subject = line.split("\t", 3)
+        branches.append(
+            {
+                "name": name,
+                "commit": commit,
+                "date": date,
+                "subject": subject,
+                "pinnable": supports_code_pinning(ROOT, commit),
+            }
+        )
+    return {
+        "branch": git("branch", "--show-current") or None,
+        "head": git("rev-parse", "HEAD"),
+        "head_subject": git("log", "-1", "--format=%s"),
+        "uncommitted": uncommitted_source_changes(ROOT),
+        "branches": branches,
+    }
+
+
+def launch(payload, run_id, *, no_lattice=False, commit=None):
     if not run_id or any(
         c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
         for c in run_id
@@ -477,9 +515,10 @@ def launch(payload, run_id, *, no_lattice=False):
         raise ValueError(plan["launch_block_reason"])
     output = ROOT / "output/regression_workflow" / run_id
     config_path = snapshot_config(payload, output)
-    return _manager_process(
-        output, config_path, run_id, ["--no-precompute-lattice"] if no_lattice else []
-    )
+    options = ["--no-precompute-lattice"] if no_lattice else []
+    if commit is not None:
+        options += ["--commit", commit]
+    return _manager_process(output, config_path, run_id, options)
 
 
 def _manager_process(output, config_path, run_id, options):

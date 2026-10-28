@@ -1177,3 +1177,53 @@ def test_manager_reexecs_from_the_runs_snapshot(tmp_path, monkeypatch):
     )
     assert required("--retry-missing") == {"code_root": str(pinned)}
     assert calls == [(manager.PROJECT_ROOT, pinned.parent, "abc123")]
+
+
+def test_new_run_can_be_pinned_to_a_named_commit(tmp_path, monkeypatch):
+    head, other, old = "a" * 40, "b" * 40, "c" * 40
+    commits = {"HEAD": head, "main": head, "feature": other, "old": old}
+    monkeypatch.setattr(manager, "resolve_commit", lambda _root, ref: commits[ref])
+    monkeypatch.setattr(
+        manager, "supports_code_pinning", lambda _root, commit: commit != old
+    )
+    dirty = []
+    monkeypatch.setattr(manager, "uncommitted_source_changes", lambda _root: dirty)
+    calls = []
+    monkeypatch.setattr(
+        manager,
+        "code_snapshot",
+        lambda root, base, commit=None: calls.append(commit) or {"code_root": "x"},
+    )
+    output = tmp_path / "run"
+    output.mkdir()
+
+    def required(*extra):
+        args = manager.parser().parse_args(
+            ["--config", "c.json", "--output-dir", str(output), "--run-id", "r",
+             *extra]
+        )
+        return manager._required_snapshot(args, output)
+
+    required("--commit", "feature")
+    assert calls == [other]
+    with pytest.raises(ValueError, match="predates run pinning"):
+        required("--commit", "old")
+    # Naming the checked-out commit still refuses uncommitted edits: the
+    # snapshot is requested without a commit, which applies that check.
+    dirty.append(" M src/x.py")
+    required("--commit", "main")
+    assert calls == [other, None]
+
+    manager._atomic_json(
+        output / "slurm_manager.json", {"code_root": "x", "git_commit": head}
+    )
+    with pytest.raises(ValueError, match="applies only to new runs"):
+        required("--retry-missing", "--commit", "feature")
+
+
+def test_snapshot_manager_is_not_passed_the_commit_option():
+    argv = ["--config", "c.json", "--commit", "main", "--run-id", "r",
+            "--commit=feature", "--dry-run"]
+    assert manager._snapshot_argv(argv) == [
+        "--config", "c.json", "--run-id", "r", "--dry-run"
+    ]

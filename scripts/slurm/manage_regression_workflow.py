@@ -48,7 +48,10 @@ from andrew_mlmdp.validation import (  # noqa: E402
     CODE_SNAPSHOT_RECORD,
     _payload_digest,
     code_snapshot,
+    resolve_commit,
     source_code_fingerprint,
+    supports_code_pinning,
+    uncommitted_source_changes,
 )
 
 MANAGER_SCHEMA_VERSION = 2
@@ -63,6 +66,11 @@ def parser():
         type=Path,
         default=PROJECT_ROOT.parent / f"{PROJECT_ROOT.name}_code",
         help="Directory holding one frozen code export per pinned commit",
+    )
+    result.add_argument(
+        "--commit",
+        help="Branch or commit to pin a new run to (default: the checked-out "
+        "HEAD, which must have no uncommitted scientific source changes)",
     )
     result.add_argument("--config", type=Path, required=True)
     result.add_argument("--output-dir", type=Path)
@@ -1217,6 +1225,13 @@ def _required_snapshot(args, output):
     record = output / "slurm_manager.json"
     if record.is_file():
         manager = _read(record)
+        if args.commit is not None and (
+            resolve_commit(args.project_root, args.commit) != manager.get("git_commit")
+        ):
+            raise ValueError(
+                f"This run is pinned to {manager.get('git_commit') or 'the live tree'}"
+                f"; --commit {args.commit} applies only to new runs."
+            )
         if "code_root" not in manager:
             return None
         # Recreates the export if it was pruned.
@@ -1227,7 +1242,38 @@ def _required_snapshot(args, output):
         )
     if args.status or args.retry_missing:
         return None
-    return code_snapshot(args.project_root, args.snapshot_base)
+    if args.commit is None:
+        return code_snapshot(args.project_root, args.snapshot_base)
+    commit = resolve_commit(args.project_root, args.commit)
+    if not supports_code_pinning(args.project_root, commit):
+        raise ValueError(
+            f"{args.commit} ({commit[:12]}) predates run pinning; merge main "
+            "into it before running from it."
+        )
+    # Naming the checked-out commit gets the same uncommitted-changes refusal
+    # as the default, so edits in the working tree are never silently left out.
+    head = resolve_commit(args.project_root, "HEAD")
+    if commit == head and uncommitted_source_changes(args.project_root):
+        return code_snapshot(args.project_root, args.snapshot_base)
+    return code_snapshot(args.project_root, args.snapshot_base, commit=commit)
+
+
+def _snapshot_argv(argv):
+    """Arguments for the snapshot's manager, without ``--commit``.
+
+    The snapshot already is the chosen commit, and managers from commits
+    before ``--commit`` existed would reject the option.
+    """
+    result = []
+    skip = False
+    for item in argv:
+        if skip:
+            skip = False
+        elif item == "--commit":
+            skip = True
+        elif not item.startswith("--commit="):
+            result.append(item)
+    return result
 
 
 def main(argv=None):
@@ -1252,7 +1298,7 @@ def main(argv=None):
             [
                 sys.executable,
                 str(script),
-                *argv,
+                *_snapshot_argv(argv),
                 "--project-root",
                 str(args.project_root.resolve()),
             ],
